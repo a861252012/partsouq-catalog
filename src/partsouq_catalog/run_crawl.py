@@ -1,0 +1,100 @@
+"""CLI 進入點：python3 -m partsouq_catalog.run_crawl [--brand TOYOTA] [--fresh]
+
+執行整趟 PartSouq 爬取。可續爬：先前完成的型號/車型會自動跳過。
+遇到 Cloudflare challenge 時，HTTP 層會停止本次 run 並保留錯誤狀態；
+不會自動取得或注入 cookie，也不會使用規避工具。
+
+本模組是「組合根」（composition root）：組裝資料庫連線、Repository、
+HTTP 工作階段與爬蟲服務，然後交給服務層執行 —— 本身不含業務邏輯。
+"""
+
+import argparse
+import fcntl
+import logging
+import logging.handlers
+import os
+import sys
+
+from .config import CRAWL, LOG_DIR
+from .crawler import Crawler
+from .db import Database
+from .governor import RequestGovernor
+from .http_client import SessionManager
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PartSouq 全站爬蟲")
+    parser.add_argument("--brand", default=None, help="只爬這個品牌（例如 Toyota）")
+    parser.add_argument("--fresh", action="store_true", help="執行前先清除爬取進度（從頭開始）")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(CRAWL.get("workers", 4)),
+        help="並行車型 worker 數（預設取自 PSQ_WORKERS 或 4）",
+    )
+    args = parser.parse_args()
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # 由 launchd 啟動時 stdout 會寫入無上限的 launchd.out.log：
+    # 此時只寫輪替檔，不重複寫 stdout。
+    handlers = [
+        # 20 MB x 5 輪替：跑好幾天的爬蟲不能讓日誌無限長大
+        logging.handlers.RotatingFileHandler(
+            LOG_DIR / "crawl.log",
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
+        ),
+    ]
+    if "LAUNCHD_JOB" not in os.environ:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+    log = logging.getLogger("main")
+
+    if args.brand:
+        CRAWL["start_brand"] = args.brand
+
+    # supervisor 的 flock 只能防兩個 supervisor；直接 CLI（尤其
+    # --fresh）也必須共用 crawler lock，否則兩趟 run 會同時重設 state
+    # 與發布 snapshot。
+    lock_fd = open(LOG_DIR / "crawler.lock", "a")
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.error("another crawler holds the lock; exiting")
+            return 2
+
+        # 組合根：組裝各層元件。--fresh 的 reset 已移到 Crawler.run，
+        # 與 start_run 在同一交易，不會在 cookie 初始化失敗時先毀進度。
+        db = Database().connect()
+        crawler = None
+
+        # 全站共用的 request governor：主 session（_brands() 等直發請求）
+        # 與 Crawler 的 worker session 共用同一實例，每個 wire request
+        # 都受全域限流（SOL P1）。
+        governor = RequestGovernor(CRAWL["request_rate"], CRAWL["request_burst"])
+        http = SessionManager(gov=governor)
+        crawler = Crawler(http, db, workers=args.workers, governor=governor, fresh=args.fresh)
+        counts = crawler.run()
+        log.info("crawl complete: %s (status=%s)", counts, crawler.last_status)
+        # full success / 預期 sample / 真正 error 使用不同 exit code；
+        # sample 不是可發布的完整型錄，但也不是爬取失敗。
+        if crawler.last_status == "success":
+            return 0
+        if crawler.last_status == "sample":
+            return 3
+        return 1
+    finally:
+        if "crawler" in locals() and crawler is not None:
+            crawler.close()
+        if "db" in locals():
+            db.close()
+        lock_fd.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

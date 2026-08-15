@@ -1,0 +1,53 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${PARTSOUQ_DB_NAME:-partsouq_catalog}
+      MYSQL_USER: ${PARTSOUQ_DB_USER:-partsouq}
+      MYSQL_PASSWORD: ${PARTSOUQ_DB_PASSWORD:?set PARTSOUQ_DB_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${PARTSOUQ_MYSQL_ROOT_PASSWORD:?set PARTSOUQ_MYSQL_ROOT_PASSWORD in .env}
+    ports:
+      - "${PARTSOUQ_DB_PORT:-3308}:3306"
+    volumes:
+      - partsouq_mysql:/var/lib/mysql
+      - ./db/catalog.sql:/docker-entrypoint-initdb.d/10-catalog.sql:ro
+      - ./db/nhtsa.sql:/docker-entrypoint-initdb.d/20-nhtsa.sql:ro
+      - ./db/admin.sql:/docker-entrypoint-initdb.d/30-admin.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  admin:
+    build: .
+    env_file: .env
+    environment:
+      PARTSOUQ_HOME: /app
+      PARTSOUQ_DB_HOST: mysql
+      PARTSOUQ_DB_PORT: 3306
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: ["partsouq-admin"]
+
+  scheduler:
+    build: .
+    profiles: ["scheduler"]
+    env_file: .env
+    environment:
+      PARTSOUQ_HOME: /app
+      PARTSOUQ_DB_HOST: mysql
+      PARTSOUQ_DB_PORT: 3306
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./output:/app/output
+      - ./logs:/app/logs
+    command: ["partsouq-scheduler", "--job", "nhtsa"]
+
+volumes:
+  partsouq_mysql:

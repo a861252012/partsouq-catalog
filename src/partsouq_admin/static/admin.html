@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PartSouq 站方後台</title>
+    <style>
+      :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", sans-serif; }
+      body { margin: 0; background: #f4f7fb; color: #172033; }
+      main { max-width: 1180px; margin: 0 auto; padding: 32px 20px 64px; }
+      h1 { margin: 0 0 8px; } h2 { margin: 0 0 12px; font-size: 18px; }
+      .note { color: #526071; margin: 0 0 24px; } .warning { color: #8a4d00; }
+      .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); }
+      section, .panel { background: #fff; border: 1px solid #dce3ed; border-radius: 12px; padding: 18px; box-shadow: 0 1px 2px #1720330a; }
+      label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
+      input, select, textarea, button { box-sizing: border-box; font: inherit; }
+      input, select, textarea { width: 100%; padding: 9px; border: 1px solid #b7c3d3; border-radius: 7px; background: #fff; }
+      textarea { min-height: 72px; resize: vertical; } button { padding: 9px 12px; margin-top: 12px; border: 0; border-radius: 7px; background: #0969da; color: white; cursor: pointer; }
+      button.secondary { background: #536274; margin-right: 8px; } button:hover { filter: brightness(.95); }
+      .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      #message { min-height: 24px; margin: 14px 0; font-weight: 600; } .error { color: #b42318; } .ok { color: #067647; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 440px; overflow: auto; padding: 14px; background: #101828; color: #d0d5dd; border-radius: 8px; font-size: 12px; }
+      .token { max-width: 560px; } .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+      .toolbar input { max-width: 320px; } @media (max-width: 560px) { .two { grid-template-columns: 1fr; } }
+      .summary-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
+      .stat { border: 1px solid #dce3ed; border-radius: 9px; padding: 12px; background: #f8fafc; }
+      .stat strong { display: block; font-size: 24px; margin-bottom: 3px; }
+      .stat span { color: #526071; font-size: 13px; }
+      .quality { margin: 12px 0 0; padding-left: 20px; color: #526071; }
+      .quality li { margin: 4px 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>PartSouq 站方後台</h1>
+      <p class="note">此後台與 PartSouq 型錄、NHTSA 同步共用同一個 MySQL 資料庫。寫入需提供管理 token。</p>
+      <section class="panel" style="margin-bottom:16px">
+        <h2>共用 DB 資料總覽</h2>
+        <div id="summary-cards" class="summary-grid" aria-live="polite"></div>
+        <p id="summary-status" class="note" style="margin-top:12px">讀取中…</p>
+        <ul id="quality-status" class="quality"></ul>
+      </section>
+      <section class="token">
+        <h2>管理 token</h2>
+        <input id="token" type="password" autocomplete="off" placeholder="X-Admin-Token">
+        <p class="note warning">完整 VIN 只會送到 NHTSA 官方解碼並存於共用資料庫；系統不猜測或掃描 VIN。</p>
+      </section>
+      <div id="message" aria-live="polite"></div>
+
+      <div class="grid">
+        <section>
+          <h2>車輛對照</h2>
+          <form data-endpoint="/api/vehicle-mappings">
+            <label>VIN 前綴</label><input name="vin_prefix" required maxlength="11" placeholder="例如 JTD">
+            <div class="two"><div><label>品牌</label><input name="make_name" required></div><div><label>型號</label><input name="model_name" required></div></div>
+            <div class="two"><div><label>年份</label><input name="model_year" type="number" min="1886" max="2100"></div><div><label>引擎</label><input name="engine"></div></div>
+            <label>Trim／車型等級</label><input name="trim_name">
+            <label>來源</label><input name="source_name" value="manual"><button>新增車輛對照</button>
+          </form>
+        </section>
+        <section>
+          <h2>零件中英文／俗稱</h2>
+          <form data-endpoint="/api/part-translations">
+            <label>英文零件名</label><input name="english_name" required>
+            <label>中文零件名</label><input name="chinese_name" required>
+            <label>常用中文名稱</label><input name="common_chinese_name">
+            <label>來源</label><input name="source_name" value="manual"><button>新增翻譯</button>
+          </form>
+        </section>
+        <section>
+          <h2>零件適用車型</h2>
+          <form data-endpoint="/api/part-fitments">
+            <label>零件號碼</label><input name="part_number" required>
+            <div class="two"><div><label>品牌</label><input name="make_name" required></div><div><label>型號</label><input name="model_name" required></div></div>
+            <div class="two"><div><label>起始年份</label><input name="model_year_from" type="number"></div><div><label>結束年份</label><input name="model_year_to" type="number"></div></div>
+            <label>VIN 前綴（選填）</label><input name="vin_prefix" maxlength="11">
+            <div class="two"><div><label>引擎</label><input name="engine"></div><div><label>Trim／車型等級</label><input name="trim_name"></div></div>
+            <label>來源</label><input name="source_name" value="manual"><button>新增適用關係</button>
+          </form>
+        </section>
+        <section>
+          <h2>零件分類標籤</h2>
+          <form data-endpoint="/api/categories">
+            <label>大分類</label><input name="category_main" required>
+            <div class="two"><div><label>中分類</label><input name="category_group"></div><div><label>小分類（目前僅人工標籤）</label><input name="category_small"></div></div>
+            <p class="note warning">目前 PartSouq 型錄只確認大分類與 group 層；站方小分類來源尚未取得，不會把中分類冒充成小分類。</p>
+            <label>中文名稱</label><input name="chinese_label" required><label>常用名稱</label><input name="common_chinese_label">
+            <label>來源</label><input name="source_name" value="manual"><button>新增分類標籤</button>
+          </form>
+        </section>
+        <section>
+          <h2>對帳頻道</h2>
+          <form data-endpoint="/api/reconciliation-items">
+            <label>類型</label><select name="channel"><option value="part">零件</option><option value="vehicle">車輛</option><option value="category">分類</option><option value="translation">翻譯</option></select>
+            <label>主鍵／識別值</label><input name="subject_key" required>
+            <label>左側資料（JSON，可選）</label><textarea name="left_value"></textarea>
+            <label>右側資料（JSON，可選）</label><textarea name="right_value"></textarea>
+            <button>建立對帳項目</button>
+          </form>
+        </section>
+        <section>
+          <h2>爬取要求</h2>
+          <form data-endpoint="/api/crawl-requests">
+            <label>工作</label><select name="job_name"><option value="catalog">PartSouq 型錄</option><option value="nhtsa-bulk">NHTSA Bulk</option><option value="nhtsa-api">NHTSA API</option><option value="nhtsa-vin">NHTSA VIN 解碼</option></select>
+            <label>範圍／VIN</label><input name="requested_scope" value="all">
+            <button>建立排程要求</button>
+          </form>
+        </section>
+        <section>
+          <h2>確認 VIN 與 PartSouq 車款</h2>
+          <p class="note">先執行 NHTSA VIN 解碼，再從候選車款確認正確的 PartSouq vehicle ID。</p>
+          <form data-endpoint="/api/vin-vehicle-mappings">
+            <label>既有 mapping ID（更正時填寫）</label><input name="mapping_id" type="number" min="1">
+            <label>完整 VIN</label><input name="vin" required minlength="17" maxlength="17">
+            <label>PartSouq vehicle ID</label><input name="partsouq_vehicle_id" type="number" min="1" required>
+            <label>來源</label><input name="source_name" value="manual-confirmed">
+            <label><input name="allow_name_override" type="checkbox" value="true"> 品牌／型號名稱不同，改用人工確認</label>
+            <label>人工確認依據（名稱不同時必填）</label><input name="source_reference">
+            <button>確認車款對應</button>
+          </form>
+        </section>
+      </div>
+
+      <section class="panel" style="margin-top:16px">
+        <h2>查詢與狀態</h2>
+        <p class="note"><code>part_id</code>、<code>model_id</code>、<code>vehicle_id</code>、<code>category_id</code>、<code>group_id</code> 是共用 DB 內部 ID；<code>vehicle_vid</code>、<code>category_cid</code>、<code>group_uid</code> 才是 PartSouq URL 參數；<code>part_code</code> 是零件表 Code，不是型號 ID。</p>
+        <div class="toolbar"><input id="part-number" placeholder="輸入零件號碼"><button class="secondary" id="find-parts">查零件</button><input id="vin-query" minlength="17" maxlength="17" placeholder="輸入完整 VIN"><button class="secondary" id="find-vin-candidates">查候選車款</button><button class="secondary" id="find-vin-parts">查 VIN 適用零件</button><button class="secondary" id="refresh">刷新後台資料</button></div>
+        <pre id="data">讀取中…</pre>
+      </section>
+    </main>
+    <script>
+      const output = document.querySelector('#data');
+      const message = document.querySelector('#message');
+      const summaryCards = document.querySelector('#summary-cards');
+      const summaryStatus = document.querySelector('#summary-status');
+      const qualityStatus = document.querySelector('#quality-status');
+      const token = () => document.querySelector('#token').value;
+      const emptyToNull = value => value === '' ? null : value;
+      const statusMessage = (text, isError = false) => { message.className = isError ? 'error' : 'ok'; message.textContent = text; };
+      async function call(path, options = {}) {
+        const headers = { ...(options.headers || {}) };
+        if (token()) headers['X-Admin-Token'] = token();
+        const response = await fetch(path, { ...options, headers });
+        const body = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(body?.detail || `HTTP ${response.status}`);
+        return body;
+      }
+      function formBody(form) {
+        const result = {};
+        for (const [key, value] of new FormData(form).entries()) result[key] = emptyToNull(value);
+        for (const key of ['model_year', 'model_year_from', 'model_year_to', 'partsouq_vehicle_id', 'mapping_id']) if (result[key] !== undefined && result[key] !== null) result[key] = Number(result[key]);
+        for (const key of ['left_value', 'right_value']) if (typeof result[key] === 'string' && result[key]) result[key] = JSON.parse(result[key]);
+        return result;
+      }
+      function renderSummary(summary) {
+        const cards = [
+          ['品牌', summary.normalized.brands], ['型號', summary.normalized.models],
+          ['具體車款', summary.normalized.vehicles], ['大分類', summary.normalized.categories],
+          ['中分類／Group', summary.normalized.groups], ['正規化零件列', summary.normalized.parts],
+          ['已發布適用列', summary.published.fitment_rows], ['不重複料號', summary.published.unique_part_numbers],
+          ['NHTSA VIN', summary.nhtsa.vin_decodes], ['已確認 VIN mapping', summary.mappings.confirmed],
+          ['過期 mapping', summary.mappings.stale],
+          ['樣本進度', `${summary.sample_progress.latest_run_rows}/${summary.sample_progress.target_rows}`]
+        ];
+        summaryCards.replaceChildren(...cards.map(([label, value]) => {
+          const card = document.createElement('div');
+          card.className = 'stat';
+          const count = document.createElement('strong');
+          count.textContent = typeof value === 'number' ? value.toLocaleString() : value;
+          const caption = document.createElement('span');
+          caption.textContent = label;
+          card.append(count, caption);
+          return card;
+        }));
+        const latest = summary.latest_crawl_run;
+        summaryStatus.className = summary.requirements_met ? 'note ok' : 'note warning';
+        summaryStatus.textContent = summary.requirements_met
+          ? '目前資料已通過需求檢查。'
+          : `目前資料尚未通過需求檢查。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
+        const reasonLabels = {
+          no_published_parts: '沒有已發布的 PartSouq 零件資料',
+          sample_rows_below_target: '樣本資料尚未達到目標筆數',
+          published_parts_data_quality_failed: '已發布資料有必填欄位、ID、年份、分類或關聯缺漏',
+          sample_parts_data_quality_failed: '樣本資料有必填欄位、ID、年份、分類或關聯缺漏',
+          no_nhtsa_vin_decodes: '沒有成功發布的 NHTSA VIN 解碼',
+          nhtsa_required_fields_missing: 'NHTSA 必填欄位有缺漏',
+          no_confirmed_vin_mapping: '沒有已確認的 VIN 與 PartSouq 車款 mapping',
+          stale_or_unconfirmed_vin_mapping: '仍有過期或未確認的 VIN mapping',
+          partsouq_small_category_source_unavailable: 'PartSouq 小分類來源目前無法取得，未以人工資料冒充'
+        };
+        qualityStatus.replaceChildren(...summary.blocking_reasons.map(reason => {
+          const item = document.createElement('li');
+          item.textContent = reasonLabels[reason] || reason;
+          return item;
+        }));
+      }
+      async function refresh() {
+        try {
+          const [summary, publishedParts, sampleParts, translations, categories] = await Promise.all([
+            call('/api/database-summary'), call('/api/parts?limit=200'),
+            call('/api/sample-parts?limit=1000'), call('/api/part-translations'),
+            call('/api/categories')
+          ]);
+          const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs] = token() ? await Promise.all([
+            call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs')
+          ]) : [[], [], [], [], [], []];
+          renderSummary(summary);
+          output.textContent = JSON.stringify({ summary, publishedParts, sampleParts, vehicles, nhtsaVehicles, vinMappings, translations, categories, reconciliation, requests, jobs }, null, 2);
+          statusMessage('已刷新資料。');
+        } catch (error) { statusMessage(error.message, true); output.textContent = ''; }
+      }
+      document.querySelectorAll('form[data-endpoint]').forEach(form => form.addEventListener('submit', async event => {
+        event.preventDefault();
+        try {
+          const body = formBody(form);
+          let endpoint = form.dataset.endpoint;
+          let method = 'POST';
+          if (endpoint === '/api/vin-vehicle-mappings' && body.mapping_id) {
+            endpoint = `${endpoint}/${body.mapping_id}`;
+            method = 'PUT';
+          }
+          delete body.mapping_id;
+          await call(endpoint, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          form.reset();
+          statusMessage('已建立資料。');
+          refresh();
+        } catch (error) { statusMessage(error.message, true); }
+      }));
+      document.querySelector('#refresh').addEventListener('click', refresh);
+      document.querySelector('#find-parts').addEventListener('click', async () => {
+        try {
+          const partNumber = document.querySelector('#part-number').value;
+          output.textContent = JSON.stringify(await call(`/api/parts/${encodeURIComponent(partNumber)}/fitments`), null, 2);
+        } catch (error) { statusMessage(error.message, true); }
+      });
+      document.querySelector('#find-vin-candidates').addEventListener('click', async () => {
+        try {
+          const vin = document.querySelector('#vin-query').value;
+          output.textContent = JSON.stringify(await call(`/api/vins/${encodeURIComponent(vin)}/vehicle-candidates`), null, 2);
+        } catch (error) { statusMessage(error.message, true); }
+      });
+      document.querySelector('#find-vin-parts').addEventListener('click', async () => {
+        try {
+          const vin = document.querySelector('#vin-query').value;
+          output.textContent = JSON.stringify(await call(`/api/vins/${encodeURIComponent(vin)}/parts`), null, 2);
+        } catch (error) { statusMessage(error.message, true); }
+      });
+      refresh();
+    </script>
+  </body>
+</html>

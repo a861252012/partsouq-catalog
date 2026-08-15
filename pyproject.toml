@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "partsouq-catalog"
+version = "0.1.0"
+description = "Unified PartSouq catalog, NHTSA sync, scheduler, and backoffice"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "a861252012" }]
+dependencies = [
+    "aiofiles>=24,<26",
+    "aiohttp>=3.11,<4",
+    "aiosqlite>=0.20,<1",
+    "beautifulsoup4>=4.12,<5",
+    "certifi>=2025.1.31",
+    "fastapi>=0.115,<1",
+    "html5lib>=1.1,<2",
+    "lxml>=5.3,<7",
+    "playwright>=1.55,<2",
+    "pymysql>=1.1,<2",
+    "requests>=2.32,<3",
+    "uvicorn[standard]>=0.34,<1",
+    "warcio>=1.7,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "mypy>=1.15,<2",
+    "pytest>=8.3,<9",
+    "pytest-cov>=6,<8",
+    "ruff>=0.9,<1",
+    "types-aiofiles>=24,<26",
+    "types-PyMySQL>=1.1,<2",
+]
+
+[project.scripts]
+partsouq-admin = "partsouq_admin.app:main"
+partsouq-catalog-crawl = "partsouq_catalog.run_crawl:main"
+partsouq-catalog-supervisor = "partsouq_catalog.supervisor:main"
+partsouq-crawler = "partsouq_crawler.cli:main"
+partsouq-scheduler = "partsouq_catalog.scheduler:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/partsouq_admin", "src/partsouq_catalog", "src/partsouq_crawler"]
+include = [
+    "src/partsouq_admin/static/admin.html",
+    "src/partsouq_crawler/db/schema.sql",
+    "src/partsouq_crawler/nhtsa/mysql_schema.sql",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+ignore = ["E501", "SIM105", "SIM115"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["partsouq_admin", "partsouq_catalog", "partsouq_crawler"]
+
+[[tool.mypy.overrides]]
+module = ["lxml.*", "warcio.*"]
+ignore_missing_imports = true
