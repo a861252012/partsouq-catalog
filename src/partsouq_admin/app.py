@@ -247,6 +247,15 @@ def database_summary() -> dict:
             "(SELECT COUNT(*) FROM published_parts) AS published_fitment_rows, "
             "(SELECT COUNT(DISTINCT part_number) FROM published_parts) AS unique_part_numbers, "
             "(SELECT COUNT(DISTINCT vehicle_id) FROM published_parts) AS unique_vehicles, "
+            "(SELECT COUNT(*) FROM nhtsa_current_records) AS nhtsa_current_records, "
+            "(SELECT COUNT(*) FROM nhtsa_current_artifacts) AS nhtsa_current_artifacts, "
+            "(SELECT COUNT(*) FROM nhtsa_sync_runs) AS nhtsa_sync_runs, "
+            "(SELECT COUNT(*) FROM nhtsa_sync_runs WHERE status = 'completed') "
+            "AS nhtsa_completed_runs, "
+            "(SELECT COUNT(*) FROM nhtsa_sync_runs WHERE status = 'failed') "
+            "AS nhtsa_failed_runs, "
+            "(SELECT COALESCE(SUM(rejected_rows), 0) FROM nhtsa_sync_runs) "
+            "AS nhtsa_rejected_rows, "
             "(SELECT COUNT(*) FROM nhtsa_vin_decodes) AS nhtsa_vin_decodes, "
             "(SELECT COUNT(*) FROM admin_part_translations) AS admin_part_translations, "
             "(SELECT COUNT(*) FROM admin_part_fitments) AS admin_part_fitments, "
@@ -256,6 +265,10 @@ def database_summary() -> dict:
             "(SELECT COUNT(*) FROM scheduled_job_runs) AS scheduled_job_runs"
         )
         or {}
+    )
+    nhtsa_datasets = _fetch_all(
+        "SELECT dataset_name, COUNT(*) AS row_count FROM nhtsa_current_records "
+        "GROUP BY dataset_name ORDER BY dataset_name"
     )
     mappings = (
         _fetch_one(
@@ -373,18 +386,20 @@ def database_summary() -> dict:
     )
 
     nhtsa_count = int(counts.get("nhtsa_vin_decodes", 0))
+    nhtsa_current_records = int(counts.get("nhtsa_current_records", 0))
     confirmed_count = int(mappings.get("confirmed", 0))
     mappings["unconfirmed_vin_decodes"] = max(nhtsa_count - confirmed_count, 0)
     sample_target = int(os.getenv("PSQ_LIMIT_PARTS", "1000"))
     sample_rows = int(sample_quality.get("row_count", 0))
 
-    blocking_reasons = []
+    demo_blocking_reasons = []
+    production_pending_reasons = []
     if int(counts.get("published_fitment_rows", 0)) == 0:
-        blocking_reasons.append("no_published_parts")
+        production_pending_reasons.append("full_catalog_not_published")
     if sample_rows < sample_target:
-        blocking_reasons.append("sample_rows_below_target")
+        demo_blocking_reasons.append("sample_rows_below_target")
     if any(int(published_quality.get(key, 0)) for key in published_quality):
-        blocking_reasons.append("published_parts_data_quality_failed")
+        production_pending_reasons.append("published_parts_data_quality_failed")
     sample_required_checks = (
         "required_field_missing_rows",
         "id_missing_rows",
@@ -395,16 +410,22 @@ def database_summary() -> dict:
         "category_group_missing_rows",
     )
     if sample_rows and any(int(sample_quality.get(key, 0)) for key in sample_required_checks):
-        blocking_reasons.append("sample_parts_data_quality_failed")
+        demo_blocking_reasons.append("sample_parts_data_quality_failed")
+    if nhtsa_current_records == 0:
+        demo_blocking_reasons.append("no_nhtsa_reference_data")
+        production_pending_reasons.append("no_nhtsa_reference_data")
     if nhtsa_count == 0:
-        blocking_reasons.append("no_nhtsa_vin_decodes")
-    if int(nhtsa_quality.get("required_field_missing_rows", 0)):
-        blocking_reasons.append("nhtsa_required_fields_missing")
-    if confirmed_count == 0:
-        blocking_reasons.append("no_confirmed_vin_mapping")
+        production_pending_reasons.append("awaiting_authorized_vin")
+    elif confirmed_count == 0:
+        production_pending_reasons.append("no_confirmed_vin_mapping")
+    if nhtsa_count and int(nhtsa_quality.get("required_field_missing_rows", 0)):
+        production_pending_reasons.append("nhtsa_required_fields_missing")
     if int(mappings.get("stale", 0)) or int(mappings["unconfirmed_vin_decodes"]):
-        blocking_reasons.append("stale_or_unconfirmed_vin_mapping")
-    blocking_reasons.append("partsouq_small_category_source_unavailable")
+        production_pending_reasons.append("stale_or_unconfirmed_vin_mapping")
+    production_pending_reasons.append("partsouq_small_category_source_unavailable")
+
+    demo_ready = not demo_blocking_reasons
+    production_ready = not production_pending_reasons
 
     return {
         "normalized": {
@@ -420,7 +441,25 @@ def database_summary() -> dict:
             "unique_part_numbers": counts.get("unique_part_numbers", 0),
             "unique_vehicles": counts.get("unique_vehicles", 0),
         },
-        "nhtsa": {"vin_decodes": nhtsa_count},
+        "nhtsa": {
+            "current_records": nhtsa_current_records,
+            "current_artifacts": int(counts.get("nhtsa_current_artifacts", 0)),
+            "datasets": [
+                {
+                    "dataset_name": row.get("dataset_name"),
+                    "row_count": int(row.get("row_count", 0)),
+                }
+                for row in nhtsa_datasets
+            ],
+            "sync_runs": {
+                "total": int(counts.get("nhtsa_sync_runs", 0)),
+                "completed": int(counts.get("nhtsa_completed_runs", 0)),
+                "failed": int(counts.get("nhtsa_failed_runs", 0)),
+            },
+            "rejected_rows": int(counts.get("nhtsa_rejected_rows", 0)),
+            "vin_decodes": nhtsa_count,
+            "vin_decode_status": ("awaiting_authorized_vin" if nhtsa_count == 0 else "decoded"),
+        },
         "mappings": mappings,
         "admin": {
             "part_translations": counts.get("admin_part_translations", 0),
@@ -458,8 +497,12 @@ def database_summary() -> dict:
             "group_uid": "partsouq_url_parameter",
             "part_code": "partsouq_part_table_code_not_model_id",
         },
-        "requirements_met": not blocking_reasons,
-        "blocking_reasons": blocking_reasons,
+        "demo_ready": demo_ready,
+        "production_ready": production_ready,
+        "demo_blocking_reasons": demo_blocking_reasons,
+        "production_pending_reasons": production_pending_reasons,
+        "requirements_met": production_ready,
+        "blocking_reasons": production_pending_reasons,
     }
 
 

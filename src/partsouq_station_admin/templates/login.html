@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>站方後台登入</title>
+  <link rel="stylesheet" href="{{ url_for('admin.static', filename='admin.css') }}">
+</head>
+<body>
+  <main class="login-shell">
+    <form class="editor" method="post">
+      <h1>站方後台登入</h1>
+      {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="notice {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ next_path }}">
+      <label>帳號<input name="username" required autocomplete="username"></label>
+      <label>密碼<input type="password" name="password" required autocomplete="current-password"></label>
+      <button type="submit">登入</button>
+    </form>
+  </main>
+</body>
+</html>

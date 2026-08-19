@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}{{ spec.title }}｜汽車資料站方後台{% endblock %}
+{% block content %}
+  <div class="page-title">
+    <div><h1>{{ spec.title }}</h1><p>可搜尋、指定頁碼，並自行選擇每頁筆數。</p></div>
+    <div>
+      {% if spec.key == 'vin_vehicle_mappings' %}<a class="button secondary" href="{{ url_for('admin.vin_decode_request') }}">加入 VIN 解碼</a>{% endif %}
+      <a class="button" href="{{ url_for('admin.entity_create', entity_type=spec.key) }}">新增人工資料</a>
+    </div>
+  </div>
+  <form class="filters" method="get">
+    <input type="search" name="q" value="{{ page.query }}" placeholder="搜尋來源欄位或覆寫內容">
+    <label>每頁
+      <select name="pageSize">
+        {% for size in page_sizes %}<option value="{{ size }}" {% if size == page.page_size %}selected{% endif %}>{{ size }}</option>{% endfor %}
+      </select>
+    </label>
+    <label><input type="checkbox" name="include_retired" value="1" {% if page.include_retired %}checked{% endif %}> 顯示已停用</label>
+    <button type="submit">查詢</button>
+  </form>
+  <div class="table-wrap record-list"><table>
+    <thead><tr><th>識別</th>{% for field in spec.display_fields %}<th>{{ field_label(field) }}</th>{% endfor %}<th>狀態</th></tr></thead>
+    <tbody>
+      {% for record in page.records %}
+        <tr class="{% if record.status == 'retired' %}retired{% endif %}">
+          <td><a href="{{ url_for('admin.entity_detail', entity_type=spec.key, identity_key=record.identity_key) }}"><code>{{ record.identity_key }}</code></a><br><span class="badge">{{ '來源' if record.source_record_id else '人工' }}</span></td>
+          {% for field in spec.display_fields %}
+            {% set value = record.payload.get(field) %}
+            <td>{% if value is mapping or (value is sequence and value is not string) %}<code>{{ value | tojson }}</code>{% else %}{{ value if value is not none else '—' }}{% endif %}</td>
+          {% endfor %}
+          <td>版本 {{ record.revision }}<br>{{ record.status }}</td>
+        </tr>
+      {% else %}
+        <tr><td class="empty" colspan="{{ spec.display_fields | length + 2 }}">沒有符合條件的資料。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  <div class="pagination">
+    <div class="pagination-controls">
+      {% if page.page > 1 %}
+        <a class="page-button" aria-label="第一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=1) }}">«</a>
+        <a class="page-button" aria-label="上一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.page - 1) }}">‹</a>
+      {% else %}
+        <span class="page-button disabled">«</span><span class="page-button disabled">‹</span>
+      {% endif %}
+      <form class="page-form" method="get">
+        <input type="hidden" name="q" value="{{ page.query }}">
+        <input type="hidden" name="pageSize" value="{{ page.page_size }}">
+        {% if page.include_retired %}<input type="hidden" name="include_retired" value="1">{% endif %}
+        <span>第</span><input aria-label="頁碼" type="number" name="page" value="{{ page.page }}" min="1" max="{{ page.total_pages }}"><span>頁，共 {{ page.total_pages }} 頁</span>
+      </form>
+      {% if page.page < page.total_pages %}
+        <a class="page-button" aria-label="下一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.page + 1) }}">›</a>
+        <a class="page-button" aria-label="末頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.total_pages) }}">»</a>
+      {% else %}
+        <span class="page-button disabled">›</span><span class="page-button disabled">»</span>
+      {% endif %}
+    </div>
+    <div>顯示 {{ page.start }} 到 {{ page.end }}，共 {{ page.total }} 筆記錄</div>
+  </div>
+{% endblock %}

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ detail.record.identity_key }}｜{{ spec.title }}{% endblock %}
+{% block content %}
+  <div class="page-title">
+    <div>
+      <h1>{{ spec.title }} <code>{{ detail.record.identity_key }}</code></h1>
+      <p>狀態 {{ detail.record.status }} · 覆寫版本 {{ detail.record.revision }} · base hash <code>{{ detail.record.base_sha256 }}</code></p>
+    </div>
+    <a class="button" href="{{ url_for('admin.entity_edit', entity_type=spec.key, identity_key=detail.record.identity_key) }}">編輯覆寫</a>
+  </div>
+  <section>
+    <h2>目前有效內容</h2>
+    <div class="table-wrap"><table><tbody>{% for field, value in detail.record.payload.items() %}<tr><th>{{ field_label(field) }}<br><code>{{ field }}</code></th><td>{% if value is mapping or (value is sequence and value is not string) %}<pre>{{ value | tojson(indent=2) }}</pre>{% else %}{{ value if value is not none else '—' }}{% endif %}</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+  {% if detail.record.source_payload %}
+    <section><h2>不可變來源內容</h2><details><summary>展開原始欄位</summary><pre>{{ detail.record.source_payload | tojson(indent=2) }}</pre></details></section>
+  {% endif %}
+  <section class="actions">
+    <h2>狀態操作</h2>
+    <form method="post" action="{{ url_for('admin.entity_restore' if detail.record.status == 'retired' else 'admin.entity_retire', entity_type=spec.key, identity_key=detail.record.identity_key) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="revision" value="{{ detail.record.revision }}">
+      <label>操作者<input name="actor" value="{{ actor }}" required></label>
+      <label>原因<input name="reason" required></label>
+      <button type="submit" class="{{ 'button' if detail.record.status == 'retired' else 'danger' }}">{{ '恢復' if detail.record.status == 'retired' else '停用' }}</button>
+    </form>
+  </section>
+  <section>
+    <h2>異動事件{% if detail.events_truncated %}（僅顯示最新 100 筆）{% endif %}</h2>
+    <div class="table-wrap"><table><thead><tr><th>版本</th><th>動作</th><th>操作者</th><th>原因</th><th>時間</th></tr></thead><tbody>
+      {% for event in detail.events %}<tr><td>{{ event.revision }}</td><td>{{ event.action }}</td><td>{{ event.actor }}</td><td>{{ event.reason }}</td><td>{{ event.created_at }}</td></tr>{% else %}<tr><td colspan="5">尚無人工異動。</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+  <section>
+    <h2>來源資訊{% if detail.provenance_truncated %}（僅顯示最新 100 筆）{% endif %}</h2>
+    <p>Response 為「—」時，代表目前只有共用 DB 的結構化來源列與已遮罩網址，不代表已保留原始 HTTP 回應或 hash。</p>
+    <div class="table-wrap"><table><thead><tr><th>來源記錄／Response</th><th>Parser</th><th>來源網址</th><th>擷取／封存時間</th></tr></thead><tbody>
+      {% for source in detail.provenance %}<tr><td>{% if source.response_id %}Response {{ source.response_id }} / HTTP {{ source.http_status }}{% else %}DB source:{{ source.source_record_id }} / HTTP —{% endif %}</td><td>{{ source.parser_name }} {{ source.parser_version }}</td><td><code>{{ source.source_url }}</code></td><td>{{ source.captured_at or source.fetched_at }}</td></tr>{% else %}<tr><td colspan="4">人工資料沒有來源列；來源資料若無紀錄，請檢查匯入完整性。</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+{% endblock %}

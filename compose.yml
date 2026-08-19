@@ -13,6 +13,7 @@ services:
       - ./db/catalog.sql:/docker-entrypoint-initdb.d/10-catalog.sql:ro
       - ./db/nhtsa.sql:/docker-entrypoint-initdb.d/20-nhtsa.sql:ro
       - ./db/admin.sql:/docker-entrypoint-initdb.d/30-admin.sql:ro
+      - ./db/station_admin.sql:/docker-entrypoint-initdb.d/40-station-admin.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
       interval: 5s
@@ -32,6 +33,28 @@ services:
     ports:
       - "8000:8000"
     command: ["partsouq-admin"]
+
+  station-admin:
+    build: .
+    env_file: .env
+    environment:
+      PARTSOUQ_HOME: /app
+      PARTSOUQ_DB_HOST: mysql
+      PARTSOUQ_DB_PORT: 3306
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8086:8086"
+    command:
+      [
+        "gunicorn",
+        "--bind",
+        "0.0.0.0:8086",
+        "--workers",
+        "1",
+        "partsouq_station_admin.wsgi:app",
+      ]
 
   scheduler:
     build: .

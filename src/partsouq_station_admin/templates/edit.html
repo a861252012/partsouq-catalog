@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{{ '新增' if mode == 'create' else '編輯' }}{{ spec.title }}{% endblock %}
+{% block content %}
+  <div class="page-title"><div><h1>{{ '新增人工資料' if mode == 'create' else '新增覆寫版本' }}</h1><p>{{ spec.title }} · 不會直接改寫爬蟲來源表。</p></div></div>
+  <form class="editor" method="post" action="{{ url_for('admin.entity_create', entity_type=spec.key) if mode == 'create' else url_for('admin.entity_update', entity_type=spec.key, identity_key=record.identity_key) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="form_mode" value="{{ mode }}">
+    {% if record %}<input type="hidden" name="revision" value="{{ record.revision }}">{% endif %}
+    <div class="field-grid">
+      {% for field in spec.editable_fields %}
+        {% set current = edit_payload.get(field) %}
+        <label>{{ field_label(field) }} <small><code>{{ field }}</code></small>
+          {% if field_kind(field) == 'json' %}
+            <textarea name="field__{{ field }}" rows="5" spellcheck="false">{% if current is not none %}{{ current | tojson }}{% elif field == 'common_names_zh_tw' or field == 'comments_json' %}[]{% else %}{}{% endif %}</textarea>
+          {% elif field_kind(field) == 'boolean' %}
+            <select name="field__{{ field }}"><option value="">不覆寫</option><option value="1" {% if current == true or current == 1 %}selected{% endif %}>是</option><option value="0" {% if current == false or current == 0 %}selected{% endif %}>否</option></select>
+          {% elif field_kind(field) == 'integer' %}
+            <input type="number" name="field__{{ field }}" value="{{ current if current is not none else '' }}" step="1">
+          {% elif field_kind(field) == 'number' %}
+            <input type="number" name="field__{{ field }}" value="{{ current if current is not none else '' }}" step="any">
+          {% else %}
+            <input name="field__{{ field }}" value="{{ current if current is not none else '' }}">
+          {% endif %}
+        </label>
+      {% endfor %}
+    </div>
+    <div class="two-columns">
+      <label>操作者<input name="actor" value="{{ actor }}" required maxlength="191"></label>
+      <label>修改原因<input name="reason" required></label>
+    </div>
+    <button type="submit">儲存新版本</button>
+  </form>
+{% endblock %}

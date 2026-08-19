@@ -19,9 +19,16 @@
 
 PartSouq 的舊 SQLite 工具保留在 `partsouq_crawler` 套件中，僅作為歷史封存／原始證據處理；正式排程不以它作為資料來源。因此排程與後台不會再分散到 SQLite 與 MySQL。
 
-## 站方後台
+## 後台
 
-啟動後開啟 [http://localhost:8000/admin](http://localhost:8000/admin)。後台可管理：
+本機啟動後有兩個角色不同的後台：
+
+- [http://localhost:8086/](http://localhost:8086/) 是完整站方後台。支援 10 類資料瀏覽、搜尋、明細、新增、修改、停用與復原；可選每頁 10／25／50／100／200 筆。修改以 overlay 生效，不改寫爬蟲原始資料；每次寫入都保留 actor、reason、revision 與只能追加的 audit event。也可查看監控與排入已獲授權 VIN 的解碼要求。
+- [http://localhost:8000/admin](http://localhost:8000/admin) 是共用 DB 的資料品質與 API mapping dashboard，不是上述 10 類資料的完整 CRUD 後台。
+
+8086 站方後台可管理的 10 類資料為：車款配置、零件分類、圖表／Group、零件號碼、零件出現位置、適用車款、中英文零件對照、VIN 車款對照、VIN 零件適用性與對帳案件。它透過 view 讀取現有的共用 catalog，不會建第二份空的 catalog。
+
+8000 資料品質後台可管理：
 
 - 車輛 WMI/VDS 前綴與品牌、型號、年份、引擎、Trim 的對照。
 - 對使用者提供的 17 碼 VIN 執行 NHTSA 官方解碼。
@@ -58,18 +65,23 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql` 與 `db/admin.sql`。現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，先確認無需保留資料後再使用 `docker compose down -v`。
+MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、`db/admin.sql` 與 `db/station_admin.sql`。現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，先確認無需保留資料後再使用 `docker compose down -v`。
 
 既有 volume 升級前，先停止後台、排程與 crawler，並完成資料庫備份，再執行：
 
 ```bash
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/007_unified_vin_mapping.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/008_admin_source_ids.sql
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
 ```
 
 migration 可重複執行。它只會為能唯一證明關聯的舊 snapshot 回填
 `vehicle_id` 與來源 ID；無法唯一確認的列會保留但不進 VIN mapping，須等
 下一次完整成功的 PartSouq publish 更新。
+
+`db/station_admin.sql` 可重複執行，用來建立 8086 後台的 compatibility views、overlay heads 與 append-only audit events。現有 volume 升級完後，以 `docker compose up -d --build station-admin` 啟動站方後台。
+
+8086 首頁會分開顯示 PartSouq normalized sample、published snapshot、NHTSA current reference records 與逐 VIN decode。Sample 筆數不等於已發布筆數；NHTSA reference records 已同步也不代表已有使用者提供的 VIN decode。
 
 PartSouq 目前可證明的型錄階層是大分類與 Group／diagram 中分類；沒有足夠
 資料證明另有獨立的小分類來源，因此後台只允許人工補充，不會用其他欄位
@@ -98,6 +110,9 @@ docker compose run --rm scheduler partsouq-scheduler --job nhtsa-api --scope all
 
 # 僅解碼一組使用者提供／獲授權的完整 VIN
 docker compose run --rm scheduler partsouq-scheduler --job nhtsa-vin --scope '<使用者提供的17碼VIN>'
+
+# 消費 8086 後台建立的 VIN／爬取要求
+docker compose run --rm scheduler partsouq-scheduler --job pending
 ```
 
 `PSQ_LIMIT_PARTS=0` 才是完整型錄模式。設為正整數時，爬蟲以獨立的
@@ -106,7 +121,7 @@ docker compose run --rm scheduler partsouq-scheduler --job nhtsa-vin --scope '<�
 Sample 不會更新 `published_parts`／`v_parts`，DB 狀態為 `sample`，CLI
 exit code 為 `3`；真正錯誤仍為 `1`，完整成功才是 `0`。
 
-來源專案已明確提供 PartSouq 每月排程，但沒有提供 NHTSA 的既定頻率。因此 repository 不會擅自啟用 cron；請依資料新鮮度與資源預算，在部署端以同一個 `partsouq-scheduler` 入口設定實際時間。
+來源專案已明確提供 PartSouq 每月排程，但沒有提供 NHTSA 的既定頻率。因此 repository 不會擅自啟用 cron；請依資料新鮮度與資源預算，在部署端以同一個 `partsouq-scheduler` 入口設定實際時間。8086 後台只會把要求寫入持久佇列；未另設 timer／cron 前，需執行上面的 `--job pending` 才會開始處理。
 
 ## 驗證
 
@@ -128,6 +143,7 @@ docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "DR
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" partsouq_catalog_test' < db/catalog.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" partsouq_catalog_test' < db/nhtsa.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" partsouq_catalog_test' < db/admin.sql
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" partsouq_catalog_test' < db/station_admin.sql
 
 PARTSOUQ_DB_NAME=partsouq_catalog_test \
 NHTSA_TEST_MYSQL=1 \

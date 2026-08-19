@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}總覽｜汽車資料站方後台{% endblock %}
+{% block content %}
+  <div class="page-title">
+    <div>
+      <h1>資料總覽</h1>
+      <p>NHTSA、PartSouq 來源資料與站方修正分開保存；差異進入對帳頻道。</p>
+    </div>
+  </div>
+  <section>
+    <h2>目前共用 DB 資料層</h2>
+    <div class="summary-grid">
+      <div><strong>{{ system_summary.partsouq_normalized_rows }}</strong><span> PartSouq normalized rows（包含 sample）</span></div>
+      <div><strong>{{ system_summary.partsouq_published_rows }}</strong><span> PartSouq published snapshot rows</span></div>
+      <div><strong>{{ system_summary.nhtsa_current_records }}</strong><span> NHTSA current reference records</span></div>
+      <div><strong>{{ system_summary.nhtsa_vin_decodes }}</strong><span> NHTSA VIN decodes（需站方提供合法 VIN）</span></div>
+    </div>
+    {% if system_summary.partsouq_published_rows == 0 %}<p class="warning">目前 1000 筆是 normalized sample，尚未發布成完整 snapshot。</p>{% endif %}
+    {% if system_summary.nhtsa_vin_decodes == 0 %}<p>NHTSA 參考資料已同步；逐 VIN 解碼需由站方輸入合法 VIN，不能列舉 VIN。</p>{% endif %}
+    <p>PartSouq 目前可證明大分類與中分類；站方頁面沒有獨立小分類來源，後台不會捏造小分類。</p>
+  </section>
+  <div class="cards">
+    {% for key, spec in entity_specs.items() %}
+      <a class="card" href="{{ url_for('admin.entity_list', entity_type=key) }}">
+        <h2>{{ spec.title }}</h2>
+        <strong>{{ counts[key].source }}</strong><span> 筆來源資料</span>
+        <dl>
+          <dt>人工新增</dt><dd>{{ counts[key].manual }}</dd>
+          <dt>來源覆寫</dt><dd>{{ counts[key].overrides }}</dd>
+          <dt>已停用</dt><dd>{{ counts[key].retired }}</dd>
+        </dl>
+      </a>
+    {% endfor %}
+  </div>
+{% endblock %}

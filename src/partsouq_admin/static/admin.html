@@ -198,12 +198,22 @@
         return result;
       }
       function renderSummary(summary) {
+        const datasetCards = summary.nhtsa.datasets.map(dataset => [
+          `NHTSA ${dataset.dataset_name}`, dataset.row_count
+        ]);
         const cards = [
           ['品牌', summary.normalized.brands], ['型號', summary.normalized.models],
           ['具體車款', summary.normalized.vehicles], ['大分類', summary.normalized.categories],
           ['中分類／Group', summary.normalized.groups], ['正規化零件列', summary.normalized.parts],
           ['已發布適用列', summary.published.fitment_rows], ['不重複料號', summary.published.unique_part_numbers],
-          ['NHTSA VIN', summary.nhtsa.vin_decodes], ['已確認 VIN mapping', summary.mappings.confirmed],
+          ['NHTSA 基礎資料', summary.nhtsa.current_records],
+          ['NHTSA current artifacts', summary.nhtsa.current_artifacts],
+          ['NHTSA 同步執行', `${summary.nhtsa.sync_runs.completed} 成功／${summary.nhtsa.sync_runs.failed} 失敗／${summary.nhtsa.sync_runs.total} 總計`],
+          ['NHTSA rejected rows', summary.nhtsa.rejected_rows],
+          ...datasetCards,
+          ['NHTSA VIN 解碼', summary.nhtsa.vin_decodes],
+          ['VIN 輸入狀態', summary.nhtsa.vin_decode_status === 'awaiting_authorized_vin' ? '尚未提供合法 VIN' : '已有解碼資料'],
+          ['已確認 VIN mapping', summary.mappings.confirmed],
           ['過期 mapping', summary.mappings.stale],
           ['樣本不重複料號', summary.sample_progress.unique_part_numbers],
           ['樣本進度', `${summary.sample_progress.latest_run_rows}/${summary.sample_progress.target_rows}`]
@@ -219,24 +229,31 @@
           return card;
         }));
         const latest = summary.latest_crawl_run;
-        summaryStatus.className = summary.requirements_met ? 'note ok' : 'note warning';
-        summaryStatus.textContent = summary.requirements_met
-          ? '目前資料已通過需求檢查。'
-          : `目前資料尚未通過需求檢查。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
+        summaryStatus.className = summary.demo_ready ? 'note ok' : 'note warning';
+        summaryStatus.textContent = summary.production_ready
+          ? '展示資料與正式資料皆已通過檢查。'
+          : summary.demo_ready
+            ? `展示資料已就緒；正式環境尚有待完成項目。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`
+            : `展示資料尚未就緒。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
         const reasonLabels = {
-          no_published_parts: '沒有已發布的 PartSouq 零件資料',
+          full_catalog_not_published: '正式全量 PartSouq snapshot 尚未發布；目前完成的 sample 仍可供展示',
           sample_rows_below_target: '樣本資料尚未達到目標筆數',
           published_parts_data_quality_failed: '已發布資料有必填欄位、ID、年份、分類或關聯缺漏',
           sample_parts_data_quality_failed: '樣本資料有必填欄位、ID、年份、分類或關聯缺漏',
-          no_nhtsa_vin_decodes: '沒有成功發布的 NHTSA VIN 解碼',
+          no_nhtsa_reference_data: 'NHTSA 基礎資料尚未同步',
+          awaiting_authorized_vin: '尚未提供合法持有或獲授權的完整 VIN；VIN 解碼等待輸入',
           nhtsa_required_fields_missing: 'NHTSA 必填欄位有缺漏',
           no_confirmed_vin_mapping: '沒有已確認的 VIN 與 PartSouq 車款 mapping',
           stale_or_unconfirmed_vin_mapping: '仍有過期或未確認的 VIN mapping',
           partsouq_small_category_source_unavailable: 'PartSouq 小分類來源目前無法取得，未以人工資料冒充'
         };
-        qualityStatus.replaceChildren(...summary.blocking_reasons.map(reason => {
+        const readinessItems = [
+          ...summary.demo_blocking_reasons.map(reason => ['展示資料', reason]),
+          ...summary.production_pending_reasons.map(reason => ['正式環境', reason])
+        ];
+        qualityStatus.replaceChildren(...readinessItems.map(([scope, reason]) => {
           const item = document.createElement('li');
-          item.textContent = reasonLabels[reason] || reason;
+          item.textContent = `${scope}：${reasonLabels[reason] || reason}`;
           return item;
         }));
       }

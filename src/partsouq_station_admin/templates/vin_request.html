@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}新增 VIN 解碼｜汽車資料站方後台{% endblock %}
+{% block content %}
+  <div class="page-title"><div><h1>新增 VIN 解碼</h1><p>只處理站方實際提供的 VIN；不暴力列舉 VIN。</p></div></div>
+  <form class="editor" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>17 碼 VIN<input name="vin" minlength="17" maxlength="17" pattern="[A-HJ-NPR-Z0-9]{17}" required autocomplete="off"></label>
+    <label>操作者<input name="actor" value="{{ actor }}" required maxlength="191"></label>
+    <button type="submit">加入解碼佇列</button>
+  </form>
+{% endblock %}

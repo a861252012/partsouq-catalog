@@ -23,10 +23,13 @@ def test_database_summary_fails_closed_for_empty_database(
         ]
     )
     monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
     monkeypatch.setenv("PSQ_LIMIT_PARTS", "1000")
 
     summary = admin_app.database_summary()
 
+    assert summary["demo_ready"] is False
+    assert summary["production_ready"] is False
     assert summary["requirements_met"] is False
     assert summary["sample_progress"] == {
         "target_rows": 1000,
@@ -34,11 +37,12 @@ def test_database_summary_fails_closed_for_empty_database(
         "unique_part_numbers": 0,
         "published_rows": 0,
     }
-    assert "no_published_parts" in summary["blocking_reasons"]
-    assert "sample_rows_below_target" in summary["blocking_reasons"]
-    assert "no_nhtsa_vin_decodes" in summary["blocking_reasons"]
-    assert "no_confirmed_vin_mapping" in summary["blocking_reasons"]
-    assert "partsouq_small_category_source_unavailable" in summary["blocking_reasons"]
+    assert "sample_rows_below_target" in summary["demo_blocking_reasons"]
+    assert "no_nhtsa_reference_data" in summary["demo_blocking_reasons"]
+    assert "full_catalog_not_published" in summary["production_pending_reasons"]
+    assert "awaiting_authorized_vin" in summary["production_pending_reasons"]
+    assert "no_confirmed_vin_mapping" not in summary["production_pending_reasons"]
+    assert "partsouq_small_category_source_unavailable" in summary["production_pending_reasons"]
     assert summary["data_quality"]["small_category"] == {
         "source_status": "unavailable_in_current_partsouq_hierarchy",
         "crawled_rows": 0,
@@ -153,6 +157,7 @@ def test_data_quality_queries_require_partsouq_part_code(
         return next(responses)
 
     monkeypatch.setattr(admin_app, "_fetch_one", capture)
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
     admin_app.database_summary()
 
     published_quality_sql = queries[2]
@@ -189,11 +194,86 @@ def test_sample_part_range_is_informational_when_vehicle_years_are_complete(
         ]
     )
     monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
 
     summary = admin_app.database_summary()
 
     assert "sample_parts_data_quality_failed" not in summary["blocking_reasons"]
     assert summary["data_quality"]["sample"]["part_range_missing_rows"] == 1000
+
+
+def test_database_summary_separates_nhtsa_reference_sync_from_vin_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datasets = [
+        {"dataset_name": "vpic_makes", "row_count": 12337},
+        {"dataset_name": "vpic_models", "row_count": 31897},
+        {"dataset_name": "vpic_variable_values", "row_count": 69818},
+    ]
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: datasets)
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "1000")
+
+    def summary_for(vin_decodes: int) -> dict:
+        responses = iter(
+            [
+                {
+                    "published_fitment_rows": 0,
+                    "nhtsa_current_records": 137120,
+                    "nhtsa_current_artifacts": 377,
+                    "nhtsa_sync_runs": 1,
+                    "nhtsa_completed_runs": 1,
+                    "nhtsa_failed_runs": 0,
+                    "nhtsa_rejected_rows": 0,
+                    "nhtsa_vin_decodes": vin_decodes,
+                },
+                {"confirmed": 0, "stale": 0},
+                {},
+                {
+                    "row_count": 1000,
+                    "unique_part_numbers": 923,
+                    "required_field_missing_rows": 0,
+                    "id_missing_rows": 0,
+                    "source_id_missing_rows": 0,
+                    "orphan_relation_rows": 0,
+                    "vehicle_range_missing_rows": 0,
+                    "part_range_missing_rows": 1000,
+                    "category_main_missing_rows": 0,
+                    "category_group_missing_rows": 0,
+                },
+                {},
+                {"status": "sample", "parts_ok": 1000},
+                {"status": "sample", "parts_ok": 1000},
+            ]
+        )
+        monkeypatch.setattr(
+            admin_app,
+            "_fetch_one",
+            lambda *_args, **_kwargs: next(responses),
+        )
+        return admin_app.database_summary()
+
+    waiting = summary_for(0)
+
+    assert waiting["demo_ready"] is True
+    assert waiting["production_ready"] is False
+    assert waiting["demo_blocking_reasons"] == []
+    assert "full_catalog_not_published" in waiting["production_pending_reasons"]
+    assert "awaiting_authorized_vin" in waiting["production_pending_reasons"]
+    assert "no_confirmed_vin_mapping" not in waiting["production_pending_reasons"]
+    assert waiting["nhtsa"] == {
+        "current_records": 137120,
+        "current_artifacts": 377,
+        "datasets": datasets,
+        "sync_runs": {"total": 1, "completed": 1, "failed": 0},
+        "rejected_rows": 0,
+        "vin_decodes": 0,
+        "vin_decode_status": "awaiting_authorized_vin",
+    }
+
+    decoded_without_mapping = summary_for(1)
+
+    assert "awaiting_authorized_vin" not in decoded_without_mapping["production_pending_reasons"]
+    assert "no_confirmed_vin_mapping" in decoded_without_mapping["production_pending_reasons"]
 
 
 def test_admin_page_loads_summary_published_and_sample_parts() -> None:
@@ -214,6 +294,10 @@ def test_admin_page_loads_summary_published_and_sample_parts() -> None:
     assert "event.key === 'Enter'" in html
     assert 'id="parts-range-label"' in html
     assert "共用 DB 資料總覽" in html
+    assert "NHTSA 基礎資料" in html
+    assert "尚未提供合法 VIN" in html
+    assert "正式全量 PartSouq snapshot 尚未發布" in html
+    assert "沒有成功發布的 NHTSA VIN 解碼" not in html
     assert "站方小分類來源尚未取得" in html
     assert "<code>part_id</code>" in html
     assert "<code>vehicle_vid</code>" in html

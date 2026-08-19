@@ -1,4 +1,4 @@
-# 爬蟲與 mapping 驗證紀錄（2026-08-15）
+# 爬蟲、mapping 與站方後台驗證紀錄（更新至 2026-08-20）
 
 ## 結論
 
@@ -13,8 +13,11 @@
 1. `db/catalog.sql`
 2. `db/nhtsa.sql`
 3. `db/admin.sql`
+4. `db/station_admin.sql`
 
-結果：container healthy，共 28 個資料表／檢視。`nhtsa_vin_decodes` 與 `v_vin_part_fitments` 均可查詢。
+結果：container healthy；共用 DB 同時包含型錄、NHTSA、mapping、站方後台
+overlay／audit tables 與 10 個 compatibility views。`nhtsa_vin_decodes`、
+`v_vin_part_fitments` 與全部 `station_admin_*` views 均可查詢。
 
 `migrations/catalog/007_unified_vin_mapping.sql` 與 `008_admin_source_ids.sql`
 已在既有／fresh schema 驗證，008 也已連續重跑。唯一可證明關聯的舊
@@ -22,13 +25,14 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 
 ## 自動測試
 
-2026-08-19 最終重跑時，在名稱以 `_test` 結尾的獨立資料庫啟用所有
+2026-08-20 最終重跑時，在名稱以 `_test` 結尾的獨立資料庫啟用所有
 MySQL 測試：
 
 ```text
-125 tests collected; MySQL gates enabled; pytest exit code 0
+149 passed; 0 skipped; MySQL gates enabled; pytest exit code 0
 ruff check: passed
-ruff format --check: 105 files already formatted
+ruff format --check: 118 files already formatted
+mypy src/partsouq_station_admin: passed
 ```
 
 端到端案例驗證：
@@ -54,12 +58,26 @@ ruff format --check: 105 files already formatted
 
 ## 本機後台
 
-本機 Compose 的 MySQL 與 admin 已實際啟動；`GET /api/health` 回
-`{"status":"ok"}`，`GET /api/database-summary` 可回讀共用 MySQL。
+本機 Compose 的 MySQL、資料品質後台與完整站方後台已實際啟動：
+
+- `http://127.0.0.1:8000/admin`：資料品質、sample／published、NHTSA 統計與
+  分頁預覽。
+- `http://127.0.0.1:8086/`：由原專案未合併的
+  `agent/mysql-admin-archive-import` 分支移植的 10 類 entity 後台；支援搜尋、
+  詳情、人工覆寫、停用／恢復與 append-only audit。人工修改不改動爬蟲來源列。
+
+兩邊 health 均回 HTTP 200，並讀取同一個 MySQL database。
 目前畫面顯示 sample `1000/1000`、923 個不重複料號、3 個大分類與 47 個
 Group 中分類；支援每頁 10／25／50／100／200 筆、頁碼輸入與首頁／前後頁／
 末頁。sample 尚未發布，NHTSA VIN 與已確認 mapping 仍為 0，因此
-`requirements_met=false`。
+正式 production gate 尚未通過；NHTSA 官方 reference sync 則已完成
+137,120 筆、377 個 current artifacts、0 rejected。
+
+8086 的 `part_numbers` 是現有 normalized `parts` 的 compatibility adapter，
+1000 列代表 1000 個料件出現／適用列，其中只有 923 個不重複料號，不能把
+1000 說成 1000 個唯一料號。`source_part_code` 是 PartSouq 表格 Code／圖號
+呼叫碼，不是車型或料件 model ID。來源追溯目前只有共用 DB 的 source URL 與
+時間；沒有保存可重算的 raw HTTP body／hash。
 
 中分類來自 PartSouq Group／diagram，目前 sample 已有 47 個 Group。現有
 型錄路徑沒有可證明的第三層小分類來源，所以後台明確標示為 unavailable，
@@ -107,3 +125,10 @@ Code、range 與 cid／group code／uid，差異為 0；必要欄位、ID 與孤
 `part_range` 1000 筆皆空；畫面年份只來自該車款生產期間，不宣稱是逐料號
 精確月份。此瀏覽器協助擷取不是正式排程 transport，不能據此宣稱 requests
 crawler 已可無人值守取得資料。
+
+## 排程邊界
+
+目前 `partsouq-scheduler` 已把 PartSouq、NHTSA 與後台要求統一為同一個 CLI，
+但 Compose 的 scheduler 是一次性 profile command，沒有常駐 timer／cron。
+8086 建立的 VIN／爬取要求需執行 `partsouq-scheduler --job pending`，或由部署端
+排程呼叫；目前不能宣稱本機已自動週期執行。

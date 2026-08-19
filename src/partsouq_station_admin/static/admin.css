@@ -1,0 +1,56 @@
+:root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", sans-serif; color: #172033; background: #f4f6f9; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+header { display: flex; gap: 2rem; align-items: center; padding: 1rem 2rem; background: #14213d; color: white; }
+header a { color: white; text-decoration: none; }
+.brand { font-size: 1.15rem; font-weight: 700; white-space: nowrap; }
+nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+.nav-form { display: inline; }
+.nav-form button { padding: 0; background: transparent; }
+main { max-width: 1180px; margin: 0 auto; padding: 2rem; }
+footer { max-width: 1180px; margin: 1rem auto; padding: 1rem 2rem 3rem; color: #667085; font-size: .85rem; }
+.page-title { display: flex; justify-content: space-between; align-items: start; gap: 1rem; margin-bottom: 1.5rem; }
+h1, h2 { margin-top: 0; }
+h1 { font-size: 1.65rem; }
+h2 { font-size: 1.1rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1rem; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .75rem; }
+.summary-grid > div { padding: .8rem; background: #f8fafc; border-radius: .4rem; }
+.summary-grid strong { font-size: 1.5rem; }
+.warning { color: #b54708; font-weight: 600; }
+.card, section, .record-row, .filters, .editor { display: block; padding: 1.2rem; background: white; border: 1px solid #d9dee8; border-radius: .7rem; color: inherit; text-decoration: none; }
+.card strong { font-size: 2rem; }
+dl { display: grid; grid-template-columns: 1fr auto; }
+dd { text-align: right; }
+.button, button { display: inline-block; border: 0; border-radius: .45rem; padding: .65rem .9rem; background: #2457d6; color: white; text-decoration: none; cursor: pointer; }
+.secondary { background: #667085; }
+.danger { background: #b42318; }
+.filters { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+input, textarea, select { width: 100%; padding: .65rem; border: 1px solid #b9c0cc; border-radius: .4rem; background: white; color: #172033; }
+.filters input[type="search"] { flex: 1; }
+.filters input[type="checkbox"] { width: auto; }
+.record-list { display: grid; gap: .75rem; margin-bottom: 1rem; }
+.record-row pre { max-height: 10rem; overflow: auto; white-space: pre-wrap; }
+.record-row.retired { opacity: .6; border-color: #f04438; }
+.badge { padding: .15rem .4rem; border-radius: 1rem; background: #e8eefc; font-size: .75rem; }
+section { margin: 1rem 0; }
+pre { padding: 1rem; overflow: auto; background: #101828; border-radius: .45rem; color: #e4e7ec; }
+.editor label, .actions label { display: block; margin-bottom: 1rem; font-weight: 600; }
+.two-columns { display: grid; grid-template-columns: 1fr 2fr; gap: 1rem; }
+.field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.field-grid label { min-width: 0; }
+.field-grid small { color: #667085; font-weight: 400; }
+.notice { margin-bottom: 1rem; padding: .8rem; border-radius: .4rem; background: #d1fadf; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+.monitor-table { min-width: 70rem; }
+th, td { padding: .65rem; border-bottom: 1px solid #e4e7ec; text-align: left; vertical-align: top; }
+td a { overflow-wrap: anywhere; }
+.empty { padding: 2rem; text-align: center; color: #667085; }
+.pagination { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem; background: white; border: 1px solid #d9dee8; }
+.pagination-controls, .page-form { display: flex; align-items: center; gap: .4rem; }
+.page-button { min-width: 2rem; padding: .35rem .55rem; border: 1px solid #d0d5dd; border-radius: .25rem; color: #2457d6; text-align: center; text-decoration: none; }
+.page-button.disabled { color: #98a2b3; background: #f2f4f7; }
+.page-form input[type="number"] { width: 4.5rem; padding: .35rem; }
+.login-shell { max-width: 32rem; padding-top: 12vh; }
+@media (max-width: 720px) { header, .page-title, .filters, .pagination { align-items: stretch; flex-direction: column; } .two-columns, .field-grid { grid-template-columns: 1fr; } main { padding: 1rem; } }
