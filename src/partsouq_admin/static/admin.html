@@ -28,6 +28,20 @@
       .stat span { color: #526071; font-size: 13px; }
       .quality { margin: 12px 0 0; padding-left: 20px; color: #526071; }
       .quality li { margin: 4px 0; }
+      .table-controls, .pagination { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+      .table-controls label { margin: 0; }
+      .table-controls select { width: auto; min-width: 150px; }
+      .table-wrap { overflow-x: auto; margin-top: 12px; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { padding: 9px 10px; border-bottom: 1px solid #e4e9f0; text-align: left; vertical-align: top; white-space: nowrap; }
+      th { background: #f8fafc; color: #344054; }
+      td.wrap { min-width: 180px; white-space: normal; }
+      td.ids { white-space: pre-line; }
+      .pagination { justify-content: space-between; margin-top: 12px; }
+      .pagination button { margin-top: 0; }
+      .pagination-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .pagination-actions .page-number { width: 68px; padding: 7px; text-align: center; }
+      button:disabled { cursor: not-allowed; opacity: .45; }
     </style>
   </head>
   <body>
@@ -46,6 +60,25 @@
         <p class="note warning">完整 VIN 只會送到 NHTSA 官方解碼並存於共用資料庫；系統不猜測或掃描 VIN。</p>
       </section>
       <div id="message" aria-live="polite"></div>
+
+      <section class="panel" style="margin-bottom:16px">
+        <h2>零件資料</h2>
+        <div class="table-controls">
+          <label>資料來源<select id="parts-dataset"><option value="sample">樣本（尚未發布）</option><option value="published">已發布資料</option></select></label>
+          <label>每頁筆數<select id="parts-page-size"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
+        </div>
+        <p id="parts-page-status" class="note warning" style="margin-top:12px">讀取中…</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>狀態</th><th>DB／站方 ID</th><th>料號／Code</th><th>產品名稱</th><th>品牌</th><th>型號／車款</th><th>年份</th><th>引擎／Trim</th><th>大分類</th><th>中分類</th></tr></thead>
+            <tbody id="parts-table-body"></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <div class="pagination-actions"><button type="button" class="secondary" id="parts-first">首頁</button><button type="button" class="secondary" id="parts-prev">上一頁</button><span>第</span><input id="parts-page-number" class="page-number" type="number" min="1" value="1" aria-label="頁碼"><span id="parts-total-pages">共 0 頁</span><button type="button" class="secondary" id="parts-next">下一頁</button><button type="button" class="secondary" id="parts-last">末頁</button><button type="button" class="secondary" id="parts-page-refresh">重新整理</button></div>
+          <span id="parts-range-label">顯示 0 到 0，共 0 筆</span>
+        </div>
+      </section>
 
       <div class="grid">
         <section>
@@ -134,6 +167,18 @@
       const summaryCards = document.querySelector('#summary-cards');
       const summaryStatus = document.querySelector('#summary-status');
       const qualityStatus = document.querySelector('#quality-status');
+      const partsDataset = document.querySelector('#parts-dataset');
+      const partsPageSize = document.querySelector('#parts-page-size');
+      const partsPageStatus = document.querySelector('#parts-page-status');
+      const partsPageNumber = document.querySelector('#parts-page-number');
+      const partsTotalPages = document.querySelector('#parts-total-pages');
+      const partsRangeLabel = document.querySelector('#parts-range-label');
+      const partsTableBody = document.querySelector('#parts-table-body');
+      const partsFirst = document.querySelector('#parts-first');
+      const partsPrev = document.querySelector('#parts-prev');
+      const partsNext = document.querySelector('#parts-next');
+      const partsLast = document.querySelector('#parts-last');
+      const partsState = { page: 1, pageSize: 10, totalPages: 0 };
       const token = () => document.querySelector('#token').value;
       const emptyToNull = value => value === '' ? null : value;
       const statusMessage = (text, isError = false) => { message.className = isError ? 'error' : 'ok'; message.textContent = text; };
@@ -160,6 +205,7 @@
           ['已發布適用列', summary.published.fitment_rows], ['不重複料號', summary.published.unique_part_numbers],
           ['NHTSA VIN', summary.nhtsa.vin_decodes], ['已確認 VIN mapping', summary.mappings.confirmed],
           ['過期 mapping', summary.mappings.stale],
+          ['樣本不重複料號', summary.sample_progress.unique_part_numbers],
           ['樣本進度', `${summary.sample_progress.latest_run_rows}/${summary.sample_progress.target_rows}`]
         ];
         summaryCards.replaceChildren(...cards.map(([label, value]) => {
@@ -194,18 +240,76 @@
           return item;
         }));
       }
+      function partsPagePath() {
+        const endpoint = partsDataset.value === 'sample' ? '/api/sample-parts' : '/api/parts';
+        return `${endpoint}?page=${partsState.page}&pageSize=${partsState.pageSize}`;
+      }
+      function renderPartsPage(result) {
+        partsState.page = result.page;
+        partsState.pageSize = result.pageSize;
+        partsState.totalPages = result.totalPages;
+        partsPageSize.value = String(result.pageSize);
+        const rows = result.items.map(item => {
+          const row = document.createElement('tr');
+          const status = item.dataset_status === 'sample_not_published' ? '樣本（尚未發布）' : '已發布';
+          const ids = `part_id: ${item.part_id ?? '—'}\nmodel_id: ${item.model_id ?? '—'}\nvehicle_id: ${item.vehicle_id ?? '—'} / vid: ${item.vehicle_vid ?? '—'}\ncategory_id: ${item.category_id ?? '—'} / cid: ${item.category_cid ?? '—'}\ngroup_id: ${item.group_id ?? '—'} / uid: ${item.group_uid ?? '—'}`;
+          const part = `${item.part_number ?? '—'}\nCode: ${item.part_code ?? '—'}`;
+          const vehicle = `${item.model ?? '—'}\n${item.vehicle_name ?? '—'} / ${item.vehicle_code ?? '—'}`;
+          const years = item.production_from || item.production_to ? `${item.production_from ?? '—'} ～ ${item.production_to ?? '—'}` : item.prod_period ?? '—';
+          const engine = `${item.engine ?? '—'}\nTrim: ${item.trim_name ?? '—'}`;
+          const values = [status, ids, part, item.part_name ?? '—', item.brand ?? '—', vehicle, years, engine, item.category_main ?? '—', item.category_group ?? '—'];
+          values.forEach((value, index) => {
+            const cell = document.createElement('td');
+            cell.textContent = value;
+            if (index === 1) cell.className = 'ids';
+            if ([2, 3, 5, 7, 8, 9].includes(index)) cell.classList.add('wrap');
+            row.append(cell);
+          });
+          return row;
+        });
+        if (!rows.length) {
+          const row = document.createElement('tr');
+          const cell = document.createElement('td');
+          cell.colSpan = 10;
+          cell.textContent = '目前沒有資料。';
+          row.append(cell);
+          rows.push(row);
+        }
+        partsTableBody.replaceChildren(...rows);
+        const start = result.total ? (result.page - 1) * result.pageSize + 1 : 0;
+        const end = result.total ? Math.min(result.page * result.pageSize, result.total) : 0;
+        partsPageNumber.value = String(result.totalPages ? result.page : 1);
+        partsPageNumber.max = String(Math.max(result.totalPages, 1));
+        partsPageNumber.disabled = result.totalPages === 0;
+        partsTotalPages.textContent = `共 ${result.totalPages} 頁`;
+        partsRangeLabel.textContent = `顯示 ${start.toLocaleString()} 到 ${end.toLocaleString()}，共 ${Number(result.total).toLocaleString()} 筆`;
+        partsFirst.disabled = result.page <= 1 || result.totalPages === 0;
+        partsPrev.disabled = result.page <= 1 || result.totalPages === 0;
+        partsNext.disabled = result.totalPages === 0 || result.page >= result.totalPages;
+        partsLast.disabled = result.totalPages === 0 || result.page >= result.totalPages;
+        partsPageStatus.className = partsDataset.value === 'sample' ? 'note warning' : 'note';
+        partsPageStatus.textContent = partsDataset.value === 'sample'
+          ? '目前顯示最近一次成功完成的樣本資料；尚未發布至正式 snapshot。'
+          : '目前顯示最近一次完整成功並已發布的正式 snapshot。';
+      }
+      async function refreshPartsPage() {
+        try {
+          renderPartsPage(await call(partsPagePath()));
+          statusMessage('已刷新零件資料。');
+        } catch (error) { statusMessage(error.message, true); }
+      }
       async function refresh() {
         try {
-          const [summary, publishedParts, sampleParts, translations, categories] = await Promise.all([
-            call('/api/database-summary'), call('/api/parts?limit=200'),
-            call('/api/sample-parts?limit=1000'), call('/api/part-translations'),
+          const [summary, partsPage, translations, categories] = await Promise.all([
+            call('/api/database-summary'), call(partsPagePath()), call('/api/part-translations'),
             call('/api/categories')
           ]);
           const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs] = token() ? await Promise.all([
             call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs')
           ]) : [[], [], [], [], [], []];
           renderSummary(summary);
-          output.textContent = JSON.stringify({ summary, publishedParts, sampleParts, vehicles, nhtsaVehicles, vinMappings, translations, categories, reconciliation, requests, jobs }, null, 2);
+          renderPartsPage(partsPage);
+          output.textContent = JSON.stringify({ summary, partsPage, vehicles, nhtsaVehicles, vinMappings, translations, categories, reconciliation, requests, jobs }, null, 2);
           statusMessage('已刷新資料。');
         } catch (error) { statusMessage(error.message, true); output.textContent = ''; }
       }
@@ -227,6 +331,25 @@
         } catch (error) { statusMessage(error.message, true); }
       }));
       document.querySelector('#refresh').addEventListener('click', refresh);
+      partsDataset.addEventListener('change', () => { partsState.page = 1; refreshPartsPage(); });
+      partsPageSize.addEventListener('change', () => { partsState.page = 1; partsState.pageSize = Number(partsPageSize.value); refreshPartsPage(); });
+      partsFirst.addEventListener('click', () => { partsState.page = 1; refreshPartsPage(); });
+      partsPrev.addEventListener('click', () => { if (partsState.page > 1) { partsState.page -= 1; refreshPartsPage(); } });
+      partsPageNumber.addEventListener('change', () => {
+        const requestedPage = Number(partsPageNumber.value);
+        if (Number.isInteger(requestedPage) && requestedPage >= 1 && requestedPage <= partsState.totalPages) {
+          partsState.page = requestedPage;
+          refreshPartsPage();
+        } else {
+          partsPageNumber.value = String(partsState.page);
+        }
+      });
+      partsPageNumber.addEventListener('keydown', event => {
+        if (event.key === 'Enter') partsPageNumber.dispatchEvent(new Event('change'));
+      });
+      partsNext.addEventListener('click', () => { if (partsState.page < partsState.totalPages) { partsState.page += 1; refreshPartsPage(); } });
+      partsLast.addEventListener('click', () => { if (partsState.totalPages) { partsState.page = partsState.totalPages; refreshPartsPage(); } });
+      document.querySelector('#parts-page-refresh').addEventListener('click', refreshPartsPage);
       document.querySelector('#find-parts').addEventListener('click', async () => {
         try {
           const partNumber = document.querySelector('#part-number').value;

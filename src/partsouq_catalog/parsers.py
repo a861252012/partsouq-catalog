@@ -523,9 +523,10 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
     """解析 unit 頁面的零件表。
 
     unit 頁面有兩張表：先是車型資訊的標題表，再來才是零件表
-    （class 約為 'glow pop-vin'）。零件列帶
-    Number|Name|Code|Note|Quantity|Range，且**第一個儲存格**會連結到
-    /search/all?q=。
+    （class 約為 'glow pop-vin'）。零件欄位以表頭名稱對應；目前站上
+    同時存在 6 欄與 7 欄版型。沒有表頭的舊 fixture 則維持
+    Number|Name|Code|Note|Quantity|Range 的相容順序。**第一個儲存格**
+    仍必須連結到 /search/all?q=。
 
     嚴謹度（P1 修復）：只接受「搜尋連結出現在第一格」的列 —— 若同頁
     有一筆合法資料讓外層 guard 通過，其他欄位不足或空料號的列必須被
@@ -536,12 +537,14 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
     避免巢狀 table 的儲存格竄入造成欄位錯位。
 
     回傳 (parts, malformed)：
-    - parts：結構完整（6 欄：Number|Name|Code|Note|Quantity|Range）
-      的零件列。第一格有搜尋連結但欄數不足的列**不算零件**。
-    - malformed：異常 candidate 列數 —— 欄數不是 6、搜尋網址非
-      PartSouq `/en/search/all`、q 為空，或顯示料號與 q 不同。這代表
-      頁面版型異常（或反爬變體）仍解析出「看似零件」的殘缺列；呼叫端
-      必須拒絕寫 terminal receipt。
+    - parts：結構完整且至少能辨認 Number、Name、Code、Quantity 的
+      零件列。Unified／Filter Note／Specification 只合併進 note；只有
+      明確名為 Range／Prod period 的欄位才會寫入日期範圍。
+    - malformed：異常 candidate 列數 —— 表頭缺必要欄位、資料欄數與
+      表頭不符、無表頭時不是舊 6 欄版型、搜尋網址非 PartSouq
+      `/en/search/all`、q 為空，或顯示料號與 q 不同。這代表頁面版型
+      異常（或反爬變體）仍解析出「看似零件」的殘缺列；呼叫端必須拒絕
+      寫 terminal receipt。
     """
     soup = soup if soup is not None else _soup(html)
     parts_by_key = {}
@@ -552,11 +555,47 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
         # fresh probe 會同時產生假料號與真料號）。
         if table.find_parent("table"):
             continue
-        # 直接子層 tr（無顯式 tbody）與 tbody 內的 tr 都要解析：
-        # 只取其一會漏掉混合結構的另一半（P1 修復：header 直接、
-        # data 在 tbody 的頁面舊碼解析出空清單）。
-        trs = table.find_all("tr", recursive=False)
-        trs += [
+        # 直接子層 tr（無顯式 tbody）與 thead/tbody 內的 tr 都要檢查；
+        # 只取其一會漏掉混合結構的另一半。
+        direct_rows = table.find_all("tr", recursive=False)
+        section_rows = [
+            tr
+            for section in table.find_all(["thead", "tbody"], recursive=False)
+            for tr in section.find_all("tr", recursive=False)
+        ]
+        all_rows = direct_rows + section_rows
+        header_row = next(
+            (tr for tr in all_rows if tr.find_all("th", recursive=False)),
+            None,
+        )
+        header_cells = header_row.find_all(["th", "td"], recursive=False) if header_row else []
+        header_labels = [cell.get_text(" ", strip=True) for cell in header_cells]
+        header_indexes = {}
+        note_indexes = []
+        for index, label in enumerate(header_labels):
+            normalized = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+            field = {
+                "number": "part_number",
+                "part number": "part_number",
+                "name": "name",
+                "part name": "name",
+                "code": "code",
+                "quantity": "quantity",
+                "qty": "quantity",
+                "qty required": "quantity",
+                "range": "range_str",
+                "part range": "range_str",
+                "prod period": "range_str",
+                "production period": "range_str",
+            }.get(normalized)
+            if field:
+                header_indexes[field] = index
+            elif normalized in {"note", "unified", "filter note", "specification"}:
+                note_indexes.append(index)
+        required_headers = {"part_number", "name", "code", "quantity"}
+        header_is_usable = not header_cells or required_headers <= header_indexes.keys()
+
+        trs = direct_rows + [
             tr
             for tb in table.find_all("tbody", recursive=False)
             for tr in tb.find_all("tr", recursive=False)
@@ -574,11 +613,34 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
                     search_links.append(href)
             if not search_links:
                 continue
-            if len(tds) != 6:
+            if header_cells:
+                if not header_is_usable or len(tds) != len(header_cells):
+                    malformed += 1
+                    continue
+            elif len(tds) != 6:
                 malformed += 1
                 continue
             cells = [td.get_text(strip=True) for td in tds]
-            part_number = cells[0]
+            if header_cells:
+                part_number = cells[header_indexes["part_number"]]
+                part_name = cells[header_indexes["name"]]
+                code = cells[header_indexes["code"]]
+                quantity = cells[header_indexes["quantity"]]
+                range_str = (
+                    cells[header_indexes["range_str"]] if "range_str" in header_indexes else ""
+                )
+                note_values = [
+                    (header_labels[index], cells[index]) for index in note_indexes if cells[index]
+                ]
+                if (
+                    len(note_indexes) == 1
+                    and header_labels[note_indexes[0]].strip().lower() == "note"
+                ):
+                    note = cells[note_indexes[0]]
+                else:
+                    note = "; ".join(f"{label}: {value}" for label, value in note_values)
+            else:
+                part_number, part_name, code, note, quantity, range_str = cells
             queries = set()
             valid_links = True
             for href in search_links:
@@ -593,24 +655,24 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
             if not valid_links or len(queries) != 1 or part_number not in queries:
                 malformed += 1
                 continue
-            if not cells[1]:
+            if not part_name:
                 malformed += 1
                 continue
             part = {
                 "part_number": part_number,
-                "name": cells[1],
-                "code": cells[2],
-                "note": cells[3],
-                "quantity": cells[4],
-                "range_str": cells[5],
+                "name": part_name,
+                "code": code,
+                "note": note,
+                "quantity": quantity,
+                "range_str": range_str,
             }
-            part_range = parse_unambiguous_range(cells[5])
+            part_range = parse_unambiguous_range(range_str)
             part["part_from"] = part_range.start
             part["part_to"] = part_range.end
             # receipt/shrink 必須使用 DB natural key 的實際列數；同頁重複
             # DOM row 不得把 fetched_row_count 灌大。後出現的列與 MySQL
             # ON DUPLICATE KEY UPDATE 語意一致，覆蓋同鍵的前一列 payload。
-            parts_by_key[(part_number, cells[5])] = part
+            parts_by_key[(part_number, range_str)] = part
     return list(parts_by_key.values()), malformed
 
 

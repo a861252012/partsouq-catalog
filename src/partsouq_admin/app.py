@@ -21,6 +21,7 @@ from partsouq_crawler.parsers.common import normalize_part_number as normalize_c
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 VIN_PREFIX_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{3,11}$")
+ALLOWED_PAGE_SIZES = {10, 25, 50, 100, 200}
 
 app = FastAPI(title="PartSouq Catalog Backoffice", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -208,6 +209,14 @@ def _update_or_conflict(sql: str, params: tuple[object, ...]) -> None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="資料已存在") from error
 
 
+def _validate_page_size(page_size: int) -> None:
+    if page_size not in ALLOWED_PAGE_SIZES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="pageSize 僅允許 10、25、50、100、200",
+        )
+
+
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse("/admin")
@@ -309,6 +318,7 @@ def database_summary() -> dict:
     sample_quality = (
         _fetch_one(
             "SELECT COUNT(p.id) AS row_count, "
+            "COUNT(DISTINCT p.part_number) AS unique_part_numbers, "
             "COUNT(CASE WHEN NULLIF(TRIM(p.part_number), '') IS NULL "
             "OR NULLIF(TRIM(p.name), '') IS NULL OR NULLIF(TRIM(b.name), '') IS NULL "
             "OR NULLIF(TRIM(m.name), '') IS NULL OR NULLIF(TRIM(v.name), '') IS NULL "
@@ -375,9 +385,16 @@ def database_summary() -> dict:
         blocking_reasons.append("sample_rows_below_target")
     if any(int(published_quality.get(key, 0)) for key in published_quality):
         blocking_reasons.append("published_parts_data_quality_failed")
-    if sample_rows and any(
-        int(value) for key, value in sample_quality.items() if key != "row_count"
-    ):
+    sample_required_checks = (
+        "required_field_missing_rows",
+        "id_missing_rows",
+        "source_id_missing_rows",
+        "orphan_relation_rows",
+        "vehicle_range_missing_rows",
+        "category_main_missing_rows",
+        "category_group_missing_rows",
+    )
+    if sample_rows and any(int(sample_quality.get(key, 0)) for key in sample_required_checks):
         blocking_reasons.append("sample_parts_data_quality_failed")
     if nhtsa_count == 0:
         blocking_reasons.append("no_nhtsa_vin_decodes")
@@ -425,6 +442,7 @@ def database_summary() -> dict:
         "sample_progress": {
             "target_rows": sample_target,
             "latest_run_rows": sample_rows,
+            "unique_part_numbers": int(sample_quality.get("unique_part_numbers", 0)),
             "published_rows": counts.get("published_fitment_rows", 0),
         },
         "latest_crawl_run": latest_crawl_run,
@@ -448,8 +466,12 @@ def database_summary() -> dict:
 @app.get("/api/parts")
 def list_parts(
     part_number: str | None = None,
-    limit: int = Query(default=50, ge=1, le=200),
-) -> list[dict]:
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, alias="pageSize"),
+) -> dict[str, object]:
+    _validate_page_size(page_size)
+    where_clause = ""
+    params: tuple[object, ...] = ()
     if part_number:
         normalized = normalize_catalog_part_number(part_number)
         if not normalized:
@@ -457,31 +479,56 @@ def list_parts(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="零件號碼正規化後不可為空",
             )
-        return _fetch_all(
-            "SELECT part_id, model_id, vehicle_id, vehicle_vid, category_id, category_cid, "
-            "group_id, group_code, group_uid, code AS part_code, "
-            "part_number, part_name, brand, model, vehicle_name, vehicle_code, "
-            "prod_period, production_from, production_to, engine, trim_name, "
-            "part_range, part_from, part_to, category_main, category_group, source_url, snapshot_at "
-            "FROM published_parts WHERE "
-            "REGEXP_REPLACE(UPPER(part_number), '[[:space:]-]+', '') LIKE %s "
-            "ORDER BY snapshot_at DESC LIMIT %s",
-            (f"%{normalized}%", limit),
-        )
-    return _fetch_all(
-        "SELECT part_id, model_id, vehicle_id, vehicle_vid, category_id, category_cid, "
-        "group_id, group_code, group_uid, code AS part_code, "
+        where_clause = " WHERE REGEXP_REPLACE(UPPER(part_number), '[[:space:]-]+', '') LIKE %s"
+        params = (f"%{normalized}%",)
+
+    count_row = _fetch_one(
+        "SELECT COUNT(*) AS total FROM published_parts" + where_clause,
+        params,
+    )
+    total = int((count_row or {}).get("total", 0))
+    offset = (page - 1) * page_size
+    items = _fetch_all(
+        "SELECT 'published' AS dataset_status, part_id, model_id, vehicle_id, vehicle_vid, "
+        "category_id, category_cid, group_id, group_code, group_uid, code AS part_code, "
         "part_number, part_name, brand, model, vehicle_name, vehicle_code, "
         "prod_period, production_from, production_to, engine, trim_name, "
         "part_range, part_from, part_to, category_main, category_group, source_url, snapshot_at "
-        "FROM published_parts ORDER BY snapshot_at DESC LIMIT %s",
-        (limit,),
+        "FROM published_parts"
+        + where_clause
+        + " ORDER BY snapshot_at DESC, part_id DESC LIMIT %s OFFSET %s",
+        (*params, page_size, offset),
     )
+    return {
+        "items": items,
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": (total + page_size - 1) // page_size,
+    }
 
 
 @app.get("/api/sample-parts")
-def list_sample_parts(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict]:
-    return _fetch_all(
+def list_sample_parts(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, alias="pageSize"),
+) -> dict[str, object]:
+    _validate_page_size(page_size)
+    sample_from = (
+        " FROM parts AS p "
+        "JOIN crawl_runs AS r ON r.id = p.seen_run_id "
+        "JOIN groups_t AS g ON g.id = p.group_id "
+        "JOIN categories AS c ON c.id = g.category_id "
+        "JOIN vehicles AS v ON v.id = c.vehicle_id "
+        "JOIN models AS m ON m.id = v.model_id "
+        "JOIN brands AS b ON b.id = m.brand_id "
+        "WHERE r.id = (SELECT id FROM crawl_runs WHERE status = 'sample' "
+        "ORDER BY started_at DESC, id DESC LIMIT 1)"
+    )
+    count_row = _fetch_one("SELECT COUNT(*) AS total" + sample_from)
+    total = int((count_row or {}).get("total", 0))
+    offset = (page - 1) * page_size
+    items = _fetch_all(
         "SELECT 'sample_not_published' AS dataset_status, p.id AS part_id, m.id AS model_id, "
         "v.id AS vehicle_id, v.vid AS vehicle_vid, c.id AS category_id, c.cid AS category_cid, "
         "g.id AS group_id, g.code AS group_code, g.uid AS group_uid, p.code AS part_code, "
@@ -490,18 +537,17 @@ def list_sample_parts(limit: int = Query(default=100, ge=1, le=1000)) -> list[di
         "v.production_from, v.production_to, v.engine, v.grade AS trim_name, "
         "p.range_str AS part_range, p.part_from, p.part_to, c.name AS category_main, "
         "g.name AS category_group, g.url AS source_url, p.updated_at AS snapshot_at "
-        "FROM parts AS p "
-        "JOIN crawl_runs AS r ON r.id = p.seen_run_id "
-        "JOIN groups_t AS g ON g.id = p.group_id "
-        "JOIN categories AS c ON c.id = g.category_id "
-        "JOIN vehicles AS v ON v.id = c.vehicle_id "
-        "JOIN models AS m ON m.id = v.model_id "
-        "JOIN brands AS b ON b.id = m.brand_id "
-        "WHERE r.id = (SELECT id FROM crawl_runs WHERE status = 'sample' "
-        "ORDER BY started_at DESC, id DESC LIMIT 1) "
-        "ORDER BY p.id LIMIT %s",
-        (limit,),
+        + sample_from
+        + " ORDER BY p.id ASC LIMIT %s OFFSET %s",
+        (page_size, offset),
     )
+    return {
+        "items": items,
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": (total + page_size - 1) // page_size,
+    }
 
 
 @app.get("/api/parts/{part_number}/fitments")

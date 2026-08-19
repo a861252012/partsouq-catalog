@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from partsouq_admin import app as admin_app
 
@@ -30,6 +31,7 @@ def test_database_summary_fails_closed_for_empty_database(
     assert summary["sample_progress"] == {
         "target_rows": 1000,
         "latest_run_rows": 0,
+        "unique_part_numbers": 0,
         "published_rows": 0,
     }
     assert "no_published_parts" in summary["blocking_reasons"]
@@ -46,19 +48,41 @@ def test_database_summary_fails_closed_for_empty_database(
 def test_part_queries_return_internal_and_partsouq_source_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    queries: list[str] = []
+    count_queries: list[tuple[str, tuple[object, ...]]] = []
+    item_queries: list[tuple[str, tuple[object, ...]]] = []
 
-    def capture(sql: str, _params: tuple[object, ...] = ()) -> list[dict]:
-        queries.append(sql)
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
+        count_queries.append((sql, params))
+        return {"total": 1000}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        item_queries.append((sql, params))
         return []
 
-    monkeypatch.setattr(admin_app, "_fetch_all", capture)
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
 
-    assert admin_app.list_parts(limit=1) == []
+    published = admin_app.list_parts(page=2, page_size=25)
     assert admin_app.part_fitments("123-AB") == {"catalog": [], "manual": []}
-    assert admin_app.list_sample_parts(limit=1) == []
+    sample = admin_app.list_sample_parts(page=3, page_size=25)
 
-    published_sql, fitment_sql, _manual_sql, sample_sql = queries
+    assert published == {
+        "items": [],
+        "page": 2,
+        "pageSize": 25,
+        "total": 1000,
+        "totalPages": 40,
+    }
+    assert sample == {
+        "items": [],
+        "page": 3,
+        "pageSize": 25,
+        "total": 1000,
+        "totalPages": 40,
+    }
+    published_sql, published_params = item_queries[0]
+    fitment_sql, _fitment_params = item_queries[1]
+    sample_sql, sample_params = item_queries[3]
     for sql in (published_sql, fitment_sql, sample_sql):
         for field in (
             "part_id",
@@ -73,8 +97,31 @@ def test_part_queries_return_internal_and_partsouq_source_ids(
             "part_code",
         ):
             assert field in sql
+    assert published_params == (25, 25)
+    assert sample_params == (25, 50)
+    assert "ORDER BY snapshot_at DESC, part_id DESC" in published_sql
+    assert "ORDER BY p.id ASC" in sample_sql
+    assert all("COUNT(*) AS total" in sql for sql, _params in count_queries)
     assert "status = 'sample'" in sample_sql
     assert "sample_not_published" in sample_sql
+
+
+def test_part_pagination_validates_page_size_and_calculates_total_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: {"total": 1000})
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
+
+    with TestClient(admin_app.app) as client:
+        for page_size, total_pages in ((10, 100), (25, 40), (50, 20), (100, 10), (200, 5)):
+            response = client.get(f"/api/sample-parts?page=1&pageSize={page_size}")
+            assert response.status_code == 200
+            assert response.json()["pageSize"] == page_size
+            assert response.json()["totalPages"] == total_pages
+
+        assert client.get("/api/sample-parts").json()["pageSize"] == 10
+        assert client.get("/api/sample-parts?page=0&pageSize=25").status_code == 422
+        assert client.get("/api/sample-parts?page=1&pageSize=15").status_code == 422
 
 
 def test_categories_mark_small_category_source_unavailable(
@@ -114,12 +161,58 @@ def test_data_quality_queries_require_partsouq_part_code(
     assert "TRIM(p.code)" in sample_quality_sql
 
 
+def test_sample_part_range_is_informational_when_vehicle_years_are_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            {
+                "published_fitment_rows": 0,
+                "nhtsa_vin_decodes": 0,
+            },
+            {},
+            {},
+            {
+                "row_count": 1000,
+                "required_field_missing_rows": 0,
+                "id_missing_rows": 0,
+                "source_id_missing_rows": 0,
+                "orphan_relation_rows": 0,
+                "vehicle_range_missing_rows": 0,
+                "part_range_missing_rows": 1000,
+                "category_main_missing_rows": 0,
+                "category_group_missing_rows": 0,
+            },
+            {},
+            None,
+            None,
+        ]
+    )
+    monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: next(responses))
+
+    summary = admin_app.database_summary()
+
+    assert "sample_parts_data_quality_failed" not in summary["blocking_reasons"]
+    assert summary["data_quality"]["sample"]["part_range_missing_rows"] == 1000
+
+
 def test_admin_page_loads_summary_published_and_sample_parts() -> None:
     html = Path(admin_app.STATIC_DIR / "admin.html").read_text()
 
     assert "/api/database-summary" in html
-    assert "/api/parts?limit=200" in html
-    assert "/api/sample-parts?limit=1000" in html
+    assert "'/api/parts'" in html
+    assert "'/api/sample-parts'" in html
+    assert "pageSize=${partsState.pageSize}" in html
+    assert "sample-parts?limit=1000" not in html
+    for page_size in (10, 25, 50, 100, 200):
+        assert f'<option value="{page_size}">{page_size}</option>' in html
+    assert "cell.textContent = value" in html
+    assert "樣本（尚未發布）" in html
+    for label in ("首頁", "上一頁", "下一頁", "末頁", "重新整理"):
+        assert f">{label}</button>" in html
+    assert 'id="parts-page-number"' in html
+    assert "event.key === 'Enter'" in html
+    assert 'id="parts-range-label"' in html
     assert "共用 DB 資料總覽" in html
     assert "站方小分類來源尚未取得" in html
     assert "<code>part_id</code>" in html

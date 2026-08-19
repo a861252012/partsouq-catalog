@@ -4,7 +4,7 @@
 
 - NHTSA：合成 fixture 已驗證逐欄解析、共用 MySQL 寫入與讀回；沒有使用者授權 VIN，因此不能宣稱 live 成功解碼。
 - Mapping：以 fixture 走過 PartSouq parser、repository、publish、VIN 車款確認與後台查詢，端到端成功。
-- PartSouq live：正式 crawler 目前被 Cloudflare challenge 擋下，沒有取得任何線上型錄資料；狀態正確記為 `error`，不可宣稱 live 成功。
+- PartSouq live：正式 requests crawler 目前仍被 Cloudflare challenge 擋下；另以已通過站方驗證的 Codex 可見瀏覽器唯讀走訪真實連結，取得 1000 筆未發布 sample。兩者不可混稱為無人值守排程成功。
 
 ## 全新 MySQL
 
@@ -26,9 +26,9 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 MySQL 測試：
 
 ```text
-117 passed, 1 warning
+125 tests collected; MySQL gates enabled; pytest exit code 0
 ruff check: passed
-ruff format --check: 104 files already formatted
+ruff format --check: 105 files already formatted
 ```
 
 端到端案例驗證：
@@ -56,12 +56,14 @@ ruff format --check: 104 files already formatted
 
 本機 Compose 的 MySQL 與 admin 已實際啟動；`GET /api/health` 回
 `{"status":"ok"}`，`GET /api/database-summary` 可回讀共用 MySQL。
-目前畫面正確顯示 sample `0/1000`、最近爬取 `error`、PartSouq 與 NHTSA
-皆為 0 筆，且 `requirements_met=false`。
+目前畫面顯示 sample `1000/1000`、923 個不重複料號、3 個大分類與 47 個
+Group 中分類；支援每頁 10／25／50／100／200 筆、頁碼輸入與首頁／前後頁／
+末頁。sample 尚未發布，NHTSA VIN 與已確認 mapping 仍為 0，因此
+`requirements_met=false`。
 
-中分類來自 PartSouq Group／diagram；目前為空是因 live crawl 在首頁即
-被擋，沒有任何 Group 落庫。現有型錄路徑沒有可證明的第三層小分類來源，
-所以後台明確標示為 unavailable，只能人工補充，不能算爬取成功資料。
+中分類來自 PartSouq Group／diagram，目前 sample 已有 47 個 Group。現有
+型錄路徑沒有可證明的第三層小分類來源，所以後台明確標示為 unavailable，
+只能人工補充，不能用其他欄位冒充爬回的小分類。
 
 ## NHTSA live 邊界
 
@@ -88,4 +90,20 @@ published_parts = 0 rows
 與主機同步；最新 DB run 為 `sample-20260819T120727998635`，MySQL 以 UTC
 保存 `2026-08-19 04:06:42`，狀態仍為 `error`、0 筆。
 
-因此目前只能確認 parser／DB／mapping 的 fixture 路徑；沒有足夠證據宣稱 PartSouq 線上爬取成功。專案不解 CAPTCHA、不注入 `cf_clearance`，也不使用代理或瀏覽器指紋規避。
+一般 HTTP 於 2026-08-19 22:04（台北）再次確認仍為 HTTP 403、
+`cf-mitigated: challenge`。專案不解 CAPTCHA、不注入 `cf_clearance`，也不
+使用代理或瀏覽器指紋規避。
+
+同日以已自然通過站方驗證的 Codex 可見瀏覽器，沿頁面真實連結唯讀走訪
+Suzuki／Chevrolet Cruize/MW（HR52S-2，2003-11 至 2005-03），擷取 47 個
+unit 頁的 1000 筆 DB natural-key 唯一關聯列。來源證據包為
+`outputs/partsouq-live-sample-20260819-final.json`；內含 source URL、時間、
+HTML byte count 與每頁 SHA-256。逐列比較證據包與 MySQL 的料號、名稱、
+Code、range 與 cid／group code／uid，差異為 0；必要欄位、ID 與孤兒關聯
+缺漏皆為 0。
+
+這批資料只標為 `sample_not_published`：`parts=1000`、不重複料號 923、
+`published_parts=0`。站方目前 unit 表沒有可證明的逐料號日期欄，所以
+`part_range` 1000 筆皆空；畫面年份只來自該車款生產期間，不宣稱是逐料號
+精確月份。此瀏覽器協助擷取不是正式排程 transport，不能據此宣稱 requests
+crawler 已可無人值守取得資料。
