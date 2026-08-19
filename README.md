@@ -148,10 +148,19 @@ docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" pa
 PARTSOUQ_DB_NAME=partsouq_catalog_test \
 NHTSA_TEST_MYSQL=1 \
 UNIFIED_TEST_MYSQL=1 \
+STATION_ADMIN_E2E=1 \
+STATION_ADMIN_E2E_BROWSER_CHANNEL=chrome \
 uv run pytest
 ```
 
-驗證範圍包含 PartSouq parser／publish、NHTSA artifact／VIN decode、後台 mapping API、年份區間交集與重複資料阻擋。
+`STATION_ADMIN_E2E=1` 會另外建立一個隨機命名且以 `_test` 結尾的暫存
+MySQL database，啟動真實 HTTP server，再用本機 Chrome 操作 8086 站方後台。
+案例會檢查 1,000 筆分頁、編輯覆寫、停用、恢復、revision／audit event，並
+直接查 DB 確認爬蟲來源列未被修改；結束後會刪除該暫存 database。Chrome
+無法啟動時會直接失敗，不會把 E2E 偷偷略過。
+
+驗證範圍包含 PartSouq parser／publish、NHTSA artifact／VIN decode、後台 mapping
+API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器到 MySQL 寫入生命週期。
 
 本次實測結果與限制見 [docs/verification-2026-08-15.md](docs/verification-2026-08-15.md)。
 

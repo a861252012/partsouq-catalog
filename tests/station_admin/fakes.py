@@ -60,6 +60,7 @@ class ScriptedDatabase:
         if tag == "dashboard.system-data-summary":
             return {
                 "partsouq_normalized_rows": 1000,
+                "partsouq_distinct_part_numbers": 923,
                 "partsouq_published_rows": 0,
                 "nhtsa_current_records": 137120,
                 "nhtsa_vin_decodes": 0,

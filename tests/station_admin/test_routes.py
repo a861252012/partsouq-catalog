@@ -87,8 +87,10 @@ def test_dashboard_separates_sample_published_and_nhtsa_vin_layers() -> None:
 
     assert response.status_code == 200
     assert b"1000" in response.data
+    assert b"923" in response.data
     assert b"137120" in response.data
     assert b"normalized sample" in response.data
+    assert b"distinct part numbers" in response.data
     assert "逐 VIN 解碼需由站方輸入合法 VIN".encode() in response.data
 
 

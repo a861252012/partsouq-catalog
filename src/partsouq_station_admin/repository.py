@@ -440,7 +440,7 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
     ),
     "part_numbers": EntitySpec(
         key="part_numbers",
-        title="零件號碼",
+        title="零件來源列／號碼（料號可重複）",
         table="station_admin_part_numbers",
         record_type="part_number",
         source_fields=_PART_NUMBER_FIELDS,
@@ -666,6 +666,8 @@ class AdminRepository:
                 """
             SELECT
                 (SELECT COUNT(*) FROM parts) AS partsouq_normalized_rows,
+                (SELECT COUNT(DISTINCT part_number) FROM parts)
+                    AS partsouq_distinct_part_numbers,
                 (SELECT COUNT(*) FROM published_parts) AS partsouq_published_rows,
                 (SELECT COUNT(*) FROM nhtsa_current_records) AS nhtsa_current_records,
                 (SELECT COUNT(*) FROM nhtsa_vin_decodes) AS nhtsa_vin_decodes
@@ -675,6 +677,7 @@ class AdminRepository:
         )
         return {
             "partsouq_normalized_rows": int(row.get("partsouq_normalized_rows", 0)),
+            "partsouq_distinct_part_numbers": int(row.get("partsouq_distinct_part_numbers", 0)),
             "partsouq_published_rows": int(row.get("partsouq_published_rows", 0)),
             "nhtsa_current_records": int(row.get("nhtsa_current_records", 0)),
             "nhtsa_vin_decodes": int(row.get("nhtsa_vin_decodes", 0)),

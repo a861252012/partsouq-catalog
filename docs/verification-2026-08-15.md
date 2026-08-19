@@ -29,9 +29,9 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 MySQL 測試：
 
 ```text
-150 passed; 0 skipped; MySQL gates enabled; pytest exit code 0
+151 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
 ruff check: passed
-ruff format --check: 118 files already formatted
+ruff format --check: 120 files already formatted
 mypy src/partsouq_station_admin: passed
 ```
 
@@ -55,6 +55,12 @@ mypy src/partsouq_station_admin: passed
 - 1001 筆真實 HTML 格式 fixture 只寫入 1000 筆；被截斷的 Group 不會清除舊 membership、不會標為完整，也不會發布 current snapshot。
 - `part_id`、`model_id`、`vehicle_id`、`category_id`、`group_id` 與 PartSouq `vid`／`cid`／`uid`／零件 Code 已從 normalized tables 寫入 snapshot、`v_parts` 與 VIN mapping view，再由 MySQL 實際讀回。
 - 後台 `/api/database-summary` 會分開顯示 normalized、published、NHTSA、mapping、sample 與資料品質計數；空資料庫不會被判成通過。
+- 站方後台 E2E 每次建立獨立隨機 `_test` MySQL、套用正式四份 schema、灌入
+  1,000 筆 fixture，並啟動真實 HTTP server 與 Chrome。瀏覽器實際選擇
+  pageSize 200、前往第 5 頁、修改零件、停用與恢復；MySQL 反查確認 revision
+  為 1／2／3、audit action 為 update／retire／restore，而且原始 `parts.name`
+  未被修改。測試結束後暫存 DB 已刪除，主 DB 的 1,000 筆 sample 與 0 筆
+  overlay event 均未改變。
 
 ## 本機後台
 
