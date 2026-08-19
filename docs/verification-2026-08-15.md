@@ -29,7 +29,7 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 MySQL 測試：
 
 ```text
-149 passed; 0 skipped; MySQL gates enabled; pytest exit code 0
+150 passed; 0 skipped; MySQL gates enabled; pytest exit code 0
 ruff check: passed
 ruff format --check: 118 files already formatted
 mypy src/partsouq_station_admin: passed

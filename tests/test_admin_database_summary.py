@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from partsouq_admin import app as admin_app
+
+
+def test_database_reads_redact_sensitive_source_url_query_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [
+        {
+            "id": 1,
+            "source_url": "https://partsouq.com/en/catalog/genuine/unit?ssd=secret&uid=9",
+        }
+    ]
+    monkeypatch.setattr(admin_app, "_connect", lambda: connection)
+
+    rows = admin_app._fetch_all("SELECT source_url FROM parts")
+
+    assert rows[0]["source_url"].endswith("ssd=%5BREDACTED%5D&uid=9")
+    connection.close.assert_called_once()
 
 
 def test_database_summary_fails_closed_for_empty_database(

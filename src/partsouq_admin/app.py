@@ -18,6 +18,7 @@ from pymysql.cursors import DictCursor
 from partsouq_catalog.config import DB_CONFIG
 from partsouq_crawler.nhtsa.api import normalize_vin
 from partsouq_crawler.parsers.common import normalize_part_number as normalize_catalog_part_number
+from partsouq_station_admin.repository import redact_sensitive_url
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 VIN_PREFIX_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{3,11}$")
@@ -157,7 +158,12 @@ def _fetch_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
     try:
         with connection.cursor() as cursor:
             cursor.execute(sql, params)
-            return list(cursor.fetchall())
+            rows = list(cursor.fetchall())
+            for row in rows:
+                source_url = row.get("source_url")
+                if isinstance(source_url, str):
+                    row["source_url"] = redact_sensitive_url(source_url)
+            return rows
     finally:
         connection.close()
 
