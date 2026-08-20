@@ -124,10 +124,11 @@ def parse_brand_index(
         href = _abs(a.get("href", ""))
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/pick"):
             continue
-        candidate = _candidate_identity(href, "c", "model", "ssd", required=("model",))
-        candidates.add(candidate)
+        # 其他品牌的交叉導覽連結是合法導覽，不是版型異常。
         if _context_mismatch(href, "c", brand, allow_missing=True):
             continue
+        candidate = _candidate_identity(href, "c", "model", "ssd", required=("model",))
+        candidates.add(candidate)
         name = a.get_text(strip=True)
         if not name or not href:
             continue
@@ -248,7 +249,11 @@ def parse_vehicles(
     candidate_specs = {}
     for a in soup.select("a[href]"):
         href = _abs(a.get("href", ""))
-        if _is_partsouq_endpoint(href, "/en/catalog/genuine/vehicle"):
+        # 只把本品牌車型的連結視為 candidate；其他品牌的交叉導覽
+        # 連結是合法導覽，不是版型異常。
+        if _is_partsouq_endpoint(href, "/en/catalog/genuine/vehicle") and not _context_mismatch(
+            href, "c", brand, allow_missing=True
+        ):
             candidates.add(_candidate_identity(href, "c", "ssd", "vid"))
 
     for table in soup.select("table"):
@@ -366,7 +371,9 @@ def parse_category_links(
     """解析 vehicle 頁面 → 分類導覽連結。
 
     每個主要分類（Engine、Power Train、Body、Electrical）都是一個
-    vehicle 頁面的變體連結，帶 cid + cname 參數。
+    vehicle 頁面的變體連結，帶 cid + cname 參數。注意：站方對每一頁
+    簽發獨立的 ssd token，因此分類連結的 ssd 與母頁不同是常態；
+    expected_ssd 保留給舊簽名相容，不作為鑑別條件。
     """
     soup = soup if soup is not None else _soup(html)
     cats = []
@@ -378,6 +385,19 @@ def parse_category_links(
         href = _abs(a.get("href", ""))
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/vehicle"):
             continue
+        # 外來 context（其他車型的交叉導覽連結）與「Categories」這類
+        # 無 cid 的標籤連結是合法導覽，不是版型異常 —— 在進入 candidate
+        # 對帳前先排除，避免整台車被誤判 malformed。注意：站方對每一頁
+        # 簽發獨立的 ssd token（分類連結帶自己的 ssd），所以 ssd 不能
+        # 當鑑別條件；品牌與 vid 才是車輛身分。
+        if (
+            _context_mismatch(href, "c", brand, allow_missing=True)
+            or _context_mismatch(href, "vid", expected_vid)
+        ):
+            continue
+        cid = _qs(href, "cid")
+        if not cid:
+            continue
         candidate = _candidate_identity(
             href,
             "c",
@@ -387,15 +407,6 @@ def parse_category_links(
             required=("cid",),
         )
         candidates.add(candidate)
-        if (
-            _context_mismatch(href, "c", brand, allow_missing=True)
-            or _context_mismatch(href, "ssd", expected_ssd)
-            or _context_mismatch(href, "vid", expected_vid)
-        ):
-            continue
-        cid = _qs(href, "cid")
-        if not cid:
-            continue
         text = a.get_text(strip=True)
         if not text:
             # 同一 cid 可能同時有圖片與文字 anchor；最後以 cid
@@ -454,6 +465,14 @@ def parse_groups(
         # query 內含 /unit? 的連結不是 group candidate。
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/unit"):
             continue
+        # 外來 context（其他車型的交叉導覽連結）是合法導覽，不是版型
+        # 異常 —— 在 candidate 對帳前先排除。站方每頁簽發獨立 ssd
+        # token，因此 ssd 不能當鑑別條件；品牌與 vid 才是車輛身分。
+        if (
+            _context_mismatch(href, "c", brand, allow_missing=True)
+            or _context_mismatch(href, "vid", expected_vid)
+        ):
+            continue
         cid = _qs(href, "cid") or default_cid
         uid = _qs(href, "uid")
         candidate = _candidate_identity(
@@ -466,12 +485,7 @@ def parse_groups(
             required=("uid",),
         )
         candidates.add(candidate)
-        if (
-            _context_mismatch(href, "c", brand, allow_missing=True)
-            or _context_mismatch(href, "ssd", expected_ssd)
-            or _context_mismatch(href, "vid", expected_vid)
-            or (expected_cid is not None and cid != str(expected_cid))
-        ):
+        if expected_cid is not None and cid != str(expected_cid):
             continue
         if not uid:
             continue
@@ -494,10 +508,12 @@ def parse_groups(
         valid_candidates.add(candidate)
         identity = (cid, m.group(1))
         if identity in seen:
-            if seen[identity] != (uid, group_name):
+            # 同一群組可能因車型變體分區以不同 (ssd, uid) token 重複
+            # 出現；只要名稱一致就不是版型異常，不計 malformed。
+            if seen[identity] != group_name:
                 malformed += 1
             continue
-        seen[identity] = (uid, group_name)
+        seen[identity] = group_name
         groups.append(
             {
                 "group_code": m.group(1),
@@ -656,8 +672,13 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
                 malformed += 1
                 continue
             if not part_name:
-                malformed += 1
-                continue
+                # 站方會以圖示呈現部分零件（純圖片列，無文字名稱）；只要
+                # 料號、code 齊全且其餘欄位皆為空，就是合法的純圖片零件，
+                # 以空字串名稱收錄。若其他欄位含有文字，才是殘缺/版型異常。
+                if not code or any(c for c in cells if c not in (part_number, code, "")):
+                    malformed += 1
+                    continue
+                part_name = ""
             part = {
                 "part_number": part_number,
                 "name": part_name,

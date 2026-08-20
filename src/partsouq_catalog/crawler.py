@@ -152,21 +152,30 @@ class Crawler:
     # ------------------------------------------------------------ helpers
 
     def _session(self) -> SessionManager:
-        """取得目前執行緒專屬的 session。"""
+        """取得目前執行緒專屬的 session，共用主 cookie jar。
+
+        因為每個 worker 執行緒都需要自己的 requests.Session（requests
+        本身不是 thread-safe），所以用 thread-local 暫存，重複使用。
+        no_browser 設定須與主 session 一致（否則 --no-browser 模式下
+        worker 仍會啟動瀏覽器刷新）。
+        """
         s = getattr(self._local, "session", None)
         if s is None:
-            s = SessionManager(gov=self.governor)
+            s = SessionManager(
+                self.http.cookies, no_browser=self.http.no_browser, gov=self.governor
+            )
             self._local.session = s
         return s
 
     def _get(self, url: str) -> str:
-        """發 GET 請求並遵守全域限速。
+        """發 GET 請求：先確保 cookie 新鮮、再取回 HTML。
 
         全域限速在 SessionManager.get() 內、每次 wire request 前由
         governor.acquire() 執行（SOL P1：重試也受控）；governor 的
         全域暫停（throttle：429 / 反爬偵測）同樣在那裡生效。
         """
         session = self._session()
+        session.ensure_fresh()
         session.sleep()
         return session.get(url)
 

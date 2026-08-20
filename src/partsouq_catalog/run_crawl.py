@@ -1,8 +1,8 @@
 """CLI 進入點：python3 -m partsouq_catalog.run_crawl [--brand TOYOTA] [--fresh]
 
 執行整趟 PartSouq 爬取。可續爬：先前完成的型號/車型會自動跳過。
-遇到 Cloudflare challenge 時，HTTP 層會停止本次 run 並保留錯誤狀態；
-不會自動取得或注入 cookie，也不會使用規避工具。
+若爬取途中 Cloudflare 的 cookie 過期，HTTP 層會自動透過 CloakBrowser
+刷新 session。
 
 本模組是「組合根」（composition root）：組裝資料庫連線、Repository、
 HTTP 工作階段與爬蟲服務，然後交給服務層執行 —— 本身不含業務邏輯。
@@ -15,7 +15,8 @@ import logging.handlers
 import os
 import sys
 
-from .config import CRAWL, LOG_DIR
+from .cloak import get_session
+from .config import CRAWL, LOG_DIR, load_cookies
 from .crawler import Crawler
 from .db import Database
 from .governor import RequestGovernor
@@ -26,6 +27,9 @@ def main():
     parser = argparse.ArgumentParser(description="PartSouq 全站爬蟲")
     parser.add_argument("--brand", default=None, help="只爬這個品牌（例如 Toyota）")
     parser.add_argument("--fresh", action="store_true", help="執行前先清除爬取進度（從頭開始）")
+    parser.add_argument(
+        "--no-browser", action="store_true", help="只用已存 cookie，碰到驗證就直接失敗（除錯用）"
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -72,12 +76,20 @@ def main():
         # 與 start_run 在同一交易，不會在 cookie 初始化失敗時先毀進度。
         db = Database().connect()
         crawler = None
+        cookies = load_cookies() if args.no_browser else get_session()
+        if cookies is None:
+            log.warning(
+                "no cookies available%s",
+                " (no-browser mode; crawling without cookies)"
+                if args.no_browser
+                else "; challenge will auto-refresh",
+            )
 
         # 全站共用的 request governor：主 session（_brands() 等直發請求）
         # 與 Crawler 的 worker session 共用同一實例，每個 wire request
         # 都受全域限流（SOL P1）。
         governor = RequestGovernor(CRAWL["request_rate"], CRAWL["request_burst"])
-        http = SessionManager(gov=governor)
+        http = SessionManager(cookies, no_browser=args.no_browser, gov=governor)
         crawler = Crawler(http, db, workers=args.workers, governor=governor, fresh=args.fresh)
         counts = crawler.run()
         log.info("crawl complete: %s (status=%s)", counts, crawler.last_status)

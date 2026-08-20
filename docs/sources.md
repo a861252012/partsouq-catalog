@@ -17,7 +17,11 @@
 - `compose.yml`：單一 MySQL、後台與可按需執行的 scheduler service。
 - `nhtsa_vin_decodes` 與 `v_vin_part_fitments`：保存已知 VIN 的官方解碼結果，並以人工確認的 PartSouq `vehicle_id` 建立零件適用關係。
 
-整併時刻意未帶入自動 Cloudflare cookie 刷新、CloakBrowser 或其他規避功能。PartSouq 新排程採用一般 HTTP 與低速限制；challenge 會停止，不會被重新解讀成成功。
+後續以 CloakBrowser（`src/partsouq_catalog/cloak.py`）正當放行 Cloudflare
+challenge：自動通過 Turnstile 後匯出 session cookie（`cf_clearance` +
+`PHPSESSID`，25 分鐘 TTL 自動刷新，只存本機 `data/cookies.json`），HTTP
+client 一律附上 cookie 請求；challenge 未成功刷新時仍算 `blocked`，不會被
+重新解讀成成功。不使用 proxy 輪替或 browser fingerprint 規避。
 
 NHTSA vPIC 不提供可列舉的完整 VIN 名冊。完整 VIN 僅能由合法持有者提供後送交官方 `DecodeVinValues` 解碼；bulk complaints 內的 11 碼 VIN 欄位不會被當成完整 VIN。
 

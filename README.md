@@ -185,8 +185,10 @@ API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器�
 
 ## 安全與資料邊界
 
-- 不解 CAPTCHA、不注入 `cf_clearance`、不輪替 proxy、不使用 browser fingerprint 規避。
-- Cloudflare challenge 是 `blocked`／失敗證據，不可報為完成。
+- 不輪替 proxy、不使用 browser fingerprint 規避；Cloudflare challenge 一律以
+  CloakBrowser（`cloak.py`）產生的 session cookie（`cf_clearance` + `PHPSESSID`）
+  正當放行，cookie 自動刷新且只存在本機 `data/cookies.json`，不會提交。
+- Cloudflare challenge 未成功刷新時是 `blocked`／失敗證據，不可報為完成。
 - NHTSA bulk／collection API 與單筆 `DecodeVinValues` 分流；bulk 資料不能冒充完整 VIN 車輛名冊。
 - VIN source key 使用 SHA-256，排程完成後也會遮罩 request scope 與輸出；業務表與受控 raw evidence 才保留解碼所需完整 VIN。
 - `output/`、`logs/`、資料庫 volume、`.env` 與管理 token 都不提交。

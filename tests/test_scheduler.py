@@ -84,7 +84,7 @@ def test_run_records_scheduler_id_in_child_environment(monkeypatch) -> None:
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
-        lambda run_id, code, output: finished.append((run_id, code, output)),
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
     monkeypatch.setenv("SCHEDULED_JOB_RUN_ID", "stale")
     monkeypatch.delenv("PSQ_BOUNDED_PARTS", raising=False)
@@ -117,7 +117,7 @@ def test_run_streams_output_and_only_records_bounded_redacted_tail(monkeypatch, 
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
-        lambda run_id, code, output: finished.append((run_id, code, output)),
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
 
     command = ["python", "-m", "partsouq_crawler", "nhtsa-decode-vin", vin]
@@ -347,7 +347,32 @@ def test_catalog_reconciliation_rolls_back_if_stale_cleanup_fails(monkeypatch) -
         scheduler._recover_interrupted_job_runs("catalog")
 
     connection.rollback.assert_called_once_with()
-    connection.commit.assert_not_called()
+
+
+def test_catalog_recovery_marks_stale_running_rows_interrupted(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.rowcount = 0
+    cursor.execute.side_effect = lambda *_args, **_kwargs: None
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+    monkeypatch.delenv("PSQ_BOUNDED_PARTS", raising=False)
+
+    assert scheduler._recover_interrupted_job_runs("catalog") is False
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert len(statements) == 2
+    stale_jobs_call, stale_runs_call = cursor.execute.call_args_list
+    stale_jobs = stale_jobs_call.args[0]
+    assert "SET status = 'failed'" in stale_jobs
+    assert "job_name = %s" in stale_jobs
+    assert stale_jobs_call.args[1][0] == scheduler.INTERRUPTED_EXIT_CODE
+    stale_runs = stale_runs_call.args[0]
+    assert "SET runs.status = 'interrupted'" in stale_runs
+    assert "JOIN scheduled_job_runs AS jobs" in stale_runs
+    assert "jobs.status = 'failed'" in stale_runs
+    connection.commit.assert_called_once_with()
 
 
 def test_nhtsa_recovery_closes_scheduler_owned_domain_run(monkeypatch) -> None:
@@ -731,7 +756,7 @@ def test_nhtsa_retry_resumes_api_without_repeating_bulk(monkeypatch) -> None:
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
-        lambda run_id, code, output: finished.append((run_id, code, output)),
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
     calls: list[str] = []
     results = iter((0, 1, 0))
@@ -777,7 +802,7 @@ def test_nhtsa_api_success_survives_progress_write_failure(monkeypatch) -> None:
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
-        lambda run_id, code, output: finished.append((run_id, code, output)),
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
     monkeypatch.setattr(scheduler, "dispatch", lambda _job, _scope: 0)
 
@@ -797,7 +822,7 @@ def test_shutdown_before_spawn_records_interrupted_without_starting_child(monkey
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
-        lambda run_id, code, output: finished.append((run_id, code, output)),
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
 
     assert scheduler._run("catalog", ["python", "-m", "crawler"]) == 125

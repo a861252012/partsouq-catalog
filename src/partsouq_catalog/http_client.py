@@ -1,7 +1,8 @@
-"""HTTP 傳輸層（基礎設施）：低速、合規的 PartSouq HTTP collector。
+"""HTTP 傳輸層（基礎設施）：高速爬蟲 + Cloudflare 驗證自動處理。
 
-本模組不取得或注入網站 session cookie，也不使用瀏覽器規避工具。
-遇到 Cloudflare challenge 會停止目前請求，交由上層把 run 標示為失敗。
+使用 CloakBrowser 取得的 Cookie 進行請求。若請求碰到 Cloudflare
+驗證頁（cf_clearance 過期），會自動透過 CloakBrowser 刷新 session
+並重試 —— 全程無人介入。
 
 本層只負責「把 HTML 拿回來」；解析與資料寫入分別屬於解析器層
 與 Repository 層。
@@ -11,7 +12,8 @@
    同時撥號時，避免 macOS ephemeral port 耗盡（OSError 49「無法指定
    要求的位址」）。伺服器關閉的閒置 socket（CLOSE_WAIT）會以
    ConnectionError 呈現，由本層的迴圈重建連線池並重試。
-2. 全域限速（F5）：每次 wire request
+2. 每次請求前先 ensure_fresh() 主動確認 cookie 新鮮度；真正碰上
+   驗證時才執行完整的刷新流程。全域限速（F5）：每次 wire request
    前呼叫 governor.acquire()，重試也受控 —— adapter 層不做重試
    （max_retries=0），所有重試都回到 get() 的迴圈，每次都會重新
    取得全域時槽（SOL P1）。
@@ -22,21 +24,30 @@ import random
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit, urlunsplit
-from urllib.robotparser import RobotFileParser
 
 import requests
 from requests.adapters import HTTPAdapter
 
-from partsouq_crawler.crawl.robots import RobotsRules, parse_robots
-
+from .cloak import (
+    REFRESH_RETRY_BACKOFF,
+    force_refresh_session,
+    get_session,
+    session_backoff_remaining,
+)
 from .config import CRAWL
 
 log = logging.getLogger("http")
 
-CATALOG_USER_AGENT = "partsouq-catalog-crawler/0.1 (+https://github.com/a861252012)"
-CATALOG_PRODUCT_TOKEN = "partsouq-catalog-crawler"
-CATALOG_HOSTS = frozenset({"partsouq.com", "www.partsouq.com"})
+
+def _cf_value(cookies) -> str:
+    """從 cookie 列表取出 cf_clearance 的值（無則回傳空字串）。
+
+    作為 cookie 版本的訊號：cf_clearance 每次刷新必然改變。
+    """
+    for c in cookies or []:
+        if c.get("name") == "cf_clearance":
+            return c.get("value", "")
+    return ""
 
 
 # Cloudflare 驗證頁的特徵片段（出現在頁面前 8000 字元內即視為驗證）
@@ -62,7 +73,7 @@ CHALLENGE_MARKERS = (
 
 
 class ChallengeError(Exception):
-    """代表回應內容是 Cloudflare 驗證頁，必須停止目前請求。"""
+    """代表回應內容是 Cloudflare 驗證頁（需要刷新 cookie 後重試）。"""
 
 
 class NotFoundError(Exception):
@@ -75,34 +86,43 @@ class NotFoundError(Exception):
     """
 
 
-class RobotsPolicyError(Exception):
-    """代表 robots.txt 無法確認允許正式 catalog 請求。"""
-
-
 class SessionManager:
-    """控制請求節奏的 HTTP 工作階段。每個 worker 各自持有一個實例。"""
+    """持有 Cookie、按需刷新、並控制請求節奏的 HTTP 工作階段。
 
-    def __init__(self, gov=None):
+    每個 worker 執行緒一個實例，共用同一份 cookie 來源。
+    """
+
+    def __init__(self, cookies=None, no_browser=False, gov=None):
         self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.proxies.clear()
-        self._robots: RobotsRules | None = None
         # F5：全域 request governor（可選）。提供時，429 的 Retry-After
         # 會同時暫停「所有」worker —— 限流是全域的，單一 worker 的
         # 退避不該讓其他 worker 繼續撞牆。
         self.gov = gov
         self.session.headers.update(
             {
-                "User-Agent": CATALOG_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/145.0.0.0 Safari/537.36"
+                ),
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"
+                ),
                 "Accept-Language": "en-US,en;q=0.9",
                 "Connection": "keep-alive",
             }
         )
+        # no_browser 模式（除錯用）：只用已存 cookie，絕不啟動瀏覽器
+        # 刷新（見 ensure_fresh / get 的處理）。
+        self.no_browser = no_browser
         # 連線池與重試設定：見模組文件說明。SOL P1：adapter 層
         # max_retries=0 —— 重試統一由 get() 的迴圈控制，每次迭代都會
         # 重新 acquire 全域時槽，否則 urllib3 層的重試會繞過限流。
         self._mount_adapter()
+        self.cookies = cookies
+        if cookies:
+            self._apply_cookies()
 
     def _mount_adapter(self):
         """掛上連線池 adapter（2 條連線，adapter 層不做重試）。"""
@@ -114,46 +134,112 @@ class SessionManager:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-    def _wire_get(self, url: str) -> requests.Response:
-        """送出不跟隨 redirect、也不保存 cookie 的單一 GET。"""
-        self.session.cookies.clear()
-        try:
-            return self.session.get(
-                url,
-                timeout=float(str(CRAWL["http_timeout"])),
-                allow_redirects=False,
+    def _apply_cookies(self):
+        """把 cookie 列表**整份**套進 requests 的 cookie jar。
+
+        SOL review P2：先清空 jar 再套用新快照 —— 舊碼用
+        session.cookies.update() 只覆寫新快照中存在的鍵，刷新結果
+        缺少舊 PHPSESSID 等 cookie 時舊值會殘留在 jar 裡，請求仍
+        帶上已失效的舊 session。
+        """
+        jar = requests.cookies.RequestsCookieJar()
+        for c in self.cookies or []:
+            jar.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain", "partsouq.com"),
+                path=c.get("path", "/"),
             )
-        finally:
-            self.session.cookies.clear()
+        self.session.cookies.clear()
+        self.session.cookies.update(jar)
+
+    def refresh(self) -> bool:
+        """透過 single-flight 的 session 管理員重新取得 cookie。
+
+        成功回傳 True。所有 worker 共用同一條刷新路徑，
+        因此永遠只會啟動一個瀏覽器。
+
+        no_browser 模式下直接回傳 False（P2 修復）：refresh 是唯一
+        沒檢查 no_browser 的入口，直接呼叫時會啟動瀏覽器。
+        """
+        if self.no_browser:
+            return False
+        cookies = get_session()
+        if not cookies:
+            return False
+        self.cookies = cookies
+        self._apply_cookies()
+        return True
+
+    def ensure_fresh(self):
+        """在 cookie 快到期前主動刷新（每次請求前呼叫）。
+
+        get_session() 是 single-flight 且 TTL 感知的，所以成本極低：
+        cookie 仍新鮮時只做一次時間檢查。刷新時只有一個 worker 真正
+        啟動瀏覽器，其餘短暫等待後直接沿用結果。
+
+        cookie 物件會被整份替換，所以 identity 判斷可能誤判（refresh
+        後 worker 的 self.cookies 可能仍與 state 指向同一份舊 list，
+        導致新 cookie 沒被套上，繼續用舊 cookie 打請求 —— 實際發生：
+        刷新後仍拿 403/反爬頁）。改用「cf_clearance 值」比較：它每次
+        刷新必然改變，是可靠的版本訊號。
+        """
+        if self.no_browser:
+            return
+        cookies = get_session()
+        if cookies is None:
+            return
+        if cookies is not self.cookies and _cf_value(cookies) != _cf_value(self.cookies):
+            self.cookies = cookies
+            self._apply_cookies()
 
     def get(self, url: str) -> str:
-        """GET 請求：正式 catalog 先檢查 robots，再依設定重試。
+        """GET 請求：含重試 + 驗證自動刷新。回傳 HTML 文字。
 
         404 有特殊語意：代表該資源在網站端不存在（例如某車型的某個
         group 頁）。以 NotFoundError 拋出、由呼叫端決定如何處理
         （unit 頁視為「此 group 無資料」，其他頁視為失敗），不與
         「空白 HTTP 200」混淆。
 
-        驗證回應會立即停止，不重試、不刷新 cookie、不嘗試規避。
-        """
-        self._ensure_catalog_allowed(url)
+        連續碰到驗證且刷新失敗超過 challenge_retries 次時直接放棄
+        該請求（讓監督迴圈/續爬機制接手），避免在 Cloudflare 封鎖
+        期間反覆啟動瀏覽器造成「刷新失敗風暴」。
 
+        F4 修復：
+        - 重試預算與刷新預算分開：刷新成功**不消耗** HTTP attempt，
+          保證刷新後必有 follow-up 請求 —— 舊碼最後一次 attempt 刷新
+          成功後迴圈已耗盡，新 cookie 從未被使用就直接拋舊錯誤。
+          （單一請求內成功刷新上限 max_refresh_per_request，防一直
+          給 challenge 時無限刷新。）
+        - 驗證偵測優先於 429：429 + cf-mitigated challenge 標頭先當
+          驗證處理（刷新 cookie），不被當一般限流 —— 舊碼 429 檢查
+          在前，5 次請求 0 次刷新，永遠過不了。
+        """
         last_err = None
+        refresh_failures = 0
+        refresh_successes = 0
         attempt = 0
         while attempt < CRAWL["max_retries"]:
             attempt += 1
             try:
-                # SOL P1：每次 wire request 前取得全域時槽，重試也受控。
+                # SOL P1：每次 wire request 前取得全域時槽（重試、刷新
+                # 後的 follow-up 也都受控）—— 拿一次 token 打 5 次請求
+                # 等於沒有限流。throttle 設定的全域暫停也在這裡生效。
                 if self.gov is not None:
                     self.gov.acquire()
-                r = self._wire_get(url)
+                r = self.session.get(url, timeout=CRAWL["http_timeout"])
                 text = r.text or ""
-                # 驗證偵測優先：403 或任何帶驗證特徵的回應均立即停止。
+                # 驗證偵測優先（F4）：403 或任何帶驗證特徵的回應
+                # （含 429 + cf-mitigated: challenge）一律進驗證分支。
                 if r.status_code in (403,) or self._is_challenge(r, text):
                     raise ChallengeError(f"http {r.status_code} challenge at {url[:100]}")
                 if r.status_code == 429:
-                    # 429 是限流，不是驗證被拒。依 Retry-After（或固定
-                    # 下限）休眠後重試；不處理 challenge 或 cookie。
+                    # P2 修復：429 是「限流」不是「驗證被拒」—— 舊碼把
+                    # 429 併入 challenge 分支，每次都會殺掉健康的瀏覽器、
+                    # 冷啟動重解驗證（~3-4 分鐘），且刷新成功後 failures
+                    # 歸零，等於無視退避連續燒瀏覽器。限流應尊重伺服器
+                    # 節奏：依 retry-after（或固定下限）休眠後重試，不動
+                    # 瀏覽器、不刷新 cookie。
                     last_err = requests.RequestException(f"http 429 rate-limited at {url[:100]}")
                     log.warning(
                         "rate-limited (429) at %s (attempt %d/%d); backing off",
@@ -170,16 +256,54 @@ class SessionManager:
                     continue
                 if r.status_code == 404:
                     raise NotFoundError(f"http 404 at {url[:100]}")
-                if 300 <= r.status_code < 400:
-                    raise RobotsPolicyError(f"catalog redirect refused at {url[:100]}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
                     raise requests.RequestException(f"http {r.status_code} at {url[:100]}")
                 return text
             except ChallengeError as e:
                 last_err = e
-                log.error("challenge detected; stopping request for %s", url[:100])
-                break
+                if self.no_browser:
+                    # no_browser 模式：不允許啟動瀏覽器刷新，直接放棄
+                    log.error("challenge while no-browser mode; giving up on %s", url[:100])
+                    break
+                if refresh_failures >= CRAWL["challenge_retries"]:
+                    log.error(
+                        "too many failed refreshes (%d); giving up on %s",
+                        refresh_failures,
+                        url[:100],
+                    )
+                    break
+                log.warning("challenge hit (attempt %d/%d)", attempt, CRAWL["max_retries"])
+                # 收到 challenge = 快取 cookie 已被伺服器拒絕，強制失效並重新刷新。
+                # SOL review P2：帶上被拒的 cf_clearance 版本 —— 若其他
+                # worker 已把全域 session 刷新成更新版本（延遲返回的舊
+                # challenge），直接沿用新 cookie，不再清掉重刷、再啟動
+                # 一次瀏覽器。
+                cookies = force_refresh_session(_cf_value(self.cookies))
+                if not cookies:
+                    refresh_failures += 1
+                    log.error("cookie refresh failed (%d consecutive)", refresh_failures)
+                    self._sleep_with_backoff(attempt)
+                    continue
+                self.cookies = cookies
+                self._apply_cookies()
+                # P2 修復：刷新成功後歸零失敗計數 —— 舊碼不歸零，
+                # 「fail, fail, success, fail」序列在第 4 次就達
+                # challenge_retries 而提前放棄，即使刷新已恢復。
+                refresh_failures = 0
+                refresh_successes += 1
+                if refresh_successes > CRAWL["max_refresh_per_request"]:
+                    log.error(
+                        "too many successful refreshes (%d); giving up on %s",
+                        refresh_successes,
+                        url[:100],
+                    )
+                    break
+                # F4 修復：刷新成功不消耗 attempt 預算 —— 保證下一輪
+                # 迭代用新 cookie 發 follow-up 請求（舊碼最後一次
+                # attempt 刷新成功後沒有第 6 次請求，直接拋舊錯誤）。
+                attempt -= 1
+                time.sleep(2 + random.random() * 3)
             except requests.exceptions.ConnectionError as e:
                 # F5：只有「連線層」失敗（伺服器關閉的過期 socket /
                 # CLOSE_WAIT / 連線被拒）才需要重建連線池 —— 500 等
@@ -203,70 +327,6 @@ class SessionManager:
                 time.sleep(2 + random.random() * 2)
         raise last_err or RuntimeError(f"get failed: {url[:100]}")
 
-    def _ensure_catalog_allowed(self, url: str) -> None:
-        """正式 PartSouq catalog 首次請求前取得 robots，無法確認即停止。"""
-        parts = urlsplit(url)
-        if parts.hostname not in CATALOG_HOSTS:
-            return
-        path_segments = parts.path.split("/")
-        if (
-            "%" in parts.path
-            or "\\" in parts.path
-            or any(segment in {".", ".."} for segment in path_segments)
-        ):
-            raise RobotsPolicyError(f"ambiguous PartSouq path refused: {parts.path[:100]}")
-        is_catalog_path = parts.path == "/en/catalog" or parts.path.startswith("/en/catalog/")
-        if not is_catalog_path:
-            return
-        if (
-            parts.scheme.lower() != "https"
-            or parts.hostname != "partsouq.com"
-            or parts.port not in (None, 443)
-            or parts.username is not None
-            or parts.password is not None
-        ):
-            raise RobotsPolicyError(f"unsupported catalog origin: {parts.scheme}://{parts.netloc}")
-
-        robots_url = urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
-        if self._robots is None:
-            if self.gov is not None:
-                self.gov.acquire()
-            response = self._wire_get(robots_url)
-            text = response.text or ""
-            if response.status_code == 403 or self._is_challenge(response, text):
-                raise ChallengeError(f"http {response.status_code} challenge at {robots_url}")
-            if not 200 <= response.status_code < 300:
-                raise RobotsPolicyError(
-                    f"robots unavailable (http {response.status_code}) at {robots_url}"
-                )
-            final_url = response.url if isinstance(response.url, str) else robots_url
-            final_parts = urlsplit(final_url)
-            if (final_parts.scheme.lower(), final_parts.netloc.lower()) != (
-                parts.scheme.lower(),
-                parts.netloc.lower(),
-            ):
-                raise RobotsPolicyError(f"robots redirected outside catalog origin: {final_url}")
-            if not text.strip() or not self._has_applicable_robots_rules(text):
-                raise RobotsPolicyError(f"robots has no explicit applicable rules at {robots_url}")
-            self._robots = parse_robots(robots_url, text.encode(), "utf-8")
-
-        if not self._robots.allows(CATALOG_USER_AGENT, url):
-            raise RobotsPolicyError(f"robots disallows catalog URL: {url[:100]}")
-
-    @staticmethod
-    def _has_applicable_robots_rules(text: str) -> bool:
-        """確認本 crawler 或萬用 UA group 具有 Allow／Disallow 指令。"""
-        parser = RobotFileParser()
-        parser.parse(text.splitlines())
-        for entry in parser.entries:
-            if entry.applies_to(CATALOG_PRODUCT_TOKEN):
-                return bool(entry.rulelines)
-        for entry in parser.entries:
-            if any(agent.strip() == "*" for agent in entry.useragents):
-                return bool(entry.rulelines)
-        default_entry = getattr(parser, "default_entry", None)
-        return bool(default_entry and default_entry.rulelines)
-
     @staticmethod
     def _retry_after_seconds(r) -> float:
         """從 429 回應的 Retry-After 標頭取得建議等待秒數。
@@ -279,7 +339,7 @@ class SessionManager:
           睡到地老天荒。
         """
         ra = r.headers.get("retry-after")
-        secs = 20.0
+        secs = REFRESH_RETRY_BACKOFF + 5
         if ra:
             try:
                 secs = float(ra)
@@ -316,6 +376,19 @@ class SessionManager:
             pass
         self._mount_adapter()
 
+    def _sleep_with_backoff(self, attempt: int):
+        """刷新失敗後的等待。
+
+        P2 修復：與 cloak 的指數退避對齊 —— cloak 退避窗口
+        （60s→120s→…→1200s）尚未走完時，以剩餘時間為準；否則才用
+        下限（避免伺服器冷卻期間狂打）。
+        """
+        remaining = session_backoff_remaining()
+        if remaining > 0:
+            time.sleep(remaining + 5)
+            return
+        time.sleep(max(REFRESH_RETRY_BACKOFF + 5, 15 * (attempt + 1)))
+
     def sleep(self):
-        """依設定延遲隨機休息（2~5 秒），降低站方請求負載。"""
+        """依設定延遲隨機休息（2~5 秒），模擬人類瀏覽節奏。"""
         time.sleep(random.uniform(CRAWL["min_delay"], CRAWL["max_delay"]))

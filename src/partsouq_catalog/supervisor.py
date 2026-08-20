@@ -9,8 +9,9 @@ launchd 每個月觸發一次本程式。它負責「擁有」爬蟲子程序，
   4. 爬蟲記憶體有沒有洩漏？    -> RSS 超過上限就重啟
   5. 磁碟空間還夠嗎？          -> 不足時記錄並提前退場
   6. 資料庫還健康嗎？          -> SELECT 1 失敗時警告
-  7. 爬取完成沒？              -> 全部品牌完成就乾淨退出
-  8. 總執行時限到了嗎？        -> 超過上限（25 天）強制結束
+  7. cookie 還新鮮嗎？         -> 過期就記 warning（刷新是 crawler 的職責）
+  8. 爬取完成沒？              -> 全部品牌完成就乾淨退出
+  9. 總執行時限到了嗎？        -> 超過上限（25 天）強制結束
 
 重啟風暴保護：在時間窗口內重啟超過 RESTART_MAX 次，監督迴圈會
 進入長時間冷卻，而不是繼續狂打網站。每趟結束時把重啟次數、原因
@@ -29,7 +30,8 @@ import sys
 import time
 from pathlib import Path
 
-from .config import CRAWL, LOG_DIR
+from .cloak import COOKIE_TTL
+from .config import COOKIE_FILE, CRAWL, LOG_DIR
 from .db import Database
 
 log = logging.getLogger("supervisor")
@@ -500,6 +502,22 @@ class Supervisor:
             log.error("mysql health check failed: %s", e)
             return False
 
+    def _cookie_fresh(self) -> bool:
+        """只讀檢查 cookie 檔案的新鮮度，不觸發瀏覽器刷新。
+
+        瀏覽器刷新是 crawler 子程序自己的職責（http_client 的
+        ensure_fresh 在每個請求前檢查、403 時觸發 refresh_session，
+        single-flight 保證併發 worker 不會重複刷新）。supervisor
+        若在這裡呼叫 get_session() 刷新，會與 crawler 進程各自持有一份
+        空的 session 狀態，兩邊同時把同一隻 CloakBrowser 當成
+        「stale browser」互相殺掉重啟 —— 永遠無法進入正常爬取。
+        """
+        try:
+            age = time.time() - COOKIE_FILE.stat().st_mtime
+            return age < COOKIE_TTL
+        except OSError:
+            return False
+
     def _crawl_done(self) -> bool:
         """判斷「當月的爬取」是否完成：當月 run_key 有 success 紀錄。
 
@@ -665,6 +683,8 @@ class Supervisor:
 
         # 3. cookie 新鮮度：過期就記 warning（刷新是 crawler 自己的職責，
         #    supervisor 只觀察、不碰瀏覽器，避免與 crawler 搶同一隻）
+        if not self._cookie_fresh():
+            log.warning("cookie file older than TTL; crawler will refresh on demand")
         # 4. 完成：最後一次爬取已成功 => 收工
         #    （爬蟲本身也會自行退出，這裡是兜底處理）
         if self._crawl_done():

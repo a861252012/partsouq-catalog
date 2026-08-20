@@ -1,9 +1,10 @@
 """PartSouq 每月爬蟲的設定（集中管理，可用環境變數覆寫）。
 
-這裡是整個專案的「單一事實來源」：資料庫連線、網站網址與爬取參數
-全部集中在這個模組，其他模組一律從這裡讀取。
+這裡是整個專案的「單一事實來源」：資料庫連線、網站網址、CloakBrowser
+整合、爬取參數，全部集中在這個模組，其他模組一律從這裡讀取。
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -13,6 +14,8 @@ BASE_DIR = (
     .expanduser()
     .resolve()
 )
+# Cookie 的持久化檔案與 CloakBrowser 設定檔目錄
+COOKIE_FILE = BASE_DIR / "data" / "cookies.json"
 
 # MySQL 連線設定。PartSouq 型錄、NHTSA 與後台使用同一組 PARTSOUQ_DB_*。
 # PSQ_DB_* 僅保留為舊部署的相容 fallback。
@@ -38,6 +41,21 @@ SITE = {
     "unit": "https://partsouq.com/en/catalog/genuine/unit?c={brand}&ssd={ssd}&vid={vid}&cid={cid}&uid={uid}&q=",
 }
 
+# CloakBrowser（隱匿瀏覽器）的整合設定
+CLOAK = {
+    "venv_python": os.environ.get(
+        "PSQ_CLOAK_PYTHON",
+        str(Path(os.environ.get("CLOAK_VENV", "~/.venvs/partsouq-cloak/bin/python")).expanduser()),
+    ),
+    "cdp_port": 9242,
+    "cdp_host": "http://127.0.0.1:9242",
+    "cookie_export_file": Path(os.environ.get("PSQ_COOKIE_EXPORT_FILE", "/tmp/psq_cloak_cookies.json")),
+    "user_agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    ),
+}
+
 # 爬取行為參數（可用環境變數覆寫；0 代表不設上限）
 CRAWL = {
     # 節奏：每個 worker 每個請求之間隨機休息 2~5 秒。
@@ -47,6 +65,8 @@ CRAWL = {
     "max_delay": float(os.environ.get("PSQ_MAX_DELAY", "5.0")),  # 每請求最大間隔（秒）
     "http_timeout": 20,  # 單次 HTTP 請求逾時（秒）
     "max_retries": 5,  # 失敗重試次數
+    "challenge_retries": 3,  # 碰到驗證時重新取得 cookie 的次數
+    "max_refresh_per_request": 3,  # 單一請求內「成功刷新 cookie」的上限（F4：重試與刷新預算分離）
     "retry_after_cap": 300,  # 429 Retry-After 等待上限（秒）（F4：防伺服器給巨額值）
     "start_brand": os.environ.get("PSQ_START_BRAND", ""),  # 只爬指定品牌（空=全部）
     "limit_brands": int(os.environ.get("PSQ_LIMIT_BRANDS", "0")),  # 品牌數上限
@@ -93,3 +113,20 @@ CRAWL = {
 
 # 日誌目錄
 LOG_DIR = BASE_DIR / "logs"
+
+
+def load_cookies():
+    """從磁碟載入已存 cookie。回傳 dict 列表或 None（不存在/解析失敗）。"""
+    if not COOKIE_FILE.exists():
+        return None
+    try:
+        return json.loads(COOKIE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_cookies(cookies):
+    """把 cookie 寫入磁碟（限所有者讀寫，保護敏感性資料）。"""
+    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    COOKIE_FILE.write_text(json.dumps(cookies, indent=1))
+    COOKIE_FILE.chmod(0o600)

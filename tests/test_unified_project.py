@@ -18,7 +18,7 @@ from partsouq_crawler.nhtsa.config import NhtsaConfig
 
 
 def test_catalog_challenge_stops_without_cookie_refresh() -> None:
-    manager = SessionManager()
+    manager = SessionManager(no_browser=True)
     response = Mock(status_code=403, text="Just a moment", headers={})
     manager.session.get = Mock(return_value=response)
 
@@ -196,7 +196,7 @@ def test_scheduler_redacts_vin_from_persisted_output(
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
-        lambda _run_id, _return_code, output: saved.append(output),
+        lambda _run_id, _return_code, output, *_success: saved.append(output),
     )
     process = Mock(returncode=0, stdout=io.StringIO('{"vin":"ZZZTEST00X0000001"}'))
     process.wait.return_value = 0

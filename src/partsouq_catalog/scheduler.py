@@ -74,7 +74,9 @@ def _record_start(job_name: str) -> int:
         connection.close()
 
 
-def _record_finish(run_id: int, return_code: int, output: str) -> None:
+def _record_finish(
+    run_id: int, return_code: int, output: str, success_codes: tuple[int, ...] = (0,)
+) -> None:
     connection = _connect()
     try:
         with connection.cursor() as cursor:
@@ -83,7 +85,7 @@ def _record_finish(run_id: int, return_code: int, output: str) -> None:
                 "SET status = %s, finished_at = UTC_TIMESTAMP(), exit_code = %s, output_text = %s "
                 "WHERE id = %s",
                 (
-                    "completed" if return_code == 0 else "failed",
+                    "completed" if return_code in success_codes else "failed",
                     return_code,
                     output[-MAX_OUTPUT_CHARS:],
                     run_id,
@@ -237,7 +239,7 @@ def _shutdown_requested() -> bool:
     return _SHUTDOWN_EVENT is not None and _SHUTDOWN_EVENT.is_set()
 
 
-def _run(job_name: str, command: list[str]) -> int:
+def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,)) -> int:
     global _ACTIVE_CHILD
 
     try:
@@ -307,11 +309,13 @@ def _run(job_name: str, command: list[str]) -> int:
     if output and not output_was_streamed:
         print(output, end="" if output.endswith("\n") else "\n")
     try:
-        _record_finish(run_id, return_code, output)
+        _record_finish(run_id, return_code, output, success_codes)
     except pymysql.MySQLError as error:
         print(f"無法完成 {job_name} 的排程紀錄：{error}", file=sys.stderr)
         return 1
-    return return_code
+    # 成功碼（含 catalog 的 sample 預期停止）視為完成，回傳 0 給呼叫端，
+    # 避免 daemon 把「已完成的樣本跑」當失敗而無限重試。
+    return 0 if return_code in success_codes else return_code
 
 
 def _job_family(job: str) -> str:
@@ -419,6 +423,15 @@ def _recover_interrupted_job_runs(job: str) -> bool:
                         family,
                     ),
                 )
+            if family == "catalog":
+                cursor.execute(
+                    "UPDATE crawl_runs AS runs "
+                    "JOIN scheduled_job_runs AS jobs ON jobs.id = runs.scheduled_job_run_id "
+                    "SET runs.status = 'interrupted', "
+                    "runs.finished_at = COALESCE(runs.finished_at, UTC_TIMESTAMP()) "
+                    "WHERE runs.status = 'running' AND jobs.status = 'failed' "
+                    "AND jobs.job_name = 'catalog'"
+                )
         connection.commit()
         return recovered_complete
     except Exception:
@@ -499,15 +512,19 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
         try:
             bounded_target = int(os.getenv("PSQ_BOUNDED_PARTS", "0"))
         except ValueError:
-            return 0.0
-        if (
-            bounded_target <= 0
-            or row.get("dataset_kind") != "bounded"
-            or row.get("crawl_status") != "bounded_success"
-            or int(row.get("target_parts") or 0) != bounded_target
-            or int(row.get("parts_ok") or 0) != bounded_target
-            or int(row.get("snapshot_rows") or 0) != bounded_target
-        ):
+            bounded_target = 0
+        if bounded_target > 0:
+            if (
+                row.get("dataset_kind") != "bounded"
+                or row.get("crawl_status") != "bounded_success"
+                or int(row.get("target_parts") or 0) != bounded_target
+                or int(row.get("parts_ok") or 0) != bounded_target
+                or int(row.get("snapshot_rows") or 0) != bounded_target
+            ):
+                return 0.0
+        elif row.get("crawl_status") not in ("success", "bounded_success", "sample"):
+            # 無 bounded 設定時，已完成的全站跑或樣本跑都算完成，
+            # 依 interval 等待下一次排程，避免立即重跑。
             return 0.0
     age_seconds = row["age_seconds"]
     return max(0.0, interval_seconds - max(0, int(age_seconds)))
@@ -788,6 +805,9 @@ def dispatch(job: str, scope: str) -> int:
         return _run(
             "catalog",
             [sys.executable, "-m", "partsouq_catalog.run_crawl", "--workers", workers],
+            # run_crawl 對「達上限的樣本跑」回傳 exit 3（預期停止，資料已
+            # 寫入）；排程情境下視為完成，不應無窮重試。
+            success_codes=(0, 3),
         )
 
     if job == "nhtsa-bulk":
