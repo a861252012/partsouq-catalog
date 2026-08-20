@@ -23,8 +23,10 @@ PartSouq 的舊 SQLite 工具保留在 `partsouq_crawler` 套件中，僅作為�
 
 本機啟動後有兩個角色不同的後台：
 
-- [http://localhost:8086/](http://localhost:8086/) 是完整站方後台。支援 10 類資料瀏覽、搜尋、明細、新增、修改、停用與復原；可選每頁 10／25／50／100／200 筆。修改以 overlay 生效，不改寫爬蟲原始資料；每次寫入都保留 actor、reason、revision 與只能追加的 audit event。也可查看監控與排入已獲授權 VIN 的解碼要求。
-- [http://localhost:8000/admin](http://localhost:8000/admin) 是共用 DB 的資料品質與 API mapping dashboard，不是上述 10 類資料的完整 CRUD 後台。
+- [http://admin.partsouq.localhost:8086/](http://admin.partsouq.localhost:8086/) 是完整站方後台。支援 10 類資料瀏覽、搜尋、明細、新增、修改、停用與復原；預設每頁 30 筆，可選 10／25／30／50／100／200 筆。修改以 overlay 生效，不改寫爬蟲原始資料；每次寫入都保留 actor、reason、revision 與只能追加的 audit event。零件料號／英文名稱的 active overlay 會由 8000 API 與 VIN 零件查詢讀取；也可查看監控與排入已獲授權 VIN 的解碼要求。
+- [http://partsouq.localhost:8000/admin](http://partsouq.localhost:8000/admin) 是共用 DB 的資料品質與 API mapping dashboard，不是上述 10 類資料的完整 CRUD 後台。
+
+`.localhost` 是保留給本機 loopback 的 domain，已實測兩個 health endpoint，無須修改 `/etc/hosts` 或取得 root 權限。
 
 8086 站方後台可管理的 10 類資料為：車款配置、零件分類、圖表／Group、零件號碼、零件出現位置、適用車款、中英文零件對照、VIN 車款對照、VIN 零件適用性與對帳案件。它透過 view 讀取現有的共用 catalog，不會建第二份空的 catalog。
 
@@ -155,7 +157,7 @@ uv run pytest
 
 `STATION_ADMIN_E2E=1` 會另外建立一個隨機命名且以 `_test` 結尾的暫存
 MySQL database，啟動真實 HTTP server，再用本機 Chrome 操作 8086 站方後台。
-案例會檢查 1,000 筆分頁、編輯覆寫、停用、恢復、revision／audit event，並
+案例會檢查 1,000 筆分頁、編輯覆寫、來源版本衝突、停用、恢復、revision／audit event，並
 直接查 DB 確認爬蟲來源列未被修改；結束後會刪除該暫存 database。Chrome
 無法啟動時會直接失敗，不會把 E2E 偷偷略過。
 
@@ -163,6 +165,8 @@ MySQL database，啟動真實 HTTP server，再用本機 Chrome 操作 8086 站�
 API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器到 MySQL 寫入生命週期。
 
 本次實測結果與限制見 [docs/verification-2026-08-15.md](docs/verification-2026-08-15.md)。
+簡報逐項需求邊界見
+[docs/pptx-requirements-audit-2026-08-20.md](docs/pptx-requirements-audit-2026-08-20.md)。
 
 ## 安全與資料邊界
 

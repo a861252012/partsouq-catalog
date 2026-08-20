@@ -27,7 +27,7 @@ def test_station_admin_uses_shared_database_environment(monkeypatch) -> None:
     assert config.page_size == 200
 
 
-def test_invalid_default_page_size_falls_back_to_fifty(monkeypatch) -> None:
+def test_invalid_default_page_size_falls_back_to_thirty(monkeypatch) -> None:
     monkeypatch.setenv("PARTSOUQ_STATION_ADMIN_PAGE_SIZE", "15")
 
-    assert AdminConfig.from_env().page_size == 50
+    assert AdminConfig.from_env().page_size == 30

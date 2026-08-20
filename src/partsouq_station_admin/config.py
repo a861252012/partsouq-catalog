@@ -12,7 +12,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_page_size(name: str, default: int) -> int:
     value = _env_int(name, default)
-    return value if value in {10, 25, 50, 100, 200} else default
+    return value if value in {10, 25, 30, 50, 100, 200} else default
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +29,7 @@ class AdminConfig:
     password: str = ""
     secure_cookie: bool = False
     default_actor: str = "local-admin"
-    page_size: int = 50
+    page_size: int = 30
 
     @classmethod
     def from_env(cls) -> AdminConfig:
@@ -52,7 +52,7 @@ class AdminConfig:
             password=os.getenv("PARTSOUQ_STATION_ADMIN_PASSWORD", ""),
             secure_cookie=os.getenv("PARTSOUQ_STATION_ADMIN_SECURE_COOKIE", "0") == "1",
             default_actor=os.getenv("PARTSOUQ_STATION_ADMIN_ACTOR", "local-admin"),
-            page_size=_env_page_size("PARTSOUQ_STATION_ADMIN_PAGE_SIZE", 50),
+            page_size=_env_page_size("PARTSOUQ_STATION_ADMIN_PAGE_SIZE", 30),
         )
 
     def resolved_secret_key(self) -> str:

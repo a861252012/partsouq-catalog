@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from partsouq_station_admin.repository import (
     PAGE_SIZES,
     AdminDataError,
     AdminRepository,
+    RevisionConflictError,
 )
 
 from .fakes import ScriptedDatabase
@@ -30,7 +32,7 @@ def test_ten_entities_read_adapter_views_in_the_unified_database() -> None:
         "reconciliation_cases",
     )
     assert all(spec.table.startswith("station_admin_") for spec in ENTITY_SPECS.values())
-    assert PAGE_SIZES == (10, 25, 50, 100, 200)
+    assert PAGE_SIZES == (10, 25, 30, 50, 100, 200)
     assert FIELD_LABELS["source_part_code"] == "零件表 Code／圖號呼叫碼"
 
 
@@ -48,12 +50,21 @@ def test_each_entity_can_be_browsed(entity_type: str) -> None:
 def test_source_update_only_writes_overlay_and_append_only_event() -> None:
     trace = QueryTrace()
     database = ScriptedDatabase(trace)
+    repository = AdminRepository(database)
+    base_sha256 = repository.get_record("part_numbers", "source:1").record.base_sha256
 
-    revision = AdminRepository(database).update_record(
+    revision = repository.update_record(
         "part_numbers",
         "source:1",
-        {"name_en_raw": "人工校正名稱"},
+        {
+            "part_brand_raw": None,
+            "number_raw": "P-1",
+            "name_en_raw": "人工校正名稱",
+            "is_assembly_inferred": False,
+            "assembly_inference_reason": None,
+        },
         expected_revision=0,
+        expected_base_sha256=base_sha256,
         actor="tester",
         reason="比對來源",
     )
@@ -66,8 +77,89 @@ def test_source_update_only_writes_overlay_and_append_only_event() -> None:
     assert "insert into admin_override_events" in write_sql
     assert "update station_admin_part_numbers" not in write_sql
     assert "delete" not in write_sql
+    insert_head = next(
+        call for call in database.calls if call.tag == "write.insert-head.part_numbers"
+    )
+    assert json.loads(str(insert_head.params[3])) == {"name_en_raw": "人工校正名稱"}
     lock_base = next(call for call in database.calls if call.tag == "write.lock-base.part_numbers")
     assert "for share" not in lock_base.sql.lower()
+
+
+def test_part_number_search_normalizes_spaces_and_hyphens() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    AdminRepository(database).list_records("part_numbers", query="P-1", limit=10)
+
+    count = next(call for call in database.calls if call.tag == "list.count.part_numbers")
+    keys = next(call for call in database.calls if call.tag == "list.keys.part_numbers")
+    assert tuple(count.params[:3]) == ("P-1%", "P1%", "P-1%")
+    assert tuple(keys.params[:3]) == ("P-1%", "P1%", "P-1%")
+
+
+def test_part_number_search_does_not_turn_only_separators_into_wildcard() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    AdminRepository(database).list_records("part_numbers", query="---", limit=10)
+
+    count = next(call for call in database.calls if call.tag == "list.count.part_numbers")
+    keys = next(call for call in database.calls if call.tag == "list.keys.part_numbers")
+    assert tuple(count.params[:3]) == ("---%", "---%", "---%")
+    assert tuple(keys.params[:3]) == ("---%", "---%", "---%")
+
+
+def test_dashboard_counts_nhtsa_rows_from_current_artifact_metadata() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    summary = AdminRepository(database).system_data_summary()
+
+    call = next(call for call in database.calls if call.tag == "dashboard.system-data-summary")
+    assert summary["nhtsa_current_records"] == 137120
+    assert "SUM(a.source_rows)" in call.sql
+    assert "FROM nhtsa_current_records" not in call.sql
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"number_raw": "---"},
+        {"name_en_raw": "   "},
+        {"number_raw": "A" * 65},
+        {"name_en_raw": "A" * 513},
+    ),
+)
+def test_part_number_update_rejects_empty_or_oversized_required_fields(
+    payload: dict[str, str],
+) -> None:
+    database = ScriptedDatabase(QueryTrace())
+    repository = AdminRepository(database)
+    base_sha256 = repository.get_record("part_numbers", "source:1").record.base_sha256
+    with pytest.raises(AdminDataError):
+        repository.update_record(
+            "part_numbers",
+            "source:1",
+            payload,
+            expected_revision=0,
+            expected_base_sha256=base_sha256,
+            actor="tester",
+            reason="invalid fixture",
+        )
+
+
+def test_source_update_rejects_stale_base_snapshot() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    with pytest.raises(RevisionConflictError, match="來源資料已更新"):
+        AdminRepository(database).update_record(
+            "part_numbers",
+            "source:1",
+            {"name_en_raw": "stale update"},
+            expected_revision=0,
+            expected_base_sha256="0" * 64,
+            actor="tester",
+            reason="stale fixture",
+        )
+
+    assert not any(call.tag.startswith("write.insert-head") for call in database.calls)
 
 
 def test_allowlist_rejects_entity_sql_injection_before_query() -> None:
@@ -102,3 +194,7 @@ def test_fitment_adapter_uses_date_intersection_and_marks_unpublished_rows() -> 
     assert "LEAST(p.part_to, v.production_to)" in schema
     assert "partsouq_normalized_unpublished" in schema
     assert "WHEN published.part_id IS NOT NULL THEN 1" in schema
+    assert "REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')" in schema
+    assert "CREATE OR REPLACE VIEW station_admin_effective_parts" in schema
+    assert "h.status AS override_status" in schema
+    assert "FROM admin_override_heads AS h" in schema

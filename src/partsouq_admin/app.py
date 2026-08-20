@@ -218,7 +218,7 @@ def _update_or_conflict(sql: str, params: tuple[object, ...]) -> None:
 def _validate_page_size(page_size: int) -> None:
     if page_size not in ALLOWED_PAGE_SIZES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="pageSize 僅允許 10、25、50、100、200",
         )
 
@@ -253,7 +253,10 @@ def database_summary() -> dict:
             "(SELECT COUNT(*) FROM published_parts) AS published_fitment_rows, "
             "(SELECT COUNT(DISTINCT part_number) FROM published_parts) AS unique_part_numbers, "
             "(SELECT COUNT(DISTINCT vehicle_id) FROM published_parts) AS unique_vehicles, "
-            "(SELECT COUNT(*) FROM nhtsa_current_records) AS nhtsa_current_records, "
+            "(SELECT COALESCE(SUM(a.source_rows), 0) "
+            "FROM nhtsa_current_artifacts AS c "
+            "JOIN nhtsa_source_artifacts AS a ON a.id = c.artifact_id) "
+            "AS nhtsa_current_records, "
             "(SELECT COUNT(*) FROM nhtsa_current_artifacts) AS nhtsa_current_artifacts, "
             "(SELECT COUNT(*) FROM nhtsa_sync_runs) AS nhtsa_sync_runs, "
             "(SELECT COUNT(*) FROM nhtsa_sync_runs WHERE status = 'completed') "
@@ -273,8 +276,10 @@ def database_summary() -> dict:
         or {}
     )
     nhtsa_datasets = _fetch_all(
-        "SELECT dataset_name, COUNT(*) AS row_count FROM nhtsa_current_records "
-        "GROUP BY dataset_name ORDER BY dataset_name"
+        "SELECT a.dataset_name, COALESCE(SUM(a.source_rows), 0) AS row_count "
+        "FROM nhtsa_current_artifacts AS c "
+        "JOIN nhtsa_source_artifacts AS a ON a.id = c.artifact_id "
+        "GROUP BY a.dataset_name ORDER BY a.dataset_name"
     )
     mappings = (
         _fetch_one(
@@ -519,33 +524,46 @@ def list_parts(
     page_size: int = Query(default=10, alias="pageSize"),
 ) -> dict[str, object]:
     _validate_page_size(page_size)
-    where_clause = ""
+    effective_number = "COALESCE(ep.part_number_override, pp.part_number)"
+    effective_name = "COALESCE(ep.part_name_override, pp.part_name)"
+    effective_normalized = (
+        "COALESCE(ep.number_normalized_override, "
+        "REGEXP_REPLACE(UPPER(pp.part_number), '[[:space:]-]+', ''))"
+    )
+    published_from = (
+        " FROM published_parts AS pp "
+        "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = pp.part_id"
+    )
+    where_clause = " WHERE COALESCE(ep.override_status, 'active') <> 'retired'"
     params: tuple[object, ...] = ()
     if part_number:
         normalized = normalize_catalog_part_number(part_number)
         if not normalized:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="零件號碼正規化後不可為空",
             )
-        where_clause = " WHERE REGEXP_REPLACE(UPPER(part_number), '[[:space:]-]+', '') LIKE %s"
+        where_clause += f" AND {effective_normalized} LIKE %s"
         params = (f"%{normalized}%",)
 
     count_row = _fetch_one(
-        "SELECT COUNT(*) AS total FROM published_parts" + where_clause,
+        "SELECT COUNT(*) AS total" + published_from + where_clause,
         params,
     )
     total = int((count_row or {}).get("total", 0))
     offset = (page - 1) * page_size
     items = _fetch_all(
-        "SELECT 'published' AS dataset_status, part_id, model_id, vehicle_id, vehicle_vid, "
-        "category_id, category_cid, group_id, group_code, group_uid, code AS part_code, "
-        "part_number, part_name, brand, model, vehicle_name, vehicle_code, "
-        "prod_period, production_from, production_to, engine, trim_name, "
-        "part_range, part_from, part_to, category_main, category_group, source_url, snapshot_at "
-        "FROM published_parts"
+        "SELECT 'published' AS dataset_status, pp.part_id, pp.model_id, pp.vehicle_id, "
+        "pp.vehicle_vid, pp.category_id, pp.category_cid, pp.group_id, pp.group_code, "
+        "pp.group_uid, pp.code AS part_code, "
+        f"{effective_number} AS part_number, {effective_name} AS part_name, pp.brand, "
+        "pp.model, pp.vehicle_name, pp.vehicle_code, pp.prod_period, pp.production_from, "
+        "pp.production_to, pp.engine, pp.trim_name, pp.part_range, pp.part_from, pp.part_to, "
+        "pp.category_main, pp.category_group, pp.source_url, pp.snapshot_at, "
+        "COALESCE(ep.override_revision, 0) AS station_override_revision"
+        + published_from
         + where_clause
-        + " ORDER BY snapshot_at DESC, part_id DESC LIMIT %s OFFSET %s",
+        + " ORDER BY pp.snapshot_at DESC, pp.part_id DESC LIMIT %s OFFSET %s",
         (*params, page_size, offset),
     )
     return {
@@ -565,6 +583,7 @@ def list_sample_parts(
     _validate_page_size(page_size)
     sample_from = (
         " FROM parts AS p "
+        "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = p.id "
         "JOIN crawl_runs AS r ON r.id = p.seen_run_id "
         "JOIN groups_t AS g ON g.id = p.group_id "
         "JOIN categories AS c ON c.id = g.category_id "
@@ -572,7 +591,8 @@ def list_sample_parts(
         "JOIN models AS m ON m.id = v.model_id "
         "JOIN brands AS b ON b.id = m.brand_id "
         "WHERE r.id = (SELECT id FROM crawl_runs WHERE status = 'sample' "
-        "ORDER BY started_at DESC, id DESC LIMIT 1)"
+        "ORDER BY started_at DESC, id DESC LIMIT 1) "
+        "AND COALESCE(ep.override_status, 'active') <> 'retired'"
     )
     count_row = _fetch_one("SELECT COUNT(*) AS total" + sample_from)
     total = int((count_row or {}).get("total", 0))
@@ -581,11 +601,14 @@ def list_sample_parts(
         "SELECT 'sample_not_published' AS dataset_status, p.id AS part_id, m.id AS model_id, "
         "v.id AS vehicle_id, v.vid AS vehicle_vid, c.id AS category_id, c.cid AS category_cid, "
         "g.id AS group_id, g.code AS group_code, g.uid AS group_uid, p.code AS part_code, "
-        "p.part_number, p.name AS part_name, b.name AS brand, m.name AS model, "
+        "COALESCE(ep.part_number_override, p.part_number) AS part_number, "
+        "COALESCE(ep.part_name_override, p.name) AS part_name, "
+        "b.name AS brand, m.name AS model, "
         "v.name AS vehicle_name, v.model_code AS vehicle_code, v.prod_period, "
         "v.production_from, v.production_to, v.engine, v.grade AS trim_name, "
         "p.range_str AS part_range, p.part_from, p.part_to, c.name AS category_main, "
-        "g.name AS category_group, g.url AS source_url, p.updated_at AS snapshot_at "
+        "g.name AS category_group, g.url AS source_url, p.updated_at AS snapshot_at, "
+        "COALESCE(ep.override_revision, 0) AS station_override_revision "
         + sample_from
         + " ORDER BY p.id ASC LIMIT %s OFFSET %s",
         (page_size, offset),
@@ -604,21 +627,28 @@ def part_fitments(part_number: str) -> dict[str, list[dict]]:
     normalized = normalize_catalog_part_number(part_number)
     if not normalized:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="零件號碼正規化後不可為空",
         )
     return {
         "catalog": _fetch_all(
-            "SELECT part_id, model_id, vehicle_id, vehicle_id AS partsouq_vehicle_id, "
-            "vehicle_vid, category_id, category_cid, group_id, group_code, group_uid, "
-            "code AS part_code, brand, brand AS make_name, model, model AS model_name, "
-            "vehicle_name, vehicle_code, prod_period, production_from, production_to, engine, "
-            "trim_name, part_number, part_name, part_range, part_from, part_to, "
-            "category_main, category_group, "
-            "source_url, snapshot_at "
-            "FROM published_parts WHERE "
-            "REGEXP_REPLACE(UPPER(part_number), '[[:space:]-]+', '') = %s "
-            "ORDER BY brand, model, vehicle_name",
+            "SELECT pp.part_id, pp.model_id, pp.vehicle_id, "
+            "pp.vehicle_id AS partsouq_vehicle_id, pp.vehicle_vid, pp.category_id, "
+            "pp.category_cid, pp.group_id, pp.group_code, pp.group_uid, pp.code AS part_code, "
+            "pp.brand, pp.brand AS make_name, pp.model, pp.model AS model_name, "
+            "pp.vehicle_name, pp.vehicle_code, pp.prod_period, pp.production_from, "
+            "pp.production_to, pp.engine, pp.trim_name, "
+            "COALESCE(ep.part_number_override, pp.part_number) AS part_number, "
+            "COALESCE(ep.part_name_override, pp.part_name) AS part_name, "
+            "pp.part_range, pp.part_from, pp.part_to, pp.category_main, pp.category_group, "
+            "pp.source_url, pp.snapshot_at, "
+            "COALESCE(ep.override_revision, 0) AS station_override_revision "
+            "FROM published_parts AS pp "
+            "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = pp.part_id "
+            "WHERE COALESCE(ep.override_status, 'active') <> 'retired' "
+            "AND COALESCE(ep.number_normalized_override, "
+            "REGEXP_REPLACE(UPPER(pp.part_number), '[[:space:]-]+', '')) = %s "
+            "ORDER BY pp.brand, pp.model, pp.vehicle_name",
             (normalized,),
         ),
         "manual": _fetch_all(
@@ -692,7 +722,7 @@ def list_vin_vehicle_mappings(
             params.append(normalize_vin(vin))
         except ValueError as error:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(error),
             ) from error
     params.append(limit)
@@ -817,7 +847,7 @@ def list_vin_vehicle_candidates(vin: str) -> list[dict]:
         normalized = normalize_vin(vin)
     except ValueError as error:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(error),
         ) from error
     return _fetch_all(
@@ -855,12 +885,27 @@ def list_vin_parts(vin: str) -> list[dict]:
         normalized = normalize_vin(vin)
     except ValueError as error:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(error),
         ) from error
     return _fetch_all(
-        "SELECT * FROM v_vin_part_fitments WHERE vin = %s "
-        "ORDER BY part_number, partsouq_vehicle_id",
+        "SELECT f.vin, f.make_name, f.model_name, f.model_year, f.engine_configuration, "
+        "f.engine_model, f.displacement_l, f.nhtsa_trim_name, f.nhtsa_source_url, "
+        "f.nhtsa_source_artifact_id, f.part_id, f.model_id, f.vehicle_id, f.vehicle_vid, "
+        "f.category_id, f.category_cid, f.group_id, f.group_uid, f.code, f.group_code, "
+        "f.partsouq_vehicle_id, f.partsouq_brand, f.partsouq_model, f.vehicle_name, "
+        "f.vehicle_code, f.partsouq_engine, f.partsouq_trim_name, "
+        "COALESCE(ep.part_number_override, f.part_number) AS part_number, "
+        "COALESCE(ep.part_name_override, f.part_name) AS part_name, "
+        "f.category_main, f.category_group, f.prod_period, f.part_range, "
+        "f.fitment_from, f.fitment_to, f.source_url, f.mapping_id, f.mapping_source_name, "
+        "f.mapping_source_reference, f.vehicle_mapping_status, f.fitment_status, "
+        "COALESCE(ep.override_revision, 0) AS station_override_revision "
+        "FROM v_vin_part_fitments AS f "
+        "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = f.part_id "
+        "WHERE f.vin = %s "
+        "AND COALESCE(ep.override_status, 'active') <> 'retired' ORDER BY "
+        "COALESCE(ep.part_number_override, f.part_number), f.partsouq_vehicle_id",
         (normalized,),
     )
 
@@ -1060,7 +1105,7 @@ def create_crawl_request(payload: CrawlRequestInput) -> dict:
             requested_scope = normalize_vin(requested_scope)
         except ValueError as error:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(error),
             ) from error
     row_id = _execute(

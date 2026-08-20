@@ -221,7 +221,7 @@ def entity_list(entity_type: str) -> str:
     except ValueError as error:
         raise AdminDataError("每頁筆數格式錯誤") from error
     if page_size not in PAGE_SIZES:
-        raise AdminDataError("每頁筆數只接受 10、25、50、100 或 200")
+        raise AdminDataError("每頁筆數只接受 10、25、30、50、100 或 200")
     page = _repository().list_records(
         entity_type,
         query=request.args.get("q", ""),
@@ -297,6 +297,7 @@ def entity_update(entity_type: str, identity_key: str) -> ResponseReturnValue:
         identity_key,
         _payload_from_form(entity_spec(entity_type)),
         expected_revision=_revision_from_form(),
+        expected_base_sha256=_base_sha256_from_form(),
         actor=request.form.get("actor", ""),
         reason=request.form.get("reason", ""),
     )
@@ -371,11 +372,11 @@ def _payload_from_form(spec: EntitySpec) -> dict[str, Any]:
         if form_key not in request.form:
             continue
         raw_value = request.form.get(form_key, "").strip()
+        kind = field_kind(field)
         if not raw_value:
             if request.form.get("form_mode") == "update":
                 typed_payload[field] = None
             continue
-        kind = field_kind(field)
         try:
             if kind == "json":
                 value: Any = json.loads(raw_value)
@@ -403,3 +404,10 @@ def _revision_from_form() -> int:
     if revision < 0:
         raise AdminDataError("版本號格式錯誤")
     return revision
+
+
+def _base_sha256_from_form() -> str:
+    value = request.form.get("base_sha256", "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise AdminDataError("來源版本格式錯誤")
+    return value

@@ -116,7 +116,7 @@ def test_create_appends_overlay_event_and_vin_request_records_actor() -> None:
         data={
             "csrf_token": token,
             "field__number_raw": "P-1",
-            "field__number_normalized": "P1",
+            "field__name_en_raw": "Fixture part",
             "actor": "tester",
             "reason": "manual correction",
         },

@@ -10,11 +10,12 @@ from decimal import Decimal
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from partsouq_crawler.parsers.common import normalize_part_number
 from partsouq_station_admin.db import Database
 
 MAX_PAGE_SIZE = 200
 FANOUT_LIMIT = 100
-PAGE_SIZES = (10, 25, 50, 100, 200)
+PAGE_SIZES = (10, 25, 30, 50, 100, 200)
 
 _SENSITIVE_QUERY_KEYS = frozenset({"ssd", "token", "key", "apikey", "api_key"})
 
@@ -156,7 +157,6 @@ _PART_NUMBER_FIELDS = (
 _PART_NUMBER_EDITABLE_FIELDS = (
     "part_brand_raw",
     "number_raw",
-    "number_normalized",
     "name_en_raw",
     "is_assembly_inferred",
     "assembly_inference_reason",
@@ -669,7 +669,11 @@ class AdminRepository:
                 (SELECT COUNT(DISTINCT part_number) FROM parts)
                     AS partsouq_distinct_part_numbers,
                 (SELECT COUNT(*) FROM published_parts) AS partsouq_published_rows,
-                (SELECT COUNT(*) FROM nhtsa_current_records) AS nhtsa_current_records,
+                (
+                    SELECT COALESCE(SUM(a.source_rows), 0)
+                    FROM nhtsa_current_artifacts AS c
+                    JOIN nhtsa_source_artifacts AS a ON a.id = c.artifact_id
+                ) AS nhtsa_current_records,
                 (SELECT COUNT(*) FROM nhtsa_vin_decodes) AS nhtsa_vin_decodes
             """,
             )
@@ -830,7 +834,7 @@ class AdminRepository:
         query: str,
         include_retired: bool,
     ) -> dict[str, Any] | None:
-        source_search_value = f"{query}%"
+        source_search_values = self._source_search_values(spec, query)
         override_search_value = f"%{query}%"
         candidate_sql = " UNION ".join(
             f"SELECT id FROM {spec.table} WHERE `{field}` LIKE %s" for field in spec.search_fields
@@ -873,11 +877,11 @@ class AdminRepository:
             ) AS matches
             """,
             [
-                *([source_search_value] * len(spec.search_fields)),
+                *source_search_values,
                 spec.key,
                 spec.key,
                 int(include_retired),
-                *([source_search_value] * len(spec.search_fields)),
+                *source_search_values,
                 spec.key,
                 override_search_value,
                 int(include_retired),
@@ -932,7 +936,7 @@ class AdminRepository:
         limit: int,
         include_retired: bool,
     ) -> list[dict[str, Any]]:
-        source_search_value = f"{query}%"
+        source_search_values = self._source_search_values(spec, query)
         override_search_value = f"%{query}%"
         candidate_sql = " UNION ".join(
             f"SELECT id FROM {spec.table} WHERE `{field}` LIKE %s" for field in spec.search_fields
@@ -978,11 +982,11 @@ class AdminRepository:
             LIMIT %s OFFSET %s
         """
         params: list[object] = [
-            *([source_search_value] * len(spec.search_fields)),
+            *source_search_values,
             spec.key,
             spec.key,
             int(include_retired),
-            *([source_search_value] * len(spec.search_fields)),
+            *source_search_values,
             spec.key,
             override_search_value,
             int(include_retired),
@@ -990,6 +994,16 @@ class AdminRepository:
             offset,
         ]
         return self.database.fetch_all(f"list.keys.{spec.key}", sql, params)
+
+    @staticmethod
+    def _source_search_values(spec: EntitySpec, query: str) -> list[str]:
+        normalized_query = normalize_part_number(query)
+        return [
+            f"{normalized_query or query}%"
+            if spec.key == "part_numbers" and field == "number_normalized"
+            else f"{query}%"
+            for field in spec.search_fields
+        ]
 
     def _source_batch(
         self,
@@ -1170,6 +1184,10 @@ class AdminRepository:
     ) -> str:
         spec = entity_spec(entity_type)
         cleaned = self._clean_payload(spec, payload)
+        if spec.key == "part_numbers" and not all(
+            cleaned.get(field) for field in ("number_raw", "name_en_raw")
+        ):
+            raise AdminDataError("人工零件資料必須包含料號與英文名稱")
         actor, reason = self._audit_fields(actor, reason)
         manual_uuid = str(uuid.uuid4())
         identity_key = f"manual:{manual_uuid}"
@@ -1211,6 +1229,7 @@ class AdminRepository:
         payload: dict[str, Any],
         *,
         expected_revision: int,
+        expected_base_sha256: str,
         actor: str,
         reason: str,
     ) -> int:
@@ -1220,6 +1239,7 @@ class AdminRepository:
             action="update",
             payload=payload,
             expected_revision=expected_revision,
+            expected_base_sha256=expected_base_sha256,
             actor=actor,
             reason=reason,
         )
@@ -1270,6 +1290,7 @@ class AdminRepository:
         action: str,
         payload: dict[str, Any] | None,
         expected_revision: int,
+        expected_base_sha256: str | None = None,
         actor: str,
         reason: str,
     ) -> int:
@@ -1301,6 +1322,9 @@ class AdminRepository:
                     f"資料已被修改；預期版本 {expected_revision}，目前版本 {current_revision}"
                 )
             source_payload = self._source_payload(spec, base) if base else {}
+            base_sha256 = canonical_sha256(source_payload)
+            if action == "update" and expected_base_sha256 != base_sha256:
+                raise RevisionConflictError("爬蟲來源資料已更新；請重新載入後再套用人工修改")
             current_override = self._json_object(head.get("override_payload_json")) if head else {}
             before = {**source_payload, **current_override}
             status = str(head.get("override_status", "active")) if head else "active"
@@ -1308,7 +1332,19 @@ class AdminRepository:
             if action == "update":
                 if payload is None:
                     raise AdminDataError("更新內容不可為空")
-                next_payload = self._clean_payload(spec, payload)
+                cleaned = self._clean_payload(spec, payload)
+                next_payload = dict(current_override)
+                for field, value in cleaned.items():
+                    if field in BOOLEAN_FIELDS and value is None:
+                        next_payload.pop(field, None)
+                    else:
+                        next_payload[field] = value
+                if source_id is not None:
+                    next_payload = {
+                        field: value
+                        for field, value in next_payload.items()
+                        if value != source_payload.get(field)
+                    }
                 next_status = status
             else:
                 next_payload = current_override
@@ -1320,7 +1356,6 @@ class AdminRepository:
 
             after = {**source_payload, **next_payload}
             next_revision = current_revision + 1
-            base_sha256 = canonical_sha256(source_payload)
             encoded_payload = self._json(next_payload)
             if head is None:
                 result = self.database.execute(
@@ -1445,6 +1480,26 @@ class AdminRepository:
         cleaned = {field: payload[field] for field in spec.editable_fields if field in payload}
         if not cleaned:
             raise AdminDataError("至少要提供一個可編輯欄位")
+        if spec.key == "part_numbers":
+            if "number_raw" in cleaned:
+                raw_number = cleaned["number_raw"]
+                if not isinstance(raw_number, str):
+                    raise AdminDataError("料號必須是字串")
+                raw_number = raw_number.strip()
+                normalized = normalize_part_number(raw_number)
+                if not normalized:
+                    raise AdminDataError("料號正規化後不可為空")
+                if len(raw_number) > 64 or len(normalized) > 64:
+                    raise AdminDataError("料號不可超過 64 字元")
+                cleaned["number_raw"] = raw_number
+                cleaned["number_normalized"] = normalized
+            if "name_en_raw" in cleaned:
+                name = cleaned["name_en_raw"]
+                if not isinstance(name, str) or not name.strip():
+                    raise AdminDataError("英文名稱不可為空")
+                cleaned["name_en_raw"] = name.strip()
+                if len(cleaned["name_en_raw"]) > 512:
+                    raise AdminDataError("英文名稱不可超過 512 字元")
         for field, value in cleaned.items():
             if value is None:
                 continue
@@ -1516,7 +1571,7 @@ class AdminRepository:
             source_payload=cls._display_mapping(source_payload),
             status=str(row.get("override_status") or "active"),
             revision=int(row.get("override_revision") or 0),
-            base_sha256=str(row.get("override_base_sha256") or canonical_sha256(source_payload)),
+            base_sha256=canonical_sha256(source_payload),
             updated_at=row.get("override_updated_at") or row.get("updated_at"),
         )
 

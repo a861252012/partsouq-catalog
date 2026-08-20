@@ -31,6 +31,8 @@ def test_database_reads_redact_sensitive_source_url_query_values(
 def test_database_summary_fails_closed_for_empty_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    one_queries: list[str] = []
+    all_queries: list[str] = []
     responses = iter(
         [
             {},
@@ -42,8 +44,17 @@ def test_database_summary_fails_closed_for_empty_database(
             None,
         ]
     )
-    monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: next(responses))
-    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
+
+    def capture_one(sql: str, *_args: object, **_kwargs: object) -> dict | None:
+        one_queries.append(sql)
+        return next(responses)
+
+    def capture_all(sql: str, *_args: object, **_kwargs: object) -> list[dict]:
+        all_queries.append(sql)
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
     monkeypatch.setenv("PSQ_LIMIT_PARTS", "1000")
 
     summary = admin_app.database_summary()
@@ -67,6 +78,10 @@ def test_database_summary_fails_closed_for_empty_database(
         "source_status": "unavailable_in_current_partsouq_hierarchy",
         "crawled_rows": 0,
     }
+    assert "SUM(a.source_rows)" in one_queries[0]
+    assert "FROM nhtsa_current_records" not in one_queries[0]
+    assert "SUM(a.source_rows)" in all_queries[0]
+    assert "FROM nhtsa_current_records" not in all_queries[0]
 
 
 def test_part_queries_return_internal_and_partsouq_source_ids(
@@ -108,6 +123,9 @@ def test_part_queries_return_internal_and_partsouq_source_ids(
     fitment_sql, _fitment_params = item_queries[1]
     sample_sql, sample_params = item_queries[3]
     for sql in (published_sql, fitment_sql, sample_sql):
+        assert "station_admin_effective_parts" in sql
+        assert "LEFT JOIN station_admin_effective_parts" in sql
+        assert "override_status" in sql
         for field in (
             "part_id",
             "model_id",
@@ -123,7 +141,7 @@ def test_part_queries_return_internal_and_partsouq_source_ids(
             assert field in sql
     assert published_params == (25, 25)
     assert sample_params == (25, 50)
-    assert "ORDER BY snapshot_at DESC, part_id DESC" in published_sql
+    assert "ORDER BY pp.snapshot_at DESC, pp.part_id DESC" in published_sql
     assert "ORDER BY p.id ASC" in sample_sql
     assert all("COUNT(*) AS total" in sql for sql, _params in count_queries)
     assert "status = 'sample'" in sample_sql

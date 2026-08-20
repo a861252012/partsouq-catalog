@@ -5,7 +5,10 @@
   <form class="editor" method="post" action="{{ url_for('admin.entity_create', entity_type=spec.key) if mode == 'create' else url_for('admin.entity_update', entity_type=spec.key, identity_key=record.identity_key) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="form_mode" value="{{ mode }}">
-    {% if record %}<input type="hidden" name="revision" value="{{ record.revision }}">{% endif %}
+    {% if record %}
+      <input type="hidden" name="revision" value="{{ record.revision }}">
+      <input type="hidden" name="base_sha256" value="{{ record.base_sha256 }}">
+    {% endif %}
     <div class="field-grid">
       {% for field in spec.editable_fields %}
         {% set current = edit_payload.get(field) %}
@@ -19,7 +22,7 @@
           {% elif field_kind(field) == 'number' %}
             <input type="number" name="field__{{ field }}" value="{{ current if current is not none else '' }}" step="any">
           {% else %}
-            <input name="field__{{ field }}" value="{{ current if current is not none else '' }}">
+            <input name="field__{{ field }}" value="{{ current if current is not none else '' }}" {% if mode == 'create' and spec.key == 'part_numbers' and field in ('number_raw', 'name_en_raw') %}required{% endif %}>
           {% endif %}
         </label>
       {% endfor %}

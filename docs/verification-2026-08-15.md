@@ -29,9 +29,9 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 MySQL 測試：
 
 ```text
-151 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
+159 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
 ruff check: passed
-ruff format --check: 120 files already formatted
+ruff format --check: 121 files already formatted
 mypy src/partsouq_station_admin: passed
 ```
 
@@ -57,25 +57,30 @@ mypy src/partsouq_station_admin: passed
 - 後台 `/api/database-summary` 會分開顯示 normalized、published、NHTSA、mapping、sample 與資料品質計數；空資料庫不會被判成通過。
 - 站方後台 E2E 每次建立獨立隨機 `_test` MySQL、套用正式四份 schema、灌入
   1,000 筆 fixture，並啟動真實 HTTP server 與 Chrome。瀏覽器實際選擇
-  pageSize 200、前往第 5 頁、修改零件、停用與恢復；MySQL 反查確認 revision
-  為 1／2／3、audit action 為 update／retire／restore，而且原始 `parts.name`
-  未被修改。測試結束後暫存 DB 已刪除，主 DB 的 1,000 筆 sample 與 0 筆
-  overlay event 均未改變。
+  預設 pageSize 30，再選擇 200、前往第 5 頁、以無連字號料號搜尋、修改零件、
+  清除 Boolean 覆寫、停用與恢復；MySQL 反查確認 revision
+  為 1／2／3／4／5、audit action 為 update／update／update／retire／restore，而且原始 `parts.name`
+  與 `published_parts` 未被修改。修改、停用、恢復也逐次反查 sample、published、
+  料號 fitment 與 VIN parts API。測試另刻意讓 normalized 與 published snapshot
+  值不同，確認未發布的新值不會洩漏；舊編輯表單遇來源更新會回 409，重新載入後
+  才能 rebase。測試結束後暫存 DB 已刪除，主 DB 的 1,000 筆
+  sample 與 0 筆 overlay event 均未改變。
 
 ## 本機後台
 
 本機 Compose 的 MySQL、資料品質後台與完整站方後台已實際啟動：
 
-- `http://127.0.0.1:8000/admin`：資料品質、sample／published、NHTSA 統計與
+- `http://partsouq.localhost:8000/admin`：資料品質、sample／published、NHTSA 統計與
   分頁預覽。
-- `http://127.0.0.1:8086/`：由原專案未合併的
+- `http://admin.partsouq.localhost:8086/`：由原專案未合併的
   `agent/mysql-admin-archive-import` 分支移植的 10 類 entity 後台；支援搜尋、
   詳情、人工覆寫、停用／恢復與 append-only audit。人工修改不改動爬蟲來源列。
 
-兩邊 health 均回 HTTP 200，並讀取同一個 MySQL database。
+兩個 `.localhost` domain 的 health 均回 HTTP 200，並讀取同一個 MySQL database；
+`.localhost` 為標準 loopback domain，不需修改 `/etc/hosts`。
 目前畫面顯示 sample `1000/1000`、923 個不重複料號、3 個大分類與 47 個
-Group 中分類；支援每頁 10／25／50／100／200 筆、頁碼輸入與首頁／前後頁／
-末頁。sample 尚未發布，NHTSA VIN 與已確認 mapping 仍為 0，因此
+Group 中分類；預設每頁 30 筆，支援 10／25／30／50／100／200 筆、頁碼輸入與
+首頁／前後頁／末頁。sample 尚未發布，NHTSA VIN 與已確認 mapping 仍為 0，因此
 正式 production gate 尚未通過；NHTSA 官方 reference sync 則已完成
 137,120 筆、377 個 current artifacts、0 rejected。
 
@@ -138,3 +143,15 @@ crawler 已可無人值守取得資料。
 但 Compose 的 scheduler 是一次性 profile command，沒有常駐 timer／cron。
 8086 建立的 VIN／爬取要求需執行 `partsouq-scheduler --job pending`，或由部署端
 排程呼叫；目前不能宣稱本機已自動週期執行。
+
+## 效能
+
+2026-08-20 以同一部本機、重建後服務、每個 endpoint 連續 25 次量測：
+
+- `GET /api/database-summary`：p50 `36.55 ms`、p95 `49.27 ms`。
+- 8086 首頁：p50 `7.15 ms`、p95 `8.02 ms`。
+- 8086 零件第 5 頁、pageSize 200：p50 `13.80 ms`、p95 `17.90 ms`。
+
+修正前兩個首頁會展開 `nhtsa_current_records` 的多表 view 掃描 137,120 列，
+p50 分別約 `776.56 ms` 與 `629.55 ms`。修正後改以 current artifact metadata
+的 `source_rows` 聚合；主 DB 逐 dataset 與總數讀回皆與原 view 相同。

@@ -166,7 +166,7 @@ SELECT
     p.code AS source_part_code,
     b.name AS part_brand_raw,
     p.part_number AS number_raw,
-    UPPER(REPLACE(TRIM(p.part_number), ' ', '')) AS number_normalized,
+    UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')) AS number_normalized,
     p.name AS name_en_raw,
     0 AS is_assembly_inferred,
     CAST(NULL AS CHAR(255)) AS assembly_inference_reason,
@@ -179,6 +179,33 @@ JOIN categories AS c ON c.id = g.category_id
 JOIN vehicles AS v ON v.id = c.vehicle_id
 JOIN models AS m ON m.id = v.model_id
 JOIN brands AS b ON b.id = m.brand_id;
+
+-- Part override projections for API consumers. Dataset-specific queries decide
+-- whether the immutable published snapshot or current normalized row is the
+-- fallback, so a failed/partial crawl cannot leak into published responses.
+CREATE OR REPLACE VIEW station_admin_effective_parts AS
+SELECT
+    h.source_record_id AS part_id,
+    CASE
+        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.number_raw') = 0 THEN NULL
+        ELSE JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$.number_raw'))
+    END AS part_number_override,
+    CASE
+        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.number_raw') = 0 THEN NULL
+        ELSE UPPER(REGEXP_REPLACE(
+            JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$.number_raw')),
+            '[[:space:]-]+',
+            ''
+        ))
+    END AS number_normalized_override,
+    CASE
+        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.name_en_raw') = 0 THEN NULL
+        ELSE JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$.name_en_raw'))
+    END AS part_name_override,
+    h.status AS override_status,
+    h.revision AS override_revision
+FROM admin_override_heads AS h
+WHERE h.entity_type = 'part_numbers' AND h.source_record_id IS NOT NULL;
 
 CREATE OR REPLACE VIEW station_admin_part_occurrences AS
 SELECT
