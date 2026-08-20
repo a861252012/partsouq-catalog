@@ -162,6 +162,24 @@ session cookie（`cf_clearance` + `PHPSESSID`，TTL 25 分鐘自動刷新，存�
   失敗路徑仍是重試而非穩定的 interval 等待。cookie 機制只讓單次 run 通過，
   尚未證明可持續無人值守完成 10,000 筆 bounded 目標。
 
+**2026-08-21 針對上述 403 迴圈修正並重新實測**：根因不是爬取頻率
+（crawl 維持 0.5 req/s），而是**每次新 process 都重啟 CloakBrowser 重解一次
+Turnstile**（`get_session()` 只吃記憶體快取，不讀磁碟上的 `data/cookies.json`）；
+短時間連續重解被 Cloudflare 標記，refresh 失敗後 cloak 退避（60→1200s）、
+daemon 又以 480→960→1920→3600 無限重試。修正：
+
+- `get_session()` 啟動時以 `data/cookies.json` 的 mtime 判斷新鮮度，TTL 內的
+  話直接沿用（`_seed_from_disk`），不再每個 run 重啟瀏覽器。
+- daemon 連續失敗達 `MAX_CONSECUTIVE_FAILURES=5` 後停止指數重試，等下一次
+  interval 再檢查，不再每小時重啟瀏覽器錘站。
+
+重新實測：先跑一趟完整 sample E2E（`PSQ_LIMIT_PARTS=60`，24 分 23:54:51 起，
+瀏覽器重啟 + 解驗證），完成後緊接跑第二趟（23:59:34 起）：日誌顯示
+`reusing persisted session cookies (cf_clearance, 127s old)`，**未重啟瀏覽器**，
+38 秒完成 60/60。兩趟 `scheduled_job_runs` 皆 `completed`（exit_code=3）、
+`crawl_runs` 皆 `sample` 60/60（id 25、26）。尚未證明可持續無人值守完成
+10,000 筆 bounded 目標，但每趟 run 不再無謂重啟瀏覽器。
+
 同日以已自然通過站方驗證的 Codex 可見瀏覽器，沿頁面真實連結唯讀走訪
 Suzuki／Chevrolet Cruize/MW（HR52S-2，2003-11 至 2005-03），擷取 47 個
 unit 頁的 1000 筆 DB natural-key 唯一關聯列。來源證據包為

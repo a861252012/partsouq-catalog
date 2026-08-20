@@ -544,11 +544,49 @@ def _mark_refresh_failed():
         log.warning("refresh failed (%d consecutive); backing off %.0fs", n, delay)
 
 
+def _seed_from_disk() -> None:
+    """程序啟動時把上次持久化的 cookie 載入記憶體（只做一次）。
+
+    每個新程序（daemon 每趟 run 都是新 process）不該為了「不知道
+    磁碟上有沒有新鮮 cookie」就重啟 CloakBrowser、重解一次 Turnstile：
+    短時間內連續重解會觸發 Cloudflare 標記，正是 2026-08-20 首次
+    成功後連續 5 次 403 的原因。以檔案 mtime 當成功時間：TTL 內的
+    話直接沿用，到期/被拒時才由 refresh_session 重啟瀏覽器。
+    """
+    if _session_state["cookies"] is not None:
+        return
+    try:
+        if not CLOAK["cookie_file"].exists():
+            return
+        mtime = CLOAK["cookie_file"].stat().st_mtime
+        if time.time() - mtime >= COOKIE_TTL:
+            return
+        cookies = json.loads(CLOAK["cookie_file"].read_text())
+        if not cookies:
+            return
+    except (OSError, json.JSONDecodeError):
+        return
+    with _SESSION_COND:
+        if _session_state["cookies"] is not None:
+            return
+        _session_state["cookies"] = cookies
+        _session_state["ok_ts"] = time.monotonic()
+        _session_state["version"] = _cf_value(cookies)
+        log.info(
+            "reusing persisted session cookies (%s, %ds old)",
+            "cf_clearance" if _cf_value(cookies) else "no cf_clearance",
+            int(time.time() - mtime),
+        )
+
+
 def get_session() -> list | None:
     """取得可用的 cookie：快取仍新鮮就直接回傳，否則執行刷新。
 
     可在多執行緒下安全呼叫：底層的刷新是 single-flight。
+    新程序第一次呼叫時會先嘗試沿用磁碟上的新鮮 cookie（_seed_from_disk），
+    避免每次 run 都重啟瀏覽器。
     """
+    _seed_from_disk()
     with _SESSION_COND:
         if _session_state["cookies"] and time.monotonic() - _session_state["ok_ts"] < COOKIE_TTL:
             return _session_state["cookies"]

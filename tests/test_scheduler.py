@@ -464,6 +464,43 @@ def test_daemon_retries_with_bounded_exponential_backoff(monkeypatch) -> None:
     daemon_lock.close.assert_called_once_with()
 
 
+def test_daemon_stops_retrying_after_max_consecutive_failures(monkeypatch) -> None:
+    stop_event = FakeStopEvent()
+    daemon_lock = mock.MagicMock()
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        lambda _job, _stop_event: daemon_lock,
+    )
+    monkeypatch.setattr(scheduler, "_seconds_until_next_run", lambda _job, _interval: 0.0)
+    calls = 0
+
+    def dispatch(_job: str, _scope: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls > scheduler.MAX_CONSECUTIVE_FAILURES:
+            stop_event.stopped = True
+        return 1
+
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+
+    assert (
+        scheduler.run_daemon(
+            "catalog",
+            "all",
+            60,
+            10,
+            1000,
+            stop_event=stop_event,
+        )
+        == 0
+    )
+    # 前 MAX_CONSECUTIVE_FAILURES 次走指數重試（10→20→40→80→160）；
+    # 達標後直接等整個 interval（60s），不再以退避每輪重發。
+    assert calls == scheduler.MAX_CONSECUTIVE_FAILURES + 1
+    assert stop_event.waits[-1] == 60.0
+
+
 def test_successful_daemon_waits_full_interval_before_next_cycle(monkeypatch) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()

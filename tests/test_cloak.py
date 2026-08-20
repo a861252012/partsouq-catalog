@@ -7,7 +7,9 @@
 
 import fcntl
 import json
+import os
 import threading
+import time
 from unittest import mock
 
 import pytest
@@ -219,3 +221,58 @@ def test_cf_value_extracts_clearance() -> None:
     assert cloak._cf_value([{"name": "PHPSESSID", "value": "x"}]) == ""
     assert cloak._cf_value(None) == ""
     assert cloak._cf_value([]) == ""
+
+
+def test_get_session_seeds_from_fresh_persisted_cookies(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES))
+    os.utime(cookie_file, (time.time() - 10, time.time() - 10))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock()
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() == COOKIES
+    impl.assert_not_called()
+    assert cloak._session_state["version"] == "v1"
+
+
+def test_get_session_ignores_stale_persisted_cookies(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES))
+    os.utime(
+        cookie_file,
+        (time.time() - cloak.COOKIE_TTL - 60, time.time() - cloak.COOKIE_TTL - 60),
+    )
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock(return_value=None)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() is None
+    impl.assert_called_once()
+
+
+def test_get_session_ignores_unparseable_persisted_cookies(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text("not-json")
+    os.utime(cookie_file, (time.time() - 5, time.time() - 5))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock(return_value=None)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() is None
+    impl.assert_called_once()
+
+
+def test_get_session_does_not_overwrite_in_memory_cookies(monkeypatch, tmp_path) -> None:
+    now = cloak.time.monotonic()
+    cloak._session_state.update({"cookies": COOKIES, "ok_ts": now - 10, "version": "v1"})
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(NEW_COOKIES))
+    os.utime(cookie_file, (time.time() - 5, time.time() - 5))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock()
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() == COOKIES
+    impl.assert_not_called()
+    assert cloak._session_state["version"] == "v1"

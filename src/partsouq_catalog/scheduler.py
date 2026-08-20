@@ -27,6 +27,10 @@ LOCK_BUSY_EXIT_CODE = 75
 # 被自動標 failed/interrupted —— 剛在另一台主機啟動、還在正常執行的
 # run 不會被誤殺（跨主機共享 MySQL 時本機 flock 擋不到）。
 RECOVERY_MIN_AGE_SECONDS = 900
+# 連續失敗上限：達到後停止指數重試，等下一次 interval 再檢查。
+# 失敗通常是網站封鎖/驗證無法通過，每小時重試只會反覆重啟瀏覽器
+# 錘站（2026-08-20 首次成功後連續 5 次 403 的失敗迴圈）。
+MAX_CONSECUTIVE_FAILURES = 5
 NHTSA_BULK_COMPLETED = "stage=bulk_completed"
 NHTSA_API_COMPLETED = "stage=api_completed"
 DAEMON_JOBS = ("catalog", "nhtsa", "pending")
@@ -631,6 +635,17 @@ def run_daemon(
                 continue
 
             failures += 1
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                # 連續失敗 = 封鎖/驗證無法通過的徵兆：停止指數重試，
+                # 等下一次 interval 再檢查，而不是每小時重啟瀏覽器。
+                wait_seconds = float(interval_seconds)
+                needs_schedule_check = False
+                print(
+                    f"{job} 排程連續失敗 {failures} 次；停止重試，{int(wait_seconds)} 秒後再執行",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             retry_seconds = min(
                 retry_max_seconds,
                 retry_base_seconds * (2 ** min(failures - 1, 20)),

@@ -52,6 +52,7 @@ CLOAK = {
     "cookie_export_file": Path(
         os.environ.get("PSQ_COOKIE_EXPORT_FILE", "/tmp/psq_cloak_cookies.json")
     ),
+    "cookie_file": COOKIE_FILE,  # 持久化 session cookie（程序啟動時沿用，見 cloak.get_session）
     "lock_file": COOKIE_FILE.parent / ".cloak-refresh.lock",
     "user_agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
