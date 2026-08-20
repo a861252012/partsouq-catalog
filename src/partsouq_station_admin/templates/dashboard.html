@@ -10,13 +10,29 @@
   <section>
     <h2>目前共用 DB 資料層</h2>
     <div class="summary-grid">
-      <div><strong>{{ system_summary.partsouq_normalized_rows }}</strong><span> PartSouq normalized rows（包含 sample）</span></div>
-      <div><strong>{{ system_summary.partsouq_distinct_part_numbers }}</strong><span> PartSouq distinct part numbers</span></div>
+      <div><strong>{{ system_summary.partsouq_current_rows }}</strong><span> 目前正式資料列（{{ system_summary.partsouq_current_scope or '尚無' }}）</span></div>
+      <div><strong>{{ system_summary.partsouq_current_distinct_part_numbers }}</strong><span> 目前正式不重複料號</span></div>
+      <div><strong>{{ system_summary.partsouq_bounded_rows }}</strong><span> 正式排程限量資料列（未發布全量）</span></div>
+      <div><strong>{{ system_summary.partsouq_bounded_distinct_part_numbers }}</strong><span> 限量資料不重複料號</span></div>
       <div><strong>{{ system_summary.partsouq_published_rows }}</strong><span> PartSouq published snapshot rows</span></div>
       <div><strong>{{ system_summary.nhtsa_current_records }}</strong><span> NHTSA current reference records</span></div>
       <div><strong>{{ system_summary.nhtsa_vin_decodes }}</strong><span> NHTSA VIN decodes（需站方提供合法 VIN）</span></div>
+      <div><strong>{{ system_summary.partsouq_normalized_rows }}</strong><span> normalized 歷史總列數（含 sample／失敗 run）</span></div>
     </div>
-    {% if system_summary.partsouq_published_rows == 0 %}<p class="warning">目前 1000 筆是 normalized sample，尚未發布成完整 snapshot。</p>{% endif %}
+    {% if system_summary.bounded_status == 'bounded_success'
+          and system_summary.partsouq_bounded_rows == system_summary.bounded_target_parts
+          and system_summary.bounded_scheduler_trigger_mode == 'daemon'
+          and system_summary.bounded_scheduler_status == 'completed'
+          and system_summary.bounded_scheduler_exit_code == 0
+          and system_summary.bounded_scheduler_linked_crawl_runs == 1
+          and system_summary.bounded_non_live_data_marker == 0
+          and system_summary.bounded_active_override_rows == 0 %}
+      <p>正式排程限量資料已完成 {{ system_summary.partsouq_bounded_rows }} / {{ system_summary.bounded_target_parts }} 筆；crawl run {{ system_summary.bounded_crawl_run_id }}，scheduler run {{ system_summary.bounded_scheduled_job_run_id }}。這不是完整全量 snapshot。</p>
+    {% else %}
+      <p class="warning">正式排程限量資料尚未通過驗收：{{ system_summary.partsouq_bounded_rows }} / {{ system_summary.bounded_target_parts or 10000 }} 筆；crawl={{ system_summary.bounded_status or '尚無' }}，scheduler={{ system_summary.bounded_scheduler_trigger_mode or '尚無' }}/{{ system_summary.bounded_scheduler_status or '尚無' }}，非正式標記={{ system_summary.bounded_non_live_data_marker }}，人工覆寫={{ system_summary.bounded_active_override_rows }}。</p>
+    {% endif %}
+    {% if system_summary.partsouq_normalized_rows > system_summary.partsouq_current_rows %}<p class="warning">normalized 總數含歷史 sample／失敗或未完成 run，不列入目前正式資料與 10,000 筆驗收。</p>{% endif %}
+    {% if system_summary.partsouq_published_rows == 0 %}<p class="warning">完整全量 snapshot 尚未發布；正式限量資料不會冒充全量發布。</p>{% endif %}
     {% if system_summary.nhtsa_vin_decodes == 0 %}<p>NHTSA 參考資料已同步；逐 VIN 解碼需由站方輸入合法 VIN，不能列舉 VIN。</p>{% endif %}
     <p>PartSouq 目前可證明大分類與中分類；站方頁面沒有獨立小分類來源，後台不會捏造小分類。</p>
   </section>

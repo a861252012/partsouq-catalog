@@ -69,9 +69,17 @@ CRAWL = {
     # 目前站上有 18 個品牌；若站方增減請用環境變數調整。
     "min_brands": int(os.environ.get("PSQ_MIN_BRANDS", "18")),
     "limit_groups": int(os.environ.get("PSQ_LIMIT_GROUPS", "0")),  # 全站零件組數上限（測試用）
-    # 單趟 sample 最多寫入的 fitment row 數；0 代表完整爬取。
-    # 非 0 時只更新 normalized tables，不發布 current snapshot。
+    # 舊有的未發布 sample 上限；只供測試，不可與 bounded 模式併用。
     "limit_parts": int(os.environ.get("PSQ_LIMIT_PARTS", "0")),
+    # 正式的有界資料集上限。只有精確達標、無爬取錯誤且通過
+    # 品質關卡才會原子發布到 bounded_parts；不會改寫全站 snapshot。
+    "bounded_parts": int(os.environ.get("PSQ_BOUNDED_PARTS", "0")),
+    # 排程重試必須沿用同一個 logical run 才能續爬。空值時由
+    # Crawler 先找同 target/provenance 的未完成 run，沒有才建新 key。
+    "bounded_run_key": os.environ.get("PSQ_BOUNDED_RUN_KEY", "").strip(),
+    # 由 partsouq-scheduler 建立子程式時注入。直接 CLI 執行為 0，
+    # 不得通過正式 bounded 發布 gate。
+    "scheduled_job_run_id": int(os.environ.get("SCHEDULED_JOB_RUN_ID", "0")),
     # 零件數縮水門檻（SOL review P1）：本次解析到的零件數 < 前次
     # receipt 的 row_count × 此比例時視為「格式完整但內容縮水」
     # （反爬變體/版型異常），拒絕寫 terminal receipt。前次 < 3 筆的

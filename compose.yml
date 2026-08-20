@@ -1,3 +1,21 @@
+x-scheduler-base: &scheduler-base
+  build: .
+  restart: unless-stopped
+  stop_grace_period: 30s
+  env_file: .env
+  environment:
+    PARTSOUQ_HOME: /app
+    PARTSOUQ_DB_HOST: mysql
+    PARTSOUQ_DB_PORT: 3306
+    PSQ_LIMIT_PARTS: "0"
+    PSQ_BOUNDED_PARTS: ${PSQ_BOUNDED_PARTS:-10000}
+  depends_on:
+    mysql:
+      condition: service_healthy
+  volumes:
+    - ./output:/app/output
+    - ./logs:/app/logs
+
 services:
   mysql:
     image: mysql:8.4
@@ -57,20 +75,40 @@ services:
       ]
 
   scheduler:
-    build: .
-    profiles: ["scheduler"]
-    env_file: .env
-    environment:
-      PARTSOUQ_HOME: /app
-      PARTSOUQ_DB_HOST: mysql
-      PARTSOUQ_DB_PORT: 3306
-    depends_on:
-      mysql:
-        condition: service_healthy
-    volumes:
-      - ./output:/app/output
-      - ./logs:/app/logs
-    command: ["partsouq-scheduler", "--job", "nhtsa"]
+    <<: *scheduler-base
+    command:
+      [
+        "partsouq-scheduler",
+        "--job",
+        "catalog",
+        "--daemon",
+        "--interval-seconds",
+        "${SCHEDULER_CATALOG_INTERVAL_SECONDS:-2592000}",
+      ]
+
+  nhtsa-scheduler:
+    <<: *scheduler-base
+    command:
+      [
+        "partsouq-scheduler",
+        "--job",
+        "nhtsa",
+        "--daemon",
+        "--interval-seconds",
+        "${SCHEDULER_NHTSA_INTERVAL_SECONDS:-86400}",
+      ]
+
+  queue-scheduler:
+    <<: *scheduler-base
+    command:
+      [
+        "partsouq-scheduler",
+        "--job",
+        "pending",
+        "--daemon",
+        "--interval-seconds",
+        "${SCHEDULER_PENDING_INTERVAL_SECONDS:-30}",
+      ]
 
 volumes:
   partsouq_mysql:

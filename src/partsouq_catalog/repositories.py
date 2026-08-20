@@ -269,7 +269,7 @@ class PartRepository:
         (group_id, part_number, range_str)，同料號不同 range 會真的
         插入兩列，統計必須與唯一鍵一致才不會低估。
 
-        ``complete_group=False`` 僅用於筆數受限的 sample：保留本次截取列，
+        ``complete_group=False`` 用於筆數受限的 run：保留本次截取列，
         但不可把未出現在截取 payload 的既有列誤判為已下架。
         """
         if not parts:
@@ -337,6 +337,55 @@ class PartRepository:
         """統計某零件組下的零件數量（供驗證與監督使用）。"""
         cur = self.db._execute("SELECT COUNT(*) AS n FROM parts WHERE group_id = %s", (group_id,))
         return cur.fetchone()["n"]
+
+    def bounded_group_context(self, group_id: int) -> dict | None:
+        """讀取正式 bounded 配額所需的 group／車款來源欄位。"""
+        return self.db._execute(
+            "SELECT v.production_from, v.production_to, "
+            "(NULLIF(TRIM(b.name), '') IS NOT NULL "
+            "AND NULLIF(TRIM(m.name), '') IS NOT NULL "
+            "AND NULLIF(TRIM(v.name), '') IS NOT NULL "
+            "AND NULLIF(TRIM(v.model_code), '') IS NOT NULL "
+            "AND NULLIF(TRIM(v.vid), '') IS NOT NULL "
+            "AND NULLIF(TRIM(c.cid), '') IS NOT NULL "
+            "AND NULLIF(TRIM(c.name), '') IS NOT NULL "
+            "AND NULLIF(TRIM(g.name), '') IS NOT NULL "
+            "AND NULLIF(TRIM(g.code), '') IS NOT NULL "
+            "AND NULLIF(TRIM(g.uid), '') IS NOT NULL "
+            "AND g.url LIKE "
+            "'https://partsouq.com/en/catalog/genuine/unit?%%') AS source_valid "
+            "FROM groups_t AS g "
+            "JOIN categories AS c ON c.id = g.category_id "
+            "JOIN vehicles AS v ON v.id = c.vehicle_id "
+            "JOIN models AS m ON m.id = v.model_id "
+            "JOIN brands AS b ON b.id = m.brand_id "
+            "WHERE g.id = %s",
+            (group_id,),
+        ).fetchone()
+
+    def seen_keys_in_group(self, group_id: int, run_id: int) -> set[tuple[str, str]]:
+        """讀取 bounded resume 已納入配額的 natural keys。"""
+        rows = self.db._execute(
+            "SELECT part_number, range_str FROM parts WHERE group_id = %s AND seen_run_id = %s",
+            (group_id, run_id),
+        ).fetchall()
+        return {(row["part_number"], row["range_str"]) for row in rows}
+
+    def clear_seen_keys(
+        self,
+        group_id: int,
+        run_id: int,
+        keys: set[tuple[str, str]],
+    ) -> int:
+        """解除 bounded run 中已從同一 unit payload 消失的 membership。"""
+        if not keys:
+            return 0
+        self.db._executemany(
+            "UPDATE parts SET seen_run_id = NULL WHERE group_id = %s AND seen_run_id = %s "
+            "AND part_number = %s AND range_str = %s",
+            [(group_id, run_id, part_number, range_str) for part_number, range_str in keys],
+        )
+        return len(keys)
 
 
 class CrawlRepository:
@@ -616,7 +665,15 @@ class CrawlRepository:
         )
         return cur.rowcount
 
-    def start_run(self, run_key: str = "", fresh: bool = False) -> int:
+    def start_run(
+        self,
+        run_key: str = "",
+        fresh: bool = False,
+        *,
+        dataset_kind: str = "full",
+        target_parts: int | None = None,
+        scheduled_job_run_id: int | None = None,
+    ) -> int:
         """新增一筆「執行中」的爬取紀錄，回傳 run id。
 
         run_key 標記這趟 run 的範圍（例如 '2026-08'）；同月再次呼叫
@@ -638,23 +695,33 @@ class CrawlRepository:
         """
         if fresh:
             cur = self.db._execute(
-                "INSERT INTO crawl_runs (run_key, started_at, status) "
-                "VALUES (%s, NOW(), 'running') "
+                "INSERT INTO crawl_runs (run_key, started_at, status, dataset_kind, "
+                "target_parts, scheduled_job_run_id) "
+                "VALUES (%s, NOW(), 'running', %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE started_at = NOW(), finished_at = NULL, "
                 "status = 'running', brands_ok = 0, models_ok = 0, vehicles_ok = 0, "
                 "groups_ok = 0, parts_ok = 0, parts_new = 0, error_msg = NULL, "
+                "dataset_kind = VALUES(dataset_kind), target_parts = VALUES(target_parts), "
+                "scheduled_job_run_id = VALUES(scheduled_job_run_id), "
                 "id = LAST_INSERT_ID(id)",
-                (run_key,),
+                (run_key, dataset_kind, target_parts, scheduled_job_run_id),
             )
         else:
             cur = self.db._execute(
-                "INSERT INTO crawl_runs (run_key, started_at, status) "
-                "VALUES (%s, NOW(), 'running') "
+                "INSERT INTO crawl_runs (run_key, started_at, status, dataset_kind, "
+                "target_parts, scheduled_job_run_id) "
+                "VALUES (%s, NOW(), 'running', %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE "
-                "status = IF(status = 'success', 'success', 'running'), "
-                "finished_at = IF(status = 'success', finished_at, NULL), "
+                "status = IF(status IN ('success', 'bounded_success'), status, 'running'), "
+                "finished_at = IF(status IN ('success', 'bounded_success'), finished_at, NULL), "
+                "dataset_kind = IF(status IN ('success', 'bounded_success'), "
+                "dataset_kind, VALUES(dataset_kind)), "
+                "target_parts = IF(status IN ('success', 'bounded_success'), "
+                "target_parts, VALUES(target_parts)), "
+                "scheduled_job_run_id = IF(status IN ('success', 'bounded_success'), "
+                "scheduled_job_run_id, VALUES(scheduled_job_run_id)), "
                 "id = LAST_INSERT_ID(id)",
-                (run_key,),
+                (run_key, dataset_kind, target_parts, scheduled_job_run_id),
             )
         return cur.lastrowid
 
@@ -664,14 +731,88 @@ class CrawlRepository:
         row = cur.fetchone()
         return row["status"] if row else None
 
+    def count_run_parts(self, run_id: int) -> int:
+        """以 DB membership 作為筆數受限 run 的續爬配額基線。"""
+        row = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
+            (run_id,),
+        ).fetchone()
+        return int((row or {}).get("row_count", 0))
+
+    def discard_invalid_bounded_membership(self, run_id: int) -> int:
+        """解除不符合正式 bounded 欄位／年份門檻的配額 membership。"""
+        cur = self.db._execute(
+            "UPDATE parts AS p "
+            "JOIN groups_t AS g ON g.id = p.group_id "
+            "JOIN categories AS c ON c.id = g.category_id "
+            "JOIN vehicles AS v ON v.id = c.vehicle_id "
+            "JOIN models AS m ON m.id = v.model_id "
+            "JOIN brands AS b ON b.id = m.brand_id "
+            "SET p.seen_run_id = NULL WHERE p.seen_run_id = %s AND ("
+            "NULLIF(TRIM(p.part_number), '') IS NULL "
+            "OR NULLIF(TRIM(p.name), '') IS NULL "
+            "OR NULLIF(TRIM(p.code), '') IS NULL "
+            "OR NULLIF(TRIM(b.name), '') IS NULL "
+            "OR NULLIF(TRIM(m.name), '') IS NULL "
+            "OR NULLIF(TRIM(v.name), '') IS NULL "
+            "OR NULLIF(TRIM(v.model_code), '') IS NULL "
+            "OR NULLIF(TRIM(v.vid), '') IS NULL "
+            "OR NULLIF(TRIM(c.cid), '') IS NULL "
+            "OR NULLIF(TRIM(c.name), '') IS NULL "
+            "OR NULLIF(TRIM(g.name), '') IS NULL "
+            "OR NULLIF(TRIM(g.code), '') IS NULL "
+            "OR NULLIF(TRIM(g.uid), '') IS NULL "
+            "OR (v.production_from IS NULL AND v.production_to IS NULL "
+            "AND p.part_from IS NULL AND p.part_to IS NULL) "
+            "OR (p.part_to IS NOT NULL AND v.production_from IS NOT NULL "
+            "AND p.part_to < v.production_from) "
+            "OR (v.production_to IS NOT NULL AND p.part_from IS NOT NULL "
+            "AND v.production_to < p.part_from) "
+            "OR NULLIF(TRIM(g.url), '') IS NULL OR g.url NOT LIKE "
+            "'https://partsouq.com/en/catalog/genuine/unit?%%')",
+            (run_id,),
+        )
+        return cur.rowcount
+
+    def resumable_bounded_run_key(
+        self,
+        target_parts: int,
+        *,
+        scheduled_job_run_id: int | None,
+    ) -> str | None:
+        """取得同 target、同 daemon/direct provenance 的最新未完成 run。"""
+        if scheduled_job_run_id is None:
+            row = self.db._execute(
+                "SELECT run_key FROM crawl_runs WHERE dataset_kind = 'bounded' "
+                "AND target_parts = %s AND status IN ('running', 'error') "
+                "AND scheduled_job_run_id IS NULL "
+                "ORDER BY started_at DESC, id DESC LIMIT 1",
+                (target_parts,),
+            ).fetchone()
+        else:
+            row = self.db._execute(
+                "SELECT cr.run_key FROM scheduled_job_runs AS current_job "
+                "JOIN crawl_runs AS cr ON cr.dataset_kind = 'bounded' "
+                "AND cr.target_parts = %s AND cr.status IN ('running', 'error') "
+                "JOIN scheduled_job_runs AS previous_job "
+                "ON previous_job.id = cr.scheduled_job_run_id "
+                "AND previous_job.job_name = 'catalog' "
+                "AND previous_job.trigger_mode = 'daemon' "
+                "WHERE current_job.id = %s AND current_job.job_name = 'catalog' "
+                "AND current_job.trigger_mode = 'daemon' AND current_job.status = 'running' "
+                "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1",
+                (target_parts, scheduled_job_run_id),
+            ).fetchone()
+        return str(row["run_key"]) if row and row.get("run_key") else None
+
     def finish_run(self, run_id: int, status: str, counts: dict, error: str | None = None):
         """收尾一筆爬取紀錄：寫入完成時間、狀態、各層計數與錯誤訊息。
 
-        若該 run 已是 success（先前全站完成），本次收尾不降級（P2
-        修復）—— 不抹掉全站完成的證據。舊碼先 SELECT status 再 UPDATE：
+        若該 run 已是 success 或 bounded_success，本次收尾不降級
+        （P2 修復）—— 不抹掉已原子發布的證據。舊碼先 SELECT status 再 UPDATE：
         併行收尾時兩方同時讀到 running → error 可在 success 後覆寫，
         留下「success + 錯誤訊息 + 錯誤計數」的矛盾紀錄。改為單一
-        條件 UPDATE（WHERE status != 'success'），由 DB 保證原子性
+        條件 UPDATE（排除兩種成功狀態），由 DB 保證原子性
         （P2 修復：TOCTOU 競態）。
 
         本方法不 commit：交易邊界由服務層決定（見 db.py 分層契約）。
@@ -681,7 +822,7 @@ class CrawlRepository:
             "status = %s, "
             "brands_ok = %s, models_ok = %s, vehicles_ok = %s, "
             "groups_ok = %s, parts_ok = %s, parts_new = %s, error_msg = %s "
-            "WHERE id = %s AND status != 'success'",
+            "WHERE id = %s AND status NOT IN ('success', 'bounded_success')",
             (
                 status,
                 counts.get("brands", 0),
@@ -716,7 +857,7 @@ class CrawlRepository:
             "part_id, vehicle_id, model_id, vehicle_vid, "
             "brand, model, vehicle_name, vehicle_code, prod_period, "
             "production_from, production_to, engine, trim_name, "
-            "part_name, part_number, category_id, category_cid, "
+            "part_name, part_number, part_number_normalized, category_id, category_cid, "
             "category_main, category_group, group_id, group_code, group_uid, "
             "part_range, part_from, part_to, source_url, note, quantity, code, snapshot_at) "
             "SELECT source.part_id, source.vehicle_id, source.model_id, source.vehicle_vid, "
@@ -724,7 +865,8 @@ class CrawlRepository:
             "source.vehicle_name, source.vehicle_code, source.prod_period, "
             "source.production_from, source.production_to, source.engine, source.trim_name, "
             "source.part_name, "
-            "source.part_number, source.category_id, source.category_cid, "
+            "source.part_number, source.part_number_normalized, "
+            "source.category_id, source.category_cid, "
             "source.category_main, source.category_group, source.group_id, "
             "source.group_code, source.group_uid, "
             "source.part_range, source.part_from, source.part_to, "
@@ -735,7 +877,9 @@ class CrawlRepository:
             "v.prod_period AS prod_period, v.production_from AS production_from, "
             "v.production_to AS production_to, v.engine AS engine, v.grade AS trim_name, "
             "p.name AS part_name, "
-            "p.part_number AS part_number, c.id AS category_id, c.cid AS category_cid, "
+            "p.part_number AS part_number, "
+            "UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')) "
+            "AS part_number_normalized, c.id AS category_id, c.cid AS category_cid, "
             "c.name AS category_main, g.name AS category_group, g.id AS group_id, "
             "g.code AS group_code, g.uid AS group_uid, "
             "p.range_str AS part_range, p.part_from AS part_from, p.part_to AS part_to, "
@@ -755,7 +899,9 @@ class CrawlRepository:
             "prod_period = source.prod_period, production_from = source.production_from, "
             "production_to = source.production_to, engine = source.engine, "
             "trim_name = source.trim_name, part_name = source.part_name, "
-            "part_number = source.part_number, category_id = source.category_id, "
+            "part_number = source.part_number, "
+            "part_number_normalized = source.part_number_normalized, "
+            "category_id = source.category_id, "
             "category_cid = source.category_cid, category_main = source.category_main, "
             "category_group = source.category_group, group_id = source.group_id, "
             "group_code = source.group_code, group_uid = source.group_uid, "
@@ -781,3 +927,145 @@ class CrawlRepository:
                 f"source={source_count}, published={published_count}"
             )
         return published_count
+
+    def publish_bounded_parts(self, run_id: int, target_parts: int) -> int:
+        """原子發布精確達標的正式有界資料集。
+
+        bounded_parts 與全站 published_parts 的語意分離。本方法只在
+        run metadata、筆數、來源 ID 關聯與必填欄位全部通過時
+        更換 current bounded snapshot；交易失敗會保留上一版。
+        """
+        if target_parts <= 0:
+            raise ValueError("bounded target_parts must be positive")
+
+        run = self.db._execute(
+            "SELECT cr.run_key, cr.dataset_kind, cr.target_parts, cr.status, "
+            "cr.scheduled_job_run_id, sj.job_name AS scheduled_job_name, "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status "
+            "FROM crawl_runs AS cr "
+            "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
+            "WHERE cr.id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if not run:
+            raise RuntimeError(f"bounded run {run_id} does not exist")
+        if (
+            run.get("dataset_kind") != "bounded"
+            or int(run.get("target_parts") or 0) != target_parts
+            or run.get("status") != "running"
+        ):
+            raise RuntimeError(f"run {run_id} is not a matching running bounded crawl")
+        if run.get("scheduled_job_run_id") is None or (
+            run.get("scheduled_job_name") != "catalog"
+            or run.get("scheduled_trigger_mode") != "daemon"
+            or run.get("scheduled_job_status") != "running"
+        ):
+            raise RuntimeError(f"bounded run {run_id} has invalid scheduler provenance")
+
+        run_key = str(run.get("run_key") or "")
+        if not run_key:
+            raise RuntimeError(f"bounded run {run_id} has no run key")
+        failure_rows = self.db._execute(
+            "SELECT id FROM crawl_state WHERE run_key = %s AND status = 'error' FOR UPDATE",
+            (run_key,),
+        ).fetchall()
+        if failure_rows:
+            raise RuntimeError(
+                f"bounded run {run_id} has crawl failures: count={len(failure_rows)}"
+            )
+
+        source_row = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
+            (run_id,),
+        ).fetchone()
+        source_count = int((source_row or {}).get("row_count", 0))
+        if source_count != target_parts:
+            raise RuntimeError(
+                f"bounded run {run_id} source count mismatch: "
+                f"source={source_count}, target={target_parts}"
+            )
+
+        # current-only snapshot：DELETE + INSERT 都在 crawler 收尾交易內。
+        # 讀者在 commit 前仍看到上一版，失敗時則整筆 rollback。
+        self.db._execute("DELETE FROM bounded_parts")
+        self.db._execute(
+            "INSERT INTO bounded_parts ("
+            "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, "
+            "brand, model, vehicle_name, vehicle_code, prod_period, "
+            "production_from, production_to, engine, trim_name, part_name, "
+            "part_number, part_number_normalized, category_id, category_cid, "
+            "category_main, category_group, group_id, group_code, group_uid, "
+            "part_range, part_from, part_to, source_url, note, quantity, code, snapshot_at) "
+            "SELECT p.id, %s, v.id, m.id, v.vid, b.name, m.name, v.name, "
+            "v.model_code, v.prod_period, v.production_from, v.production_to, "
+            "v.engine, v.grade, p.name, p.part_number, "
+            "UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')), "
+            "c.id, c.cid, c.name, g.name, g.id, g.code, g.uid, p.range_str, "
+            "p.part_from, p.part_to, g.url, p.note, p.quantity, p.code, NOW() "
+            "FROM parts AS p "
+            "JOIN groups_t AS g ON g.id = p.group_id "
+            "JOIN categories AS c ON c.id = g.category_id "
+            "JOIN vehicles AS v ON v.id = c.vehicle_id "
+            "JOIN models AS m ON m.id = v.model_id "
+            "JOIN brands AS b ON b.id = m.brand_id "
+            "WHERE p.seen_run_id = %s",
+            (run_id, run_id),
+        )
+
+        snapshot = self.db._execute(
+            "SELECT COUNT(*) AS row_count, "
+            "COUNT(DISTINCT crawl_run_id) AS run_count, "
+            "MIN(crawl_run_id) AS min_run_id, MAX(crawl_run_id) AS max_run_id "
+            "FROM bounded_parts"
+        ).fetchone()
+        if (
+            int((snapshot or {}).get("row_count", 0)) != target_parts
+            or int((snapshot or {}).get("run_count", 0)) != 1
+            or int((snapshot or {}).get("min_run_id") or 0) != run_id
+            or int((snapshot or {}).get("max_run_id") or 0) != run_id
+        ):
+            raise RuntimeError(f"bounded run {run_id} snapshot identity/count mismatch")
+
+        quality = self.db._execute(
+            "SELECT COUNT(*) AS invalid_rows FROM bounded_parts AS bp "
+            "LEFT JOIN parts AS p ON p.id = bp.part_id "
+            "LEFT JOIN groups_t AS g ON g.id = bp.group_id "
+            "LEFT JOIN categories AS c ON c.id = bp.category_id "
+            "LEFT JOIN vehicles AS v ON v.id = bp.vehicle_id "
+            "LEFT JOIN models AS m ON m.id = bp.model_id "
+            "WHERE bp.crawl_run_id = %s AND ("
+            "p.id IS NULL OR g.id IS NULL OR c.id IS NULL OR v.id IS NULL OR m.id IS NULL "
+            "OR p.group_id <> bp.group_id OR g.category_id <> bp.category_id "
+            "OR c.vehicle_id <> bp.vehicle_id OR v.model_id <> bp.model_id "
+            "OR NULLIF(TRIM(bp.part_number), '') IS NULL "
+            "OR NULLIF(TRIM(bp.part_number_normalized), '') IS NULL "
+            "OR bp.part_number_normalized <> "
+            "UPPER(REGEXP_REPLACE(bp.part_number, '[[:space:]-]+', '')) "
+            "OR NULLIF(TRIM(bp.part_name), '') IS NULL "
+            "OR NULLIF(TRIM(bp.brand), '') IS NULL OR NULLIF(TRIM(bp.model), '') IS NULL "
+            "OR NULLIF(TRIM(bp.vehicle_name), '') IS NULL "
+            "OR NULLIF(TRIM(bp.vehicle_code), '') IS NULL "
+            "OR NULLIF(TRIM(bp.vehicle_vid), '') IS NULL "
+            "OR NULLIF(TRIM(bp.category_cid), '') IS NULL "
+            "OR NULLIF(TRIM(bp.category_main), '') IS NULL "
+            "OR NULLIF(TRIM(bp.category_group), '') IS NULL "
+            "OR NULLIF(TRIM(bp.group_code), '') IS NULL "
+            "OR NULLIF(TRIM(bp.group_uid), '') IS NULL "
+            "OR NULLIF(TRIM(bp.code), '') IS NULL "
+            "OR (bp.production_from IS NULL AND bp.production_to IS NULL "
+            "AND bp.part_from IS NULL AND bp.part_to IS NULL) "
+            "OR (bp.part_to IS NOT NULL AND bp.production_from IS NOT NULL "
+            "AND bp.part_to < bp.production_from) "
+            "OR (bp.production_to IS NOT NULL AND bp.part_from IS NOT NULL "
+            "AND bp.production_to < bp.part_from) "
+            "OR bp.source_url NOT LIKE "
+            "'https://partsouq.com/en/catalog/genuine/unit?%%')",
+            (run_id,),
+        ).fetchone()
+        invalid_rows = int((quality or {}).get("invalid_rows", 0))
+        if invalid_rows:
+            raise RuntimeError(
+                f"bounded run {run_id} failed source/field quality gate: "
+                f"invalid_rows={invalid_rows}"
+            )
+        return target_parts

@@ -22,7 +22,8 @@ from partsouq_station_admin.repository import redact_sensitive_url
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 VIN_PREFIX_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{3,11}$")
-ALLOWED_PAGE_SIZES = {10, 25, 50, 100, 200}
+ALLOWED_PAGE_SIZES = {10, 25, 30, 50, 100, 200}
+BOUNDED_ACCEPTANCE_TARGET = 10_000
 
 app = FastAPI(title="PartSouq Catalog Backoffice", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -68,8 +69,10 @@ class VinVehicleMappingInput(VinInput):
 
     @model_validator(mode="after")
     def validate_name_override(self) -> VinVehicleMappingInput:
-        if self.allow_name_override and not self.source_reference:
-            raise ValueError("跨來源名稱不一致時，必須填寫人工確認依據")
+        if self.allow_name_override and not (self.source_reference or "").strip():
+            raise ValueError("跨來源車款不一致時，必須填寫人工確認依據")
+        if self.source_name == "manual-name-override" and not self.allow_name_override:
+            raise ValueError("人工 override 來源名稱只允許由人工確認流程設定")
         return self
 
 
@@ -145,7 +148,7 @@ class ReconciliationUpdate(InputModel):
 
 
 class CrawlRequestInput(InputModel):
-    job_name: Literal["catalog", "nhtsa-bulk", "nhtsa-api", "nhtsa-vin"]
+    job_name: Literal["nhtsa-bulk", "nhtsa-api", "nhtsa-vin"]
     requested_scope: str = Field(default="all", min_length=1, max_length=64)
 
 
@@ -271,7 +274,130 @@ def database_summary() -> dict:
             "(SELECT COUNT(*) FROM admin_category_labels) AS admin_category_labels, "
             "(SELECT COUNT(*) FROM admin_reconciliation_items) AS admin_reconciliation_items, "
             "(SELECT COUNT(*) FROM admin_crawl_requests) AS admin_crawl_requests, "
-            "(SELECT COUNT(*) FROM scheduled_job_runs) AS scheduled_job_runs"
+            "(SELECT COUNT(*) FROM scheduled_job_runs) AS scheduled_job_runs, "
+            "current_catalog.*, bounded.* FROM ("
+            "SELECT MAX(dataset_scope) AS current_catalog_scope, "
+            "MAX(source_crawl_run_id) AS current_catalog_crawl_run_id, "
+            "COUNT(*) AS current_catalog_rows, "
+            "COUNT(DISTINCT part_number_normalized) AS current_unique_part_numbers, "
+            "COUNT(CASE WHEN OCTET_LENGTH(part_name) <> CHAR_LENGTH(part_name) "
+            "THEN 1 END) AS current_non_ascii_part_name_rows "
+            "FROM v_current_catalog_parts) AS current_catalog CROSS JOIN ("
+            "SELECT MAX(r.id) AS bounded_crawl_run_id, "
+            "MAX(r.run_key) AS bounded_run_key, "
+            "MAX(r.dataset_kind) AS bounded_dataset_kind, "
+            "MAX(r.status) AS bounded_run_status, "
+            "MAX(r.target_parts) AS bounded_target_parts, "
+            "MAX(r.parts_ok) AS bounded_run_parts_ok, "
+            "MAX(r.started_at) AS bounded_started_at, "
+            "MAX(r.finished_at) AS bounded_finished_at, "
+            "MAX(r.error_msg) AS bounded_error_msg, "
+            "MAX(r.scheduled_job_run_id) AS bounded_scheduled_job_run_id, "
+            "MAX(sj.job_name) AS bounded_scheduler_job_name, "
+            "MAX(sj.trigger_mode) AS bounded_scheduler_trigger_mode, "
+            "MAX(sj.status) AS bounded_scheduler_status, "
+            "MAX(sj.exit_code) AS bounded_scheduler_exit_code, "
+            "MAX(sj.started_at) AS bounded_scheduler_started_at, "
+            "MAX(sj.finished_at) AS bounded_scheduler_finished_at, "
+            "MAX(scheduler_links.crawl_run_count) "
+            "AS bounded_scheduler_linked_crawl_runs, "
+            "MAX(CASE WHEN RIGHT(DATABASE(), 5) = '_test' "
+            "OR LOWER(COALESCE(r.run_key, '')) LIKE 'sample-%%' "
+            "OR LOWER(COALESCE(r.error_msg, '')) "
+            "REGEXP 'browser-assisted|fixture|synthetic|fake' "
+            "OR LOWER(COALESCE(sj.output_text, '')) "
+            "REGEXP 'browser-assisted|fixture|synthetic|fake' "
+            "THEN 1 ELSE 0 END) AS bounded_non_live_data_marker, "
+            "COUNT(bp.part_id) AS bounded_fitment_rows, "
+            "MIN(bp.crawl_run_id) AS bounded_snapshot_min_run_id, "
+            "MAX(bp.crawl_run_id) AS bounded_snapshot_max_run_id, "
+            "COUNT(DISTINCT bp.part_number_normalized) AS bounded_unique_part_numbers, "
+            "COUNT(DISTINCT bp.vehicle_id) AS bounded_unique_vehicles, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL "
+            "AND OCTET_LENGTH(bp.part_name) <> CHAR_LENGTH(bp.part_name) THEN 1 END) "
+            "AS bounded_english_name_unverified_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND ("
+            "NULLIF(TRIM(bp.part_number), '') IS NULL "
+            "OR NULLIF(TRIM(bp.part_name), '') IS NULL "
+            "OR NULLIF(TRIM(bp.brand), '') IS NULL "
+            "OR NULLIF(TRIM(bp.model), '') IS NULL "
+            "OR NULLIF(TRIM(bp.vehicle_name), '') IS NULL "
+            "OR NULLIF(TRIM(bp.vehicle_code), '') IS NULL) THEN 1 END) "
+            "AS bounded_required_field_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND (bp.model_id IS NULL "
+            "OR bp.vehicle_id IS NULL OR bp.category_id IS NULL OR bp.group_id IS NULL) "
+            "THEN 1 END) AS bounded_id_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND ("
+            "NULLIF(TRIM(bp.vehicle_vid), '') IS NULL "
+            "OR NULLIF(TRIM(bp.category_cid), '') IS NULL "
+            "OR NULLIF(TRIM(bp.group_code), '') IS NULL "
+            "OR NULLIF(TRIM(bp.group_uid), '') IS NULL "
+            "OR NULLIF(TRIM(bp.code), '') IS NULL) THEN 1 END) "
+            "AS bounded_source_id_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND (p.id IS NULL OR g.id IS NULL "
+            "OR c.id IS NULL OR v.id IS NULL OR m.id IS NULL OR b.id IS NULL "
+            "OR p.group_id <> bp.group_id OR g.category_id <> bp.category_id "
+            "OR c.vehicle_id <> bp.vehicle_id OR v.model_id <> bp.model_id) "
+            "THEN 1 END) AS bounded_orphan_relation_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL "
+            "AND bp.production_from IS NULL AND bp.production_to IS NULL THEN 1 END) "
+            "AS bounded_vehicle_range_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL "
+            "AND bp.part_from IS NULL AND bp.part_to IS NULL THEN 1 END) "
+            "AS bounded_part_range_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL "
+            "AND bp.production_from IS NULL AND bp.production_to IS NULL "
+            "AND bp.part_from IS NULL AND bp.part_to IS NULL THEN 1 END) "
+            "AS bounded_effective_year_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL "
+            "AND NULLIF(TRIM(bp.category_main), '') IS NULL THEN 1 END) "
+            "AS bounded_category_main_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL "
+            "AND NULLIF(TRIM(bp.category_group), '') IS NULL THEN 1 END) "
+            "AS bounded_category_group_missing_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND ("
+            "LOWER(bp.source_url) LIKE 'https://partsouq.com/en/catalog/genuine/unit?%%' "
+            "OR LOWER(bp.source_url) LIKE "
+            "'https://www.partsouq.com/en/catalog/genuine/unit?%%') THEN 1 END) "
+            "AS bounded_official_source_url_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND ("
+            "NULLIF(TRIM(bp.source_url), '') IS NULL OR NOT ("
+            "LOWER(bp.source_url) LIKE 'https://partsouq.com/en/catalog/genuine/unit?%%' "
+            "OR LOWER(bp.source_url) LIKE "
+            "'https://www.partsouq.com/en/catalog/genuine/unit?%%')) THEN 1 END) "
+            "AS bounded_invalid_source_url_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND bp.crawl_run_id <> r.id THEN 1 END) "
+            "AS bounded_run_mismatch_rows, "
+            "COUNT(CASE WHEN overrides.id IS NOT NULL THEN 1 END) "
+            "AS bounded_active_override_rows, "
+            "COUNT(CASE WHEN bp.part_id IS NOT NULL AND ("
+            "CAST(bp.part_number AS BINARY) <> CAST(p.part_number AS BINARY) "
+            "OR bp.part_number_normalized <> "
+            "UPPER(REGEXP_REPLACE(bp.part_number, '[[:space:]-]+', '')) "
+            "OR CAST(bp.part_name AS BINARY) <> CAST(p.name AS BINARY) "
+            "OR CAST(bp.brand AS BINARY) <> CAST(b.name AS BINARY) "
+            "OR CAST(bp.model AS BINARY) <> CAST(m.name AS BINARY)) THEN 1 END) "
+            "AS bounded_source_value_mismatch_rows "
+            "FROM (SELECT 1 AS singleton) AS anchor "
+            "LEFT JOIN (SELECT id, run_key, dataset_kind, status, target_parts, parts_ok, "
+            "started_at, finished_at, error_msg, scheduled_job_run_id FROM crawl_runs "
+            "WHERE dataset_kind = 'bounded' ORDER BY started_at DESC, id DESC LIMIT 1) AS r "
+            "ON TRUE "
+            "LEFT JOIN scheduled_job_runs AS sj ON sj.id = r.scheduled_job_run_id "
+            "LEFT JOIN (SELECT scheduled_job_run_id, COUNT(*) AS crawl_run_count "
+            "FROM crawl_runs WHERE scheduled_job_run_id IS NOT NULL "
+            "GROUP BY scheduled_job_run_id) AS scheduler_links "
+            "ON scheduler_links.scheduled_job_run_id = sj.id "
+            "LEFT JOIN bounded_parts AS bp ON r.id IS NOT NULL "
+            "LEFT JOIN admin_override_heads AS overrides "
+            "ON overrides.entity_type = 'part_numbers' "
+            "AND overrides.source_record_id = bp.part_id AND overrides.status = 'active' "
+            "LEFT JOIN parts AS p ON p.id = bp.part_id "
+            "LEFT JOIN groups_t AS g ON g.id = bp.group_id "
+            "LEFT JOIN categories AS c ON c.id = bp.category_id "
+            "LEFT JOIN vehicles AS v ON v.id = bp.vehicle_id "
+            "LEFT JOIN models AS m ON m.id = bp.model_id "
+            "LEFT JOIN brands AS b ON b.id = m.brand_id) AS bounded"
         )
         or {}
     )
@@ -287,17 +413,78 @@ def database_summary() -> dict:
             "COUNT(CASE WHEN a.vin IS NULL THEN 1 END) AS manual, "
             "COUNT(CASE WHEN a.vin IS NOT NULL AND d.vin IS NOT NULL "
             "AND published.vehicle_id IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM v_current_catalog_parts AS current_year "
+            "WHERE current_year.vehicle_id = a.partsouq_vehicle_id "
+            "AND (current_year.production_from IS NOT NULL "
+            "OR current_year.production_to IS NOT NULL) "
+            "AND (current_year.production_from IS NULL OR d.model_year >= "
+            "CAST(LEFT(current_year.production_from, 4) AS UNSIGNED)) "
+            "AND (current_year.production_to IS NULL OR d.model_year <= "
+            "CAST(LEFT(current_year.production_to, 4) AS UNSIGNED))) "
             "AND CAST(a.make_name AS BINARY) = CAST(d.make_name AS BINARY) "
             "AND CAST(a.model_name AS BINARY) = CAST(d.model_name AS BINARY) "
-            "AND a.model_year <=> d.model_year THEN 1 END) AS confirmed, "
+            "AND a.model_year <=> d.model_year "
+            "AND NULLIF(TRIM(d.engine_configuration), '') IS NOT NULL "
+            "AND d.displacement_l IS NOT NULL "
+            "AND NULLIF(TRIM(d.trim_name), '') IS NOT NULL "
+            "AND CAST(a.engine AS BINARY) <=> "
+            "CAST(CONCAT_WS(' / ', d.engine_configuration, d.engine_model) AS BINARY) "
+            "AND CAST(a.trim_name AS BINARY) <=> CAST(d.trim_name AS BINARY) "
+            "AND (a.source_name = 'manual-name-override' OR EXISTS ("
+            "SELECT 1 FROM v_current_catalog_parts AS exact "
+            "WHERE exact.vehicle_id = a.partsouq_vehicle_id "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.brand), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY) "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.model), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY) "
+            "AND NULLIF(TRIM(d.engine_model), '') IS NOT NULL "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.engine), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY) "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.trim_name), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY) "
+            "AND (exact.production_from IS NULL OR d.model_year >= "
+            "CAST(LEFT(exact.production_from, 4) AS UNSIGNED)) "
+            "AND (exact.production_to IS NULL OR d.model_year <= "
+            "CAST(LEFT(exact.production_to, 4) AS UNSIGNED)))) "
+            "THEN 1 END) AS confirmed, "
             "COUNT(CASE WHEN a.vin IS NOT NULL AND (d.vin IS NULL "
             "OR published.vehicle_id IS NULL "
+            "OR NOT EXISTS (SELECT 1 FROM v_current_catalog_parts AS current_year "
+            "WHERE current_year.vehicle_id = a.partsouq_vehicle_id "
+            "AND (current_year.production_from IS NOT NULL "
+            "OR current_year.production_to IS NOT NULL) "
+            "AND (current_year.production_from IS NULL OR d.model_year >= "
+            "CAST(LEFT(current_year.production_from, 4) AS UNSIGNED)) "
+            "AND (current_year.production_to IS NULL OR d.model_year <= "
+            "CAST(LEFT(current_year.production_to, 4) AS UNSIGNED))) "
+            "OR NULLIF(TRIM(d.engine_configuration), '') IS NULL "
+            "OR d.displacement_l IS NULL OR NULLIF(TRIM(d.trim_name), '') IS NULL "
             "OR CAST(a.make_name AS BINARY) <> CAST(d.make_name AS BINARY) "
             "OR CAST(a.model_name AS BINARY) <> CAST(d.model_name AS BINARY) "
-            "OR NOT (a.model_year <=> d.model_year)) THEN 1 END) AS stale "
+            "OR NOT (a.model_year <=> d.model_year) "
+            "OR NOT (CAST(a.engine AS BINARY) <=> "
+            "CAST(CONCAT_WS(' / ', d.engine_configuration, d.engine_model) AS BINARY)) "
+            "OR NOT (CAST(a.trim_name AS BINARY) <=> CAST(d.trim_name AS BINARY)) "
+            "OR (a.source_name <> 'manual-name-override' AND NOT EXISTS ("
+            "SELECT 1 FROM v_current_catalog_parts AS exact "
+            "WHERE exact.vehicle_id = a.partsouq_vehicle_id "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.brand), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY) "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.model), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY) "
+            "AND NULLIF(TRIM(d.engine_model), '') IS NOT NULL "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.engine), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY) "
+            "AND CAST(REGEXP_REPLACE(UPPER(exact.trim_name), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY) "
+            "AND (exact.production_from IS NULL OR d.model_year >= "
+            "CAST(LEFT(exact.production_from, 4) AS UNSIGNED)) "
+            "AND (exact.production_to IS NULL OR d.model_year <= "
+            "CAST(LEFT(exact.production_to, 4) AS UNSIGNED)))) "
+            ") THEN 1 END) AS stale "
             "FROM admin_vehicle_mappings AS a "
             "LEFT JOIN nhtsa_vin_decodes AS d ON d.vin = a.vin "
-            "LEFT JOIN (SELECT DISTINCT vehicle_id FROM published_parts "
+            "LEFT JOIN (SELECT DISTINCT vehicle_id FROM v_current_catalog_parts "
             "WHERE vehicle_id IS NOT NULL) AS published "
             "ON published.vehicle_id = a.partsouq_vehicle_id"
         )
@@ -379,7 +566,7 @@ def database_summary() -> dict:
             "SELECT COUNT(CASE WHEN NULLIF(TRIM(vin), '') IS NULL "
             "OR NULLIF(TRIM(make_name), '') IS NULL OR NULLIF(TRIM(model_name), '') IS NULL "
             "OR model_year IS NULL OR NULLIF(TRIM(engine_configuration), '') IS NULL "
-            "OR NULLIF(TRIM(engine_model), '') IS NULL OR displacement_l IS NULL "
+            "OR displacement_l IS NULL "
             "OR NULLIF(TRIM(trim_name), '') IS NULL THEN 1 END) AS required_field_missing_rows "
             "FROM nhtsa_vin_decodes"
         )
@@ -402,6 +589,75 @@ def database_summary() -> dict:
     mappings["unconfirmed_vin_decodes"] = max(nhtsa_count - confirmed_count, 0)
     sample_target = int(os.getenv("PSQ_LIMIT_PARTS", "1000"))
     sample_rows = int(sample_quality.get("row_count", 0))
+    current_catalog_rows = int(counts.get("current_catalog_rows") or 0)
+    bounded_rows = int(counts.get("bounded_fitment_rows") or 0)
+    bounded_target = int(counts.get("bounded_target_parts") or 0)
+    bounded_run_parts = int(counts.get("bounded_run_parts_ok") or 0)
+    bounded_scheduler_exit = counts.get("bounded_scheduler_exit_code")
+    bounded_quality = {
+        "required_field_missing_rows": int(counts.get("bounded_required_field_missing_rows") or 0),
+        "id_missing_rows": int(counts.get("bounded_id_missing_rows") or 0),
+        "source_id_missing_rows": int(counts.get("bounded_source_id_missing_rows") or 0),
+        "orphan_relation_rows": int(counts.get("bounded_orphan_relation_rows") or 0),
+        "vehicle_range_missing_rows": int(counts.get("bounded_vehicle_range_missing_rows") or 0),
+        "part_range_missing_rows": int(counts.get("bounded_part_range_missing_rows") or 0),
+        "effective_year_missing_rows": int(counts.get("bounded_effective_year_missing_rows") or 0),
+        "category_main_missing_rows": int(counts.get("bounded_category_main_missing_rows") or 0),
+        "category_group_missing_rows": int(counts.get("bounded_category_group_missing_rows") or 0),
+        "invalid_source_url_rows": int(counts.get("bounded_invalid_source_url_rows") or 0),
+        "run_mismatch_rows": int(counts.get("bounded_run_mismatch_rows") or 0),
+        "active_override_rows": int(counts.get("bounded_active_override_rows") or 0),
+        "source_value_mismatch_rows": int(counts.get("bounded_source_value_mismatch_rows") or 0),
+        "english_name_unverified_rows": int(
+            counts.get("bounded_english_name_unverified_rows") or 0
+        ),
+        "non_live_data_marker": int(counts.get("bounded_non_live_data_marker") or 0),
+    }
+    bounded_blocking_reasons = []
+    bounded_crawl_run_id = counts.get("bounded_crawl_run_id")
+    if bounded_crawl_run_id is None:
+        bounded_blocking_reasons.append("no_bounded_crawl_run")
+    else:
+        if counts.get("bounded_dataset_kind") != "bounded":
+            bounded_blocking_reasons.append("bounded_dataset_kind_invalid")
+        if counts.get("bounded_run_status") != "bounded_success":
+            bounded_blocking_reasons.append("bounded_run_not_successful")
+        if bounded_target != BOUNDED_ACCEPTANCE_TARGET:
+            bounded_blocking_reasons.append("bounded_target_not_10000")
+        if bounded_run_parts != bounded_target:
+            bounded_blocking_reasons.append("bounded_run_count_mismatch")
+        if bounded_rows != bounded_target:
+            bounded_blocking_reasons.append("bounded_snapshot_count_mismatch")
+        if counts.get("bounded_scheduled_job_run_id") is None:
+            bounded_blocking_reasons.append("bounded_scheduler_not_linked")
+        elif counts.get("bounded_scheduler_job_name") != "catalog":
+            bounded_blocking_reasons.append("bounded_scheduler_job_invalid")
+        elif counts.get("bounded_scheduler_trigger_mode") != "daemon":
+            bounded_blocking_reasons.append("bounded_scheduler_trigger_not_daemon")
+        elif counts.get("bounded_scheduler_status") != "completed" or bounded_scheduler_exit != 0:
+            bounded_blocking_reasons.append("bounded_scheduler_not_completed")
+        elif int(counts.get("bounded_scheduler_linked_crawl_runs") or 0) != 1:
+            bounded_blocking_reasons.append("bounded_scheduler_link_not_unique")
+        if bounded_quality["non_live_data_marker"]:
+            bounded_blocking_reasons.append("bounded_non_live_data_marker")
+
+    bounded_quality_reasons = {
+        "required_field_missing_rows": "bounded_required_fields_missing",
+        "id_missing_rows": "bounded_ids_missing",
+        "source_id_missing_rows": "bounded_source_ids_missing",
+        "orphan_relation_rows": "bounded_orphan_relations",
+        "effective_year_missing_rows": "bounded_vehicle_years_missing",
+        "category_main_missing_rows": "bounded_categories_missing",
+        "category_group_missing_rows": "bounded_categories_missing",
+        "invalid_source_url_rows": "bounded_source_url_invalid",
+        "run_mismatch_rows": "bounded_snapshot_run_mismatch",
+        "active_override_rows": "bounded_active_overrides_present",
+        "source_value_mismatch_rows": "bounded_source_values_mismatch",
+    }
+    for metric, reason in bounded_quality_reasons.items():
+        if bounded_quality[metric] and reason not in bounded_blocking_reasons:
+            bounded_blocking_reasons.append(reason)
+    bounded_ready = not bounded_blocking_reasons
 
     demo_blocking_reasons = []
     production_pending_reasons = []
@@ -434,6 +690,7 @@ def database_summary() -> dict:
     if int(mappings.get("stale", 0)) or int(mappings["unconfirmed_vin_decodes"]):
         production_pending_reasons.append("stale_or_unconfirmed_vin_mapping")
     production_pending_reasons.append("partsouq_small_category_source_unavailable")
+    production_pending_reasons.append("partsouq_english_name_language_not_verified")
 
     demo_ready = not demo_blocking_reasons
     production_ready = not production_pending_reasons
@@ -451,6 +708,85 @@ def database_summary() -> dict:
             "fitment_rows": counts.get("published_fitment_rows", 0),
             "unique_part_numbers": counts.get("unique_part_numbers", 0),
             "unique_vehicles": counts.get("unique_vehicles", 0),
+        },
+        "current_catalog": {
+            "dataset_scope": counts.get("current_catalog_scope"),
+            "crawl_run_id": counts.get("current_catalog_crawl_run_id"),
+            "fitment_rows": current_catalog_rows,
+            "unique_part_numbers": int(counts.get("current_unique_part_numbers") or 0),
+            "name_language": {
+                "status": "not_verified" if current_catalog_rows else "not_available",
+                "non_ascii_rows": int(counts.get("current_non_ascii_part_name_rows") or 0),
+                "screening": "non_ascii_conservative_only",
+            },
+        },
+        "bounded": {
+            "dataset_status": (
+                "scheduled_bounded_not_full_published"
+                if bounded_crawl_run_id is not None
+                else "not_available"
+            ),
+            "crawl_run_id": bounded_crawl_run_id,
+            "run_key": counts.get("bounded_run_key"),
+            "dataset_kind": counts.get("bounded_dataset_kind"),
+            "status": counts.get("bounded_run_status"),
+            "target_rows": bounded_target,
+            "run_rows": bounded_run_parts,
+            "fitment_rows": bounded_rows,
+            "snapshot_crawl_run_id": (
+                counts.get("bounded_snapshot_min_run_id")
+                if counts.get("bounded_snapshot_min_run_id")
+                == counts.get("bounded_snapshot_max_run_id")
+                else None
+            ),
+            "unique_part_numbers": int(counts.get("bounded_unique_part_numbers") or 0),
+            "unique_vehicles": int(counts.get("bounded_unique_vehicles") or 0),
+            "started_at": counts.get("bounded_started_at"),
+            "finished_at": counts.get("bounded_finished_at"),
+            "error": counts.get("bounded_error_msg"),
+            "scheduler": {
+                "run_id": counts.get("bounded_scheduled_job_run_id"),
+                "job_name": counts.get("bounded_scheduler_job_name"),
+                "trigger_mode": counts.get("bounded_scheduler_trigger_mode"),
+                "status": counts.get("bounded_scheduler_status"),
+                "exit_code": bounded_scheduler_exit,
+                "started_at": counts.get("bounded_scheduler_started_at"),
+                "finished_at": counts.get("bounded_scheduler_finished_at"),
+            },
+            "source_provenance": {
+                "official_source_url_rows": int(
+                    counts.get("bounded_official_source_url_rows") or 0
+                ),
+                "invalid_source_url_rows": bounded_quality["invalid_source_url_rows"],
+                "evidence_level": (
+                    "linked_scheduler_run_and_source_url"
+                    if counts.get("bounded_scheduled_job_run_id") is not None
+                    else "not_verified"
+                ),
+                "raw_http_artifact_status": "not_persisted_by_catalog_crawler",
+                "live_http_evidence": False,
+                "non_live_data_marker": bool(bounded_quality["non_live_data_marker"]),
+            },
+            "part_range_source": {
+                "populated_rows": max(bounded_rows - bounded_quality["part_range_missing_rows"], 0),
+                "missing_rows": bounded_quality["part_range_missing_rows"],
+                "status": (
+                    "not_available"
+                    if bounded_rows == 0
+                    else "unavailable_vehicle_range_used"
+                    if bounded_quality["part_range_missing_rows"] == bounded_rows
+                    else "partially_available"
+                    if bounded_quality["part_range_missing_rows"]
+                    else "complete"
+                ),
+            },
+            "name_language": {
+                "status": "not_verified" if bounded_rows else "not_available",
+                "english_name_unverified_rows": bounded_quality["english_name_unverified_rows"],
+                "screening": "non_ascii_conservative_only",
+            },
+            "ready": bounded_ready,
+            "blocking_reasons": bounded_blocking_reasons,
         },
         "nhtsa": {
             "current_records": nhtsa_current_records,
@@ -483,6 +819,7 @@ def database_summary() -> dict:
         "data_quality": {
             "published": published_quality,
             "sample": sample_quality,
+            "bounded": bounded_quality,
             "nhtsa": nhtsa_quality,
             "small_category": {
                 "source_status": "unavailable_in_current_partsouq_hierarchy",
@@ -497,6 +834,16 @@ def database_summary() -> dict:
         },
         "latest_crawl_run": latest_crawl_run,
         "latest_sample_run": latest_sample_run,
+        "latest_bounded_run": {
+            "id": bounded_crawl_run_id,
+            "run_key": counts.get("bounded_run_key"),
+            "status": counts.get("bounded_run_status"),
+            "target_parts": bounded_target,
+            "parts_ok": bounded_run_parts,
+            "scheduled_job_run_id": counts.get("bounded_scheduled_job_run_id"),
+        }
+        if bounded_crawl_run_id is not None
+        else None,
         "identifier_semantics": {
             "part_id": "shared_database_internal_id",
             "model_id": "shared_database_internal_id",
@@ -509,6 +856,7 @@ def database_summary() -> dict:
             "part_code": "partsouq_part_table_code_not_model_id",
         },
         "demo_ready": demo_ready,
+        "bounded_ready": bounded_ready,
         "production_ready": production_ready,
         "demo_blocking_reasons": demo_blocking_reasons,
         "production_pending_reasons": production_pending_reasons,
@@ -524,15 +872,12 @@ def list_parts(
     page_size: int = Query(default=10, alias="pageSize"),
 ) -> dict[str, object]:
     _validate_page_size(page_size)
-    effective_number = "COALESCE(ep.part_number_override, pp.part_number)"
-    effective_name = "COALESCE(ep.part_name_override, pp.part_name)"
-    effective_normalized = (
-        "COALESCE(ep.number_normalized_override, "
-        "REGEXP_REPLACE(UPPER(pp.part_number), '[[:space:]-]+', ''))"
-    )
-    published_from = (
-        " FROM published_parts AS pp "
-        "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = pp.part_id"
+    effective_number = "COALESCE(ep.part_number_override, current_part.part_number)"
+    effective_name = "COALESCE(ep.part_name_override, current_part.part_name)"
+    current_from = (
+        " FROM v_current_catalog_parts AS current_part "
+        "LEFT JOIN station_admin_effective_parts AS ep "
+        "ON ep.part_id = current_part.part_id"
     )
     where_clause = " WHERE COALESCE(ep.override_status, 'active') <> 'retired'"
     params: tuple[object, ...] = ()
@@ -543,31 +888,58 @@ def list_parts(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="零件號碼正規化後不可為空",
             )
-        where_clause += f" AND {effective_normalized} LIKE %s"
-        params = (f"%{normalized}%",)
+        current_from += (
+            " JOIN (SELECT candidate.part_id "
+            "FROM v_current_catalog_parts AS candidate "
+            "LEFT JOIN station_admin_effective_parts AS candidate_override "
+            "ON candidate_override.part_id = candidate.part_id "
+            "WHERE candidate.part_number_normalized = %s "
+            "AND candidate_override.number_normalized_override IS NULL "
+            "UNION ALL SELECT candidate_override.part_id "
+            "FROM station_admin_effective_parts AS candidate_override "
+            "JOIN v_current_catalog_parts AS candidate "
+            "ON candidate.part_id = candidate_override.part_id "
+            "WHERE candidate_override.number_normalized_override = %s "
+            "AND candidate_override.override_status = 'active') AS matched_part "
+            "ON matched_part.part_id = current_part.part_id"
+        )
+        params = (normalized, normalized)
 
     count_row = _fetch_one(
-        "SELECT COUNT(*) AS total" + published_from + where_clause,
+        "SELECT COUNT(*) AS total, MAX(current_part.dataset_scope) AS dataset_scope, "
+        "MAX(current_part.source_crawl_run_id) AS source_crawl_run_id"
+        + current_from
+        + where_clause,
         params,
     )
     total = int((count_row or {}).get("total", 0))
     offset = (page - 1) * page_size
     items = _fetch_all(
-        "SELECT 'published' AS dataset_status, pp.part_id, pp.model_id, pp.vehicle_id, "
-        "pp.vehicle_vid, pp.category_id, pp.category_cid, pp.group_id, pp.group_code, "
-        "pp.group_uid, pp.code AS part_code, "
-        f"{effective_number} AS part_number, {effective_name} AS part_name, pp.brand, "
-        "pp.model, pp.vehicle_name, pp.vehicle_code, pp.prod_period, pp.production_from, "
-        "pp.production_to, pp.engine, pp.trim_name, pp.part_range, pp.part_from, pp.part_to, "
-        "pp.category_main, pp.category_group, pp.source_url, pp.snapshot_at, "
+        "SELECT CASE WHEN current_part.dataset_scope = 'bounded' "
+        "THEN 'scheduled_bounded_not_full_published' ELSE 'published' END AS dataset_status, "
+        "current_part.dataset_scope, current_part.source_crawl_run_id, "
+        "current_part.part_id, current_part.model_id, current_part.vehicle_id, "
+        "current_part.vehicle_vid, current_part.category_id, current_part.category_cid, "
+        "current_part.group_id, current_part.group_code, current_part.group_uid, "
+        "current_part.code AS part_code, "
+        f"{effective_number} AS part_number, {effective_name} AS part_name, "
+        "current_part.brand, current_part.model, current_part.vehicle_name, "
+        "current_part.vehicle_code, current_part.prod_period, current_part.production_from, "
+        "current_part.production_to, current_part.engine, current_part.trim_name, "
+        "current_part.part_range, current_part.part_from, current_part.part_to, "
+        "current_part.category_main, current_part.category_group, current_part.source_url, "
+        "current_part.snapshot_at, "
         "COALESCE(ep.override_revision, 0) AS station_override_revision"
-        + published_from
+        + current_from
         + where_clause
-        + " ORDER BY pp.snapshot_at DESC, pp.part_id DESC LIMIT %s OFFSET %s",
+        + " ORDER BY current_part.snapshot_at DESC, current_part.part_id DESC "
+        "LIMIT %s OFFSET %s",
         (*params, page_size, offset),
     )
     return {
         "items": items,
+        "datasetScope": (count_row or {}).get("dataset_scope"),
+        "crawlRunId": (count_row or {}).get("source_crawl_run_id"),
         "page": page,
         "pageSize": page_size,
         "total": total,
@@ -622,6 +994,79 @@ def list_sample_parts(
     }
 
 
+@app.get("/api/bounded-parts")
+def list_bounded_parts(
+    part_number: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, alias="pageSize"),
+) -> dict[str, object]:
+    _validate_page_size(page_size)
+    bounded_from = (
+        " FROM bounded_parts AS bp "
+        "JOIN crawl_runs AS r ON r.id = bp.crawl_run_id "
+        "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = bp.part_id"
+    )
+    bounded_where = (
+        " WHERE r.id = (SELECT id FROM crawl_runs WHERE dataset_kind = 'bounded' "
+        "AND status = 'bounded_success' ORDER BY started_at DESC, id DESC LIMIT 1) "
+        "AND COALESCE(ep.override_status, 'active') <> 'retired'"
+    )
+    params: tuple[object, ...] = ()
+    if part_number:
+        normalized = normalize_catalog_part_number(part_number)
+        if not normalized:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="零件號碼正規化後不可為空",
+            )
+        bounded_from += (
+            " JOIN (SELECT candidate.part_id FROM bounded_parts AS candidate "
+            "LEFT JOIN station_admin_effective_parts AS candidate_override "
+            "ON candidate_override.part_id = candidate.part_id "
+            "WHERE candidate.part_number_normalized = %s "
+            "AND candidate_override.number_normalized_override IS NULL "
+            "UNION ALL SELECT candidate_override.part_id "
+            "FROM station_admin_effective_parts AS candidate_override "
+            "JOIN bounded_parts AS candidate "
+            "ON candidate.part_id = candidate_override.part_id "
+            "WHERE candidate_override.number_normalized_override = %s "
+            "AND candidate_override.override_status = 'active') AS matched_part "
+            "ON matched_part.part_id = bp.part_id"
+        )
+        params = (normalized, normalized)
+    count_row = _fetch_one(
+        "SELECT COUNT(*) AS total, MAX(bp.crawl_run_id) AS crawl_run_id"
+        + bounded_from
+        + bounded_where,
+        params,
+    )
+    total = int((count_row or {}).get("total", 0))
+    offset = (page - 1) * page_size
+    items = _fetch_all(
+        "SELECT 'scheduled_bounded_not_full_published' AS dataset_status, "
+        "bp.crawl_run_id, bp.part_id, bp.model_id, bp.vehicle_id, bp.vehicle_vid, "
+        "bp.category_id, bp.category_cid, bp.group_id, bp.group_code, bp.group_uid, "
+        "bp.code AS part_code, COALESCE(ep.part_number_override, bp.part_number) "
+        "AS part_number, COALESCE(ep.part_name_override, bp.part_name) AS part_name, "
+        "bp.brand, bp.model, bp.vehicle_name, bp.vehicle_code, bp.prod_period, "
+        "bp.production_from, bp.production_to, bp.engine, bp.trim_name, bp.part_range, "
+        "bp.part_from, bp.part_to, bp.category_main, bp.category_group, bp.source_url, "
+        "bp.snapshot_at, COALESCE(ep.override_revision, 0) AS station_override_revision"
+        + bounded_from
+        + bounded_where
+        + " ORDER BY bp.part_id ASC LIMIT %s OFFSET %s",
+        (*params, page_size, offset),
+    )
+    return {
+        "items": items,
+        "crawlRunId": (count_row or {}).get("crawl_run_id"),
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": (total + page_size - 1) // page_size,
+    }
+
+
 @app.get("/api/parts/{part_number}/fitments")
 def part_fitments(part_number: str) -> dict[str, list[dict]]:
     normalized = normalize_catalog_part_number(part_number)
@@ -632,7 +1077,8 @@ def part_fitments(part_number: str) -> dict[str, list[dict]]:
         )
     return {
         "catalog": _fetch_all(
-            "SELECT pp.part_id, pp.model_id, pp.vehicle_id, "
+            "SELECT pp.part_id, pp.dataset_scope, pp.source_crawl_run_id, "
+            "pp.model_id, pp.vehicle_id, "
             "pp.vehicle_id AS partsouq_vehicle_id, pp.vehicle_vid, pp.category_id, "
             "pp.category_cid, pp.group_id, pp.group_code, pp.group_uid, pp.code AS part_code, "
             "pp.brand, pp.brand AS make_name, pp.model, pp.model AS model_name, "
@@ -643,13 +1089,24 @@ def part_fitments(part_number: str) -> dict[str, list[dict]]:
             "pp.part_range, pp.part_from, pp.part_to, pp.category_main, pp.category_group, "
             "pp.source_url, pp.snapshot_at, "
             "COALESCE(ep.override_revision, 0) AS station_override_revision "
-            "FROM published_parts AS pp "
+            "FROM v_current_catalog_parts AS pp "
+            "JOIN (SELECT candidate.part_id "
+            "FROM v_current_catalog_parts AS candidate "
+            "LEFT JOIN station_admin_effective_parts AS candidate_override "
+            "ON candidate_override.part_id = candidate.part_id "
+            "WHERE candidate.part_number_normalized = %s "
+            "AND candidate_override.number_normalized_override IS NULL "
+            "UNION ALL SELECT candidate_override.part_id "
+            "FROM station_admin_effective_parts AS candidate_override "
+            "JOIN v_current_catalog_parts AS candidate "
+            "ON candidate.part_id = candidate_override.part_id "
+            "WHERE candidate_override.number_normalized_override = %s "
+            "AND candidate_override.override_status = 'active') AS matched_part "
+            "ON matched_part.part_id = pp.part_id "
             "LEFT JOIN station_admin_effective_parts AS ep ON ep.part_id = pp.part_id "
             "WHERE COALESCE(ep.override_status, 'active') <> 'retired' "
-            "AND COALESCE(ep.number_normalized_override, "
-            "REGEXP_REPLACE(UPPER(pp.part_number), '[[:space:]-]+', '')) = %s "
             "ORDER BY pp.brand, pp.model, pp.vehicle_name",
-            (normalized,),
+            (normalized, normalized),
         ),
         "manual": _fetch_all(
             "SELECT * FROM admin_part_fitments WHERE "
@@ -730,17 +1187,48 @@ def list_vin_vehicle_mappings(
         "SELECT a.*, b.name AS partsouq_brand, m.name AS partsouq_model, "
         "v.name AS partsouq_vehicle_name, v.model_code AS partsouq_vehicle_code, "
         "CASE WHEN published.vehicle_id IS NULL "
+        "OR NOT EXISTS (SELECT 1 FROM v_current_catalog_parts AS current_year "
+        "WHERE current_year.vehicle_id = a.partsouq_vehicle_id "
+        "AND (current_year.production_from IS NOT NULL "
+        "OR current_year.production_to IS NOT NULL) "
+        "AND (current_year.production_from IS NULL OR d.model_year >= "
+        "CAST(LEFT(current_year.production_from, 4) AS UNSIGNED)) "
+        "AND (current_year.production_to IS NULL OR d.model_year <= "
+        "CAST(LEFT(current_year.production_to, 4) AS UNSIGNED))) "
+        "OR NULLIF(TRIM(d.engine_configuration), '') IS NULL "
+        "OR d.displacement_l IS NULL "
+        "OR NULLIF(TRIM(d.trim_name), '') IS NULL "
         "OR CAST(a.make_name AS BINARY) <> CAST(d.make_name AS BINARY) "
         "OR CAST(a.model_name AS BINARY) <> CAST(d.model_name AS BINARY) "
         "OR NOT (a.model_year <=> d.model_year) "
-        "THEN 'stale' ELSE 'confirmed' END "
+        "OR NOT (CAST(a.engine AS BINARY) <=> "
+        "CAST(CONCAT_WS(' / ', d.engine_configuration, d.engine_model) AS BINARY)) "
+        "OR NOT (CAST(a.trim_name AS BINARY) <=> CAST(d.trim_name AS BINARY)) "
+        "OR (a.source_name <> 'manual-name-override' AND NOT EXISTS ("
+        "SELECT 1 FROM v_current_catalog_parts AS exact "
+        "WHERE exact.vehicle_id = a.partsouq_vehicle_id "
+        "AND CAST(REGEXP_REPLACE(UPPER(exact.brand), '[^A-Z0-9]', '') AS BINARY) = "
+        "CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY) "
+        "AND CAST(REGEXP_REPLACE(UPPER(exact.model), '[^A-Z0-9]', '') AS BINARY) = "
+        "CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY) "
+        "AND NULLIF(TRIM(d.engine_model), '') IS NOT NULL "
+        "AND CAST(REGEXP_REPLACE(UPPER(exact.engine), '[^A-Z0-9]', '') AS BINARY) = "
+        "CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY) "
+        "AND CAST(REGEXP_REPLACE(UPPER(exact.trim_name), '[^A-Z0-9]', '') AS BINARY) = "
+        "CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY) "
+        "AND (exact.production_from IS NULL OR d.model_year >= "
+        "CAST(LEFT(exact.production_from, 4) AS UNSIGNED)) "
+        "AND (exact.production_to IS NULL OR d.model_year <= "
+        "CAST(LEFT(exact.production_to, 4) AS UNSIGNED)))) "
+        "THEN 'stale' WHEN a.source_name = 'manual-name-override' "
+        "THEN 'confirmed_manual_override' ELSE 'confirmed' END "
         "AS vehicle_mapping_status "
         "FROM admin_vehicle_mappings AS a "
         "JOIN nhtsa_vin_decodes AS d ON d.vin = a.vin "
         "JOIN vehicles AS v ON v.id = a.partsouq_vehicle_id "
         "JOIN models AS m ON m.id = v.model_id "
         "JOIN brands AS b ON b.id = m.brand_id "
-        "LEFT JOIN (SELECT DISTINCT vehicle_id FROM published_parts "
+        "LEFT JOIN (SELECT DISTINCT vehicle_id FROM v_current_catalog_parts "
         "WHERE vehicle_id IS NOT NULL) AS published "
         "ON published.vehicle_id = a.partsouq_vehicle_id "
         f"{clause} ORDER BY a.updated_at DESC LIMIT %s",
@@ -793,6 +1281,22 @@ def _validated_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> tuple[obj
             status_code=status.HTTP_409_CONFLICT,
             detail="請先完成這組 VIN 的 NHTSA 解碼",
         )
+    required_decode_fields = (
+        "make_name",
+        "model_name",
+        "model_year",
+        "engine_configuration",
+        "displacement_l",
+        "trim_name",
+    )
+    if any(
+        value is None or (isinstance(value, str) and not value.strip())
+        for value in (decoded.get(field) for field in required_decode_fields)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="這組 VIN 的 NHTSA 解碼資料不完整，不能建立車款對應",
+        )
     candidates = list_vin_vehicle_candidates(payload.vin)
     is_exact_candidate = payload.partsouq_vehicle_id in {
         int(candidate["partsouq_vehicle_id"]) for candidate in candidates
@@ -800,11 +1304,11 @@ def _validated_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> tuple[obj
     if not is_exact_candidate and not payload.allow_name_override:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="這個 PartSouq 車款不是正規化品牌、型號與年份相符的候選",
+            detail="這個 PartSouq 車款不是品牌、型號、年份、引擎與 Trim 相符的候選",
         )
     if not is_exact_candidate:
         override_candidate = _fetch_one(
-            "SELECT DISTINCT p.vehicle_id FROM published_parts AS p "
+            "SELECT DISTINCT p.vehicle_id FROM v_current_catalog_parts AS p "
             "JOIN nhtsa_vin_decodes AS d ON d.vin = %s "
             "WHERE p.vehicle_id = %s "
             "AND (p.production_from IS NOT NULL OR p.production_to IS NOT NULL) "
@@ -853,18 +1357,28 @@ def list_vin_vehicle_candidates(vin: str) -> list[dict]:
     return _fetch_all(
         "SELECT DISTINCT p.vehicle_id AS partsouq_vehicle_id, p.brand AS partsouq_brand, "
         "p.model AS partsouq_model, p.vehicle_name, p.vehicle_code, "
+        "p.dataset_scope AS catalog_dataset_scope, "
+        "p.source_crawl_run_id AS catalog_crawl_run_id, "
         "p.prod_period, p.production_from, p.production_to, p.engine, p.trim_name, "
         "d.engine_configuration AS nhtsa_engine_configuration, "
         "d.engine_model AS nhtsa_engine_model, d.displacement_l AS nhtsa_displacement_l, "
         "d.trim_name AS nhtsa_trim_name, "
-        "'normalized_make_model_year_in_published_range' AS candidate_reason "
+        "'normalized_make_model_year_engine_trim_in_current_range' AS candidate_reason "
         "FROM nhtsa_vin_decodes AS d "
-        "JOIN published_parts AS p ON "
+        "JOIN v_current_catalog_parts AS p ON "
         "CAST(REGEXP_REPLACE(UPPER(p.brand), '[^A-Z0-9]', '') AS BINARY) = "
         "CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY) "
         "AND CAST(REGEXP_REPLACE(UPPER(p.model), '[^A-Z0-9]', '') AS BINARY) = "
         "CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY) "
+        "AND CAST(REGEXP_REPLACE(UPPER(p.engine), '[^A-Z0-9]', '') AS BINARY) = "
+        "CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY) "
+        "AND CAST(REGEXP_REPLACE(UPPER(p.trim_name), '[^A-Z0-9]', '') AS BINARY) = "
+        "CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY) "
         "WHERE d.vin = %s "
+        "AND NULLIF(TRIM(d.engine_configuration), '') IS NOT NULL "
+        "AND NULLIF(TRIM(d.engine_model), '') IS NOT NULL "
+        "AND d.displacement_l IS NOT NULL "
+        "AND NULLIF(TRIM(d.trim_name), '') IS NOT NULL "
         "AND p.vehicle_id IS NOT NULL "
         "AND (p.production_from IS NOT NULL OR p.production_to IS NOT NULL) "
         "AND (p.production_from IS NULL "
@@ -891,7 +1405,8 @@ def list_vin_parts(vin: str) -> list[dict]:
     return _fetch_all(
         "SELECT f.vin, f.make_name, f.model_name, f.model_year, f.engine_configuration, "
         "f.engine_model, f.displacement_l, f.nhtsa_trim_name, f.nhtsa_source_url, "
-        "f.nhtsa_source_artifact_id, f.part_id, f.model_id, f.vehicle_id, f.vehicle_vid, "
+        "f.nhtsa_source_artifact_id, f.part_id, f.catalog_dataset_scope, "
+        "f.catalog_crawl_run_id, f.model_id, f.vehicle_id, f.vehicle_vid, "
         "f.category_id, f.category_cid, f.group_id, f.group_uid, f.code, f.group_code, "
         "f.partsouq_vehicle_id, f.partsouq_brand, f.partsouq_model, f.vehicle_name, "
         "f.vehicle_code, f.partsouq_engine, f.partsouq_trim_name, "
@@ -990,6 +1505,11 @@ def list_categories(limit: int = Query(default=200, ge=1, le=500)) -> list[dict]
         "l.id, l.chinese_label, l.common_chinese_label, l.source_name, l.updated_at FROM ("
         "SELECT DISTINCT category_main, COALESCE(category_group, '') AS category_group, "
         "NULL AS category_small, 'published' AS dataset_status FROM published_parts UNION "
+        "SELECT DISTINCT bp.category_main, COALESCE(bp.category_group, '') AS category_group, "
+        "NULL AS category_small, 'scheduled_bounded_not_full_published' AS dataset_status "
+        "FROM bounded_parts AS bp JOIN crawl_runs AS r ON r.id = bp.crawl_run_id "
+        "WHERE r.id = (SELECT id FROM crawl_runs WHERE dataset_kind = 'bounded' "
+        "AND status = 'bounded_success' ORDER BY started_at DESC, id DESC LIMIT 1) UNION "
         "SELECT DISTINCT c.name AS category_main, COALESCE(g.name, '') AS category_group, "
         "NULL AS category_small, 'sample_not_published' AS dataset_status "
         "FROM parts AS p JOIN crawl_runs AS r ON r.id = p.seen_run_id "

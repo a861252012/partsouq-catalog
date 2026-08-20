@@ -22,13 +22,21 @@ import random
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
 
 import requests
 from requests.adapters import HTTPAdapter
 
+from partsouq_crawler.crawl.robots import RobotsRules, parse_robots
+
 from .config import CRAWL
 
 log = logging.getLogger("http")
+
+CATALOG_USER_AGENT = "partsouq-catalog-crawler/0.1 (+https://github.com/a861252012)"
+CATALOG_PRODUCT_TOKEN = "partsouq-catalog-crawler"
+CATALOG_HOSTS = frozenset({"partsouq.com", "www.partsouq.com"})
 
 
 # Cloudflare 驗證頁的特徵片段（出現在頁面前 8000 字元內即視為驗證）
@@ -67,21 +75,26 @@ class NotFoundError(Exception):
     """
 
 
+class RobotsPolicyError(Exception):
+    """代表 robots.txt 無法確認允許正式 catalog 請求。"""
+
+
 class SessionManager:
     """控制請求節奏的 HTTP 工作階段。每個 worker 各自持有一個實例。"""
 
     def __init__(self, gov=None):
         self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.proxies.clear()
+        self._robots: RobotsRules | None = None
         # F5：全域 request governor（可選）。提供時，429 的 Retry-After
         # 會同時暫停「所有」worker —— 限流是全域的，單一 worker 的
         # 退避不該讓其他 worker 繼續撞牆。
         self.gov = gov
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/145.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "User-Agent": CATALOG_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Connection": "keep-alive",
             }
@@ -101,8 +114,20 @@ class SessionManager:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
+    def _wire_get(self, url: str) -> requests.Response:
+        """送出不跟隨 redirect、也不保存 cookie 的單一 GET。"""
+        self.session.cookies.clear()
+        try:
+            return self.session.get(
+                url,
+                timeout=float(str(CRAWL["http_timeout"])),
+                allow_redirects=False,
+            )
+        finally:
+            self.session.cookies.clear()
+
     def get(self, url: str) -> str:
-        """GET 請求：含重試 + 驗證自動刷新。回傳 HTML 文字。
+        """GET 請求：正式 catalog 先檢查 robots，再依設定重試。
 
         404 有特殊語意：代表該資源在網站端不存在（例如某車型的某個
         group 頁）。以 NotFoundError 拋出、由呼叫端決定如何處理
@@ -111,6 +136,8 @@ class SessionManager:
 
         驗證回應會立即停止，不重試、不刷新 cookie、不嘗試規避。
         """
+        self._ensure_catalog_allowed(url)
+
         last_err = None
         attempt = 0
         while attempt < CRAWL["max_retries"]:
@@ -119,18 +146,14 @@ class SessionManager:
                 # SOL P1：每次 wire request 前取得全域時槽，重試也受控。
                 if self.gov is not None:
                     self.gov.acquire()
-                r = self.session.get(url, timeout=CRAWL["http_timeout"])
+                r = self._wire_get(url)
                 text = r.text or ""
                 # 驗證偵測優先：403 或任何帶驗證特徵的回應均立即停止。
                 if r.status_code in (403,) or self._is_challenge(r, text):
                     raise ChallengeError(f"http {r.status_code} challenge at {url[:100]}")
                 if r.status_code == 429:
-                    # P2 修復：429 是「限流」不是「驗證被拒」—— 舊碼把
-                    # 429 併入 challenge 分支，每次都會殺掉健康的瀏覽器、
-                    # 冷啟動重解驗證（~3-4 分鐘），且刷新成功後 failures
-                    # 歸零，等於無視退避連續燒瀏覽器。限流應尊重伺服器
-                    # 節奏：依 retry-after（或固定下限）休眠後重試，不動
-                    # 瀏覽器、不刷新 cookie。
+                    # 429 是限流，不是驗證被拒。依 Retry-After（或固定
+                    # 下限）休眠後重試；不處理 challenge 或 cookie。
                     last_err = requests.RequestException(f"http 429 rate-limited at {url[:100]}")
                     log.warning(
                         "rate-limited (429) at %s (attempt %d/%d); backing off",
@@ -147,6 +170,8 @@ class SessionManager:
                     continue
                 if r.status_code == 404:
                     raise NotFoundError(f"http 404 at {url[:100]}")
+                if 300 <= r.status_code < 400:
+                    raise RobotsPolicyError(f"catalog redirect refused at {url[:100]}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
                     raise requests.RequestException(f"http {r.status_code} at {url[:100]}")
@@ -177,6 +202,70 @@ class SessionManager:
                 log.warning("request error (attempt %d/%d): %s", attempt, CRAWL["max_retries"], e)
                 time.sleep(2 + random.random() * 2)
         raise last_err or RuntimeError(f"get failed: {url[:100]}")
+
+    def _ensure_catalog_allowed(self, url: str) -> None:
+        """正式 PartSouq catalog 首次請求前取得 robots，無法確認即停止。"""
+        parts = urlsplit(url)
+        if parts.hostname not in CATALOG_HOSTS:
+            return
+        path_segments = parts.path.split("/")
+        if (
+            "%" in parts.path
+            or "\\" in parts.path
+            or any(segment in {".", ".."} for segment in path_segments)
+        ):
+            raise RobotsPolicyError(f"ambiguous PartSouq path refused: {parts.path[:100]}")
+        is_catalog_path = parts.path == "/en/catalog" or parts.path.startswith("/en/catalog/")
+        if not is_catalog_path:
+            return
+        if (
+            parts.scheme.lower() != "https"
+            or parts.hostname != "partsouq.com"
+            or parts.port not in (None, 443)
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            raise RobotsPolicyError(f"unsupported catalog origin: {parts.scheme}://{parts.netloc}")
+
+        robots_url = urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
+        if self._robots is None:
+            if self.gov is not None:
+                self.gov.acquire()
+            response = self._wire_get(robots_url)
+            text = response.text or ""
+            if response.status_code == 403 or self._is_challenge(response, text):
+                raise ChallengeError(f"http {response.status_code} challenge at {robots_url}")
+            if not 200 <= response.status_code < 300:
+                raise RobotsPolicyError(
+                    f"robots unavailable (http {response.status_code}) at {robots_url}"
+                )
+            final_url = response.url if isinstance(response.url, str) else robots_url
+            final_parts = urlsplit(final_url)
+            if (final_parts.scheme.lower(), final_parts.netloc.lower()) != (
+                parts.scheme.lower(),
+                parts.netloc.lower(),
+            ):
+                raise RobotsPolicyError(f"robots redirected outside catalog origin: {final_url}")
+            if not text.strip() or not self._has_applicable_robots_rules(text):
+                raise RobotsPolicyError(f"robots has no explicit applicable rules at {robots_url}")
+            self._robots = parse_robots(robots_url, text.encode(), "utf-8")
+
+        if not self._robots.allows(CATALOG_USER_AGENT, url):
+            raise RobotsPolicyError(f"robots disallows catalog URL: {url[:100]}")
+
+    @staticmethod
+    def _has_applicable_robots_rules(text: str) -> bool:
+        """確認本 crawler 或萬用 UA group 具有 Allow／Disallow 指令。"""
+        parser = RobotFileParser()
+        parser.parse(text.splitlines())
+        for entry in parser.entries:
+            if entry.applies_to(CATALOG_PRODUCT_TOKEN):
+                return bool(entry.rulelines)
+        for entry in parser.entries:
+            if any(agent.strip() == "*" for agent in entry.useragents):
+                return bool(entry.rulelines)
+        default_entry = getattr(parser, "default_entry", None)
+        return bool(default_entry and default_entry.rulelines)
 
     @staticmethod
     def _retry_after_seconds(r) -> float:
@@ -228,5 +317,5 @@ class SessionManager:
         self._mount_adapter()
 
     def sleep(self):
-        """依設定延遲隨機休息（2~5 秒），模擬人類瀏覽節奏。"""
+        """依設定延遲隨機休息（2~5 秒），降低站方請求負載。"""
         time.sleep(random.uniform(CRAWL["min_delay"], CRAWL["max_delay"]))

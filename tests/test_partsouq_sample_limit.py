@@ -179,7 +179,14 @@ def test_mysql_partial_sample_readback(monkeypatch):
     monkeypatch.setitem(CRAWL, "limit_parts", 1000)
     database = Database().connect()
     try:
-        for table in ("published_parts", "crawl_state", "crawl_runs", "brands"):
+        for table in (
+            "bounded_parts",
+            "published_parts",
+            "admin_vehicle_mappings",
+            "crawl_state",
+            "crawl_runs",
+            "brands",
+        ):
             database._execute(f"DELETE FROM {table}")
         database.commit()
 
@@ -272,7 +279,14 @@ def test_mysql_partial_sample_readback(monkeypatch):
         assert published["n"] == 0
     finally:
         database.rollback()
-        for table in ("published_parts", "crawl_state", "crawl_runs", "brands"):
+        for table in (
+            "bounded_parts",
+            "published_parts",
+            "admin_vehicle_mappings",
+            "crawl_state",
+            "crawl_runs",
+            "brands",
+        ):
             database._execute(f"DELETE FROM {table}")
         database.commit()
         database.close()
@@ -280,7 +294,7 @@ def test_mysql_partial_sample_readback(monkeypatch):
 
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [("success", 0), ("sample", 3), ("error", 1)],
+    [("success", 0), ("bounded_success", 0), ("sample", 3), ("error", 1)],
 )
 def test_cli_has_distinct_exit_codes(monkeypatch, tmp_path, status, expected):
     database = mock.MagicMock()

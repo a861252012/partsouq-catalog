@@ -63,10 +63,11 @@ def _clear_shared_database(repository: NhtsaMySQLRepository) -> None:
             "admin_category_labels",
             "admin_reconciliation_items",
             "admin_crawl_requests",
-            "scheduled_job_runs",
+            "bounded_parts",
             "published_parts",
             "crawl_state",
             "crawl_runs",
+            "scheduled_job_runs",
             "brands",
         ):
             cursor.execute(f"DELETE FROM {table}")
@@ -264,14 +265,16 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
             )
             assert candidates.status_code == 200
             candidates_by_id = {row["partsouq_vehicle_id"]: row for row in candidates.json()}
-            assert set(candidates_by_id) == {vehicle_id, alternate_vehicle_id}
+            assert set(candidates_by_id) == {vehicle_id}
             assert candidates_by_id[vehicle_id]["nhtsa_engine_model"] == "A25A-FKS"
             assert candidates_by_id[vehicle_id]["nhtsa_displacement_l"] == "2.500000000"
             assert candidates_by_id[vehicle_id]["nhtsa_trim_name"] == "LE"
             assert (
                 candidates_by_id[vehicle_id]["candidate_reason"]
-                == "normalized_make_model_year_in_published_range"
+                == "normalized_make_model_year_engine_trim_in_current_range"
             )
+            assert candidates_by_id[vehicle_id]["catalog_dataset_scope"] == "full"
+            assert candidates_by_id[vehicle_id]["catalog_crawl_run_id"] is None
 
             first_manual_mapping = client.post(
                 "/api/vehicle-mappings",
@@ -313,6 +316,15 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
             first_vehicle_parts = client.get(f"/api/vins/{VIN}/parts", headers=headers)
             assert first_vehicle_parts.status_code == 200
             assert {row["part_number"] for row in first_vehicle_parts.json()} == {"TEST-PART-001"}
+            assert first_vehicle_parts.json()[0]["vehicle_mapping_status"] == "confirmed"
+            assert first_vehicle_parts.json()[0]["fitment_status"] == (
+                "compatible_by_model_year_engine_trim"
+            )
+
+            exact_summary = client.get("/api/database-summary")
+            assert exact_summary.status_code == 200
+            assert exact_summary.json()["mappings"]["confirmed"] == 1
+            assert exact_summary.json()["mappings"]["stale"] == 0
 
             corrected_mapping = client.put(
                 f"/api/vin-vehicle-mappings/{mapping.json()['id']}",
@@ -324,9 +336,22 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                     "source_reference": "fixture re-confirmation",
                 },
             )
-            assert corrected_mapping.status_code == 200
-            assert corrected_mapping.json()["partsouq_vehicle_id"] == alternate_vehicle_id
-            assert corrected_mapping.json()["source_name"] == "manual-corrected"
+            assert corrected_mapping.status_code == 409
+            assert "引擎與 Trim 相符" in corrected_mapping.json()["detail"]
+
+            override_mapping = client.put(
+                f"/api/vin-vehicle-mappings/{mapping.json()['id']}",
+                headers=headers,
+                json={
+                    "vin": VIN,
+                    "partsouq_vehicle_id": alternate_vehicle_id,
+                    "allow_name_override": True,
+                    "source_reference": "fixture engine and trim override evidence",
+                },
+            )
+            assert override_mapping.status_code == 200
+            assert override_mapping.json()["partsouq_vehicle_id"] == alternate_vehicle_id
+            assert override_mapping.json()["source_name"] == "manual-name-override"
 
             duplicate = client.post(
                 "/api/vin-vehicle-mappings",
@@ -352,8 +377,30 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
             assert fitments[0]["nhtsa_trim_name"] == "LE"
             assert fitments[0]["fitment_from"] == "2018-01"
             assert fitments[0]["fitment_to"] == "2019-12"
-            assert fitments[0]["vehicle_mapping_status"] == "confirmed"
-            assert fitments[0]["fitment_status"] == "compatible_by_model_year"
+            assert fitments[0]["vehicle_mapping_status"] == "confirmed_manual_override"
+            assert fitments[0]["fitment_status"] == "manual_vehicle_override"
+
+            database._execute(
+                "UPDATE published_parts SET production_from = %s, production_to = %s "
+                "WHERE vehicle_id = %s",
+                ("2020-01", "2020-12", alternate_vehicle_id),
+            )
+            database.commit()
+            out_of_range_mapping = client.get(
+                f"/api/vin-vehicle-mappings?vin={VIN}",
+                headers=headers,
+            )
+            assert out_of_range_mapping.status_code == 200
+            assert out_of_range_mapping.json()[0]["vehicle_mapping_status"] == "stale"
+            out_of_range_parts = client.get(f"/api/vins/{VIN}/parts", headers=headers)
+            assert out_of_range_parts.status_code == 200
+            assert out_of_range_parts.json() == []
+            database._execute(
+                "UPDATE published_parts SET production_from = %s, production_to = %s "
+                "WHERE vehicle_id = %s",
+                ("2018-01", "2020-12", alternate_vehicle_id),
+            )
+            database.commit()
 
             part = client.get("/api/parts/TEST-PART-001/fitments")
             assert part.status_code == 200
@@ -369,7 +416,9 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                 headers=headers,
             )
             assert active_mapping.status_code == 200
-            assert active_mapping.json()[0]["vehicle_mapping_status"] == "confirmed"
+            assert active_mapping.json()[0]["vehicle_mapping_status"] == (
+                "confirmed_manual_override"
+            )
 
             database._execute(
                 "UPDATE nhtsa_vin_decodes SET model_name = %s WHERE vin = %s",
@@ -402,17 +451,144 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
             recovered_parts = client.get(f"/api/vins/{VIN}/parts", headers=headers)
             assert {row["part_number"] for row in recovered_parts.json()} == {"ALT-PART-002"}
 
+            database._execute("DELETE FROM admin_vehicle_mappings WHERE vin = %s", (VIN,))
             database._execute(
-                "DELETE FROM published_parts WHERE vehicle_id = %s",
-                (alternate_vehicle_id,),
+                "UPDATE nhtsa_vin_decodes SET model_name = %s WHERE vin = %s",
+                ("CAMRY", VIN),
+            )
+            untrusted_bounded_run = database._execute(
+                "INSERT INTO crawl_runs(run_key, started_at, finished_at, status, "
+                "dataset_kind, target_parts, parts_ok) VALUES "
+                "(%s, UTC_TIMESTAMP(), UTC_TIMESTAMP(), 'bounded_success', 'bounded', 3, 3)",
+                ("bounded-3-untrusted",),
+            )
+            untrusted_bounded_run_id = int(untrusted_bounded_run.lastrowid)
+            database._execute(
+                "INSERT INTO bounded_parts("
+                "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, brand, model, "
+                "vehicle_name, vehicle_code, prod_period, production_from, production_to, "
+                "engine, trim_name, part_name, part_number, part_number_normalized, "
+                "category_id, category_cid, category_main, category_group, group_id, "
+                "group_code, group_uid, part_range, part_from, part_to, source_url, note, "
+                "quantity, code, snapshot_at) SELECT part_id, %s, vehicle_id, model_id, "
+                "vehicle_vid, brand, model, vehicle_name, vehicle_code, prod_period, "
+                "production_from, production_to, engine, trim_name, part_name, part_number, "
+                "part_number_normalized, category_id, category_cid, category_main, "
+                "category_group, group_id, group_code, group_uid, part_range, part_from, "
+                "part_to, source_url, note, quantity, code, snapshot_at FROM published_parts "
+                "WHERE part_number <> 'OUTSIDE-RANGE'",
+                (untrusted_bounded_run_id,),
             )
             database.commit()
-            stale_mapping = client.get(
+
+            full_precedence = client.get(
+                f"/api/vins/{VIN}/vehicle-candidates",
+                headers=headers,
+            )
+            assert full_precedence.status_code == 200
+            assert {row["catalog_dataset_scope"] for row in full_precedence.json()} == {"full"}
+
+            database._execute("DELETE FROM published_parts")
+            database.commit()
+            untrusted_candidates = client.get(
+                f"/api/vins/{VIN}/vehicle-candidates",
+                headers=headers,
+            )
+            assert untrusted_candidates.status_code == 200
+            assert untrusted_candidates.json() == []
+
+            scheduler_run_id = int(
+                database._execute(
+                    "INSERT INTO scheduled_job_runs("
+                    "job_name, trigger_mode, status, started_at) "
+                    "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+                ).lastrowid
+            )
+            bounded_crawl = CrawlRepository(database, "bounded-10000-mapping-daemon")
+            bounded_run_id = bounded_crawl.start_run(
+                "bounded-10000-mapping-daemon",
+                fresh=True,
+                dataset_kind="bounded",
+                target_parts=10_000,
+                scheduled_job_run_id=scheduler_run_id,
+            )
+            bounded_fixture_parts = [parts[0]] + [
+                {
+                    "part_number": f"BOUND-{index:05d}",
+                    "name": f"BOUNDED MAPPING PART {index:05d}",
+                    "code": f"B{index:05d}",
+                    "note": "synthetic integration fixture; not live crawl evidence",
+                    "quantity": "01",
+                    "range_str": "01.2019 - 12.2020",
+                    "part_from": "2019-01",
+                    "part_to": "2020-12",
+                }
+                for index in range(1, 10_000)
+            ]
+            part_repository.upsert_parts(
+                group_id,
+                bounded_fixture_parts,
+                run_id=bounded_run_id,
+            )
+            assert bounded_crawl.count_run_parts(bounded_run_id) == 10_000
+            assert bounded_crawl.publish_bounded_parts(bounded_run_id, 10_000) == 10_000
+            bounded_crawl.finish_run(
+                bounded_run_id,
+                "bounded_success",
+                {
+                    "brands": 1,
+                    "models": 1,
+                    "vehicles": 1,
+                    "groups": 1,
+                    "parts": 10_000,
+                    "parts_new": 9_999,
+                },
+            )
+            database._execute(
+                "UPDATE scheduled_job_runs SET status = 'completed', exit_code = 0, "
+                "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+                (scheduler_run_id,),
+            )
+            database.commit()
+
+            bounded_candidates = client.get(
+                f"/api/vins/{VIN}/vehicle-candidates",
+                headers=headers,
+            )
+            assert bounded_candidates.status_code == 200
+            bounded_by_id = {row["partsouq_vehicle_id"]: row for row in bounded_candidates.json()}
+            assert set(bounded_by_id) == {vehicle_id}
+            assert bounded_by_id[vehicle_id]["catalog_dataset_scope"] == "bounded"
+            assert bounded_by_id[vehicle_id]["catalog_crawl_run_id"] == bounded_run_id
+
+            bounded_mapping = client.post(
+                "/api/vin-vehicle-mappings",
+                headers=headers,
+                json={"vin": VIN, "partsouq_vehicle_id": vehicle_id},
+            )
+            assert bounded_mapping.status_code == 201
+
+            bounded_active_mapping = client.get(
                 f"/api/vin-vehicle-mappings?vin={VIN}",
                 headers=headers,
             )
-            assert stale_mapping.status_code == 200
-            assert stale_mapping.json()[0]["vehicle_mapping_status"] == "stale"
+            assert bounded_active_mapping.status_code == 200
+            assert bounded_active_mapping.json()[0]["vehicle_mapping_status"] == "confirmed"
+
+            bounded_summary = client.get("/api/database-summary")
+            assert bounded_summary.status_code == 200
+            assert bounded_summary.json()["bounded_ready"] is False
+            assert bounded_summary.json()["bounded"]["blocking_reasons"] == [
+                "bounded_non_live_data_marker"
+            ]
+            assert bounded_summary.json()["mappings"]["confirmed"] == 1
+            assert bounded_summary.json()["mappings"]["stale"] == 0
+
+            bounded_parts = client.get(f"/api/vins/{VIN}/parts", headers=headers)
+            assert bounded_parts.status_code == 200
+            assert {row["part_number"] for row in bounded_parts.json()} == {"TEST-PART-001"}
+            assert {row["catalog_dataset_scope"] for row in bounded_parts.json()} == {"bounded"}
+            assert {row["catalog_crawl_run_id"] for row in bounded_parts.json()} == {bounded_run_id}
     finally:
         database.close()
         _clear_shared_database(repository)

@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import uuid
+
+import pymysql
+import pytest
+from pymysql.connections import Connection
+from pymysql.cursors import DictCursor
+
+from partsouq_catalog.config import DB_CONFIG
+from partsouq_station_admin.db import AdminDatabase
+from partsouq_station_admin.query_trace import QueryTrace
+from partsouq_station_admin.repository import ENTITY_SPECS, AdminRepository
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run station-admin MySQL tests",
+)
+
+
+def _connect() -> Connection[DictCursor]:
+    database_name = str(DB_CONFIG["database"])
+    if not database_name.endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+    return pymysql.connect(
+        host=str(DB_CONFIG["host"]),
+        port=int(DB_CONFIG["port"]),
+        user=str(DB_CONFIG["user"]),
+        password=str(DB_CONFIG["password"]),
+        database=database_name,
+        charset="utf8mb4",
+        autocommit=False,
+        cursorclass=DictCursor,
+    )
+
+
+def test_legacy_json_null_part_overrides_fall_back_to_source_values() -> None:
+    connection = _connect()
+    source_id = uuid.uuid4().int % (2**63 - 1) + 1
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO admin_override_heads("
+                "entity_type, identity_key, source_record_id, manual_uuid, payload_json, "
+                "status, revision, base_sha256, actor, reason, created_at, updated_at"
+                ") VALUES ('part_numbers', %s, %s, NULL, %s, 'active', 1, %s, "
+                "'legacy-test', 'legacy null compatibility', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
+                (
+                    f"source:{source_id}",
+                    source_id,
+                    '{"number_raw":null,"name_en_raw":null}',
+                    "0" * 64,
+                ),
+            )
+            cursor.execute(
+                "SELECT part_number_override, number_normalized_override, part_name_override "
+                "FROM station_admin_effective_parts WHERE part_id = %s",
+                (source_id,),
+            )
+            assert cursor.fetchone() == {
+                "part_number_override": None,
+                "number_normalized_override": None,
+                "part_name_override": None,
+            }
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def _seed_lock_fixture(
+    connection: Connection[DictCursor],
+) -> tuple[dict[str, int], dict[str, object]]:
+    suffix = uuid.uuid4().hex[:12]
+    vin = f"ZZZ{uuid.uuid4().int % 10**14:014d}"
+    with connection.cursor() as cursor:
+        cursor.execute("INSERT INTO brands(name) VALUES (%s)", (f"LOCK-{suffix}",))
+        brand_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO models(brand_id, name) VALUES (%s, %s)",
+            (brand_id, f"MODEL-{suffix}"),
+        )
+        model_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO vehicles(model_id, identity_hash, name, model_code) "
+            "VALUES (%s, %s, %s, %s)",
+            (
+                model_id,
+                hashlib.sha256(suffix.encode()).hexdigest(),
+                f"VEHICLE-{suffix}",
+                f"CODE-{suffix}",
+            ),
+        )
+        vehicle_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO categories(vehicle_id, name, cid) VALUES (%s, %s, %s)",
+            (vehicle_id, "LOCK CATEGORY", suffix),
+        )
+        category_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO groups_t(category_id, code, name, uid) VALUES (%s, %s, %s, %s)",
+            (category_id, suffix, "LOCK GROUP", suffix),
+        )
+        group_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO parts(group_id, part_number, name) VALUES (%s, %s, %s)",
+            (group_id, f"LOCK-{suffix}", "LOCK SOURCE PART"),
+        )
+        part_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO published_parts("
+            "part_id, vehicle_id, model_id, brand, model, vehicle_name, vehicle_code, "
+            "prod_period, production_from, production_to, engine, trim_name, part_name, "
+            "part_number, part_number_normalized, category_main, group_id, "
+            "group_code, part_range, snapshot_at"
+            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '2020-01', '2025-12', %s, %s, "
+            "%s, %s, %s, %s, %s, %s, '', "
+            "UTC_TIMESTAMP())",
+            (
+                part_id,
+                vehicle_id,
+                model_id,
+                f"LOCK-{suffix}",
+                f"MODEL-{suffix}",
+                f"VEHICLE-{suffix}",
+                f"CODE-{suffix}",
+                "2020-01 - 2025-12",
+                "LOCK ENGINE",
+                "LOCK TRIM",
+                "LOCK SOURCE PART",
+                f"LOCK-{suffix}",
+                f"LOCK{suffix}",
+                "LOCK CATEGORY",
+                group_id,
+                suffix,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO admin_part_translations(english_name, chinese_name, source_name) "
+            "VALUES ('LOCK SOURCE PART', %s, 'lock-test')",
+            (f"鎖定測試-{suffix}",),
+        )
+        translation_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO nhtsa_source_artifacts("
+            "dataset_name, source_key, source_url, http_status, response_headers_json, "
+            "sha256, stored_path, byte_count, parser_name, parser_version, status, "
+            "downloaded_at, verified_at, imported_at, source_rows, new_versions"
+            ") VALUES ('vpic_vin_decodes', %s, 'https://example.test/vin', 200, '{}', "
+            "%s, %s, 2, 'lock-test', '1', 'imported', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), "
+            "UTC_TIMESTAMP(6), 1, 1)",
+            (f"lock-{suffix}", hashlib.sha256(vin.encode()).hexdigest(), f"{suffix}.json"),
+        )
+        artifact_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO nhtsa_vin_decodes("
+            "vin, make_name, model_name, model_year, engine_configuration, engine_model, "
+            "displacement_l, trim_name, error_code, payload_json, source_url, "
+            "source_artifact_id, decoded_at"
+            ") VALUES (%s, %s, %s, 2020, 'Inline 4', 'LOCK ENGINE', 2.0, 'LOCK TRIM', "
+            "'0', '{}', 'https://example.test/vin', %s, "
+            "UTC_TIMESTAMP(6))",
+            (vin, f"LOCK-{suffix}", f"MODEL-{suffix}", artifact_id),
+        )
+        cursor.execute(
+            "INSERT INTO admin_vehicle_mappings("
+            "vin_prefix, vin, partsouq_vehicle_id, make_name, model_name, model_year, engine, "
+            "trim_name, source_name"
+            ") VALUES (%s, %s, %s, %s, %s, 2020, 'Inline 4 / LOCK ENGINE', 'LOCK TRIM', "
+            "'lock-test')",
+            (vin[:11], vin, vehicle_id, f"LOCK-{suffix}", f"MODEL-{suffix}"),
+        )
+        mapping_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO admin_reconciliation_items(channel, subject_key) VALUES ('part', %s)",
+            (f"lock-{suffix}",),
+        )
+        reconciliation_id = int(cursor.lastrowid)
+        cursor.execute(
+            "SELECT CAST(CONV(SUBSTRING(SHA2(%s, 256), 1, 15), 16, 10) AS UNSIGNED) AS id",
+            (vin,),
+        )
+        vin_vehicle_id = int(cursor.fetchone()["id"])
+    connection.commit()
+    return (
+        {
+            "vehicle_configurations": vehicle_id,
+            "taxonomy_nodes": category_id * 2,
+            "diagrams": group_id,
+            "part_numbers": part_id,
+            "part_occurrences": part_id,
+            "fitments": part_id,
+            "part_term_mappings": translation_id,
+            "vin_vehicle_mappings": vin_vehicle_id,
+            "vin_part_fitments": mapping_id * 4294967296 + part_id,
+            "reconciliation_cases": reconciliation_id,
+        },
+        {
+            "brand_id": brand_id,
+            "part_id": part_id,
+            "translation_id": translation_id,
+            "artifact_id": artifact_id,
+            "vin": vin,
+            "mapping_id": mapping_id,
+            "reconciliation_id": reconciliation_id,
+            "taxonomy_group_id": group_id * 2 + 1,
+        },
+    )
+
+
+def _cleanup_lock_fixture(connection: Connection[DictCursor], fixture: dict[str, object]) -> None:
+    connection.rollback()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM admin_reconciliation_items WHERE id = %s",
+            (fixture["reconciliation_id"],),
+        )
+        cursor.execute("DELETE FROM admin_vehicle_mappings WHERE id = %s", (fixture["mapping_id"],))
+        cursor.execute("DELETE FROM nhtsa_vin_decodes WHERE vin = %s", (fixture["vin"],))
+        cursor.execute(
+            "DELETE FROM nhtsa_source_artifacts WHERE id = %s", (fixture["artifact_id"],)
+        )
+        cursor.execute(
+            "DELETE FROM admin_part_translations WHERE id = %s", (fixture["translation_id"],)
+        )
+        cursor.execute("DELETE FROM published_parts WHERE part_id = %s", (fixture["part_id"],))
+        cursor.execute("DELETE FROM brands WHERE id = %s", (fixture["brand_id"],))
+    connection.commit()
+
+
+def test_each_entity_locks_real_source_rows_and_blocks_crawler_update() -> None:
+    locker = _connect()
+    writer = _connect()
+    fixture: dict[str, object] = {}
+    try:
+        entity_ids, fixture = _seed_lock_fixture(locker)
+        locker.begin()
+        repository = AdminRepository(AdminDatabase(locker, QueryTrace()))
+        for entity_type, source_id in entity_ids.items():
+            assert repository._locked_base(ENTITY_SPECS[entity_type], source_id) is not None
+        assert (
+            repository._locked_base(
+                ENTITY_SPECS["taxonomy_nodes"], int(fixture["taxonomy_group_id"])
+            )
+            is not None
+        )
+
+        with writer.cursor() as cursor:
+            cursor.execute("SET SESSION innodb_lock_wait_timeout = 1")
+        writer.begin()
+        with writer.cursor() as cursor:
+            with pytest.raises(pymysql.err.OperationalError) as captured:
+                cursor.execute(
+                    "UPDATE parts SET name = CONCAT(name, ' writer') WHERE id = %s",
+                    (fixture["part_id"],),
+                )
+            assert captured.value.args[0] == 1205
+    finally:
+        writer.rollback()
+        writer.close()
+        if fixture:
+            _cleanup_lock_fixture(locker, fixture)
+        else:
+            locker.rollback()
+        locker.close()

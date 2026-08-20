@@ -167,8 +167,8 @@ def _seed_parts(database: E2EDatabase) -> None:
             cursor.execute(
                 "INSERT INTO vehicles("
                 "model_id, identity_hash, name, model_code, prod_period, "
-                "production_from, production_to, engine, ssd, vid, url, fetched_at"
-                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, UTC_TIMESTAMP())",
+                "production_from, production_to, engine, grade, ssd, vid, url, fetched_at"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, UTC_TIMESTAMP())",
                 (
                     model_id,
                     hashlib.sha256(b"station-admin-e2e-vehicle").hexdigest(),
@@ -178,6 +178,7 @@ def _seed_parts(database: E2EDatabase) -> None:
                     "2020-01",
                     "2025-12",
                     "E2E ENGINE",
+                    "E2E TRIM",
                     "vehicle-secret",
                     "E2E-VID",
                     "https://partsouq.example/e2e/vehicle?ssd=vehicle-secret",
@@ -240,12 +241,15 @@ def _seed_parts(database: E2EDatabase) -> None:
                 "INSERT INTO published_parts("
                 "part_id, vehicle_id, model_id, vehicle_vid, brand, model, vehicle_name, "
                 "vehicle_code, prod_period, production_from, production_to, engine, trim_name, "
-                "part_name, part_number, category_id, category_cid, category_main, "
+                "part_name, part_number, part_number_normalized, category_id, category_cid, "
+                "category_main, "
                 "category_group, group_id, group_code, group_uid, part_range, part_from, "
                 "part_to, source_url, note, quantity, code, snapshot_at"
                 ") SELECT p.id, v.id, m.id, v.vid, b.name, m.name, v.name, v.model_code, "
                 "v.prod_period, v.production_from, v.production_to, v.engine, v.grade, "
-                "p.name, p.part_number, c.id, c.cid, c.name, g.name, g.id, g.code, g.uid, "
+                "p.name, p.part_number, "
+                "UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')), "
+                "c.id, c.cid, c.name, g.name, g.id, g.code, g.uid, "
                 "p.range_str, p.part_from, p.part_to, p.url, p.note, p.quantity, p.code, "
                 "UTC_TIMESTAMP() FROM parts AS p "
                 "JOIN groups_t AS g ON g.id = p.group_id "
@@ -281,8 +285,9 @@ def _seed_parts(database: E2EDatabase) -> None:
             cursor.execute(
                 "INSERT INTO admin_vehicle_mappings("
                 "vin_prefix, vin, partsouq_vehicle_id, make_name, model_name, model_year, "
-                "source_name"
-                ") VALUES (%s, %s, %s, 'E2E MOTORS', 'E2E MODEL', 2022, 'e2e')",
+                "engine, trim_name, source_name"
+                ") VALUES (%s, %s, %s, 'E2E MOTORS', 'E2E MODEL', 2022, "
+                "'INLINE / E2E ENGINE', 'E2E TRIM', 'e2e')",
                 (VIN[:11], VIN, vehicle_id),
             )
         connection.commit()
@@ -423,19 +428,19 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
             try:
                 page = browser.new_page()
                 page.goto(base_url)
-                normalized_card = page.locator(".summary-grid > div").filter(
-                    has_text="PartSouq normalized rows"
+                current_card = page.locator(".summary-grid > div").filter(has_text="目前正式資料列")
+                normalized_history_card = page.locator(".summary-grid > div").filter(
+                    has_text="normalized 歷史總列數"
                 )
-                distinct_card = page.locator(".summary-grid > div").filter(
-                    has_text="PartSouq distinct part numbers"
-                )
-                expect(normalized_card).to_contain_text("1000")
-                expect(distinct_card).to_contain_text("1000")
+                expect(current_card).to_contain_text("1")
+                expect(normalized_history_card).to_contain_text("1000")
 
                 before_override = _read_pre_override_api_evidence(data_client, headers)
                 _assert_snapshot_boundary(before_override)
 
                 page.goto(f"{base_url}/entities/part_numbers")
+                page.get_by_label("資料來源").select_option("historical_sample")
+                page.get_by_role("button", name="查詢").click()
                 expect(page.get_by_text("顯示 1 到 30，共 1000 筆記錄", exact=True)).to_be_visible()
 
                 page.get_by_label("每頁").select_option("200")
@@ -454,7 +459,7 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
 
                 page.goto(
                     f"{base_url}/entities/part_numbers?"
-                    f"q={NORMALIZED_PART_NUMBER_NORMALIZED}&pageSize=200"
+                    f"q={NORMALIZED_PART_NUMBER_NORMALIZED}&dataset=historical_sample&pageSize=200"
                 )
                 expect(page.get_by_text("顯示 1 到 1，共 1 筆記錄", exact=True)).to_be_visible()
                 page.get_by_role("link", name=f"source:{TARGET_PART_ID}").click()

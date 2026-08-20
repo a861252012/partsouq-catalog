@@ -513,9 +513,26 @@ class NhtsaMySQLRepository:
         make_name = str(payload.get("Make") or "").strip()
         model_name = str(payload.get("Model") or "").strip()
         model_year_raw = str(payload.get("ModelYear") or "").strip()
+        engine_configuration = str(payload.get("EngineConfiguration") or "").strip()
+        engine_model = str(payload.get("EngineModel") or "").strip()
+        displacement_raw = str(payload.get("DisplacementL") or "").strip()
+        trim_name = str(payload.get("Trim") or "").strip()
         error_code = str(payload.get("ErrorCode") or "").strip()
-        if not make_name or not model_name or not model_year_raw.isdigit():
-            raise ValueError("NHTSA VIN decode is missing VIN, Make, Model, or ModelYear")
+        required_fields = {
+            "Make": make_name,
+            "Model": model_name,
+            "ModelYear": model_year_raw,
+            "EngineConfiguration": engine_configuration,
+            "DisplacementL": displacement_raw,
+            "Trim": trim_name,
+        }
+        missing_fields = [name for name, value in required_fields.items() if not value]
+        if missing_fields:
+            raise ValueError(
+                "NHTSA VIN decode is missing required fields: " + ", ".join(missing_fields)
+            )
+        if not model_year_raw.isdigit():
+            raise ValueError(f"NHTSA VIN decode returned an invalid ModelYear: {model_year_raw}")
         model_year = int(model_year_raw)
         if not 1886 <= model_year <= 2100:
             raise ValueError(f"NHTSA VIN decode returned an invalid model year: {model_year}")
@@ -524,14 +541,13 @@ class NhtsaMySQLRepository:
                 f"NHTSA VIN decode failed with ErrorCode={error_code}: "
                 f"{str(payload.get('ErrorText') or '').strip()}"
             )
-        displacement_raw = str(payload.get("DisplacementL") or "").strip()
         try:
-            displacement_l = Decimal(displacement_raw) if displacement_raw else None
+            displacement_l = Decimal(displacement_raw)
         except InvalidOperation as error:
             raise ValueError(
                 f"NHTSA VIN decode returned an invalid DisplacementL: {displacement_raw}"
             ) from error
-        if displacement_l is not None and (not displacement_l.is_finite() or displacement_l < 0):
+        if not displacement_l.is_finite() or displacement_l < 0:
             raise ValueError(
                 f"NHTSA VIN decode returned an invalid DisplacementL: {displacement_raw}"
             )
@@ -581,10 +597,10 @@ class NhtsaMySQLRepository:
                     make_name,
                     model_name,
                     model_year,
-                    str(payload.get("EngineConfiguration") or "").strip() or None,
-                    str(payload.get("EngineModel") or "").strip() or None,
+                    engine_configuration,
+                    engine_model or None,
                     displacement_l,
-                    str(payload.get("Trim") or "").strip() or None,
+                    trim_name,
                     str(payload.get("Series") or "").strip() or None,
                     error_code,
                     str(payload.get("ErrorText") or "").strip() or None,
@@ -608,10 +624,10 @@ class NhtsaMySQLRepository:
             "make_name": make_name,
             "model_name": model_name,
             "model_year": model_year,
-            "engine_configuration": str(payload.get("EngineConfiguration") or "").strip() or None,
-            "engine_model": str(payload.get("EngineModel") or "").strip() or None,
-            "displacement_l": str(displacement_l) if displacement_l is not None else None,
-            "trim_name": str(payload.get("Trim") or "").strip() or None,
+            "engine_configuration": engine_configuration,
+            "engine_model": engine_model or None,
+            "displacement_l": str(displacement_l),
+            "trim_name": trim_name,
         }
 
     def status_report(self) -> dict[str, Any]:

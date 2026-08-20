@@ -56,7 +56,7 @@ BRAND_PAUSE_SECONDS = 120
 
 
 class SampleLimitReached(Exception):
-    """代表 sample 已達零件筆數上限；不是網站或解析錯誤。"""
+    """代表筆數受限 run 已達零件上限；不是網站或解析錯誤。"""
 
 
 class Crawler:
@@ -78,10 +78,34 @@ class Crawler:
         self.vehicles = VehicleRepository(db)
         self.parts = PartRepository(db)
         self.crawl = CrawlRepository(db)
-        if CRAWL["limit_parts"] < 0:
+        sample_limit = int(CRAWL["limit_parts"])
+        bounded_limit = int(CRAWL["bounded_parts"])
+        if sample_limit < 0:
             raise ValueError("PSQ_LIMIT_PARTS must be zero or a positive integer")
-        if CRAWL["limit_parts"] and workers != 1:
-            log.warning("PSQ_LIMIT_PARTS sample mode forces workers=1 for an exact row cap")
+        if bounded_limit < 0:
+            raise ValueError("PSQ_BOUNDED_PARTS must be zero or a positive integer")
+        if sample_limit and bounded_limit:
+            raise ValueError("PSQ_LIMIT_PARTS and PSQ_BOUNDED_PARTS are mutually exclusive")
+        if bounded_limit and any(
+            bool(CRAWL.get(key))
+            for key in (
+                "start_brand",
+                "limit_brands",
+                "limit_models",
+                "limit_vehicles",
+                "limit_groups",
+            )
+        ):
+            raise ValueError("PSQ_BOUNDED_PARTS cannot be combined with another scope limit")
+        scheduled_job_run_id = int(CRAWL["scheduled_job_run_id"])
+        if scheduled_job_run_id < 0:
+            raise ValueError("SCHEDULED_JOB_RUN_ID must be zero or a positive integer")
+        self.sample_mode = bool(sample_limit)
+        self.bounded_mode = bool(bounded_limit)
+        self.part_limit = bounded_limit or sample_limit
+        self.scheduled_job_run_id = scheduled_job_run_id or None
+        if self.part_limit and workers != 1:
+            log.warning("part row limit mode forces workers=1 for an exact row cap")
             workers = 1
         self.workers = workers
         self.fresh = fresh
@@ -92,7 +116,7 @@ class Crawler:
         # governor 可由組合根（run_crawl）注入，與主 session 共用同一個
         # 實例，讓 _brands() 等直發請求也受全域限流。
         self.governor = governor or RequestGovernor(CRAWL["request_rate"], CRAWL["request_burst"])
-        # run() 的最終狀態（'success'/'sample'/'error'），供 CLI 決定 exit code
+        # run() 的最終狀態，供 CLI 決定 exit code。
         self.last_status = "error"
         self._sample_limit_reached = threading.Event()
         # 本 run 實際處理過的品牌（閉合檢查用，F1b）：_brands() 縮水時
@@ -483,7 +507,7 @@ class Crawler:
                     if self._sample_limit_reached.is_set():
                         raise SampleLimitReached
                 except SampleLimitReached:
-                    # sample 達上限是預期停止；目前車不得標 done/error。
+                    # 筆數達上限是預期停止；目前車不得標 done/error。
                     for f, v in list(futures.items()):
                         f.cancel()
                         f.add_done_callback(lambda fut, vv=v: _settle(fut, vv))
@@ -916,10 +940,69 @@ class Crawler:
         # parts 也走統一空解析檢查：空白 200 或異常頁解析 0 零件必須
         # 視為失敗（P0 修復），不能當成「這組沒零件」靜默跳過。
         self._guard_parse(html, parts, "parts", f"{brand} group={group.get('group_code')}")
+        parsed_row_count = len(parts)
+        # bounded retry 可能在 commit 已成功、process 尚未更新記憶體計數
+        # 時中斷。以 DB membership 為準，先排除同 run 已寫入的
+        # natural key，避免重試反覆占用配額卻無法達到 target。
+        if self.bounded_mode:
+            if self.run_id is None:
+                raise RuntimeError("crawl run is not initialized")
+            context = self.parts.bounded_group_context(group_id)
+            production_from = context.get("production_from") if context else None
+            production_to = context.get("production_to") if context else None
+            eligible = []
+            for part in parts:
+                required = all(
+                    str(part.get(field) or "").strip() for field in ("part_number", "name", "code")
+                )
+                has_year = any(
+                    (production_from, production_to, part.get("part_from"), part.get("part_to"))
+                )
+                overlaps = not (
+                    part.get("part_to")
+                    and production_from
+                    and part["part_to"] < production_from
+                    or production_to
+                    and part.get("part_from")
+                    and production_to < part["part_from"]
+                )
+                if context and context.get("source_valid") and required and has_year and overlaps:
+                    eligible.append(part)
+            if len(eligible) != len(parts):
+                log.warning(
+                    "[%s group=%s] excluded %d row(s) from bounded quota quality gate",
+                    brand,
+                    group.get("group_code"),
+                    len(parts) - len(eligible),
+                )
+            parts = eligible
+            already_seen = self.parts.seen_keys_in_group(group_id, self.run_id)
+            parsed_keys = {
+                (part.get("part_number") or "", part.get("range_str") or "") for part in parts
+            }
+            stale_keys = already_seen - parsed_keys
+            if stale_keys:
+                removed = self.parts.clear_seen_keys(group_id, self.run_id, stale_keys)
+                self.db.commit()
+                self._bump("parts", -removed)
+                already_seen -= stale_keys
+            parts = [
+                part
+                for part in parts
+                if (part.get("part_number") or "", part.get("range_str") or "") not in already_seen
+            ]
+            if not parts:
+                self.crawl.mark_group_fetched(
+                    group_id, run_key, status="done", row_count=parsed_row_count
+                )
+                self.db.commit()
+                if fetched is not None:
+                    fetched[map_key] = parsed_row_count
+                return False
         complete_group = True
-        limit_parts = CRAWL["limit_parts"]
+        limit_parts = self.part_limit
         if limit_parts:
-            # sample mode 在 __init__ 強制單 worker，因此 counts 是唯一配額
+            # 筆數受限模式在 __init__ 強制單 worker，因此 counts 是唯一配額
             # 來源，沒有跨 worker 超射。先截斷再交給 Repository 寫入。
             remaining = max(0, limit_parts - self.counts["parts"])
             selected = min(len(parts), remaining)
@@ -948,11 +1031,11 @@ class Crawler:
                 )
                 if complete_group:
                     self.crawl.mark_group_fetched(
-                        group_id, run_key, status="done", row_count=len(parts)
+                        group_id, run_key, status="done", row_count=parsed_row_count
                     )
                 self.db.commit()
                 if complete_group and fetched is not None:
-                    fetched[map_key] = len(parts)
+                    fetched[map_key] = parsed_row_count
                 # 計數在 commit 成功後才累加：重跑時不重複計。
                 self._bump("parts", len(parts))
                 self._bump("parts_new", new)
@@ -988,7 +1071,7 @@ class Crawler:
 
     def run(self) -> dict:
         """執行整趟爬取（進入點）。回傳統計計數；self.last_status 記錄
-        最終狀態（'success'/'sample'/'error'），供 CLI 決定 exit code（P2 修復：
+        最終狀態，供 CLI 決定 exit code（P2 修復：
         不完整 run 不該以 exit 0 結束）。"""
         self.last_status = "error"  # 預設：任何失敗路徑都保持 error
         # lxml/bs4 的解析樹會形成循環參考，循環 GC 必須保持開啟；
@@ -999,8 +1082,25 @@ class Crawler:
         # 每月重新爬取時不會被上個月的 done 擋住（P0 修復）。
         from datetime import datetime
 
-        sample_mode = bool(CRAWL["limit_parts"])
-        run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f" if sample_mode else "%Y-%m")
+        sample_mode = self.sample_mode
+        bounded_mode = self.bounded_mode
+        if bounded_mode:
+            run_key = (
+                CRAWL["bounded_run_key"]
+                or self.crawl.resumable_bounded_run_key(
+                    self.part_limit,
+                    scheduled_job_run_id=self.scheduled_job_run_id,
+                )
+                or f"bounded-{self.part_limit}-"
+                f"{'s' if self.scheduled_job_run_id else 'd'}"
+                f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
+            )
+            if len(run_key) > 32:
+                raise ValueError("PSQ_BOUNDED_RUN_KEY must be at most 32 characters")
+        elif sample_mode:
+            run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f")
+        else:
+            run_key = datetime.now().strftime("%Y-%m")
         self.crawl.run_key = run_key
         partial = any(
             bool(CRAWL.get(k))
@@ -1011,9 +1111,17 @@ class Crawler:
                 "limit_vehicles",
                 "limit_groups",
                 "limit_parts",
+                "bounded_parts",
             )
         )
-        run_id = self.crawl.start_run(run_key, fresh=self.fresh)
+        dataset_kind = "bounded" if bounded_mode else "sample" if sample_mode else "full"
+        run_id = self.crawl.start_run(
+            run_key,
+            fresh=self.fresh,
+            dataset_kind=dataset_kind,
+            target_parts=self.part_limit or None,
+            scheduled_job_run_id=self.scheduled_job_run_id,
+        )
         self.run_id = run_id
         # --fresh 的 run 邊界、state、receipt 與 membership reset 必須在
         # 同一交易。若程序在初始化後崩潰，DB 會保留 running，下一次
@@ -1024,6 +1132,24 @@ class Crawler:
             self.crawl.reset_part_markers(run_id)
         # 交易邊界由服務層決定（db.py 分層契約）。
         self.db.commit()
+        if bounded_mode:
+            # 排程重試沿用穩定 run_key。配額必須從持久化 membership
+            # 恢復，不能從 0 重算，否則中斷後會再爬 target 筆。
+            self.counts["parts"] = self.crawl.count_run_parts(run_id)
+            if not self.fresh and self.crawl.run_status(run_id) == "bounded_success":
+                self.last_status = "bounded_success"
+                log.info("bounded run %s already published; skipping duplicate crawl", run_key)
+                return self.counts
+            discarded = self.crawl.discard_invalid_bounded_membership(run_id)
+            if discarded:
+                self.db.commit()
+                self.counts["parts"] = self.crawl.count_run_parts(run_id)
+                log.warning(
+                    "discarded %d invalid bounded membership row(s); continuing from %d/%d",
+                    discarded,
+                    self.counts["parts"],
+                    self.part_limit,
+                )
         # 同月完整 run 已成功時，普通重啟不應再次 publish 舊 logical
         # window；--fresh 已在 start_run 重設邊界，局部 run 則仍允許執行
         # 修補 normalized 資料（但不會發布 current snapshot）。
@@ -1044,6 +1170,25 @@ class Crawler:
             log.exception("legacy state purge failed; continuing")
         finalizing = False
         try:
+            if bounded_mode and self.counts["parts"] > self.part_limit:
+                raise RuntimeError(
+                    f"bounded run membership exceeds target: "
+                    f"{self.counts['parts']}/{self.part_limit}"
+                )
+            if bounded_mode and self.counts["parts"] == self.part_limit:
+                errors = self.crawl.count_failures(run_key)
+                if not errors:
+                    finalizing = True
+                    self.crawl.publish_bounded_parts(run_id, self.part_limit)
+                    self.crawl.finish_run(run_id, "bounded_success", self.counts)
+                    self.db.commit()
+                    finalizing = False
+                    self.last_status = "bounded_success"
+                    return self.counts
+                log.warning(
+                    "bounded run reached target with %d crawl error(s); retrying failed scope",
+                    errors,
+                )
             self._check_capacity(run_key)
             brands = self._brands()
             if not brands:
@@ -1076,24 +1221,30 @@ class Crawler:
                 try:
                     failures = self.crawl_brand(b["name"])
                     if self._sample_limit_reached.is_set():
-                        log.info("sample part limit reached; stopping before next brand")
+                        log.info("part row limit reached; stopping before next brand")
                         break
                     if failures:
                         # 品牌下仍有型號失敗：記 error，讓同月續爬重試
                         self.crawl.mark_error("brand", b["name"], f"{failures} model(s) failed")
+                        if bounded_mode:
+                            self.db.commit()
+                            break
                     else:
                         # 品牌完整爬完：清除先前暫態錯誤（P0 修復），
                         # 否則一次暫時失敗會讓 count_errors 永遠包含它，
                         # 該月永遠無法標 success。
                         self.crawl.mark_done("brand", b["name"])
                 except SampleLimitReached:
-                    log.info("sample part limit reached; stopping before next brand")
+                    log.info("part row limit reached; stopping before next brand")
                     break
                 except Exception as e:
                     # 品牌層失敗（例如 locate 頁解析失敗）：記錄但不放棄
                     # 其他品牌，結束時由 count_errors 一併判定 status。
                     log.error("[%s] brand crawl failed: %s", b["name"], e)
                     self.crawl.mark_error("brand", b["name"], str(e))
+                    if bounded_mode:
+                        self.db.commit()
+                        break
                 self.db.commit()
                 # 每個品牌後回收一次：清掉解析樹的循環參考
                 gc.collect()
@@ -1102,14 +1253,42 @@ class Crawler:
             # 沒有任何殘留 error（P0 修復）。局部執行、有 limit、或任何
             # model/vehicle/brand 失敗，都不該標 success，否則監督迴圈
             # 會誤判「當月已爬完」而退出、讓失敗項目永遠缺漏。
-            # sample 預期會在目前 model/vehicle 留下 pending；只有真正
-            # status=error 才算失敗。完整 crawl 仍要求 pending+error 都為 0。
+            # 筆數受限 run 預期會在目前 model/vehicle 留下 pending；
+            # 只有 status=error 才算失敗。完整 crawl 仍要求
+            # pending+error 都為 0。
             errors = (
                 self.crawl.count_failures(run_key)
-                if sample_mode
+                if sample_mode or bounded_mode
                 else self.crawl.count_errors(run_key)
             )
-            if sample_mode and errors:
+            if bounded_mode and errors:
+                self.crawl.finish_run(
+                    run_id,
+                    "error",
+                    self.counts,
+                    f"bounded run stopped with {errors} crawl_state error(s)",
+                )
+                self.db.commit()
+            elif bounded_mode and self.counts["parts"] != self.part_limit:
+                self.crawl.finish_run(
+                    run_id,
+                    "error",
+                    self.counts,
+                    f"bounded run did not reach exact target: "
+                    f"{self.counts['parts']}/{self.part_limit}",
+                )
+                self.db.commit()
+            elif bounded_mode:
+                # bounded snapshot 與 terminal status 必須是同一個交易。
+                # Repository 會再次核對 target、來源關聯與必填欄位；
+                # 任一失敗會 rollback，上一版 bounded dataset 仍可讀。
+                finalizing = True
+                self.crawl.publish_bounded_parts(run_id, self.part_limit)
+                self.crawl.finish_run(run_id, "bounded_success", self.counts)
+                self.db.commit()
+                finalizing = False
+                self.last_status = "bounded_success"
+            elif sample_mode and errors:
                 self.crawl.finish_run(
                     run_id,
                     "error",
@@ -1118,7 +1297,7 @@ class Crawler:
                 )
                 self.db.commit()
             elif sample_mode:
-                limit_parts = CRAWL["limit_parts"]
+                limit_parts = self.part_limit
                 message = (
                     f"sample run: {self.counts['parts']}/{limit_parts} part fitment row(s); "
                     "current snapshot not published"
@@ -1196,9 +1375,10 @@ class Crawler:
             # snapshot + success，就承認成功；否則另開交易標 error。
             if finalizing:
                 try:
-                    if self.crawl.run_status(run_id) == "success":
-                        self.last_status = "success"
-                        log.warning("success commit acknowledged after finalize exception")
+                    final_status = self.crawl.run_status(run_id)
+                    if final_status in ("success", "bounded_success"):
+                        self.last_status = final_status
+                        log.warning("%s commit acknowledged after finalize exception", final_status)
                         return self.counts
                 except Exception:
                     log.exception("could not reconcile run after connection loss")

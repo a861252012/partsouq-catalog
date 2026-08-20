@@ -2,7 +2,7 @@
 {% block title %}{{ spec.title }}｜汽車資料站方後台{% endblock %}
 {% block content %}
   <div class="page-title">
-    <div><h1>{{ spec.title }}</h1><p>可搜尋、指定頁碼，並自行選擇每頁筆數。</p></div>
+    <div><h1>{{ spec.title }}</h1><p>可搜尋、指定頁碼，並自行選擇每頁筆數。正式資料預設排除歷史 sample。</p></div>
     <div>
       {% if spec.key == 'vin_vehicle_mappings' %}<a class="button secondary" href="{{ url_for('admin.vin_decode_request') }}">加入 VIN 解碼</a>{% endif %}
       <a class="button" href="{{ url_for('admin.entity_create', entity_type=spec.key) }}">新增人工資料</a>
@@ -10,6 +10,14 @@
   </div>
   <form class="filters" method="get">
     <input type="search" name="q" value="{{ page.query }}" placeholder="搜尋來源欄位或覆寫內容">
+    {% if spec.key in ['part_numbers', 'part_occurrences', 'fitments'] %}
+      <label>資料來源
+        <select name="dataset">
+          <option value="formal" {% if source_scope == 'formal' %}selected{% endif %}>目前正式資料（full 優先，否則 bounded）</option>
+          <option value="historical_sample" {% if source_scope == 'historical_sample' %}selected{% endif %}>歷史 sample（非正式）</option>
+        </select>
+      </label>
+    {% endif %}
     <label>每頁
       <select name="pageSize">
         {% for size in page_sizes %}<option value="{{ size }}" {% if size == page.page_size %}selected{% endif %}>{{ size }}</option>{% endfor %}
@@ -38,20 +46,21 @@
   <div class="pagination">
     <div class="pagination-controls">
       {% if page.page > 1 %}
-        <a class="page-button" aria-label="第一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=1) }}">«</a>
-        <a class="page-button" aria-label="上一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.page - 1) }}">‹</a>
+        <a class="page-button" aria-label="第一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, dataset=source_scope, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=1) }}">«</a>
+        <a class="page-button" aria-label="上一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, dataset=source_scope, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.page - 1) }}">‹</a>
       {% else %}
         <span class="page-button disabled">«</span><span class="page-button disabled">‹</span>
       {% endif %}
       <form class="page-form" method="get">
         <input type="hidden" name="q" value="{{ page.query }}">
         <input type="hidden" name="pageSize" value="{{ page.page_size }}">
+        <input type="hidden" name="dataset" value="{{ source_scope }}">
         {% if page.include_retired %}<input type="hidden" name="include_retired" value="1">{% endif %}
         <span>第</span><input aria-label="頁碼" type="number" name="page" value="{{ page.page }}" min="1" max="{{ page.total_pages }}"><span>頁，共 {{ page.total_pages }} 頁</span>
       </form>
       {% if page.page < page.total_pages %}
-        <a class="page-button" aria-label="下一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.page + 1) }}">›</a>
-        <a class="page-button" aria-label="末頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.total_pages) }}">»</a>
+        <a class="page-button" aria-label="下一頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, dataset=source_scope, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.page + 1) }}">›</a>
+        <a class="page-button" aria-label="末頁" href="{{ url_for('admin.entity_list', entity_type=spec.key, q=page.query, dataset=source_scope, include_retired=1 if page.include_retired else 0, pageSize=page.page_size, page=page.total_pages) }}">»</a>
       {% else %}
         <span class="page-button disabled">›</span><span class="page-button disabled">»</span>
       {% endif %}

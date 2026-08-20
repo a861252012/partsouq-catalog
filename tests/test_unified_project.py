@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from unittest.mock import Mock
 
 import pytest
@@ -89,12 +90,23 @@ def test_manual_fitment_rejects_empty_normalized_part_number() -> None:
         )
 
 
-def test_name_override_requires_audit_reference() -> None:
+@pytest.mark.parametrize("source_reference", (None, "   "))
+def test_name_override_requires_audit_reference(source_reference: str | None) -> None:
     with pytest.raises(ValueError, match="人工確認依據"):
         VinVehicleMappingInput(
             vin="ZZZTEST00X0000001",
             partsouq_vehicle_id=42,
             allow_name_override=True,
+            source_reference=source_reference,
+        )
+
+
+def test_override_source_name_cannot_bypass_audit_flow() -> None:
+    with pytest.raises(ValueError, match="只允許由人工確認流程設定"):
+        VinVehicleMappingInput(
+            vin="ZZZTEST00X0000001",
+            partsouq_vehicle_id=42,
+            source_name="manual-name-override",
         )
 
 
@@ -109,10 +121,16 @@ def test_vehicle_candidates_exclude_unmapped_legacy_snapshots(
 
     assert list_vin_vehicle_candidates("ZZZTEST00X0000001") == []
     assert "p.vehicle_id IS NOT NULL" in queries[0]
+    assert "UPPER(p.engine)" in queries[0]
+    assert "UPPER(p.trim_name)" in queries[0]
+    assert "d.displacement_l IS NOT NULL" in queries[0]
 
 
 def test_scheduler_runs_nhtsa_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job_name: 8)
+    monkeypatch.setattr(scheduler, "_record_progress", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_record_finish", lambda *_args: None)
 
     def fake_run(job_name: str, command: list[str]) -> int:
         calls.append((job_name, command))
@@ -126,13 +144,24 @@ def test_scheduler_runs_nhtsa_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[1][1][3:5] == ["nhtsa-sync-api", "--scope"]
 
 
-def test_scheduler_consumes_pending_admin_request(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scheduler_consumes_pending_admin_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
     completed: list[tuple[int, int]] = []
 
+    monkeypatch.setattr(scheduler, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(scheduler, "_requeue_interrupted_requests", lambda: None)
+    monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", lambda _job: None)
     monkeypatch.setattr(
         scheduler,
         "_pending_requests",
-        lambda: [{"id": 7, "job_name": "catalog", "requested_scope": "all"}],
+        lambda: [
+            {
+                "id": 7,
+                "job_name": "nhtsa-vin",
+                "requested_scope": "ZZZTEST00X0000001",
+            }
+        ],
     )
     monkeypatch.setattr(scheduler, "_claim_request", lambda _request_id: True)
     monkeypatch.setattr(
@@ -169,11 +198,10 @@ def test_scheduler_redacts_vin_from_persisted_output(
         "_record_finish",
         lambda _run_id, _return_code, output: saved.append(output),
     )
-    monkeypatch.setattr(
-        scheduler.subprocess,
-        "run",
-        lambda *_args, **_kwargs: Mock(returncode=0, stdout='{"vin":"ZZZTEST00X0000001"}'),
-    )
+    process = Mock(returncode=0, stdout=io.StringIO('{"vin":"ZZZTEST00X0000001"}'))
+    process.wait.return_value = 0
+    process.poll.return_value = 0
+    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *_args, **_kwargs: process)
 
     assert (
         scheduler._run(

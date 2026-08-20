@@ -81,9 +81,9 @@ def main():
         crawler = Crawler(http, db, workers=args.workers, governor=governor, fresh=args.fresh)
         counts = crawler.run()
         log.info("crawl complete: %s (status=%s)", counts, crawler.last_status)
-        # full success / 預期 sample / 真正 error 使用不同 exit code；
-        # sample 不是可發布的完整型錄，但也不是爬取失敗。
-        if crawler.last_status == "success":
+        # 全站與正式 bounded dataset 成功均是 exit 0；sample 是
+        # 未發布的預期停止，仍保留獨立 exit 3。
+        if crawler.last_status in ("success", "bounded_success"):
             return 0
         if crawler.last_status == "sample":
             return 3

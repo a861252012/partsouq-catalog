@@ -30,6 +30,7 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
     try:
         for table in (
             "admin_vehicle_mappings",
+            "bounded_parts",
             "published_parts",
             "crawl_state",
             "crawl_runs",
@@ -61,6 +62,8 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
                 "production_to": "2020-12",
                 "vid": "SITE-VID-1",
                 "ssd": "VEHICLE-SSD",
+                "engine": "A25A-FKS",
+                "grade": "LE",
             },
         )
         category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
@@ -150,7 +153,7 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
                 "TOYOTA",
                 "CAMRY",
                 2018,
-                "A25A-FKS",
+                "In-Line / A25A-FKS",
                 "LE",
                 "test",
                 "source ID view fixture",
@@ -197,6 +200,7 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
         database.rollback()
         for table in (
             "admin_vehicle_mappings",
+            "bounded_parts",
             "published_parts",
             "crawl_state",
             "crawl_runs",

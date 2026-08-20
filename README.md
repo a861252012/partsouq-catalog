@@ -74,6 +74,7 @@ MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、`
 ```bash
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/007_unified_vin_mapping.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/008_admin_source_ids.sql
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/009_bounded_production_dataset.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
 ```
 
@@ -93,37 +94,51 @@ DB 內部 ID；`vehicle_vid`、`category_cid`、`group_uid` 是 PartSouq URL
 
 ## 統一排程入口
 
-排程只經由 `partsouq-scheduler` 執行，並把 stdout、結束碼與執行時間寫入 `scheduled_job_runs`。
+本機 Compose 直接用三個常駐服務模擬 server 排程。它們共用同一個 MySQL，
+但分開執行，避免數小時的 PartSouq 爬取阻塞 NHTSA 與後台佇列：
 
 ```bash
-# PartSouq 型錄：一般 HTTP、低速；遇到 challenge 立即停止，不會規避
-docker compose run --rm scheduler partsouq-scheduler --job catalog
-
-# 最多抓 1000 筆 PartSouq fitment sample；exit code 3 代表預期 sample 完成
-docker compose run --rm -e PSQ_LIMIT_PARTS=1000 scheduler \
-  partsouq-catalog-crawl --workers 1 --fresh
-
-# NHTSA：bulk 與 allowlist API 依序執行
-docker compose run --rm scheduler partsouq-scheduler --job nhtsa
-
-# 也可個別執行
-docker compose run --rm scheduler partsouq-scheduler --job nhtsa-bulk --scope all
-docker compose run --rm scheduler partsouq-scheduler --job nhtsa-api --scope all
-
-# 僅解碼一組使用者提供／獲授權的完整 VIN
-docker compose run --rm scheduler partsouq-scheduler --job nhtsa-vin --scope '<使用者提供的17碼VIN>'
-
-# 消費 8086 後台建立的 VIN／爬取要求
-docker compose run --rm scheduler partsouq-scheduler --job pending
+docker compose up -d --build scheduler nhtsa-scheduler queue-scheduler
 ```
 
-`PSQ_LIMIT_PARTS=0` 才是完整型錄模式。設為正整數時，爬蟲以獨立的
+預設排程如下；都可用同名環境變數調整，不需要人工逐次觸發：
+
+- `scheduler`：啟動後自動執行正式 10,000 筆 bounded PartSouq crawl，之後每 30 天執行。
+- `nhtsa-scheduler`：依序同步 NHTSA bulk 與 allowlist API，完成後每 24 小時執行。
+- `queue-scheduler`：每 30 秒消費 8086 建立的要求；VIN 只處理使用者提供或獲授權的 17 碼值，不枚舉 VIN。
+
+PartSouq catalog 只由專用 `scheduler` 執行；queue 會拒絕舊的 catalog 要求，
+避免長時間型錄工作堵住後續 VIN。lock busy 或 scheduler 中斷的工作會保留為
+pending 並自動重試；無效 VIN 等一般非零結果會結束為 failed，避免永久重試。
+
+`SCHEDULER_CATALOG_INTERVAL_SECONDS`、`SCHEDULER_NHTSA_INTERVAL_SECONDS`、
+`SCHEDULER_PENDING_INTERVAL_SECONDS` 控制頻率；失敗會從 60 秒開始指數退避，
+最多等 3,600 秒。daemon 與實際 job 都使用共享 lock，同一工作不會重複執行。
+排程狀態暫時讀不到時只會退避後重讀，不會直接啟動爬蟲；NHTSA bulk 已完成、
+API 失敗時，下一輪會從 API stage 續跑，不會重抓同一批 bulk sources。
+每次子程序會即時輸出 Docker log，並把最後 60,000 字、結束碼、執行時間與
+`manual`／`daemon`／`queue` 來源寫入 `scheduled_job_runs`。PartSouq
+`crawl_runs.scheduled_job_run_id` 會保存實際 scheduler run；正式資料只接受
+`daemon`，不能用手動或 sample run 冒充。若 bounded 資料已完整 commit、但
+scheduler 在完成紀錄前中斷，下一個 daemon 會先核對筆數與關聯並補記完成，
+不會重爬同一批 10,000 筆。
+
+檔案 lock 適用本機單主機，三個 Compose 服務必須共用 `./logs` volume。若改為
+多主機部署，需另外使用跨主機的 DB lease，不能把這套 flock 當成分散式鎖。
+
+Compose 明確使用 `PSQ_BOUNDED_PARTS=10000` 並覆寫 `PSQ_LIMIT_PARTS=0`。
+bounded dataset 必須精確 10,000 筆且通過來源／欄位／關聯品質關卡才會
+`bounded_success` 與 exit `0`；它是可驗證的正式限量資料，不冒充全站完整 snapshot。
+
+`PSQ_LIMIT_PARTS` 只保留給隔離測試。設為正整數時，爬蟲以獨立的
 `sample` run 保存最多指定筆數的 normalized `parts` 關聯資料；即使上限
 落在單一零件組中間，也不會清除該組舊 membership 或把該組標成完成。
 Sample 不會更新 `published_parts`／`v_parts`，DB 狀態為 `sample`，CLI
 exit code 為 `3`；真正錯誤仍為 `1`，完整成功才是 `0`。
 
-來源專案已明確提供 PartSouq 每月排程，但沒有提供 NHTSA 的既定頻率。因此 repository 不會擅自啟用 cron；請依資料新鮮度與資源預算，在部署端以同一個 `partsouq-scheduler` 入口設定實際時間。8086 後台只會把要求寫入持久佇列；未另設 timer／cron 前，需執行上面的 `--job pending` 才會開始處理。
+來源專案有 PartSouq 每月排程，沒有指定 NHTSA 頻率。本機 Compose 明確採用
+「PartSouq 每 30 天、NHTSA 每 24 小時、後台佇列每 30 秒」作為可重現的部署值；
+正式環境可用前述環境變數調整。這是本專案的部署選擇，不宣稱是來源網站規定。
 
 ## 驗證
 

@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -17,7 +17,98 @@ MAX_PAGE_SIZE = 200
 FANOUT_LIMIT = 100
 PAGE_SIZES = (10, 25, 30, 50, 100, 200)
 
+_FORMAL_SOURCE_TABLES = {
+    "vehicle_configurations": "station_admin_formal_vehicle_configurations",
+    "taxonomy_nodes": "station_admin_formal_taxonomy_nodes",
+    "diagrams": "station_admin_formal_diagrams",
+    "part_numbers": "station_admin_formal_part_numbers",
+    "part_occurrences": "station_admin_formal_part_occurrences",
+    "fitments": "station_admin_formal_fitments",
+}
+_HISTORICAL_SAMPLE_TABLES = {
+    "part_numbers": "station_admin_historical_sample_part_numbers",
+    "part_occurrences": "station_admin_historical_sample_part_occurrences",
+    "fitments": "station_admin_historical_sample_fitments",
+}
+
 _SENSITIVE_QUERY_KEYS = frozenset({"ssd", "token", "key", "apikey", "api_key"})
+
+_SOURCE_LOCK_SQL = {
+    "vehicle_configurations": """
+        SELECT v.id, m.id AS model_id, b.id AS brand_id
+        FROM vehicles AS v
+        JOIN models AS m ON m.id = v.model_id
+        JOIN brands AS b ON b.id = m.brand_id
+        WHERE v.id = %s
+        FOR SHARE
+    """,
+    "diagrams": """
+        SELECT g.id, c.id AS category_id
+        FROM groups_t AS g
+        JOIN categories AS c ON c.id = g.category_id
+        WHERE g.id = %s
+        FOR SHARE
+    """,
+    "part_numbers": """
+        SELECT p.id, g.id AS group_id, c.id AS category_id, v.id AS vehicle_id,
+               m.id AS model_id, b.id AS brand_id
+        FROM parts AS p
+        JOIN groups_t AS g ON g.id = p.group_id
+        JOIN categories AS c ON c.id = g.category_id
+        JOIN vehicles AS v ON v.id = c.vehicle_id
+        JOIN models AS m ON m.id = v.model_id
+        JOIN brands AS b ON b.id = m.brand_id
+        WHERE p.id = %s
+        FOR SHARE
+    """,
+    "part_occurrences": """
+        SELECT p.id, g.id AS group_id, c.id AS category_id
+        FROM parts AS p
+        JOIN groups_t AS g ON g.id = p.group_id
+        JOIN categories AS c ON c.id = g.category_id
+        WHERE p.id = %s
+        FOR SHARE
+    """,
+    "fitments": """
+        SELECT p.id, g.id AS group_id, c.id AS category_id, v.id AS vehicle_id,
+               published.part_id AS published_part_id
+        FROM parts AS p
+        JOIN groups_t AS g ON g.id = p.group_id
+        JOIN categories AS c ON c.id = g.category_id
+        JOIN vehicles AS v ON v.id = c.vehicle_id
+        LEFT JOIN published_parts AS published ON published.part_id = p.id
+        WHERE p.id = %s
+        FOR SHARE
+    """,
+    "part_term_mappings": """
+        SELECT t.id, p.id AS part_id
+        FROM admin_part_translations AS t
+        LEFT JOIN parts AS p ON p.name = t.english_name
+        WHERE t.id = %s
+        FOR SHARE
+    """,
+    "vin_vehicle_mappings": """
+        SELECT d.vin, m.id AS mapping_id
+        FROM nhtsa_vin_decodes AS d
+        LEFT JOIN admin_vehicle_mappings AS m ON m.vin = d.vin
+        WHERE CAST(CONV(SUBSTRING(SHA2(d.vin, 256), 1, 15), 16, 10) AS UNSIGNED) = %s
+        FOR SHARE
+    """,
+    "vin_part_fitments": """
+        SELECT m.id, d.vin, p.part_id
+        FROM admin_vehicle_mappings AS m
+        JOIN nhtsa_vin_decodes AS d ON d.vin = m.vin
+        JOIN published_parts AS p ON p.vehicle_id = m.partsouq_vehicle_id
+        WHERE m.id = %s AND p.part_id = %s
+        FOR SHARE
+    """,
+    "reconciliation_cases": """
+        SELECT r.id
+        FROM admin_reconciliation_items AS r
+        WHERE r.id = %s
+        FOR SHARE
+    """,
+}
 
 
 def redact_sensitive_url(value: str) -> str:
@@ -311,7 +402,7 @@ FIELD_LABELS: dict[str, str] = {
     "depth": "分類層級",
     "diagram_code_raw": "分解圖代碼",
     "diagram_name_raw": "分解圖名稱",
-    "part_brand_raw": "零件品牌",
+    "part_brand_raw": "適用車輛品牌（非零件品牌）",
     "number_raw": "零件碼",
     "number_normalized": "標準化零件碼",
     "name_en_raw": "英文零件名稱",
@@ -628,7 +719,9 @@ class AdminRepository:
 
     def dashboard_counts(self) -> dict[str, dict[str, int]]:
         source_columns = ",\n".join(
-            f"(SELECT COUNT(*) FROM {spec.table}) AS `{spec.key}`" for spec in ENTITY_SPECS.values()
+            f"(SELECT COUNT(*) FROM {_FORMAL_SOURCE_TABLES.get(spec.key, spec.table)}) "
+            f"AS `{spec.key}`"
+            for spec in ENTITY_SPECS.values()
         )
         source = (
             self.database.fetch_one(
@@ -659,7 +752,7 @@ class AdminRepository:
             for key in ENTITY_SPECS
         }
 
-    def system_data_summary(self) -> dict[str, int]:
+    def system_data_summary(self) -> dict[str, Any]:
         row = (
             self.database.fetch_one(
                 "dashboard.system-data-summary",
@@ -674,7 +767,57 @@ class AdminRepository:
                     FROM nhtsa_current_artifacts AS c
                     JOIN nhtsa_source_artifacts AS a ON a.id = c.artifact_id
                 ) AS nhtsa_current_records,
-                (SELECT COUNT(*) FROM nhtsa_vin_decodes) AS nhtsa_vin_decodes
+                (SELECT COUNT(*) FROM nhtsa_vin_decodes) AS nhtsa_vin_decodes,
+                current_catalog.*,
+                bounded.*
+            FROM (
+                SELECT MAX(dataset_scope) AS partsouq_current_scope,
+                       COUNT(*) AS partsouq_current_rows,
+                       COUNT(DISTINCT part_number_normalized)
+                           AS partsouq_current_distinct_part_numbers
+                FROM v_current_catalog_parts
+            ) AS current_catalog
+            CROSS JOIN (
+                SELECT MAX(r.id) AS bounded_crawl_run_id,
+                       MAX(r.target_parts) AS bounded_target_parts,
+                       MAX(r.status) AS bounded_status,
+                       MAX(r.scheduled_job_run_id) AS bounded_scheduled_job_run_id,
+                       MAX(jobs.trigger_mode) AS bounded_scheduler_trigger_mode,
+                       MAX(jobs.status) AS bounded_scheduler_status,
+                       MAX(jobs.exit_code) AS bounded_scheduler_exit_code,
+                       MAX(scheduler_links.crawl_run_count)
+                           AS bounded_scheduler_linked_crawl_runs,
+                       MAX(CASE WHEN RIGHT(DATABASE(), 5) = '_test'
+                           OR LOWER(COALESCE(r.run_key, '')) LIKE 'sample-%%'
+                           OR LOWER(COALESCE(jobs.output_text, ''))
+                               REGEXP 'browser-assisted|fixture|synthetic|fake'
+                           THEN 1 ELSE 0 END) AS bounded_non_live_data_marker,
+                       COUNT(bp.part_id) AS partsouq_bounded_rows,
+                       COUNT(overrides.id) AS bounded_active_override_rows,
+                       COUNT(DISTINCT bp.part_number_normalized)
+                           AS partsouq_bounded_distinct_part_numbers
+                FROM (SELECT 1 AS singleton) AS anchor
+                LEFT JOIN (
+                    SELECT id, run_key, target_parts, status, scheduled_job_run_id
+                    FROM crawl_runs
+                    WHERE dataset_kind = 'bounded'
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT 1
+                ) AS r ON TRUE
+                LEFT JOIN scheduled_job_runs AS jobs ON jobs.id = r.scheduled_job_run_id
+                LEFT JOIN (
+                    SELECT scheduled_job_run_id, COUNT(*) AS crawl_run_count
+                    FROM crawl_runs
+                    WHERE scheduled_job_run_id IS NOT NULL
+                    GROUP BY scheduled_job_run_id
+                ) AS scheduler_links
+                    ON scheduler_links.scheduled_job_run_id = jobs.id
+                LEFT JOIN bounded_parts AS bp ON bp.crawl_run_id = r.id
+                LEFT JOIN admin_override_heads AS overrides
+                    ON overrides.entity_type = 'part_numbers'
+                   AND overrides.source_record_id = bp.part_id
+                   AND overrides.status = 'active'
+            ) AS bounded
             """,
             )
             or {}
@@ -683,6 +826,27 @@ class AdminRepository:
             "partsouq_normalized_rows": int(row.get("partsouq_normalized_rows", 0)),
             "partsouq_distinct_part_numbers": int(row.get("partsouq_distinct_part_numbers", 0)),
             "partsouq_published_rows": int(row.get("partsouq_published_rows", 0)),
+            "partsouq_current_scope": row.get("partsouq_current_scope"),
+            "partsouq_current_rows": int(row.get("partsouq_current_rows", 0)),
+            "partsouq_current_distinct_part_numbers": int(
+                row.get("partsouq_current_distinct_part_numbers", 0)
+            ),
+            "partsouq_bounded_rows": int(row.get("partsouq_bounded_rows", 0)),
+            "partsouq_bounded_distinct_part_numbers": int(
+                row.get("partsouq_bounded_distinct_part_numbers", 0)
+            ),
+            "bounded_crawl_run_id": row.get("bounded_crawl_run_id"),
+            "bounded_target_parts": int(row.get("bounded_target_parts") or 0),
+            "bounded_status": row.get("bounded_status"),
+            "bounded_scheduled_job_run_id": row.get("bounded_scheduled_job_run_id"),
+            "bounded_scheduler_trigger_mode": row.get("bounded_scheduler_trigger_mode"),
+            "bounded_scheduler_status": row.get("bounded_scheduler_status"),
+            "bounded_scheduler_exit_code": row.get("bounded_scheduler_exit_code"),
+            "bounded_scheduler_linked_crawl_runs": int(
+                row.get("bounded_scheduler_linked_crawl_runs") or 0
+            ),
+            "bounded_non_live_data_marker": int(row.get("bounded_non_live_data_marker") or 0),
+            "bounded_active_override_rows": int(row.get("bounded_active_override_rows") or 0),
             "nhtsa_current_records": int(row.get("nhtsa_current_records", 0)),
             "nhtsa_vin_decodes": int(row.get("nhtsa_vin_decodes", 0)),
         }
@@ -691,7 +855,7 @@ class AdminRepository:
         job_runs = self.database.fetch_all(
             "monitor.scheduled-job-runs",
             """
-            SELECT id, job_name, status, started_at, finished_at, exit_code,
+            SELECT id, job_name, trigger_mode, status, started_at, finished_at, exit_code,
                    LEFT(output_text, 1000) AS output_text
             FROM scheduled_job_runs
             ORDER BY id DESC
@@ -701,7 +865,8 @@ class AdminRepository:
         crawl_runs = self.database.fetch_all(
             "monitor.crawl-runs",
             """
-            SELECT id, run_key, status, started_at, finished_at,
+            SELECT id, run_key, dataset_kind, target_parts, scheduled_job_run_id,
+                   status, started_at, finished_at,
                    brands_ok, models_ok, vehicles_ok, groups_ok,
                    parts_ok, parts_new, error_msg
             FROM crawl_runs
@@ -746,8 +911,19 @@ class AdminRepository:
         page: int = 1,
         limit: int = 50,
         include_retired: bool = False,
+        source_scope: str = "formal",
     ) -> RecordPage:
         spec = entity_spec(entity_type)
+        if source_scope == "formal":
+            source_table = _FORMAL_SOURCE_TABLES.get(spec.key)
+        elif source_scope == "historical_sample":
+            source_table = _HISTORICAL_SAMPLE_TABLES.get(spec.key)
+            if source_table is None:
+                raise AdminDataError("這個資料類型沒有歷史 sample 檢視")
+        else:
+            raise AdminDataError("資料來源只接受正式資料或歷史 sample")
+        if source_table is not None:
+            spec = replace(spec, table=source_table)
         size = min(max(limit, 1), MAX_PAGE_SIZE)
         if page < 1:
             raise AdminDataError("頁碼不可小於 1")
@@ -1423,12 +1599,44 @@ class AdminRepository:
         return next_revision
 
     def _locked_base(self, spec: EntitySpec, source_id: int) -> dict[str, Any] | None:
+        if source_id > 0:
+            lock_sql, lock_params = self._source_lock_query(spec, source_id)
+            self.database.fetch_all(f"write.lock-source.{spec.key}", lock_sql, lock_params)
         fields = ", ".join(f"`{field}`" for field in spec.source_fields)
         return self.database.fetch_one(
             f"write.lock-base.{spec.key}",
             f"SELECT id, {fields} FROM {spec.table} WHERE id = %s",
             (source_id,),
         )
+
+    @staticmethod
+    def _source_lock_query(spec: EntitySpec, source_id: int) -> tuple[str, tuple[int, ...]]:
+        if spec.key == "taxonomy_nodes":
+            if source_id % 2 == 0:
+                return (
+                    """
+                    SELECT c.id, g.id AS group_id
+                    FROM categories AS c
+                    LEFT JOIN groups_t AS g ON g.category_id = c.id
+                    WHERE c.id = %s
+                    FOR SHARE
+                    """,
+                    (source_id // 2,),
+                )
+            return (
+                """
+                SELECT g.id, c.id AS category_id
+                FROM groups_t AS g
+                JOIN categories AS c ON c.id = g.category_id
+                WHERE g.id = %s
+                FOR SHARE
+                """,
+                ((source_id - 1) // 2,),
+            )
+        if spec.key == "vin_part_fitments":
+            mapping_id, part_id = divmod(source_id, 4294967296)
+            return _SOURCE_LOCK_SQL[spec.key], (mapping_id, part_id)
+        return _SOURCE_LOCK_SQL[spec.key], (source_id,)
 
     def _insert_event(
         self,

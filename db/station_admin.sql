@@ -187,11 +187,13 @@ CREATE OR REPLACE VIEW station_admin_effective_parts AS
 SELECT
     h.source_record_id AS part_id,
     CASE
-        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.number_raw') = 0 THEN NULL
+        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.number_raw') = 0
+          OR JSON_TYPE(JSON_EXTRACT(h.payload_json, '$.number_raw')) = 'NULL' THEN NULL
         ELSE JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$.number_raw'))
     END AS part_number_override,
     CASE
-        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.number_raw') = 0 THEN NULL
+        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.number_raw') = 0
+          OR JSON_TYPE(JSON_EXTRACT(h.payload_json, '$.number_raw')) = 'NULL' THEN NULL
         ELSE UPPER(REGEXP_REPLACE(
             JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$.number_raw')),
             '[[:space:]-]+',
@@ -199,7 +201,8 @@ SELECT
         ))
     END AS number_normalized_override,
     CASE
-        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.name_en_raw') = 0 THEN NULL
+        WHEN JSON_CONTAINS_PATH(h.payload_json, 'one', '$.name_en_raw') = 0
+          OR JSON_TYPE(JSON_EXTRACT(h.payload_json, '$.name_en_raw')) = 'NULL' THEN NULL
         ELSE JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$.name_en_raw'))
     END AS part_name_override,
     h.status AS override_status,
@@ -287,6 +290,79 @@ FROM (
     JOIN vehicles AS v ON v.id = c.vehicle_id
 ) AS source
 LEFT JOIN published_parts AS published ON published.part_id = source.id;
+
+-- Default business lists share the API's current catalog definition: a full
+-- published snapshot wins; otherwise use the latest successful bounded snapshot.
+-- Historical sample rows remain queryable through the explicit history views;
+-- they never become the default source merely because they are present in parts.
+CREATE OR REPLACE VIEW station_admin_formal_vehicle_configurations AS
+SELECT source.*
+FROM station_admin_vehicle_configurations AS source
+JOIN (
+    SELECT DISTINCT vehicle_id
+    FROM v_current_catalog_parts
+) AS current_catalog ON current_catalog.vehicle_id = source.id;
+
+CREATE OR REPLACE VIEW station_admin_formal_taxonomy_nodes AS
+SELECT source.*
+FROM station_admin_taxonomy_nodes AS source
+JOIN (
+    SELECT DISTINCT CAST(category_id * 2 AS UNSIGNED) AS taxonomy_node_id
+    FROM v_current_catalog_parts
+    UNION
+    SELECT DISTINCT CAST(group_id * 2 + 1 AS UNSIGNED) AS taxonomy_node_id
+    FROM v_current_catalog_parts
+) AS current_catalog ON current_catalog.taxonomy_node_id = source.id;
+
+CREATE OR REPLACE VIEW station_admin_formal_diagrams AS
+SELECT source.*
+FROM station_admin_diagrams AS source
+JOIN (
+    SELECT DISTINCT group_id
+    FROM v_current_catalog_parts
+) AS current_catalog ON current_catalog.group_id = source.id;
+
+CREATE OR REPLACE VIEW station_admin_formal_part_numbers AS
+SELECT source.*
+FROM station_admin_part_numbers AS source
+JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
+
+CREATE OR REPLACE VIEW station_admin_formal_part_occurrences AS
+SELECT source.*
+FROM station_admin_part_occurrences AS source
+JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
+
+CREATE OR REPLACE VIEW station_admin_formal_fitments AS
+SELECT source.*
+FROM station_admin_fitments AS source
+JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
+
+CREATE OR REPLACE VIEW station_admin_historical_sample_part_numbers AS
+SELECT source.*
+FROM station_admin_part_numbers AS source
+JOIN parts AS p ON p.id = source.id
+WHERE p.seen_run_id = (
+    SELECT id FROM crawl_runs WHERE status = 'sample'
+    ORDER BY started_at DESC, id DESC LIMIT 1
+);
+
+CREATE OR REPLACE VIEW station_admin_historical_sample_part_occurrences AS
+SELECT source.*
+FROM station_admin_part_occurrences AS source
+JOIN parts AS p ON p.id = source.id
+WHERE p.seen_run_id = (
+    SELECT id FROM crawl_runs WHERE status = 'sample'
+    ORDER BY started_at DESC, id DESC LIMIT 1
+);
+
+CREATE OR REPLACE VIEW station_admin_historical_sample_fitments AS
+SELECT source.*
+FROM station_admin_fitments AS source
+JOIN parts AS p ON p.id = source.id
+WHERE p.seen_run_id = (
+    SELECT id FROM crawl_runs WHERE status = 'sample'
+    ORDER BY started_at DESC, id DESC LIMIT 1
+);
 
 CREATE OR REPLACE VIEW station_admin_part_term_mappings AS
 SELECT

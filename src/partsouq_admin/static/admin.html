@@ -64,8 +64,8 @@
       <section class="panel" style="margin-bottom:16px">
         <h2>零件資料</h2>
         <div class="table-controls">
-          <label>資料來源<select id="parts-dataset"><option value="sample">樣本（尚未發布）</option><option value="published">已發布資料</option></select></label>
-          <label>每頁筆數<select id="parts-page-size"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
+          <label>資料來源<select id="parts-dataset"><option value="current">目前正式資料（full 優先，否則 bounded）</option><option value="bounded">指定最新 bounded（未發布全量）</option><option value="sample">舊樣本（僅供診斷）</option></select></label>
+          <label>每頁筆數<select id="parts-page-size"><option value="10">10</option><option value="25">25</option><option value="30">30</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
         </div>
         <p id="parts-page-status" class="note warning" style="margin-top:12px">讀取中…</p>
         <div class="table-wrap">
@@ -134,7 +134,7 @@
         <section>
           <h2>爬取要求</h2>
           <form data-endpoint="/api/crawl-requests">
-            <label>工作</label><select name="job_name"><option value="catalog">PartSouq 型錄</option><option value="nhtsa-bulk">NHTSA Bulk</option><option value="nhtsa-api">NHTSA API</option><option value="nhtsa-vin">NHTSA VIN 解碼</option></select>
+            <label>工作</label><select name="job_name"><option value="nhtsa-bulk">NHTSA Bulk</option><option value="nhtsa-api">NHTSA API</option><option value="nhtsa-vin">NHTSA VIN 解碼</option></select>
             <label>範圍／VIN</label><input name="requested_scope" value="all">
             <button>建立排程要求</button>
           </form>
@@ -147,8 +147,8 @@
             <label>完整 VIN</label><input name="vin" required minlength="17" maxlength="17">
             <label>PartSouq vehicle ID</label><input name="partsouq_vehicle_id" type="number" min="1" required>
             <label>來源</label><input name="source_name" value="manual-confirmed">
-            <label><input name="allow_name_override" type="checkbox" value="true"> 品牌／型號名稱不同，改用人工確認</label>
-            <label>人工確認依據（名稱不同時必填）</label><input name="source_reference">
+            <label><input name="allow_name_override" type="checkbox" value="true"> 品牌／型號／年份／引擎／Trim 不一致，改用人工確認</label>
+            <label>人工確認依據（跨來源不一致時必填）</label><input name="source_reference">
             <button>確認車款對應</button>
           </form>
         </section>
@@ -205,7 +205,19 @@
           ['品牌', summary.normalized.brands], ['型號', summary.normalized.models],
           ['具體車款', summary.normalized.vehicles], ['大分類', summary.normalized.categories],
           ['中分類／Group', summary.normalized.groups], ['正規化零件列', summary.normalized.parts],
+          ['目前正式來源', summary.current_catalog.dataset_scope ?? '尚無'],
+          ['目前正式適用列', summary.current_catalog.fitment_rows],
+          ['目前正式不重複料號', summary.current_catalog.unique_part_numbers],
           ['已發布適用列', summary.published.fitment_rows], ['不重複料號', summary.published.unique_part_numbers],
+          ['排程限量進度', `${summary.bounded.fitment_rows}/${summary.bounded.target_rows || 10000}`],
+          ['限量不重複料號', summary.bounded.unique_part_numbers],
+          ['限量適用車款', summary.bounded.unique_vehicles],
+          ['限量非 ASCII 名稱（英文未驗證）', summary.bounded.name_language.english_name_unverified_rows],
+          ['PartSouq 官方來源列', summary.bounded.source_provenance.official_source_url_rows],
+          ['Bounded crawl run', summary.bounded.crawl_run_id ?? '尚無'],
+          ['Scheduler run', summary.bounded.scheduler.run_id ?? '尚無'],
+          ['Scheduler 觸發方式', summary.bounded.scheduler.trigger_mode ?? '尚無'],
+          ['Scheduler 狀態', summary.bounded.scheduler.status ?? '尚無'],
           ['NHTSA 基礎資料', summary.nhtsa.current_records],
           ['NHTSA current artifacts', summary.nhtsa.current_artifacts],
           ['NHTSA 同步執行', `${summary.nhtsa.sync_runs.completed} 成功／${summary.nhtsa.sync_runs.failed} 失敗／${summary.nhtsa.sync_runs.total} 總計`],
@@ -229,14 +241,34 @@
           return card;
         }));
         const latest = summary.latest_crawl_run;
-        summaryStatus.className = summary.demo_ready ? 'note ok' : 'note warning';
-        summaryStatus.textContent = summary.production_ready
-          ? '展示資料與正式資料皆已通過檢查。'
-          : summary.demo_ready
-            ? `展示資料已就緒；正式環境尚有待完成項目。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`
-            : `展示資料尚未就緒。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
+        summaryStatus.className = summary.bounded_ready ? 'note ok' : 'note warning';
+        summaryStatus.textContent = summary.bounded_ready
+          ? `正式排程限量資料已通過 10,000 筆技術 gate；不代表完整需求已符合。產品英文名稱尚未做語言驗證，小分類來源也尚不可得。crawl run ${summary.bounded.crawl_run_id}，scheduler run ${summary.bounded.scheduler.run_id}。`
+          : `正式排程限量 10,000 筆資料尚未通過驗收。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
         const reasonLabels = {
-          full_catalog_not_published: '正式全量 PartSouq snapshot 尚未發布；目前完成的 sample 仍可供展示',
+          no_bounded_crawl_run: '尚無正式 bounded crawl run；舊 sample 不列入驗收',
+          bounded_dataset_kind_invalid: '最新限量 run 的 dataset kind 不是 bounded',
+          bounded_run_not_successful: '最新限量 run 尚未 bounded_success',
+          bounded_target_not_10000: '最新限量 run 的持久化目標不是 10,000 筆',
+          bounded_run_count_mismatch: '爬蟲回報筆數與持久化目標不一致',
+          bounded_snapshot_count_mismatch: 'bounded snapshot 筆數不是精確 10,000 筆',
+          bounded_scheduler_not_linked: 'bounded crawl run 沒有連到實際 scheduler run',
+          bounded_scheduler_job_invalid: '連結的 scheduler job 不是 catalog',
+          bounded_scheduler_trigger_not_daemon: 'catalog 不是由本機正式 daemon 觸發',
+          bounded_scheduler_not_completed: 'scheduler 尚未成功完成或 exit code 不是 0',
+          bounded_scheduler_link_not_unique: 'scheduler run 連到不只一個 crawl run',
+          bounded_non_live_data_marker: '偵測到 test／fixture／synthetic／sample 標記，不可列為正式成果',
+          bounded_required_fields_missing: '限量資料缺少料號、名稱、品牌、型號或車款',
+          bounded_ids_missing: '限量資料缺少 DB 關聯 ID',
+          bounded_source_ids_missing: '限量資料缺少 PartSouq vid/cid/uid/code',
+          bounded_orphan_relations: '限量資料有 FK／關聯孤兒',
+          bounded_vehicle_years_missing: '限量資料缺少可用的車款生產年份',
+          bounded_categories_missing: '限量資料缺少大分類或中分類',
+          bounded_source_url_invalid: '限量資料有缺漏或非 PartSouq 官方 unit URL',
+          bounded_snapshot_run_mismatch: 'bounded snapshot 混入其他 crawl run',
+          bounded_active_overrides_present: '限量資料存在有效人工覆寫；不符合禁止人工介入驗收',
+          bounded_source_values_mismatch: 'bounded snapshot 與 normalized 來源值不一致',
+          full_catalog_not_published: '正式全量 PartSouq snapshot 尚未發布；通過 gate 的 bounded 資料可暫作目前正式來源',
           sample_rows_below_target: '樣本資料尚未達到目標筆數',
           published_parts_data_quality_failed: '已發布資料有必填欄位、ID、年份、分類或關聯缺漏',
           sample_parts_data_quality_failed: '樣本資料有必填欄位、ID、年份、分類或關聯缺漏',
@@ -245,10 +277,11 @@
           nhtsa_required_fields_missing: 'NHTSA 必填欄位有缺漏',
           no_confirmed_vin_mapping: '沒有已確認的 VIN 與 PartSouq 車款 mapping',
           stale_or_unconfirmed_vin_mapping: '仍有過期或未確認的 VIN mapping',
-          partsouq_small_category_source_unavailable: 'PartSouq 小分類來源目前無法取得，未以人工資料冒充'
+          partsouq_small_category_source_unavailable: 'PartSouq 小分類來源目前無法取得，未以人工資料冒充',
+          partsouq_english_name_language_not_verified: '產品名稱只驗證非空；尚未建立可證明英文名稱的語言驗證'
         };
         const readinessItems = [
-          ...summary.demo_blocking_reasons.map(reason => ['展示資料', reason]),
+          ...summary.bounded.blocking_reasons.map(reason => ['10,000 筆驗收', reason]),
           ...summary.production_pending_reasons.map(reason => ['正式環境', reason])
         ];
         qualityStatus.replaceChildren(...readinessItems.map(([scope, reason]) => {
@@ -258,7 +291,9 @@
         }));
       }
       function partsPagePath() {
-        const endpoint = partsDataset.value === 'sample' ? '/api/sample-parts' : '/api/parts';
+        const endpoint = partsDataset.value === 'bounded'
+          ? '/api/bounded-parts'
+          : partsDataset.value === 'sample' ? '/api/sample-parts' : '/api/parts';
         return `${endpoint}?page=${partsState.page}&pageSize=${partsState.pageSize}`;
       }
       function renderPartsPage(result) {
@@ -268,7 +303,9 @@
         partsPageSize.value = String(result.pageSize);
         const rows = result.items.map(item => {
           const row = document.createElement('tr');
-          const status = item.dataset_status === 'sample_not_published' ? '樣本（尚未發布）' : '已發布';
+          const status = item.dataset_status === 'scheduled_bounded_not_full_published'
+            ? '正式排程限量（未發布全量）'
+            : item.dataset_status === 'sample_not_published' ? '舊樣本（僅供診斷）' : '完整已發布';
           const ids = `part_id: ${item.part_id ?? '—'}\nmodel_id: ${item.model_id ?? '—'}\nvehicle_id: ${item.vehicle_id ?? '—'} / vid: ${item.vehicle_vid ?? '—'}\ncategory_id: ${item.category_id ?? '—'} / cid: ${item.category_cid ?? '—'}\ngroup_id: ${item.group_id ?? '—'} / uid: ${item.group_uid ?? '—'}`;
           const part = `${item.part_number ?? '—'}\nCode: ${item.part_code ?? '—'}`;
           const vehicle = `${item.model ?? '—'}\n${item.vehicle_name ?? '—'} / ${item.vehicle_code ?? '—'}`;
@@ -304,10 +341,17 @@
         partsPrev.disabled = result.page <= 1 || result.totalPages === 0;
         partsNext.disabled = result.totalPages === 0 || result.page >= result.totalPages;
         partsLast.disabled = result.totalPages === 0 || result.page >= result.totalPages;
-        partsPageStatus.className = partsDataset.value === 'sample' ? 'note warning' : 'note';
-        partsPageStatus.textContent = partsDataset.value === 'sample'
-          ? '目前顯示最近一次成功完成的樣本資料；尚未發布至正式 snapshot。'
-          : '目前顯示最近一次完整成功並已發布的正式 snapshot。';
+        partsPageStatus.className = partsDataset.value === 'current' && result.datasetScope === 'full'
+          ? 'note' : 'note warning';
+        partsPageStatus.textContent = partsDataset.value === 'bounded'
+          ? '目前指定顯示最新 bounded_success 限量資料；不是完整全量 snapshot。'
+          : partsDataset.value === 'sample'
+            ? '目前顯示舊 sample，只供診斷，不列入 10,000 筆驗收。'
+            : result.datasetScope === 'full'
+              ? '目前正式來源為完整已發布 snapshot。'
+              : result.datasetScope === 'bounded'
+                ? '尚無完整已發布 snapshot；目前正式來源為最新 bounded_success 限量資料。'
+                : '目前沒有可用的正式 full／bounded 資料。';
       }
       async function refreshPartsPage() {
         try {

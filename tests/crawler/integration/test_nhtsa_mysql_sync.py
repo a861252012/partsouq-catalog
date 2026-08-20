@@ -315,7 +315,10 @@ def test_duplicate_and_updated_source_rows_keep_every_lineage_entry(tmp_path: Pa
     (
         ({"ErrorCode": "1", "ErrorText": "Invalid VIN"}, "ErrorCode=1"),
         ({"VIN": OTHER_VIN}, "does not match the requested VIN"),
-        ({"Make": ""}, "missing VIN, Make, Model, or ModelYear"),
+        ({"Make": ""}, "missing required fields: Make"),
+        ({"EngineConfiguration": ""}, "missing required fields: EngineConfiguration"),
+        ({"DisplacementL": ""}, "missing required fields: DisplacementL"),
+        ({"Trim": ""}, "missing required fields: Trim"),
     ),
 )
 def test_invalid_vin_decode_quarantines_unpublished_artifact(
@@ -354,6 +357,31 @@ def test_invalid_vin_decode_quarantines_unpublished_artifact(
                 (report["run_id"],),
             )
             assert cursor.fetchone()["status"] == "failed"
+    finally:
+        repository.clear_for_tests()
+        repository.close()
+
+
+def test_vin_decode_allows_optional_engine_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_vin_client(monkeypatch, tmp_path, _vin_payload(EngineModel=""))
+    repository = NhtsaMySQLRepository.create(_config(tmp_path))
+    try:
+        repository.clear_for_tests()
+        report = asyncio.run(
+            NhtsaApiSyncService(repository, _config(tmp_path)).decode_vin(
+                run_key="vin-without-engine-model",
+                vin=VIN,
+            )
+        )
+
+        assert report["status"] == "completed"
+        assert report["vehicle"]["engine_model"] is None
+        with repository.connection.cursor() as cursor:
+            cursor.execute("SELECT engine_model FROM nhtsa_vin_decodes WHERE vin = %s", (VIN,))
+            assert cursor.fetchone()["engine_model"] is None
     finally:
         repository.clear_for_tests()
         repository.close()

@@ -34,6 +34,7 @@ def test_ten_entities_read_adapter_views_in_the_unified_database() -> None:
     assert all(spec.table.startswith("station_admin_") for spec in ENTITY_SPECS.values())
     assert PAGE_SIZES == (10, 25, 30, 50, 100, 200)
     assert FIELD_LABELS["source_part_code"] == "零件表 Code／圖號呼叫碼"
+    assert FIELD_LABELS["part_brand_raw"] == "適用車輛品牌（非零件品牌）"
 
 
 @pytest.mark.parametrize("entity_type", ENTITY_SPECS)
@@ -45,6 +46,51 @@ def test_each_entity_can_be_browsed(entity_type: str) -> None:
     assert len(page.records) == 1
     assert page.page_size == 10
     assert page.records[0].identity_key == "source:1"
+
+
+def test_part_lists_default_to_formal_and_keep_explicit_sample_history() -> None:
+    formal_database = ScriptedDatabase(QueryTrace())
+    historical_database = ScriptedDatabase(QueryTrace())
+
+    AdminRepository(formal_database).list_records("part_numbers", limit=10)
+    AdminRepository(historical_database).list_records(
+        "part_numbers", source_scope="historical_sample", limit=10
+    )
+
+    formal_sql = "\n".join(call.sql for call in formal_database.calls)
+    historical_sql = "\n".join(call.sql for call in historical_database.calls)
+    assert "station_admin_formal_part_numbers" in formal_sql
+    assert "station_admin_historical_sample_part_numbers" in historical_sql
+    assert "station_admin_historical_sample_part_numbers" not in formal_sql
+
+
+@pytest.mark.parametrize(
+    ("entity_type", "formal_view"),
+    (
+        ("vehicle_configurations", "station_admin_formal_vehicle_configurations"),
+        ("taxonomy_nodes", "station_admin_formal_taxonomy_nodes"),
+        ("diagrams", "station_admin_formal_diagrams"),
+        ("part_numbers", "station_admin_formal_part_numbers"),
+        ("part_occurrences", "station_admin_formal_part_occurrences"),
+        ("fitments", "station_admin_formal_fitments"),
+    ),
+)
+def test_catalog_lists_default_to_shared_current_catalog(
+    entity_type: str,
+    formal_view: str,
+) -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    AdminRepository(database).list_records(entity_type, limit=10)
+
+    assert formal_view in "\n".join(call.sql for call in database.calls)
+
+
+def test_non_part_entity_rejects_historical_sample_scope() -> None:
+    with pytest.raises(AdminDataError, match="沒有歷史 sample"):
+        AdminRepository(ScriptedDatabase(QueryTrace())).list_records(
+            "vehicle_configurations", source_scope="historical_sample"
+        )
 
 
 def test_source_update_only_writes_overlay_and_append_only_event() -> None:
@@ -81,6 +127,11 @@ def test_source_update_only_writes_overlay_and_append_only_event() -> None:
         call for call in database.calls if call.tag == "write.insert-head.part_numbers"
     )
     assert json.loads(str(insert_head.params[3])) == {"name_en_raw": "人工校正名稱"}
+    lock_source = next(
+        call for call in database.calls if call.tag == "write.lock-source.part_numbers"
+    )
+    assert lock_source.sql.rstrip().lower().endswith("for share")
+    assert "from parts as p" in lock_source.sql.lower()
     lock_base = next(call for call in database.calls if call.tag == "write.lock-base.part_numbers")
     assert "for share" not in lock_base.sql.lower()
 
@@ -116,6 +167,32 @@ def test_dashboard_counts_nhtsa_rows_from_current_artifact_metadata() -> None:
     assert summary["nhtsa_current_records"] == 137120
     assert "SUM(a.source_rows)" in call.sql
     assert "FROM nhtsa_current_records" not in call.sql
+    assert "LEFT JOIN bounded_parts AS bp ON bp.crawl_run_id = r.id" in call.sql
+    assert "FROM v_current_catalog_parts" in call.sql
+    assert call.sql.count("FROM crawl_runs") == 2
+    assert summary["partsouq_current_scope"] == "bounded"
+    assert summary["partsouq_current_rows"] == 10000
+    assert summary["partsouq_bounded_rows"] == 10000
+    assert summary["bounded_scheduled_job_run_id"] == 77
+    assert summary["bounded_scheduler_trigger_mode"] == "daemon"
+    assert "MAX(jobs.trigger_mode)" in call.sql
+    assert summary["bounded_scheduler_linked_crawl_runs"] == 1
+    assert summary["bounded_non_live_data_marker"] == 0
+    assert summary["bounded_active_override_rows"] == 0
+
+
+def test_dashboard_source_counts_use_formal_part_views() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    AdminRepository(database).dashboard_counts()
+
+    call = next(call for call in database.calls if call.tag == "dashboard.source-counts")
+    assert "station_admin_formal_part_numbers" in call.sql
+    assert "station_admin_formal_part_occurrences" in call.sql
+    assert "station_admin_formal_fitments" in call.sql
+    assert "station_admin_formal_vehicle_configurations" in call.sql
+    assert "station_admin_formal_taxonomy_nodes" in call.sql
+    assert "station_admin_formal_diagrams" in call.sql
 
 
 @pytest.mark.parametrize(
@@ -196,5 +273,18 @@ def test_fitment_adapter_uses_date_intersection_and_marks_unpublished_rows() -> 
     assert "WHEN published.part_id IS NOT NULL THEN 1" in schema
     assert "REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')" in schema
     assert "CREATE OR REPLACE VIEW station_admin_effective_parts" in schema
+    assert "JSON_TYPE(JSON_EXTRACT(h.payload_json, '$.number_raw')) = 'NULL'" in schema
+    assert "JSON_TYPE(JSON_EXTRACT(h.payload_json, '$.name_en_raw')) = 'NULL'" in schema
     assert "h.status AS override_status" in schema
     assert "FROM admin_override_heads AS h" in schema
+    assert "CREATE OR REPLACE VIEW station_admin_formal_part_numbers" in schema
+    assert "CREATE OR REPLACE VIEW station_admin_historical_sample_part_numbers" in schema
+    assert schema.count("JOIN v_current_catalog_parts AS current_catalog") == 3
+    for view_name in (
+        "station_admin_formal_vehicle_configurations",
+        "station_admin_formal_taxonomy_nodes",
+        "station_admin_formal_diagrams",
+    ):
+        assert f"CREATE OR REPLACE VIEW {view_name}" in schema
+    assert schema.count("FROM v_current_catalog_parts") >= 4
+    assert "SELECT id FROM crawl_runs WHERE status = 'sample'" in schema

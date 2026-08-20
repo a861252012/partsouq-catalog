@@ -14,6 +14,7 @@
 2. `db/nhtsa.sql`
 3. `db/admin.sql`
 4. `db/station_admin.sql`
+5. `migrations/catalog/009_bounded_production_dataset.sql`
 
 結果：container healthy；共用 DB 同時包含型錄、NHTSA、mapping、站方後台
 overlay／audit tables 與 10 個 compatibility views。`nhtsa_vin_decodes`、
@@ -29,11 +30,15 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 MySQL 測試：
 
 ```text
-159 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
+263 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
 ruff check: passed
-ruff format --check: 121 files already formatted
+ruff format --check: 126 files already formatted
 mypy src/partsouq_station_admin: passed
 ```
+
+JUnit 結果：`/private/tmp/partsouq-final-20260820.xml`。此輪以
+`partsouq_final_20260820_test` 執行 shared MySQL gates；Browser E2E 另建立
+隨機命名的 `_test` 資料庫，結束後刪除。
 
 端到端案例驗證：
 
@@ -82,7 +87,7 @@ mypy src/partsouq_station_admin: passed
 Group 中分類；預設每頁 30 筆，支援 10／25／30／50／100／200 筆、頁碼輸入與
 首頁／前後頁／末頁。sample 尚未發布，NHTSA VIN 與已確認 mapping 仍為 0，因此
 正式 production gate 尚未通過；NHTSA 官方 reference sync 則已完成
-137,120 筆、377 個 current artifacts、0 rejected。
+137,140 筆、377 個 current artifacts、0 rejected。
 
 8086 的 `part_numbers` 是現有 normalized `parts` 的 compatibility adapter，
 1000 列代表 1000 個料件出現／適用列，其中只有 923 個不重複料號，不能把
@@ -111,9 +116,16 @@ HTTP 403
 ChallengeError
 exit code 1
 crawl_runs.status = error
-parts = 0 rows
+new crawl parts_ok = 0 rows
 published_parts = 0 rows
 ```
+
+2026-08-20 已用本機 `scheduler` daemon 實際執行正式 bounded 10,000 筆工作；
+run `bounded-10000-s260820111142950` 同樣在 genuine catalog 得到 HTTP 403，
+`crawl_runs.status=error`、`parts_ok=0`，linked `scheduled_job_runs` 為
+`catalog/daemon/failed/exit=1`，然後進入 60 秒退避。DB 仍保留較早的
+browser-assisted 1,000 筆歷史 sample；它不是這次排程的輸出，也不進
+`v_current_catalog_parts`。
 
 2026-08-19 再次以一般低速 HTTP 重跑，結果仍相同。Docker runtime 時鐘已
 與主機同步；最新 DB run 為 `sample-20260819T120727998635`，MySQL 以 UTC
@@ -139,10 +151,24 @@ crawler 已可無人值守取得資料。
 
 ## 排程邊界
 
-目前 `partsouq-scheduler` 已把 PartSouq、NHTSA 與後台要求統一為同一個 CLI，
-但 Compose 的 scheduler 是一次性 profile command，沒有常駐 timer／cron。
-8086 建立的 VIN／爬取要求需執行 `partsouq-scheduler --job pending`，或由部署端
-排程呼叫；目前不能宣稱本機已自動週期執行。
+`partsouq-scheduler --daemon` 已提供常駐週期與自動重試。Compose 分成
+PartSouq、NHTSA 與後台佇列三個常駐服務，避免長時間工作互相阻塞；共享 lock
+會拒絕同類工作重複執行。正式 PartSouq 服務固定覆寫舊 sample 設定，改用
+`PSQ_BOUNDED_PARTS=10000`。每個 catalog child 另保存 `SCHEDULED_JOB_RUN_ID`，
+讓 bounded crawl 可精確連回 `scheduled_job_runs`，並以 `trigger_mode=daemon`
+排除手動執行，不是只用時間推測來源。若資料 publish 已 commit、但 parent 在
+完成排程紀錄前中斷，下一輪會先核對 exact target 與 bounded snapshot 後對帳，
+不會再重爬同一批 10,000 筆。兩筆交易之間 current view 會維持 fail-closed（0 筆），
+直到 scheduler 完成紀錄或重啟對帳成功才公開資料，不會預先偽造 exit `0`。
+若完成寫入回應不明確，daemon 也會先重查 cadence，再決定是否重跑。
+NHTSA 中斷留下的 scheduler-owned running row
+也會在取得 family lock 後自動標記為 interrupted；bulk 已完成而 API 失敗時，
+24 小時內 retry 會從 API stage 續跑；超過 24 小時會重新同步 bulk。
+排程狀態查詢失敗只會 backoff 後重讀，不會把
+「無法判斷是否到期」誤當成「立即到期」。
+
+本段只描述已實作並通過隔離測試的排程行為；正式 10,000 筆是否成功，仍須以
+本機 `bounded_success`、精確筆數、scheduler exit `0` 與資料品質讀回為準。
 
 ## 效能
 
@@ -152,6 +178,6 @@ crawler 已可無人值守取得資料。
 - 8086 首頁：p50 `7.15 ms`、p95 `8.02 ms`。
 - 8086 零件第 5 頁、pageSize 200：p50 `13.80 ms`、p95 `17.90 ms`。
 
-修正前兩個首頁會展開 `nhtsa_current_records` 的多表 view 掃描 137,120 列，
+修正前兩個首頁會展開 `nhtsa_current_records` 的多表 view 掃描 137,140 列，
 p50 分別約 `776.56 ms` 與 `629.55 ms`。修正後改以 current artifact metadata
 的 `source_rows` 聚合；主 DB 逐 dataset 與總數讀回皆與原 view 相同。

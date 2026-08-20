@@ -11,15 +11,15 @@
   <section>
     <h2>統一排程執行</h2>
     <div class="table-wrap"><table class="monitor-table">
-      <thead><tr><th>ID</th><th>工作</th><th>狀態</th><th>開始</th><th>結束</th><th>Exit</th><th>輸出摘要</th></tr></thead>
+      <thead><tr><th>ID</th><th>工作</th><th>觸發</th><th>狀態</th><th>開始</th><th>結束</th><th>Exit</th><th>輸出摘要</th></tr></thead>
       <tbody>
         {% for run in monitor.job_runs %}
           <tr>
-            <td>{{ run.id }}</td><td>{{ run.job_name }}</td><td><span class="badge">{{ run.status }}</span></td>
+            <td>{{ run.id }}</td><td>{{ run.job_name }}</td><td>{{ run.trigger_mode }}</td><td><span class="badge">{{ run.status }}</span></td>
             <td>{{ run.started_at }}</td><td>{{ run.finished_at or '—' }}</td><td>{{ run.exit_code if run.exit_code is not none else '—' }}</td>
             <td><pre>{{ run.output_text or '—' }}</pre></td>
           </tr>
-        {% else %}<tr><td colspan="7" class="empty">尚無排程執行紀錄。</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="8" class="empty">尚無排程執行紀錄。</td></tr>{% endfor %}
       </tbody>
     </table></div>
   </section>
@@ -27,16 +27,16 @@
   <section>
     <h2>PartSouq 型錄執行</h2>
     <div class="table-wrap"><table class="monitor-table">
-      <thead><tr><th>Run</th><th>狀態</th><th>品牌</th><th>型號</th><th>車款</th><th>群組</th><th>零件</th><th>開始／結束</th><th>錯誤</th></tr></thead>
+      <thead><tr><th>Run</th><th>資料集／排程</th><th>狀態</th><th>品牌</th><th>型號</th><th>車款</th><th>群組</th><th>零件</th><th>開始／結束</th><th>錯誤</th></tr></thead>
       <tbody>
         {% for run in monitor.crawl_runs %}
           <tr>
-            <td>{{ run.run_key }}</td><td><span class="badge">{{ run.status }}</span></td>
+            <td>{{ run.run_key }}</td><td>{{ run.dataset_kind or 'legacy' }}<br>目標 {{ run.target_parts or '全量' }}<br>scheduler {{ run.scheduled_job_run_id or '—' }}</td><td><span class="badge">{{ run.status }}</span></td>
             <td>{{ run.brands_ok }}</td><td>{{ run.models_ok }}</td><td>{{ run.vehicles_ok }}</td>
             <td>{{ run.groups_ok }}</td><td>{{ run.parts_ok }}（新增 {{ run.parts_new }}）</td>
             <td>{{ run.started_at }}<br>{{ run.finished_at or '—' }}</td><td>{{ run.error_msg or '—' }}</td>
           </tr>
-        {% else %}<tr><td colspan="9" class="empty">尚無 PartSouq 型錄執行紀錄。</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="10" class="empty">尚無 PartSouq 型錄執行紀錄。</td></tr>{% endfor %}
       </tbody>
     </table></div>
   </section>

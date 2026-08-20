@@ -43,6 +43,9 @@ def test_list_allows_supported_page_size_and_keeps_it_on_next_link() -> None:
     assert response.status_code == 200
     assert response.headers["X-Admin-Query-Count"] == "4"
     assert b'<option value="200" selected>' in response.data
+    assert b'<option value="formal" selected>' in response.data
+    assert "目前正式資料（full 優先，否則 bounded）".encode() in response.data
+    assert "歷史 sample（非正式）".encode() in response.data
     assert b"pageSize=200" in response.data
     assert "顯示 1 到 200，共 1000 筆記錄".encode() in response.data
     assert "共 5 頁".encode() in response.data
@@ -51,6 +54,18 @@ def test_list_allows_supported_page_size_and_keeps_it_on_next_link() -> None:
         == 1
     )
     assert databases[-1].closed
+
+
+def test_part_list_can_explicitly_show_historical_sample() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases)
+
+    response = app.test_client().get("/entities/part_numbers?dataset=historical_sample&pageSize=25")
+
+    assert response.status_code == 200
+    assert b'<option value="historical_sample" selected>' in response.data
+    sql = "\n".join(call.sql for call in databases[-1].calls)
+    assert "station_admin_historical_sample_part_numbers" in sql
 
 
 def test_list_rejects_unsupported_page_size_before_query() -> None:
@@ -70,6 +85,7 @@ def test_monitoring_uses_unified_scheduler_tables() -> None:
     response = app.test_client().get("/monitoring")
 
     assert response.status_code == 200
+    assert b"daemon" in response.data
     assert response.headers["X-Admin-Query-Tags"].split(",") == [
         "monitor.scheduled-job-runs",
         "monitor.crawl-runs",
@@ -88,9 +104,14 @@ def test_dashboard_separates_sample_published_and_nhtsa_vin_layers() -> None:
     assert response.status_code == 200
     assert b"1000" in response.data
     assert b"923" in response.data
+    assert b"10000" in response.data
+    assert b"9234" in response.data
     assert b"137120" in response.data
-    assert b"normalized sample" in response.data
-    assert b"distinct part numbers" in response.data
+    assert "正式排程限量資料已完成 10000 / 10000 筆".encode() in response.data
+    assert b"crawl run 42" in response.data
+    assert b"scheduler run 77" in response.data
+    assert "完整全量 snapshot 尚未發布".encode() in response.data
+    assert "目前正式不重複料號".encode() in response.data
     assert "逐 VIN 解碼需由站方輸入合法 VIN".encode() in response.data
 
 

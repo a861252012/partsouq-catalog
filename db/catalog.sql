@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS published_parts (
   trim_name      VARCHAR(256) NULL,
   part_name      VARCHAR(512) NOT NULL,
   part_number    VARCHAR(64) NOT NULL,
+  part_number_normalized VARCHAR(64) NOT NULL,
   category_id    INT NULL,
   category_cid   VARCHAR(32) NULL,
   category_main  VARCHAR(256) NOT NULL,
@@ -167,7 +168,9 @@ CREATE TABLE IF NOT EXISTS published_parts (
   code           VARCHAR(64) NULL,
   snapshot_at    DATETIME NOT NULL,
   KEY idx_published_part_number (part_number),
+  KEY idx_published_part_number_normalized (part_number_normalized),
   KEY idx_published_brand_model (brand, model),
+  KEY idx_published_snapshot_page (snapshot_at, part_id),
   KEY idx_published_vehicle (vehicle_id),
   KEY idx_published_model (model_id),
   KEY idx_published_category (category_id),
@@ -204,6 +207,86 @@ CREATE TABLE IF NOT EXISTS published_parts (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 正式、有界、current-only 的 PartSouq dataset。它明確不代表全站；
+-- 只有 exact target 且通過來源/關聯品質關卡的 bounded run 會在
+-- 同一交易更換本表。part_id 是穩定分頁鍵，預先正規化的
+-- 料號則避免查詢時每列 REGEXP_REPLACE。
+CREATE TABLE IF NOT EXISTS bounded_parts (
+  part_id        INT NOT NULL PRIMARY KEY,
+  crawl_run_id   INT NOT NULL,
+  vehicle_id     INT NOT NULL,
+  model_id       INT NOT NULL,
+  vehicle_vid    VARCHAR(32) NOT NULL,
+  brand          VARCHAR(64) NOT NULL,
+  model          VARCHAR(128) NOT NULL,
+  vehicle_name   VARCHAR(256) NOT NULL,
+  vehicle_code   VARCHAR(128) NOT NULL,
+  prod_period    VARCHAR(64) NULL,
+  production_from CHAR(7) NULL,
+  production_to   CHAR(7) NULL,
+  engine         VARCHAR(256) NULL,
+  trim_name      VARCHAR(256) NULL,
+  part_name      VARCHAR(512) NOT NULL,
+  part_number    VARCHAR(64) NOT NULL,
+  part_number_normalized VARCHAR(64) NOT NULL,
+  category_id    INT NOT NULL,
+  category_cid   VARCHAR(32) NOT NULL,
+  category_main  VARCHAR(256) NOT NULL,
+  category_group VARCHAR(256) NOT NULL,
+  group_id       INT NOT NULL,
+  group_code     VARCHAR(16) NOT NULL,
+  group_uid      VARCHAR(32) NOT NULL,
+  part_range     VARCHAR(64) NOT NULL,
+  part_from      CHAR(7) NULL,
+  part_to        CHAR(7) NULL,
+  source_url     VARCHAR(1024) NOT NULL,
+  note           TEXT NULL,
+  quantity       VARCHAR(16) NULL,
+  code           VARCHAR(64) NOT NULL,
+  snapshot_at    DATETIME NOT NULL,
+  KEY idx_bounded_run (crawl_run_id),
+  KEY idx_bounded_part_number (part_number),
+  KEY idx_bounded_part_number_normalized (part_number_normalized),
+  KEY idx_bounded_brand_model (brand, model),
+  KEY idx_bounded_snapshot_page (snapshot_at, part_id),
+  CONSTRAINT chk_bounded_production_from CHECK (
+    production_from IS NULL OR (
+      production_from REGEXP '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      AND CAST(LEFT(production_from, 4) AS UNSIGNED) BETWEEN 1886 AND 2100
+    )
+  ),
+  CONSTRAINT chk_bounded_production_to CHECK (
+    production_to IS NULL OR (
+      production_to REGEXP '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      AND CAST(LEFT(production_to, 4) AS UNSIGNED) BETWEEN 1886 AND 2100
+    )
+  ),
+  CONSTRAINT chk_bounded_production_order CHECK (
+    production_from IS NULL OR production_to IS NULL OR production_from <= production_to
+  ),
+  CONSTRAINT chk_bounded_part_from CHECK (
+    part_from IS NULL OR (
+      part_from REGEXP '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      AND CAST(LEFT(part_from, 4) AS UNSIGNED) BETWEEN 1886 AND 2100
+    )
+  ),
+  CONSTRAINT chk_bounded_part_to CHECK (
+    part_to IS NULL OR (
+      part_to REGEXP '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      AND CAST(LEFT(part_to, 4) AS UNSIGNED) BETWEEN 1886 AND 2100
+    )
+  ),
+  CONSTRAINT chk_bounded_part_order CHECK (
+    part_from IS NULL OR part_to IS NULL OR part_from <= part_to
+  ),
+  CONSTRAINT chk_bounded_range_overlap_start CHECK (
+    part_to IS NULL OR production_from IS NULL OR part_to >= production_from
+  ),
+  CONSTRAINT chk_bounded_range_overlap_end CHECK (
+    production_to IS NULL OR part_from IS NULL OR production_to >= part_from
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 爬蟲狀態 (斷點續爬)
 CREATE TABLE IF NOT EXISTS crawl_state (
   id           INT AUTO_INCREMENT PRIMARY KEY,
@@ -224,6 +307,9 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
   started_at   DATETIME NOT NULL,
   finished_at  DATETIME NULL,
   status       VARCHAR(16) NULL,             -- running / success / error
+  dataset_kind VARCHAR(16) NOT NULL DEFAULT 'full', -- full / sample / bounded
+  target_parts INT NULL,
+  scheduled_job_run_id BIGINT UNSIGNED NULL,
   brands_ok    INT DEFAULT 0,
   models_ok    INT DEFAULT 0,
   vehicles_ok  INT DEFAULT 0,
@@ -231,7 +317,9 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
   parts_ok     INT DEFAULT 0,
   parts_new    INT DEFAULT 0,
   error_msg    TEXT NULL,
-  UNIQUE KEY uq_run_key (run_key)
+  UNIQUE KEY uq_run_key (run_key),
+  KEY idx_crawl_run_schedule (scheduled_job_run_id),
+  CONSTRAINT chk_crawl_run_target CHECK (target_parts IS NULL OR target_parts > 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 「現存」語意：只讀最近一次完整 success 交易建立的 snapshot。

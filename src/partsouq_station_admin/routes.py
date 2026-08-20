@@ -210,6 +210,7 @@ def monitoring() -> str:
 @bp.get("/entities/<entity_type>")
 def entity_list(entity_type: str) -> str:
     spec = entity_spec(entity_type)
+    source_scope = request.args.get("dataset", "formal")
     include_retired = request.args.get("include_retired") == "1"
     try:
         page_number = int(request.args.get("page", "1"))
@@ -228,8 +229,9 @@ def entity_list(entity_type: str) -> str:
         page=page_number,
         limit=page_size,
         include_retired=include_retired,
+        source_scope=source_scope,
     )
-    return render_template("list.html", spec=spec, page=page)
+    return render_template("list.html", spec=spec, page=page, source_scope=source_scope)
 
 
 @bp.route("/entities/<entity_type>/new", methods=["GET", "POST"])
