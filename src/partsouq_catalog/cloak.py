@@ -14,6 +14,8 @@
 
 # ruff: noqa: UP031  -- 底下 `%` 格式是刻意保留：內嵌子程序腳本含有大量
 # `{}`（dict literal），改用 .format()/f-string 會與腳本內容衝突。
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -73,6 +75,39 @@ def _cf_value(cookies) -> str:
         if c.get("name") == "cf_clearance":
             return c.get("value", "")
     return ""
+
+
+@contextlib.contextmanager
+def _process_refresh_lock():
+    """跨程序 refresh 互斥鎖（single-flight 只管得到同程序內執行緒）。
+
+    CloakBrowser 的 CDP port 是全域資源：兩個 crawler 程序同時啟動
+    瀏覽器會互搶 port、互相誤殺。用 flock 鎖檔串列化 refresh；鎖被
+    佔用超過期限時放棄（fail-closed），呼叫端拿到 acquired=False。
+    """
+    lock_path = CLOAK["lock_file"]
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    acquired = False
+    deadline = time.monotonic() + COOKIE_EXPORT_TIMEOUT + 120
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(3)
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_file.close()
 
 
 def _stop_owned_browser():
@@ -343,38 +378,46 @@ def _launch_cloak() -> bool:
 def refresh_session() -> list | None:
     """完整刷新流程：啟動 CloakBrowser、解決驗證、匯出 cookie。
 
+    跨程序互斥：先取得 process lock，再走同程序內的 single-flight。
     Single-flight：並行呼叫者會等同一場刷新完成，而不是各自啟動瀏覽器。
     成功回傳 cookie 列表；失敗回傳 None。失敗的退避時間隨連續失敗
     次數指數成長（60s → 120s → 240s，上限 20 分鐘），避免封鎖期間
     反覆啟動瀏覽器造成「刷新失敗風暴」。
     """
-    with _SESSION_COND:
-        while _session_state["busy"]:
-            _SESSION_COND.wait()
-        # 若剛才刷新成功且尚未過期，直接沿用，不需動瀏覽器
-        if _session_state["cookies"] and time.monotonic() - _session_state["ok_ts"] < COOKIE_TTL:
-            return _session_state["cookies"]
-        # 退避期間（上次刷新失敗）共用失敗結果（P1 修復）：等待中的
-        # worker 直接拿到 None，而不是輪流成為 leader 各自再刷一次。
-        # 退避期過後的下一次呼叫才會真正再刷。
-        if time.monotonic() < _session_state["retry_after"]:
+    with _process_refresh_lock() as lock_acquired:
+        if not lock_acquired:
+            log.error("refresh lock held by another process; refresh skipped")
             return None
-        _session_state["busy"] = True
+        with _SESSION_COND:
+            while _session_state["busy"]:
+                _SESSION_COND.wait()
+            # 若剛才刷新成功且尚未過期，直接沿用，不需動瀏覽器
+            if (
+                _session_state["cookies"]
+                and time.monotonic() - _session_state["ok_ts"] < COOKIE_TTL
+            ):
+                return _session_state["cookies"]
+            # 退避期間（上次刷新失敗）共用失敗結果（P1 修復）：等待中的
+            # worker 直接拿到 None，而不是輪流成為 leader 各自再刷一次。
+            # 退避期過後的下一次呼叫才會真正再刷。
+            if time.monotonic() < _session_state["retry_after"]:
+                return None
+            _session_state["busy"] = True
 
-    try:
-        cookies = _refresh_impl()
-        with _SESSION_COND:
-            if cookies:
-                _session_state["cookies"] = cookies
-                _session_state["ok_ts"] = time.monotonic()
-                _session_state["retry_after"] = 0.0
-                _session_state["failures"] = 0
-                _session_state["version"] = _cf_value(cookies)
-        return cookies
-    finally:
-        with _SESSION_COND:
-            _session_state["busy"] = False
-            _SESSION_COND.notify_all()
+        try:
+            cookies = _refresh_impl()
+            with _SESSION_COND:
+                if cookies:
+                    _session_state["cookies"] = cookies
+                    _session_state["ok_ts"] = time.monotonic()
+                    _session_state["retry_after"] = 0.0
+                    _session_state["failures"] = 0
+                    _session_state["version"] = _cf_value(cookies)
+            return cookies
+        finally:
+            with _SESSION_COND:
+                _session_state["busy"] = False
+                _SESSION_COND.notify_all()
 
 
 def session_backoff_remaining() -> float:
@@ -447,6 +490,12 @@ def _refresh_impl() -> list | None:
                 last_progress_log = time.time()
                 log.info("waiting for cookie export... %ds elapsed", int(deadline - time.time()))
             if export_file.exists():
+                # 子程序以預設 umask 寫出，先限縮成 owner-only 再讀，
+                # 避免 cf_clearance 短暫暴露給本機其他使用者。
+                try:
+                    export_file.chmod(0o600)
+                except OSError:
+                    pass
                 try:
                     cookies = json.loads(export_file.read_text())
                     if cookies:
@@ -473,6 +522,11 @@ def _refresh_impl() -> list | None:
         return None
     finally:
         _stop_owned_browser()
+        # 無論成功與否都清掉暫存匯出檔（cookie 已在 save_cookies 落地）。
+        try:
+            export_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _mark_refresh_failed():

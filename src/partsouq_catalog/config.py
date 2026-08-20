@@ -49,7 +49,10 @@ CLOAK = {
     ),
     "cdp_port": 9242,
     "cdp_host": "http://127.0.0.1:9242",
-    "cookie_export_file": Path(os.environ.get("PSQ_COOKIE_EXPORT_FILE", "/tmp/psq_cloak_cookies.json")),
+    "cookie_export_file": Path(
+        os.environ.get("PSQ_COOKIE_EXPORT_FILE", "/tmp/psq_cloak_cookies.json")
+    ),
+    "lock_file": COOKIE_FILE.parent / ".cloak-refresh.lock",
     "user_agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"

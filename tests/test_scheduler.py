@@ -303,8 +303,12 @@ def test_catalog_crash_after_publish_is_reconciled_without_recrawl(monkeypatch) 
     assert "runs.status = 'bounded_success'" in reconciliation
     assert "jobs.finished_at = runs.finished_at" in reconciliation
     assert "runs.finished_at IS NOT NULL" in reconciliation
-    assert "snapshots.snapshot_rows = %s" in reconciliation
-    assert reconciliation_call.args[1][-3:] == (10_000, 10_000, 10_000)
+    # 對帳不依賴排程器自身的 PSQ_BOUNDED_PARTS：以 DB 內的
+    # target/parts_ok/snapshot 一致性為準。
+    assert "runs.target_parts > 0" in reconciliation
+    assert "runs.parts_ok = runs.target_parts" in reconciliation
+    assert "snapshots.snapshot_rows = runs.target_parts" in reconciliation
+    assert reconciliation_call.args[1][0].endswith("reconciled automatically\n")
     connection.begin.assert_called_once_with()
     connection.commit.assert_called_once_with()
     connection.rollback.assert_not_called()
@@ -347,6 +351,7 @@ def test_catalog_reconciliation_rolls_back_if_stale_cleanup_fails(monkeypatch) -
         scheduler._recover_interrupted_job_runs("catalog")
 
     connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
 
 
 def test_catalog_recovery_marks_stale_running_rows_interrupted(monkeypatch) -> None:
@@ -362,16 +367,22 @@ def test_catalog_recovery_marks_stale_running_rows_interrupted(monkeypatch) -> N
     assert scheduler._recover_interrupted_job_runs("catalog") is False
 
     statements = [call.args[0] for call in cursor.execute.call_args_list]
-    assert len(statements) == 2
-    stale_jobs_call, stale_runs_call = cursor.execute.call_args_list
+    assert len(statements) == 3
+    reconcile_call, stale_jobs_call, stale_runs_call = cursor.execute.call_args_list
+    # 第一筆是 bounded 對帳（env 獨立），rowcount=0 → 無需略過 dispatch
+    assert "dataset_kind = 'bounded'" in reconcile_call.args[0]
     stale_jobs = stale_jobs_call.args[0]
     assert "SET status = 'failed'" in stale_jobs
     assert "job_name = %s" in stale_jobs
+    # 年齡閘：啟動未滿 RECOVERY_MIN_AGE_SECONDS 的 run 不得被自動翻 failed
+    assert "started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND" in stale_jobs
     assert stale_jobs_call.args[1][0] == scheduler.INTERRUPTED_EXIT_CODE
+    assert stale_jobs_call.args[1][-1] == scheduler.RECOVERY_MIN_AGE_SECONDS
     stale_runs = stale_runs_call.args[0]
     assert "SET runs.status = 'interrupted'" in stale_runs
     assert "JOIN scheduled_job_runs AS jobs" in stale_runs
     assert "jobs.status = 'failed'" in stale_runs
+    assert "jobs.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND" in stale_runs
     connection.commit.assert_called_once_with()
 
 

@@ -138,14 +138,29 @@ browser-assisted 1,000 筆歷史 sample；它不是這次排程的輸出，也�
 一般 HTTP 於 2026-08-19 22:04（台北）再次確認仍為 HTTP 403、
 `cf-mitigated: challenge`。
 
-**2026-08-20 已切換為 CloakBrowser cookie 機制**：`cloak.py` 以真實瀏覽器
-正當通過 Turnstile 後匯出 session cookie（`cf_clearance` + `PHPSESSID`，
-TTL 25 分鐘自動刷新，存本機 `data/cookies.json`），HTTP client 一律附上
-cookie 請求；challenge 未成功刷新時仍算 `blocked`，不報為完成。不使用
-proxy 輪替或瀏覽器指紋規避。同日以 bounded E2E（Toyota model 1000）與
-`partsouq-scheduler --job catalog --daemon` 無人值守執行驗證：爬蟲完成
-60 筆零件寫入 MySQL，`crawl_runs.status=sample`、`scheduled_job_runs`
-`catalog/daemon/completed`，daemon 依 interval 等待而非無限重試。
+**2026-08-20 已切換為 CloakBrowser cookie 機制**：`cloak.py` 以指紋修補版
+Chromium（CloakBrowser）讓 Turnstile 人機驗證在無人操作下自動通過，匯出
+session cookie（`cf_clearance` + `PHPSESSID`，TTL 25 分鐘自動刷新，存本機
+`data/cookies.json`），HTTP client 一律附上 cookie 請求；此機制本質是瀏覽器
+指紋規避與驗證自動通過，非站方授權。challenge 未成功刷新時仍算 `blocked`，
+不報為完成。不輪替 proxy。
+
+同日以 sample E2E（Toyota model、`PSQ_LIMIT_PARTS=60`）與
+`partsouq-scheduler --job catalog --daemon` 無人值守執行驗證：爬蟲跑完
+60 筆 fitment 列，`crawl_runs.status=sample`（`sample-20260820T221248030118`，
+`target=60`、`parts_ok=60`）、對應 `scheduled_job_runs` 為
+`catalog/daemon/completed`。注意事項：
+
+- 該次完成的排程 run 是 **exit_code=3**（樣本達上限的預期停止；scheduler 以
+  `success_codes=(0,3)` 記為 completed）。若樣本未達上限就結束，crawler 改記
+  `error`，不偽造 sample 完成。
+- 60 筆全部是**更新既有樣本列**（`parts_new=0`），不是新增；`parts` 總數為
+  1060（含較早的 1000 筆 browser-assisted sample）。未發布
+  （`published_parts=0`、`v_current_catalog_parts=0`）。
+- daemon 完成後的**下一次 interval run 又回到 HTTP 403 challenge**：之後
+  連續 5 次 daemon run 失敗（exit=1），退避 480→960→1920→3600 秒持續增長；
+  失敗路徑仍是重試而非穩定的 interval 等待。cookie 機制只讓單次 run 通過，
+  尚未證明可持續無人值守完成 10,000 筆 bounded 目標。
 
 同日以已自然通過站方驗證的 Codex 可見瀏覽器，沿頁面真實連結唯讀走訪
 Suzuki／Chevrolet Cruize/MW（HR52S-2，2003-11 至 2005-03），擷取 47 個

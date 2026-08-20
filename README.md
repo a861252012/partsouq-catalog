@@ -185,10 +185,15 @@ API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器�
 
 ## 安全與資料邊界
 
-- 不輪替 proxy、不使用 browser fingerprint 規避；Cloudflare challenge 一律以
-  CloakBrowser（`cloak.py`）產生的 session cookie（`cf_clearance` + `PHPSESSID`）
-  正當放行，cookie 自動刷新且只存在本機 `data/cookies.json`，不會提交。
-- Cloudflare challenge 未成功刷新時是 `blocked`／失敗證據，不可報為完成。
+- PartSouq catalog 請求前先以可識別 crawler UA 檢查 robots.txt 與 origin；robots
+  無法確認允許、origin 不符或 redirect 一律停止（fail-closed），不跟隨 redirect。
+- Cloudflare challenge 的處理方式：`cloak.py` 啟動 CloakBrowser（指紋修補版
+  Chromium，其指紋隱匿讓 Turnstile 人機驗證在無人操作下自動通過），匯出 session
+  cookie（`cf_clearance` + `PHPSESSID`）供 HTTP client 使用。此機制本質上是
+  瀏覽器指紋規避與驗證自動通過，非站方授權；cookie 只存本機 `data/cookies.json`，
+  不會提交。
+- challenge 未成功刷新時是 `blocked`／失敗證據，不可報為完成；challenge 一律
+  以刷新 cookie 後的 follow-up 請求重試，不輪替 proxy。
 - NHTSA bulk／collection API 與單筆 `DecodeVinValues` 分流；bulk 資料不能冒充完整 VIN 車輛名冊。
 - VIN source key 使用 SHA-256，排程完成後也會遮罩 request scope 與輸出；業務表與受控 raw evidence 才保留解碼所需完整 VIN。
 - `output/`、`logs/`、資料庫 volume、`.env` 與管理 token 都不提交。

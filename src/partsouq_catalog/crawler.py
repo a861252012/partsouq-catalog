@@ -604,7 +604,7 @@ class Crawler:
         )
         html = self._get(vehicle_url)
         soup = _soup(html)
-        category_links, malformed_categories = parse_category_links(
+        category_links, malformed_categories, skipped_category_links = parse_category_links(
             html,
             brand=brand,
             soup=soup,
@@ -616,6 +616,13 @@ class Crawler:
             raise RuntimeError(
                 f"[{brand} vehicle={vehicle_id}] {malformed_categories} malformed "
                 "vehicle category link(s); parser may miss categories"
+            )
+        if skipped_category_links:
+            log.warning(
+                "[%s vehicle=%s] %d category link(s) skipped as foreign context/navigation",
+                brand,
+                vehicle_id,
+                skipped_category_links,
             )
         # 分類清單 = 引擎/燃油/工具（預設第一分類）+ 頁面上的其他分類連結
         categories = [
@@ -733,7 +740,7 @@ class Crawler:
         if self._sample_limit_reached.is_set():
             return 1
 
-        groups, malformed = parse_groups(
+        groups, malformed, skipped_groups = parse_groups(
             html,
             brand,
             default_cid=default_cid,
@@ -747,6 +754,14 @@ class Crawler:
             raise RuntimeError(
                 f"[{brand} vehicle={vehicle_id} cid={default_cid}] "
                 f"{malformed} malformed unit link(s); parser may miss groups"
+            )
+        if skipped_groups:
+            log.warning(
+                "[%s vehicle=%s cid=%s] %d unit link(s) skipped as foreign context/navigation",
+                brand,
+                vehicle_id,
+                default_cid,
+                skipped_groups,
             )
         self._guard_parse(html, groups, "groups", f"{brand} vehicle={vehicle_id}")
         # P1 修復：group 子集合閉合對帳 —— DB 已知的 group manifest
@@ -1307,14 +1322,27 @@ class Crawler:
                 self.db.commit()
             elif sample_mode:
                 limit_parts = self.part_limit
-                message = (
-                    f"sample run: {self.counts['parts']}/{limit_parts} part fitment row(s); "
-                    "current snapshot not published"
-                )
-                log.info(message)
-                self.crawl.finish_run(run_id, "sample", self.counts, message)
-                self.db.commit()
-                self.last_status = "sample"
+                if limit_parts and self.counts["parts"] < limit_parts:
+                    # 樣本跑未達上限就結束（資料集比上限小、或爬取提前
+                    # 中止）不是「預期停止」：不得記 sample，否則 daemon
+                    # 會把它當完成而跳過整個 interval 的正式 run。
+                    self.crawl.finish_run(
+                        run_id,
+                        "error",
+                        self.counts,
+                        f"sample run ended before cap: "
+                        f"{self.counts['parts']}/{limit_parts} part row(s)",
+                    )
+                    self.db.commit()
+                else:
+                    message = (
+                        f"sample run: {self.counts['parts']}/{limit_parts} part fitment row(s); "
+                        "current snapshot not published"
+                    )
+                    log.info(message)
+                    self.crawl.finish_run(run_id, "sample", self.counts, message)
+                    self.db.commit()
+                    self.last_status = "sample"
             elif partial:
                 scope = CRAWL["start_brand"] or "limited"
                 log.warning(

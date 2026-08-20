@@ -7,6 +7,10 @@
 本層只負責「把 HTML 拿回來」；解析與資料寫入分別屬於解析器層
 與 Repository 層。
 
+正式 catalog 請求（partsouq.com /en/catalog）在送出前會先以可識別
+crawler UA 檢查 robots.txt 與 origin/path 合法性；robots 無法確認
+允許、origin 不符或回應為 redirect 時一律停止（fail-closed）。
+
 穩定性與限流的兩個關鍵設計：
 1. 連線池刻意只開 2 條（pool_connections / pool_maxsize）：多 worker
    同時撥號時，避免 macOS ephemeral port 耗盡（OSError 49「無法指定
@@ -24,9 +28,13 @@ import random
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
 
 import requests
 from requests.adapters import HTTPAdapter
+
+from partsouq_crawler.crawl.robots import RobotsRules, parse_robots
 
 from .cloak import (
     REFRESH_RETRY_BACKOFF,
@@ -37,6 +45,10 @@ from .cloak import (
 from .config import CRAWL
 
 log = logging.getLogger("http")
+
+CATALOG_USER_AGENT = "partsouq-catalog-crawler/0.1 (+https://github.com/a861252012)"
+CATALOG_PRODUCT_TOKEN = "partsouq-catalog-crawler"
+CATALOG_HOSTS = frozenset({"partsouq.com", "www.partsouq.com"})
 
 
 def _cf_value(cookies) -> str:
@@ -86,6 +98,10 @@ class NotFoundError(Exception):
     """
 
 
+class RobotsPolicyError(Exception):
+    """代表 robots.txt 無法確認允許正式 catalog 請求。"""
+
+
 class SessionManager:
     """持有 Cookie、按需刷新、並控制請求節奏的 HTTP 工作階段。
 
@@ -94,6 +110,10 @@ class SessionManager:
 
     def __init__(self, cookies=None, no_browser=False, gov=None):
         self.session = requests.Session()
+        # 傳輸層不得沿用環境代理（避免流量被本機 proxy 攔截/改寫）。
+        self.session.trust_env = False
+        self.session.proxies.clear()
+        self._robots: RobotsRules | None = None
         # F5：全域 request governor（可選）。提供時，429 的 Retry-After
         # 會同時暫停「所有」worker —— 限流是全域的，單一 worker 的
         # 退避不該讓其他 worker 繼續撞牆。
@@ -152,6 +172,26 @@ class SessionManager:
             )
         self.session.cookies.clear()
         self.session.cookies.update(jar)
+
+    def _wire_get(self, url: str, headers: dict | None = None) -> requests.Response:
+        """送出「不跟隨 redirect」的單一 GET；cookie jar 會暫時清空。
+
+        robots.txt 與其他不應帶 session cookie 的請求走這條路；請求
+        完成後 jar 還原，不影響後續 catalog 請求的 cookie。
+        """
+        saved = requests.cookies.RequestsCookieJar()
+        saved.update(self.session.cookies)
+        self.session.cookies.clear()
+        try:
+            return self.session.get(
+                url,
+                timeout=float(str(CRAWL["http_timeout"])),
+                allow_redirects=False,
+                headers=headers,
+            )
+        finally:
+            self.session.cookies.clear()
+            self.session.cookies.update(saved)
 
     def refresh(self) -> bool:
         """透過 single-flight 的 session 管理員重新取得 cookie。
@@ -219,6 +259,9 @@ class SessionManager:
         refresh_failures = 0
         refresh_successes = 0
         attempt = 0
+        # 正式 catalog 請求先過 robots/origin/path 檢查；robots 無法確認
+        # 允許時立即停止（不發 catalog 請求）。
+        self._ensure_catalog_allowed(url)
         while attempt < CRAWL["max_retries"]:
             attempt += 1
             try:
@@ -227,7 +270,7 @@ class SessionManager:
                 # 等於沒有限流。throttle 設定的全域暫停也在這裡生效。
                 if self.gov is not None:
                     self.gov.acquire()
-                r = self.session.get(url, timeout=CRAWL["http_timeout"])
+                r = self.session.get(url, timeout=CRAWL["http_timeout"], allow_redirects=False)
                 text = r.text or ""
                 # 驗證偵測優先（F4）：403 或任何帶驗證特徵的回應
                 # （含 429 + cf-mitigated: challenge）一律進驗證分支。
@@ -256,6 +299,8 @@ class SessionManager:
                     continue
                 if r.status_code == 404:
                     raise NotFoundError(f"http 404 at {url[:100]}")
+                if 300 <= r.status_code < 400:
+                    raise RobotsPolicyError(f"catalog redirect refused at {url[:100]}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
                     raise requests.RequestException(f"http {r.status_code} at {url[:100]}")
@@ -292,6 +337,9 @@ class SessionManager:
                 # challenge_retries 而提前放棄，即使刷新已恢復。
                 refresh_failures = 0
                 refresh_successes += 1
+                # 刻意保留的 off-by-one：第 max_refresh_per_request+1 次
+                # 刷新成功後直接放棄，不帶新 cookie 發 follow-up 請求。
+                # 修正會讓規避路徑更有效率，故維持現狀並以註解記錄決策。
                 if refresh_successes > CRAWL["max_refresh_per_request"]:
                     log.error(
                         "too many successful refreshes (%d); giving up on %s",
@@ -326,6 +374,76 @@ class SessionManager:
                 log.warning("request error (attempt %d/%d): %s", attempt, CRAWL["max_retries"], e)
                 time.sleep(2 + random.random() * 2)
         raise last_err or RuntimeError(f"get failed: {url[:100]}")
+
+    def _ensure_catalog_allowed(self, url: str) -> None:
+        """正式 PartSouq catalog 首次請求前取得 robots，無法確認即停止。
+
+        只檢查正式 catalog 主機（partsouq.com）與 /en/catalog 路徑；
+        其他主機/路徑（例如測試用的 partsouq.example）不受此閘影響。
+        origin（https://partsouq.com）、無 userinfo、無歧義路徑
+        （% 編碼、反斜線、./.. 片段）都必須符合才放行。
+        """
+        parts = urlsplit(url)
+        if parts.hostname not in CATALOG_HOSTS:
+            return
+        path_segments = parts.path.split("/")
+        if (
+            "%" in parts.path
+            or "\\" in parts.path
+            or any(segment in {".", ".."} for segment in path_segments)
+        ):
+            raise RobotsPolicyError(f"ambiguous PartSouq path refused: {parts.path[:100]}")
+        is_catalog_path = parts.path == "/en/catalog" or parts.path.startswith("/en/catalog/")
+        if not is_catalog_path:
+            return
+        if (
+            parts.scheme.lower() != "https"
+            or parts.hostname != "partsouq.com"
+            or parts.port not in (None, 443)
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            raise RobotsPolicyError(f"unsupported catalog origin: {parts.scheme}://{parts.netloc}")
+
+        robots_url = urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
+        if self._robots is None:
+            if self.gov is not None:
+                self.gov.acquire()
+            response = self._wire_get(robots_url, headers={"User-Agent": CATALOG_USER_AGENT})
+            text = response.text or ""
+            if response.status_code == 403 or self._is_challenge(response, text):
+                raise ChallengeError(f"http {response.status_code} challenge at {robots_url}")
+            if not 200 <= response.status_code < 300:
+                raise RobotsPolicyError(
+                    f"robots unavailable (http {response.status_code}) at {robots_url}"
+                )
+            final_url = response.url if isinstance(response.url, str) else robots_url
+            final_parts = urlsplit(final_url)
+            if (final_parts.scheme.lower(), final_parts.netloc.lower()) != (
+                parts.scheme.lower(),
+                parts.netloc.lower(),
+            ):
+                raise RobotsPolicyError(f"robots redirected outside catalog origin: {final_url}")
+            if not text.strip() or not self._has_applicable_robots_rules(text):
+                raise RobotsPolicyError(f"robots has no explicit applicable rules at {robots_url}")
+            self._robots = parse_robots(robots_url, text.encode(), "utf-8")
+
+        if not self._robots.allows(CATALOG_USER_AGENT, url):
+            raise RobotsPolicyError(f"robots disallows catalog URL: {url[:100]}")
+
+    @staticmethod
+    def _has_applicable_robots_rules(text: str) -> bool:
+        """確認本 crawler 或萬用 UA group 具有 Allow／Disallow 指令。"""
+        parser = RobotFileParser()
+        parser.parse(text.splitlines())
+        for entry in parser.entries:
+            if entry.applies_to(CATALOG_PRODUCT_TOKEN):
+                return bool(entry.rulelines)
+        for entry in parser.entries:
+            if any(agent.strip() == "*" for agent in entry.useragents):
+                return bool(entry.rulelines)
+        default_entry = getattr(parser, "default_entry", None)
+        return bool(default_entry and default_entry.rulelines)
 
     @staticmethod
     def _retry_after_seconds(r) -> float:

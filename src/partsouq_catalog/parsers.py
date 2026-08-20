@@ -367,7 +367,7 @@ def parse_category_links(
     diagnostics: bool = False,
     expected_ssd: str | None = None,
     expected_vid: str | None = None,
-) -> list[dict] | tuple[list[dict], int]:
+) -> list[dict] | tuple[list[dict], int] | tuple[list[dict], int, int]:
     """解析 vehicle 頁面 → 分類導覽連結。
 
     每個主要分類（Engine、Power Train、Body、Electrical）都是一個
@@ -378,6 +378,7 @@ def parse_category_links(
     soup = soup if soup is not None else _soup(html)
     cats = []
     malformed = 0
+    skipped_context = 0
     candidates = set()
     valid_candidates = set()
     seen = {}
@@ -389,14 +390,17 @@ def parse_category_links(
         # 無 cid 的標籤連結是合法導覽，不是版型異常 —— 在進入 candidate
         # 對帳前先排除，避免整台車被誤判 malformed。注意：站方對每一頁
         # 簽發獨立的 ssd token（分類連結帶自己的 ssd），所以 ssd 不能
-        # 當鑑別條件；品牌與 vid 才是車輛身分。
-        if (
-            _context_mismatch(href, "c", brand, allow_missing=True)
-            or _context_mismatch(href, "vid", expected_vid)
+        # 當鑑別條件；品牌與 vid 才是車輛身分。被排除的連結仍計入
+        # skipped_context 供呼叫端診斷（首次爬取沒有 DB 歷史可對照時，
+        # 靜默排除可能藏住漏抓的分類）。
+        if _context_mismatch(href, "c", brand, allow_missing=True) or _context_mismatch(
+            href, "vid", expected_vid
         ):
+            skipped_context += 1
             continue
         cid = _qs(href, "cid")
         if not cid:
+            skipped_context += 1
             continue
         candidate = _candidate_identity(
             href,
@@ -433,7 +437,7 @@ def parse_category_links(
         )
     malformed += len(candidates - valid_candidates)
     if diagnostics:
-        return cats, malformed
+        return cats, malformed, skipped_context
     return cats
 
 
@@ -446,7 +450,7 @@ def parse_groups(
     expected_ssd: str | None = None,
     expected_vid: str | None = None,
     expected_cid: str | None = None,
-) -> list[dict] | tuple[list[dict], int]:
+) -> list[dict] | tuple[list[dict], int] | tuple[list[dict], int, int]:
     """解析 vehicle 頁面 → 零件組連結（NNNN: NAME → /unit?...）。
 
     零件組位於目前啟用的分類區塊；每個都連結到
@@ -455,6 +459,7 @@ def parse_groups(
     soup = soup if soup is not None else _soup(html)
     groups = []
     malformed = 0
+    skipped_context = 0
     seen = {}
     candidates = set()
     valid_candidates = set()
@@ -468,10 +473,11 @@ def parse_groups(
         # 外來 context（其他車型的交叉導覽連結）是合法導覽，不是版型
         # 異常 —— 在 candidate 對帳前先排除。站方每頁簽發獨立 ssd
         # token，因此 ssd 不能當鑑別條件；品牌與 vid 才是車輛身分。
-        if (
-            _context_mismatch(href, "c", brand, allow_missing=True)
-            or _context_mismatch(href, "vid", expected_vid)
+        # 被排除的連結仍計入 skipped_context 供呼叫端診斷。
+        if _context_mismatch(href, "c", brand, allow_missing=True) or _context_mismatch(
+            href, "vid", expected_vid
         ):
+            skipped_context += 1
             continue
         cid = _qs(href, "cid") or default_cid
         uid = _qs(href, "uid")
@@ -506,10 +512,11 @@ def parse_groups(
             continue
         candidate_specs[candidate] = candidate_spec
         valid_candidates.add(candidate)
-        identity = (cid, m.group(1))
+        # 身分包含 uid：同一 (cid, group_code) 在不同車型變體區會以
+        # 不同 uid 出現，內容可能不同（變體專屬零件）；只保留第一筆
+        # 會漏抓。名稱衝突只在「完全相同身分」時才計 malformed。
+        identity = (cid, m.group(1), uid)
         if identity in seen:
-            # 同一群組可能因車型變體分區以不同 (ssd, uid) token 重複
-            # 出現；只要名稱一致就不是版型異常，不計 malformed。
             if seen[identity] != group_name:
                 malformed += 1
             continue
@@ -528,7 +535,7 @@ def parse_groups(
         )
     malformed += len(candidates - valid_candidates)
     if diagnostics:
-        return groups, malformed
+        return groups, malformed, skipped_context
     return groups
 
 
@@ -673,9 +680,13 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
                 continue
             if not part_name:
                 # 站方會以圖示呈現部分零件（純圖片列，無文字名稱）；只要
-                # 料號、code 齊全且其餘欄位皆為空，就是合法的純圖片零件，
-                # 以空字串名稱收錄。若其他欄位含有文字，才是殘缺/版型異常。
-                if not code or any(c for c in cells if c not in (part_number, code, "")):
+                # 料號、code 齊全且其餘欄位僅含 Quantity/Range/Note 等
+                # 合法欄位，就是合法的純圖片零件，以空字串名稱收錄。
+                # 若其他欄位含有文字，才是殘缺/版型異常。
+                allowed_cells = {part_number, code, quantity, range_str, ""}
+                for index in note_indexes:
+                    allowed_cells.add(cells[index])
+                if not code or any(c for c in cells if c not in allowed_cells):
                     malformed += 1
                     continue
                 part_name = ""

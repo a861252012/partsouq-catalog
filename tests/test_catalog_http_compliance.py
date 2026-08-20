@@ -15,9 +15,11 @@ import pytest
 
 from partsouq_catalog.config import CLOAK
 from partsouq_catalog.http_client import (
+    CATALOG_USER_AGENT,
     CHALLENGE_MARKERS,
     ChallengeError,
     NotFoundError,
+    RobotsPolicyError,
     SessionManager,
     _cf_value,
 )
@@ -104,9 +106,7 @@ def test_challenge_forces_refresh_then_retries(monkeypatch: pytest.MonkeyPatch) 
         "partsouq_catalog.http_client.force_refresh_session",
         lambda rejected_version: refreshed,
     )
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda _seconds: None
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
     assert manager.get("https://partsouq.example/catalog") == "catalog"
     # 被拒的 cf_clearance 版本必須傳給 force_refresh_session（SOL P2）
@@ -119,12 +119,8 @@ def test_challenge_with_failed_refresh_retries_then_gives_up(
 ) -> None:
     manager = SessionManager(cookies=cookies())
     manager.session.get = Mock(return_value=CHALLENGE_RESPONSE)
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.force_refresh_session", lambda _v: None
-    )
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda _seconds: None
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.force_refresh_session", lambda _v: None)
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
     with pytest.raises(ChallengeError, match="challenge"):
         manager.get("https://partsouq.example/catalog")
@@ -142,9 +138,7 @@ def test_challenge_after_too_many_successful_refreshes_gives_up(
         "partsouq_catalog.http_client.force_refresh_session",
         lambda _v: cookies(cf="fresh-v1"),
     )
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda _seconds: None
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
     with pytest.raises(ChallengeError):
         manager.get("https://partsouq.example/catalog")
@@ -175,9 +169,7 @@ def test_429_respects_retry_after_and_cap(monkeypatch: pytest.MonkeyPatch) -> No
         ]
     )
     slept: list[float] = []
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda s: slept.append(float(s))
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda s: slept.append(float(s)))
 
     assert manager.get("https://partsouq.example/catalog") == "catalog"
     assert manager.session.get.call_count == 2
@@ -199,9 +191,7 @@ def test_429_http_date_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
         ]
     )
     slept: list[float] = []
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda s: slept.append(float(s))
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda s: slept.append(float(s)))
 
     assert manager.get("https://partsouq.example/catalog") == "catalog"
     # 過去的日期 → 低於 15 秒下限 → 以 15 秒重試（F4 修復：不會拋錯）
@@ -211,9 +201,7 @@ def test_429_http_date_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_500_is_retried_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = SessionManager(cookies=cookies(), no_browser=True)
     manager.session.get = Mock(return_value=response(500, "boom", "https://partsouq.example/x"))
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda _seconds: None
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
     with pytest.raises(Exception, match="http 500"):
         manager.get("https://partsouq.example/x")
@@ -228,9 +216,7 @@ def test_connection_error_resets_pool_and_retries(monkeypatch: pytest.MonkeyPatc
     manager.session.get = Mock(
         side_effect=[requests.exceptions.ConnectionError("CLOSE_WAIT"), OK_RESPONSE]
     )
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.time.sleep", lambda _seconds: None
-    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
     assert manager.get("https://partsouq.example/catalog") == "catalog"
     assert manager.session.get.call_count == 2
@@ -277,3 +263,234 @@ def test_ensure_fresh_skipped_in_no_browser_mode(monkeypatch: pytest.MonkeyPatch
 
     manager.ensure_fresh()
     assert fresh.call_count == 0
+
+
+def test_transport_ignores_environment_proxy() -> None:
+    manager = SessionManager()
+
+    assert manager.session.trust_env is False
+    assert manager.session.proxies == {}
+
+
+def test_robots_fetch_uses_identifiable_crawler_user_agent() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        side_effect=[
+            response(200, "User-agent: *\nDisallow:\n", "https://partsouq.com/robots.txt"),
+            response(200, "catalog", "https://partsouq.com/en/catalog/genuine"),
+        ]
+    )
+
+    assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
+    robots_call = manager.session.get.call_args_list[0]
+    assert robots_call.kwargs["headers"] == {"User-Agent": CATALOG_USER_AGENT}
+    assert "Mozilla" not in CATALOG_USER_AGENT
+    assert "github.com/a861252012" in CATALOG_USER_AGENT
+
+
+def test_catalog_fetches_robots_before_first_allowed_request() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        side_effect=[
+            response(
+                200,
+                "User-agent: *\nDisallow: /private\n",
+                "https://partsouq.com/robots.txt",
+            ),
+            response(200, "catalog", "https://partsouq.com/en/catalog/genuine"),
+        ]
+    )
+
+    assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
+    assert [call.args[0] for call in manager.session.get.call_args_list] == [
+        "https://partsouq.com/robots.txt",
+        "https://partsouq.com/en/catalog/genuine",
+    ]
+    assert all(
+        call.kwargs["allow_redirects"] is False for call in manager.session.get.call_args_list
+    )
+
+
+def test_catalog_reuses_robots_but_checks_each_url() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        side_effect=[
+            response(200, "User-agent: *\nDisallow:\n", "https://partsouq.com/robots.txt"),
+            response(200, "one", "https://partsouq.com/en/catalog/genuine"),
+            response(200, "two", "https://partsouq.com/en/catalog/genuine/locate"),
+        ]
+    )
+
+    assert manager.get("https://partsouq.com/en/catalog/genuine") == "one"
+    assert manager.get("https://partsouq.com/en/catalog/genuine/locate") == "two"
+    assert manager.session.get.call_count == 3
+
+
+def test_disallowed_catalog_url_is_never_requested() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        return_value=response(
+            200,
+            "User-agent: *\nDisallow: /en/catalog/\n",
+            "https://partsouq.com/robots.txt",
+        )
+    )
+
+    with pytest.raises(RobotsPolicyError, match="disallows"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 1
+
+
+def test_named_crawler_rule_takes_precedence_over_wildcard() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        return_value=response(
+            200,
+            """User-agent: partsouq-catalog-crawler
+Disallow: /en/catalog/
+
+User-agent: *
+Disallow:
+""",
+            "https://partsouq.com/robots.txt",
+        )
+    )
+
+    with pytest.raises(RobotsPolicyError, match="disallows"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "robots_text",
+    [
+        "User-agent: unrelated-bot\nDisallow: /\n",
+        "User-agent: partsouq-catalog-crawler\nCrawl-delay: 10\n",
+        "User-agent: *\nDisallow /en/catalog/\n",
+        "User-agent: partsouq-catalog-crawler\nDisallow: /en/catalog/$bad\n",
+    ],
+)
+def test_robots_without_explicit_applicable_access_rule_fails_closed(
+    robots_text: str,
+) -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        return_value=response(200, robots_text, "https://partsouq.com/robots.txt")
+    )
+
+    with pytest.raises(RobotsPolicyError, match="no explicit applicable rules"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("robots_response", "error"),
+    [
+        (
+            response(503, "unavailable", "https://partsouq.com/robots.txt"),
+            RobotsPolicyError,
+        ),
+        (response(200, "", "https://partsouq.com/robots.txt"), RobotsPolicyError),
+        (
+            response(
+                403,
+                "Just a moment...",
+                "https://partsouq.com/robots.txt",
+            ),
+            ChallengeError,
+        ),
+    ],
+)
+def test_unusable_robots_fails_closed_without_catalog_request(
+    robots_response: Mock,
+    error: type[Exception],
+) -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(return_value=robots_response)
+
+    with pytest.raises(error):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 1
+
+
+def test_robots_redirect_to_another_origin_fails_closed() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        return_value=response(
+            200,
+            "User-agent: *\nDisallow:\n",
+            "https://example.com/robots.txt",
+        )
+    )
+
+    with pytest.raises(RobotsPolicyError, match="outside catalog origin"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 1
+
+
+def test_robots_redirect_is_not_followed() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(return_value=response(302, "", "https://partsouq.com/robots.txt"))
+
+    with pytest.raises(RobotsPolicyError, match="robots unavailable"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_args.kwargs["allow_redirects"] is False
+
+
+def test_catalog_redirect_is_not_followed() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        side_effect=[
+            response(200, "User-agent: *\nDisallow:\n", "https://partsouq.com/robots.txt"),
+            response(302, "", "https://partsouq.com/en/catalog/genuine"),
+        ]
+    )
+
+    with pytest.raises(RobotsPolicyError, match="catalog redirect refused"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 2
+    assert manager.session.get.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://partsouq.com/en/catalog/genuine",
+        "https://www.partsouq.com/en/catalog/genuine",
+        "https://partsouq.com:8443/en/catalog/genuine",
+    ],
+)
+def test_non_formal_catalog_origin_fails_closed_without_request(url: str) -> None:
+    manager = SessionManager()
+    manager.session.get = Mock()
+
+    with pytest.raises(RobotsPolicyError, match="unsupported catalog origin"):
+        manager.get(url)
+
+    manager.session.get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://partsouq.com/%65n/catalog/genuine",
+        "https://partsouq.com/en/%63atalog/genuine",
+        "https://partsouq.com/foo/../en/catalog/genuine",
+        "https://partsouq.com/en\\catalog/genuine",
+    ],
+)
+def test_ambiguous_partsouq_path_fails_closed_without_request(url: str) -> None:
+    manager = SessionManager()
+    manager.session.get = Mock()
+
+    with pytest.raises(RobotsPolicyError, match="ambiguous PartSouq path"):
+        manager.get(url)
+
+    manager.session.get.assert_not_called()

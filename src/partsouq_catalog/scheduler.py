@@ -23,6 +23,10 @@ OUTPUT_CHUNK_CHARS = 8_192
 CHILD_TERMINATE_GRACE_SECONDS = 5
 INTERRUPTED_EXIT_CODE = 125
 LOCK_BUSY_EXIT_CODE = 75
+# 中斷回收的「最小年齡」：只有 started_at 早於此值的 running 排程才會
+# 被自動標 failed/interrupted —— 剛在另一台主機啟動、還在正常執行的
+# run 不會被誤殺（跨主機共享 MySQL 時本機 flock 擋不到）。
+RECOVERY_MIN_AGE_SECONDS = 900
 NHTSA_BULK_COMPLETED = "stage=bulk_completed"
 NHTSA_API_COMPLETED = "stage=api_completed"
 DAEMON_JOBS = ("catalog", "nhtsa", "pending")
@@ -345,37 +349,33 @@ def _recover_interrupted_job_runs(job: str) -> bool:
         with connection.cursor() as cursor:
             recovered_complete = False
             if family == "catalog":
-                try:
-                    bounded_target = int(os.getenv("PSQ_BOUNDED_PARTS", "0"))
-                except ValueError:
-                    bounded_target = 0
-                if bounded_target > 0:
-                    cursor.execute(
-                        "UPDATE scheduled_job_runs AS jobs "
-                        "JOIN crawl_runs AS runs ON runs.scheduled_job_run_id = jobs.id "
-                        "JOIN (SELECT crawl_run_id, COUNT(*) AS snapshot_rows "
-                        "FROM bounded_parts GROUP BY crawl_run_id) AS snapshots "
-                        "ON snapshots.crawl_run_id = runs.id "
-                        "SET jobs.status = 'completed', jobs.finished_at = runs.finished_at, "
-                        "jobs.exit_code = 0, jobs.output_text = "
-                        "RIGHT(CONCAT(COALESCE(jobs.output_text, ''), %s), %s) "
-                        "WHERE jobs.status = 'running' AND jobs.job_name = 'catalog' "
-                        "AND jobs.trigger_mode = 'daemon' "
-                        "AND runs.dataset_kind = 'bounded' "
-                        "AND runs.status = 'bounded_success' "
-                        "AND runs.finished_at IS NOT NULL "
-                        "AND runs.target_parts = %s AND runs.parts_ok = %s "
-                        "AND snapshots.snapshot_rows = %s",
-                        (
-                            "\nbounded publish committed before scheduler interruption; "
-                            "completion reconciled automatically\n",
-                            MAX_OUTPUT_CHARS,
-                            bounded_target,
-                            bounded_target,
-                            bounded_target,
-                        ),
-                    )
-                    recovered_complete = cursor.rowcount > 0
+                # 對帳不依賴排程器自身的 PSQ_BOUNDED_PARTS 環境變數：
+                # daemon 重啟時若環境變數遺失，仍能認出「已發布的
+                # bounded run」（target/parts_ok/snapshot 三者一致）。
+                cursor.execute(
+                    "UPDATE scheduled_job_runs AS jobs "
+                    "JOIN crawl_runs AS runs ON runs.scheduled_job_run_id = jobs.id "
+                    "JOIN (SELECT crawl_run_id, COUNT(*) AS snapshot_rows "
+                    "FROM bounded_parts GROUP BY crawl_run_id) AS snapshots "
+                    "ON snapshots.crawl_run_id = runs.id "
+                    "SET jobs.status = 'completed', jobs.finished_at = runs.finished_at, "
+                    "jobs.exit_code = 0, jobs.output_text = "
+                    "RIGHT(CONCAT(COALESCE(jobs.output_text, ''), %s), %s) "
+                    "WHERE jobs.status = 'running' AND jobs.job_name = 'catalog' "
+                    "AND jobs.trigger_mode = 'daemon' "
+                    "AND runs.dataset_kind = 'bounded' "
+                    "AND runs.status = 'bounded_success' "
+                    "AND runs.finished_at IS NOT NULL "
+                    "AND runs.target_parts > 0 "
+                    "AND runs.parts_ok = runs.target_parts "
+                    "AND snapshots.snapshot_rows = runs.target_parts",
+                    (
+                        "\nbounded publish committed before scheduler interruption; "
+                        "completion reconciled automatically\n",
+                        MAX_OUTPUT_CHARS,
+                    ),
+                )
+                recovered_complete = cursor.rowcount > 0
 
             if family == "nhtsa":
                 cursor.execute(
@@ -415,12 +415,14 @@ def _recover_interrupted_job_runs(job: str) -> bool:
                     "UPDATE scheduled_job_runs SET status = 'failed', "
                     "finished_at = UTC_TIMESTAMP(), exit_code = %s, "
                     "output_text = RIGHT(CONCAT(COALESCE(output_text, ''), %s), %s) "
-                    "WHERE status = 'running' AND job_name = %s",
+                    "WHERE status = 'running' AND job_name = %s "
+                    "AND started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
                     (
                         INTERRUPTED_EXIT_CODE,
                         "\nprevious scheduler interrupted; recovered automatically\n",
                         MAX_OUTPUT_CHARS,
                         family,
+                        RECOVERY_MIN_AGE_SECONDS,
                     ),
                 )
             if family == "catalog":
@@ -430,7 +432,9 @@ def _recover_interrupted_job_runs(job: str) -> bool:
                     "SET runs.status = 'interrupted', "
                     "runs.finished_at = COALESCE(runs.finished_at, UTC_TIMESTAMP()) "
                     "WHERE runs.status = 'running' AND jobs.status = 'failed' "
-                    "AND jobs.job_name = 'catalog'"
+                    "AND jobs.job_name = 'catalog' "
+                    "AND jobs.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                    (RECOVERY_MIN_AGE_SECONDS,),
                 )
         connection.commit()
         return recovered_complete
@@ -556,6 +560,7 @@ def run_daemon(
     _JOB_CONTEXT.trigger_mode = "daemon"
     failures = 0
     schedule_read_failures = 0
+    completion_check_failures = 0
     wait_seconds = 0.0
     needs_schedule_check = job != "pending"
     announce_completion = False
@@ -590,8 +595,16 @@ def run_daemon(
                     needs_schedule_check = True
                     continue
                 if announce_completion:
-                    failures = 1
-                    wait_seconds = float(min(retry_max_seconds, retry_base_seconds))
+                    # 子程序回報成功但 DB 驗證未過（例如環境變數不一致）：
+                    # 用獨立的指數退避重查，而不是每 retry_base 就重發一次
+                    # 新的完整爬取。
+                    completion_check_failures += 1
+                    wait_seconds = float(
+                        min(
+                            retry_max_seconds,
+                            retry_base_seconds * (2 ** min(completion_check_failures - 1, 20)),
+                        )
+                    )
                     announce_completion = False
                     needs_schedule_check = True
                     print(
@@ -607,6 +620,7 @@ def run_daemon(
                 break
             if return_code == 0:
                 failures = 0
+                completion_check_failures = 0
                 if job == "pending":
                     wait_seconds = float(interval_seconds)
                     print(f"{job} 排程完成；{int(wait_seconds)} 秒後再執行", flush=True)
