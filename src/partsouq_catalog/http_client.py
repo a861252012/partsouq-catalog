@@ -42,7 +42,7 @@ from .cloak import (
     get_session,
     session_backoff_remaining,
 )
-from .config import CRAWL
+from .config import CLOAK, CRAWL
 
 log = logging.getLogger("http")
 
@@ -120,11 +120,7 @@ class SessionManager:
         self.gov = gov
         self.session.headers.update(
             {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/145.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": CLOAK["user_agent"],
                 "Accept": (
                     "text/html,application/xhtml+xml,application/xml;q=0.9,"
                     "image/avif,image/webp,*/*;q=0.8"

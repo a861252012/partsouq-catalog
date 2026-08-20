@@ -23,6 +23,10 @@ OUTPUT_CHUNK_CHARS = 8_192
 CHILD_TERMINATE_GRACE_SECONDS = 5
 INTERRUPTED_EXIT_CODE = 125
 LOCK_BUSY_EXIT_CODE = 75
+# scheduler 自身的 DB 紀錄失敗（_record_start/_record_finish/_recover）：
+# 與子程序的站台失敗（exit=1）區分，daemon 的 MAX_CONSECUTIVE_FAILURES
+# 只該偵測站台封鎖，DB 閃失會自癒、不該把排程靜默掉。
+SCHEDULER_DB_ERROR_EXIT_CODE = 2
 # 中斷回收的「最小年齡」：只有 started_at 早於此值的 running 排程才會
 # 被自動標 failed/interrupted —— 剛在另一台主機啟動、還在正常執行的
 # run 不會被誤殺（跨主機共享 MySQL 時本機 flock 擋不到）。
@@ -254,7 +258,7 @@ def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,
         run_id = _record_start(job_name)
     except pymysql.MySQLError as error:
         print(f"無法記錄 {job_name} 排程：{error}", file=sys.stderr)
-        return 1
+        return SCHEDULER_DB_ERROR_EXIT_CODE
 
     child_environment = os.environ.copy()
     child_environment["SCHEDULED_JOB_RUN_ID"] = str(run_id)
@@ -320,9 +324,8 @@ def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,
         _record_finish(run_id, return_code, output, success_codes)
     except pymysql.MySQLError as error:
         print(f"無法完成 {job_name} 的排程紀錄：{error}", file=sys.stderr)
-        return 1
-    # 成功碼（含 catalog 的 sample 預期停止）視為完成，回傳 0 給呼叫端，
-    # 避免 daemon 把「已完成的樣本跑」當失敗而無限重試。
+        return SCHEDULER_DB_ERROR_EXIT_CODE
+    # 只有呼叫端明確列出的成功碼會轉成 0；正式 catalog 只接受 0。
     return 0 if return_code in success_codes else return_code
 
 
@@ -461,7 +464,7 @@ def dispatch_locked(job: str, scope: str) -> int:
             recovered_complete = _recover_interrupted_job_runs(job)
         except pymysql.MySQLError as error:
             print(f"無法回收 {job} 的中斷排程：{error}", file=sys.stderr)
-            return 1
+            return SCHEDULER_DB_ERROR_EXIT_CODE
         if (
             recovered_complete
             and job in ("catalog", "nhtsa")
@@ -530,9 +533,8 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
                 or int(row.get("snapshot_rows") or 0) != bounded_target
             ):
                 return 0.0
-        elif row.get("crawl_status") not in ("success", "bounded_success", "sample"):
-            # 無 bounded 設定時，已完成的全站跑或樣本跑都算完成，
-            # 依 interval 等待下一次排程，避免立即重跑。
+        elif row.get("crawl_status") not in ("success", "bounded_success"):
+            # Sample 是隔離測試資料，不能延後正式 catalog 排程。
             return 0.0
     age_seconds = row["age_seconds"]
     return max(0.0, interval_seconds - max(0, int(age_seconds)))
@@ -563,6 +565,7 @@ def run_daemon(
     previous_trigger_mode = getattr(_JOB_CONTEXT, "trigger_mode", None)
     _JOB_CONTEXT.trigger_mode = "daemon"
     failures = 0
+    non_site_failures = 0
     schedule_read_failures = 0
     completion_check_failures = 0
     wait_seconds = 0.0
@@ -619,11 +622,14 @@ def run_daemon(
                     )
                     continue
 
+            if stop_event.is_set():
+                break
             return_code = dispatch_locked(job, scope)
             if stop_event.is_set():
                 break
             if return_code == 0:
                 failures = 0
+                non_site_failures = 0
                 completion_check_failures = 0
                 if job == "pending":
                     wait_seconds = float(interval_seconds)
@@ -634,12 +640,53 @@ def run_daemon(
                     announce_completion = True
                 continue
 
+            if job == "catalog" and return_code == 3:
+                # Sample 代表排程環境誤設 PSQ_LIMIT_PARTS；記為失敗，
+                # 但不連續重跑同一批測試資料。
+                failures += 1
+                wait_seconds = float(interval_seconds)
+                needs_schedule_check = True
+                print(
+                    "catalog 排程收到 sample exit=3；請修正 PSQ_LIMIT_PARTS，"
+                    f"{int(wait_seconds)} 秒後重新檢查",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            if return_code in (
+                LOCK_BUSY_EXIT_CODE,
+                SCHEDULER_DB_ERROR_EXIT_CODE,
+                127,
+            ):
+                # 非站台失敗（鎖衝突／DB 紀錄閃失／子程序無法啟動）：
+                # 指數退避但不計入 MAX_CONSECUTIVE_FAILURES —— 上限是
+                # 為了偵測站台封鎖；這些原因會自癒，計入只會讓
+                # catalog 在無辜的狀況下靜默 30 天。
+                non_site_failures += 1
+                wait_seconds = float(
+                    min(
+                        retry_max_seconds,
+                        retry_base_seconds * (2 ** min(non_site_failures - 1, 20)),
+                    )
+                )
+                if job != "pending":
+                    needs_schedule_check = True
+                print(
+                    f"{job} 排程非站台失敗（exit={return_code}）；{int(wait_seconds)} 秒後自動重試",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
             failures += 1
             if failures >= MAX_CONSECUTIVE_FAILURES:
                 # 連續失敗 = 封鎖/驗證無法通過的徵兆：停止指數重試，
                 # 等下一次 interval 再檢查，而不是每小時重啟瀏覽器。
                 wait_seconds = float(interval_seconds)
-                needs_schedule_check = False
+                # 長時間等待後必須重新查 DB；等待期間可能已由另一個
+                # daemon 完成，不能醒來就直接重跑整個 catalog/NHTSA。
+                needs_schedule_check = job != "pending"
                 print(
                     f"{job} 排程連續失敗 {failures} 次；停止重試，{int(wait_seconds)} 秒後再執行",
                     file=sys.stderr,
@@ -834,9 +881,6 @@ def dispatch(job: str, scope: str) -> int:
         return _run(
             "catalog",
             [sys.executable, "-m", "partsouq_catalog.run_crawl", "--workers", workers],
-            # run_crawl 對「達上限的樣本跑」回傳 exit 3（預期停止，資料已
-            # 寫入）；排程情境下視為完成，不應無窮重試。
-            success_codes=(0, 3),
         )
 
     if job == "nhtsa-bulk":

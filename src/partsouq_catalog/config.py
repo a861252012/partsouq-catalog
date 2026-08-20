@@ -6,6 +6,7 @@
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 # 專案根目錄。安裝成套件後仍可用 PARTSOUQ_HOME 指向實際資料目錄。
@@ -130,7 +131,22 @@ def load_cookies():
 
 
 def save_cookies(cookies):
-    """把 cookie 寫入磁碟（限所有者讀寫，保護敏感性資料）。"""
+    """以 owner-only 暫存檔原子更新 cookie，避免半份 JSON 或權限窗口。"""
     COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_FILE.write_text(json.dumps(cookies, indent=1))
-    COOKIE_FILE.chmod(0o600)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=COOKIE_FILE.parent,
+            prefix=f".{COOKIE_FILE.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            os.fchmod(temporary.fileno(), 0o600)
+            json.dump(cookies, temporary, indent=1)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, COOKIE_FILE)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)

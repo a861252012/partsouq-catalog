@@ -15,6 +15,7 @@ from unittest import mock
 import pytest
 
 import partsouq_catalog.cloak as cloak
+import partsouq_catalog.config as config
 
 COOKIES = [
     {"name": "cf_clearance", "value": "v1", "domain": "partsouq.com", "path": "/"},
@@ -38,8 +39,10 @@ def _reset_session_state(monkeypatch, tmp_path):
             "version": None,
         }
     )
+    cloak._rejected_versions.clear()
     monkeypatch.setitem(cloak.CLOAK, "lock_file", tmp_path / "cloak.lock")
     yield
+    cloak._rejected_versions.clear()
     cloak._session_state.update(
         {
             "cookies": None,
@@ -236,6 +239,64 @@ def test_get_session_seeds_from_fresh_persisted_cookies(monkeypatch, tmp_path) -
     assert cloak._session_state["version"] == "v1"
 
 
+def test_persisted_cookie_keeps_its_original_age(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES))
+    wall_now = 10_000.0
+    monotonic_now = 2_000.0
+    age = cloak.COOKIE_TTL - 10
+    os.utime(cookie_file, (wall_now - age, wall_now - age))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    monkeypatch.setattr(cloak.time, "time", lambda: wall_now)
+    monkeypatch.setattr(cloak.time, "monotonic", lambda: monotonic_now)
+
+    cloak._seed_from_disk()
+
+    assert cloak._session_state["ok_ts"] == monotonic_now - age
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        [{"name": "PHPSESSID", "value": "p1"}],
+        {"name": "cf_clearance", "value": "v1"},
+        [{"name": "cf_clearance"}],
+    ),
+)
+def test_get_session_rejects_invalid_persisted_cookie_shape(monkeypatch, tmp_path, payload) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(payload))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock(return_value=None)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() is None
+    impl.assert_called_once()
+
+
+def test_get_session_rejects_future_dated_cookie_file(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES))
+    os.utime(cookie_file, (time.time() + 60, time.time() + 60))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock(return_value=None)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() is None
+    impl.assert_called_once()
+
+
+def test_save_cookies_is_owner_only_and_leaves_no_temporary_file(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    monkeypatch.setattr(config, "COOKIE_FILE", cookie_file)
+
+    config.save_cookies(COOKIES)
+
+    assert json.loads(cookie_file.read_text()) == COOKIES
+    assert cookie_file.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [cookie_file]
+
+
 def test_get_session_ignores_stale_persisted_cookies(monkeypatch, tmp_path) -> None:
     cookie_file = tmp_path / "cookies.json"
     cookie_file.write_text(json.dumps(COOKIES))
@@ -276,3 +337,43 @@ def test_get_session_does_not_overwrite_in_memory_cookies(monkeypatch, tmp_path)
     assert cloak.get_session() == COOKIES
     impl.assert_not_called()
     assert cloak._session_state["version"] == "v1"
+
+
+def test_force_refresh_rejected_version_is_not_reseeded_from_disk(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES))
+    os.utime(cookie_file, (time.time() - 10, time.time() - 10))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    impl = mock.Mock(return_value=None)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.get_session() == COOKIES
+    impl.assert_not_called()
+
+    assert cloak.force_refresh_session("v1") is None
+    assert cloak._session_state["cookies"] is None
+
+    # 退避期結束後：同一份被拒的 v1 不得再從磁碟 seed 回來，
+    # 必須真的走一次瀏覽器刷新。
+    cloak._session_state["retry_after"] = 0.0
+    assert cloak.get_session() is None
+    assert cloak._session_state["cookies"] is None
+    assert impl.call_count == 2
+
+    # 換成全新版本的檔案（v2）→ 正常沿用，不再啟動瀏覽器。
+    cookie_file.write_text(json.dumps(NEW_COOKIES))
+    os.utime(cookie_file, (time.time() - 5, time.time() - 5))
+    assert cloak.get_session() == NEW_COOKIES
+    assert cloak._session_state["version"] == "v2"
+    assert impl.call_count == 2
+
+
+def test_rejected_versions_are_forgotten_after_successful_refresh(monkeypatch) -> None:
+    now = cloak.time.monotonic()
+    cloak._session_state.update({"cookies": COOKIES, "ok_ts": now - 10, "version": "v1"})
+    impl = mock.Mock(return_value=NEW_COOKIES)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.force_refresh_session("v1") == NEW_COOKIES
+    assert cloak._session_state["version"] == "v2"
+    assert cloak._rejected_versions == set()

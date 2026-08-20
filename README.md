@@ -75,6 +75,7 @@ MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、`
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/007_unified_vin_mapping.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/008_admin_source_ids.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/009_bounded_production_dataset.sql
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/010_group_uid_identity.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
 ```
 
@@ -100,6 +101,11 @@ DB 內部 ID；`vehicle_vid`、`category_cid`、`group_uid` 是 PartSouq URL
 ```bash
 docker compose up -d --build scheduler nhtsa-scheduler queue-scheduler
 ```
+
+目前 Compose image 不包含 CloakBrowser runtime、Chromium 與顯示環境，也不能
+直接使用 macOS host 的 `PSQ_CLOAK_PYTHON` 路徑。因此上述
+catalog scheduler 在尚未配置站方授權 transport/runtime 時會 fail-closed；
+host 上的手動 sample 不是 server-like Compose 部署成功的證據。
 
 預設排程如下；都可用同名環境變數調整，不需要人工逐次觸發：
 

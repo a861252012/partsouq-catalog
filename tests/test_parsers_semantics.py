@@ -1,11 +1,10 @@
-"""parser 語意測試：外來 context 排除、變體 group dedup、純圖片列。
+"""parser 語意測試：外來 context 排除、變體 group dedup、必填名稱。
 
 覆蓋 2954268 後續 review 發現的三項語意變更：
 - context mismatch 連結不計 malformed，但必須計入 diagnostics 的
   skipped 計數（呼叫端可據此診斷首次爬取漏抓）
 - 同一 (cid, group_code) 以不同 uid 出現時兩筆都要保留（變體專屬零件）
-- 純圖片零件列（空名稱）允許合法欄位（Quantity/Range/Note），
-  其他欄位有文字才計 malformed
+- 純圖片零件列若沒有可驗證的文字名稱，一律計 malformed
 """
 
 from partsouq_catalog.parsers import parse_category_links, parse_groups, parse_parts
@@ -114,7 +113,7 @@ def test_groups_count_foreign_context_in_skipped_not_malformed() -> None:
     assert skipped == 1
 
 
-def test_parts_accepts_image_row_with_quantity_and_note() -> None:
+def test_parts_rejects_image_row_without_product_name() -> None:
     html = _unit_table(
         ["Number", "Name", "Code", "Quantity", "Note"],
         ["IMG10001", "", "B10", "02", "CHECK FIT"],
@@ -122,22 +121,11 @@ def test_parts_accepts_image_row_with_quantity_and_note() -> None:
 
     parts, malformed = parse_parts(html)
 
-    assert malformed == 0
-    assert parts == [
-        {
-            "part_number": "IMG10001",
-            "name": "",
-            "code": "B10",
-            "note": "CHECK FIT",
-            "quantity": "02",
-            "range_str": "",
-            "part_from": None,
-            "part_to": None,
-        }
-    ]
+    assert malformed == 1
+    assert parts == []
 
 
-def test_parts_image_row_with_range_column_is_accepted() -> None:
+def test_parts_image_row_with_range_but_no_name_is_malformed() -> None:
     html = _unit_table(
         ["Number", "Name", "Code", "Quantity", "Range"],
         ["IMG20002", "", "C20", "01", "01.2018 - 12.2019"],
@@ -145,10 +133,8 @@ def test_parts_image_row_with_range_column_is_accepted() -> None:
 
     parts, malformed = parse_parts(html)
 
-    assert malformed == 0
-    assert parts[0]["name"] == ""
-    assert parts[0]["part_from"] == "2018-01"
-    assert parts[0]["part_to"] == "2019-12"
+    assert malformed == 1
+    assert parts == []
 
 
 def test_parts_image_row_with_unexpected_text_is_malformed() -> None:

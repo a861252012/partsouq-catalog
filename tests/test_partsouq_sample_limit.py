@@ -90,7 +90,7 @@ def test_exactly_1000_rows_complete_group(sample_crawler):
         status="done",
         row_count=1000,
     )
-    assert fetched == {("1", "1101"): 1000}
+    assert fetched == {("1", "1101", "10001"): 1000}
 
 
 def test_1001_rows_are_capped_without_completing_group(sample_crawler):

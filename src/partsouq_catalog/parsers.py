@@ -560,7 +560,7 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
     避免巢狀 table 的儲存格竄入造成欄位錯位。
 
     回傳 (parts, malformed)：
-    - parts：結構完整且至少能辨認 Number、Name、Code、Quantity 的
+    - parts：結構完整、Number 與 Name 非空，且能辨認 Code、Quantity 的
       零件列。Unified／Filter Note／Specification 只合併進 note；只有
       明確名為 Range／Prod period 的欄位才會寫入日期範圍。
     - malformed：異常 candidate 列數 —— 表頭缺必要欄位、資料欄數與
@@ -679,17 +679,10 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
                 malformed += 1
                 continue
             if not part_name:
-                # 站方會以圖示呈現部分零件（純圖片列，無文字名稱）；只要
-                # 料號、code 齊全且其餘欄位僅含 Quantity/Range/Note 等
-                # 合法欄位，就是合法的純圖片零件，以空字串名稱收錄。
-                # 若其他欄位含有文字，才是殘缺/版型異常。
-                allowed_cells = {part_number, code, quantity, range_str, ""}
-                for index in note_indexes:
-                    allowed_cells.add(cells[index])
-                if not code or any(c for c in cells if c not in allowed_cells):
-                    malformed += 1
-                    continue
-                part_name = ""
+                # 需求的發布資料必須能把料號對到產品名稱。圖片列若沒有
+                # 可驗證的文字名稱，就不能猜名稱或當成完整零件列。
+                malformed += 1
+                continue
             part = {
                 "part_number": part_number,
                 "name": part_name,

@@ -280,6 +280,27 @@ def test_catalog_is_not_delayed_without_exact_bounded_success(monkeypatch) -> No
     assert "jobs.trigger_mode = 'daemon'" in cursor.execute.call_args.args[0]
 
 
+def test_catalog_sample_never_satisfies_daemon_cadence(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = {
+        "job_name": "catalog",
+        "status": "completed",
+        "age_seconds": 10,
+        "dataset_kind": "sample",
+        "crawl_status": "sample",
+        "target_parts": 60,
+        "parts_ok": 60,
+        "snapshot_rows": 0,
+    }
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler.pymysql, "connect", lambda **_kwargs: connection)
+    monkeypatch.delenv("PSQ_BOUNDED_PARTS", raising=False)
+
+    assert scheduler._seconds_until_next_run("catalog", 100) == 0
+
+
 def test_catalog_crash_after_publish_is_reconciled_without_recrawl(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
@@ -435,7 +456,7 @@ def test_daemon_retries_with_bounded_exponential_backoff(monkeypatch) -> None:
         lambda _job, _stop_event: daemon_lock,
     )
     monkeypatch.setattr(scheduler, "_seconds_until_next_run", lambda _job, _interval: 0.0)
-    results = iter((3, 1, 0))
+    results = iter((1, 1, 0))
     trigger_modes: list[str] = []
 
     def dispatch(_job: str, _scope: str) -> int:
@@ -472,7 +493,14 @@ def test_daemon_stops_retrying_after_max_consecutive_failures(monkeypatch) -> No
         "_wait_for_daemon_lock",
         lambda _job, _stop_event: daemon_lock,
     )
-    monkeypatch.setattr(scheduler, "_seconds_until_next_run", lambda _job, _interval: 0.0)
+    schedule_checks = 0
+
+    def due_now(_job: str, _interval: int) -> float:
+        nonlocal schedule_checks
+        schedule_checks += 1
+        return 0.0
+
+    monkeypatch.setattr(scheduler, "_seconds_until_next_run", due_now)
     calls = 0
 
     def dispatch(_job: str, _scope: str) -> int:
@@ -499,6 +527,86 @@ def test_daemon_stops_retrying_after_max_consecutive_failures(monkeypatch) -> No
     # 達標後直接等整個 interval（60s），不再以退避每輪重發。
     assert calls == scheduler.MAX_CONSECUTIVE_FAILURES + 1
     assert stop_event.waits[-1] == 60.0
+    assert schedule_checks == scheduler.MAX_CONSECUTIVE_FAILURES + 1
+
+
+def test_daemon_non_site_failures_do_not_trip_failure_cap(monkeypatch, capsys) -> None:
+    stop_event = FakeStopEvent()
+    daemon_lock = mock.MagicMock()
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        lambda _job, _stop_event: daemon_lock,
+    )
+    monkeypatch.setattr(scheduler, "_seconds_until_next_run", lambda _job, _interval: 0.0)
+    calls = 0
+
+    def dispatch(_job: str, _scope: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls > 8:
+            stop_event.stopped = True
+        return scheduler.LOCK_BUSY_EXIT_CODE if calls <= 8 else 0
+
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+
+    assert (
+        scheduler.run_daemon(
+            "catalog",
+            "all",
+            60,
+            10,
+            1000,
+            stop_event=stop_event,
+        )
+        == 0
+    )
+    # 8 次鎖衝突（非站台失敗）都不能觸發 MAX_CONSECUTIVE_FAILURES：
+    # 沒有 interval 靜默、沒有「停止重試」訊息。
+    assert calls == 9
+    assert 60.0 not in stop_event.waits
+    assert "排程連續失敗" not in capsys.readouterr().err
+
+
+def test_catalog_sample_exit_waits_without_immediate_retry(monkeypatch) -> None:
+    stop_event = FakeStopEvent()
+    daemon_lock = mock.MagicMock()
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        lambda _job, _stop_event: daemon_lock,
+    )
+    schedule_checks = 0
+
+    def due_now(_job: str, _interval: int) -> float:
+        nonlocal schedule_checks
+        schedule_checks += 1
+        if schedule_checks == 2:
+            stop_event.stopped = True
+        return 0.0
+
+    monkeypatch.setattr(scheduler, "_seconds_until_next_run", due_now)
+    dispatch = mock.MagicMock(return_value=3)
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+
+    assert scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event) == 0
+    assert stop_event.waits == [0.0, 60.0]
+    dispatch.assert_called_once_with("catalog", "all")
+
+
+def test_catalog_sample_exit_is_not_recorded_as_scheduler_success(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def run(job_name: str, command: list[str], success_codes=(0,)) -> int:
+        captured.update(job=job_name, command=command, success_codes=success_codes)
+        return 3
+
+    monkeypatch.setattr(scheduler, "_run", run)
+    monkeypatch.setenv("PSQ_WORKERS", "1")
+
+    assert scheduler.dispatch("catalog", "all") == 3
+    assert captured["job"] == "catalog"
+    assert captured["success_codes"] == (0,)
 
 
 def test_successful_daemon_waits_full_interval_before_next_cycle(monkeypatch) -> None:

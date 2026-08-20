@@ -768,18 +768,19 @@ class Crawler:
         # 若未全部出現在本次解析結果中（頁面縮水、版型變更），視為
         # 解析異常而非合法刪減，拋錯讓 vehicle 不標 done（避免缺漏
         # 被續爬固定）。
-        known_codes = self.vehicles.list_group_codes_for_category(vehicle_id, default_cid)
-        if known_codes:
-            parsed_codes = {
-                g.get("group_code") or ""
+        known_groups = self.vehicles.list_group_identities_for_category(vehicle_id, default_cid)
+        if known_groups:
+            parsed_groups = {
+                (g.get("group_code") or "", g.get("uid") or "")
                 for g in groups
                 if str(g.get("cid") or default_cid) == str(default_cid)
             }
-            missing = known_codes - parsed_codes
+            missing = known_groups - parsed_groups
             if missing:
+                examples = ", ".join(f"{code}/{uid}" for code, uid in sorted(missing)[:5])
                 raise RuntimeError(
                     f"[{brand} vehicle={vehicle_id} cid={default_cid}] {len(missing)} known "
-                    f"group(s) missing from this parse: {', '.join(sorted(missing)[:5])}"
+                    f"group(s) missing from this parse: {examples}"
                 )
         truncated = 0
         limit = CRAWL["limit_groups"]
@@ -838,7 +839,7 @@ class Crawler:
 
         fetched：本車「一次載入」的 receipt map（F5），避免每組查一次
         DB；爬完的組也會同步更新到 map（同車內不重複抓）。map 以
-        (cid, code) 為鍵、值為 row_count；
+        (cid, code, uid) 為鍵、值為 row_count；
         提供 map 時未命中即視為未抓過，不回頭查 DB（SOL P1）。
         prev_rows：本車上一 run 的 row_count map（SOL review P1）——
         本次解析到的零件數相較前次大幅縮水（格式完整但內容縮水）
@@ -861,15 +862,23 @@ class Crawler:
         # （fetched is not None）未命中直接視為未抓過，不再逐組查 DB
         # （一臺車約 200 組 = 200 次往返，SOL 實測 bulk 6 次 + 逐組
         # 334 次就是空 map 被誤當「沒載入」造成的）。
-        # map 鍵是 (cid, code)：DB 的 group 唯一身分是
-        # (category_id, code)，只用 code 會讓不同分類的同 code 組
-        # 互相覆蓋、誤 skip（SOL P2）。
-        map_key = (str(group.get("cid") or ""), group.get("group_code") or "")
+        # map 鍵是 (cid, code, uid)：同分類與同 code 仍可能有多個
+        # 變體 unit，省略 uid 會讓後一個變體被誤判為已完成。
+        map_key = (
+            str(group.get("cid") or ""),
+            group.get("group_code") or "",
+            group.get("uid") or "",
+        )
         if skip_if_fetched:
             already = (
                 map_key in fetched
                 if fetched is not None
-                else self.crawl.is_group_fetched(vehicle_id, group["group_code"], run_key)
+                else self.crawl.is_group_fetched(
+                    vehicle_id,
+                    group["group_code"],
+                    group.get("uid") or "",
+                    run_key,
+                )
             )
             if already:
                 log.debug(

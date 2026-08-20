@@ -28,7 +28,7 @@ def test_catalog_challenge_stops_without_cookie_refresh() -> None:
     assert manager.session.get.call_count == 1
 
 
-def test_catalog_part_without_product_name_is_accepted_as_image_row() -> None:
+def test_catalog_part_without_product_name_is_rejected() -> None:
     html = """
     <table><tr>
       <td><a href="/en/search/all?q=12345">12345</a></td>
@@ -38,13 +38,8 @@ def test_catalog_part_without_product_name_is_accepted_as_image_row() -> None:
 
     parts, malformed = parse_parts(html)
 
-    # 純圖片列（空名稱）在 parser 層合法（站方以圖示呈現部分零件）；
-    # 空名稱不得進入 bounded 配額 —— 該限制由 crawl_group 的 bounded
-    # 品質閘（part_number/name/code 皆非空）執行，不在 parser 層。
-    assert malformed == 0
-    assert parts[0]["name"] == ""
-    assert parts[0]["part_from"] == "2018-01"
-    assert parts[0]["part_to"] == "2019-12"
+    assert malformed == 1
+    assert parts == []
 
 
 def test_nhtsa_uses_shared_database_environment(monkeypatch: pytest.MonkeyPatch) -> None:

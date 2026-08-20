@@ -23,18 +23,12 @@ import signal
 import subprocess
 import threading
 import time
-import urllib.parse
 import urllib.request
 
 from .config import CLOAK, SITE, save_cookies
 
 log = logging.getLogger("cloak")
 
-# CDP HTTP 端點：開新分頁用
-HTTP_GET = "http://{host}/json/new?{url}"
-# 驗證頁檢查間隔與逾時
-TURNSTILE_CHECK_INTERVAL = 3.0
-CHALLENGE_TIMEOUT = 90.0
 CDP_START_TIMEOUT = 60.0
 COOKIE_EXPORT_TIMEOUT = 180.0
 
@@ -57,6 +51,10 @@ _session_state = {
     "failures": 0,  # 連續失敗次數（退避指數成長用）
     "version": None,  # 目前 cookie 的 cf_clearance 值（session 版本訊號，SOL review P2）
 }
+# 被伺服器拒絕過的 cf_clearance 版本：force_refresh_session 清掉記憶體
+# 快取後，_seed_from_disk 不得再把同一份被拒 cookie 從磁碟撈回來
+# （否則 403 迴圈只會重演，等於白清了快取）。
+_rejected_versions: set[str] = set()
 # Cookie 的有效期限：每 25 分鐘主動刷新一次
 COOKIE_TTL = 25 * 60.0
 # 刷新失敗後的退避基礎：連續失敗會指數成長（60s → 120s → 240s ...）
@@ -165,137 +163,6 @@ def _cdp_alive() -> bool:
         return False
 
 
-def _open_tab(url: str) -> bool:
-    """透過 CDP 開新分頁（保留給備援流程使用）。"""
-    try:
-        req = urllib.request.Request(
-            f"{CLOAK['cdp_host']}/json/new?{urllib.parse.quote(url, safe='')}",
-            method="PUT",
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-
-def _send_cdp(method: str, params: dict):
-    """呼叫 CDP 方法（若端點支援 JSON-RPC HTTP 介面）。"""
-    try:
-        with urllib.request.urlopen(
-            f"{CLOAK['cdp_host']}/json/rpc",
-            data=json.dumps({"method": method, "params": params}).encode(),
-            timeout=10,
-        ) as r:
-            return json.loads(r.read())
-    except Exception:
-        return None
-
-
-def _export_cookies_via_agent_browser() -> list | None:
-    """備援一：用 agent-browser CLI 從 CDP 工作階段匯出 cookie。
-
-    （主要流程已改為瀏覽器內直接匯出；此函式僅保留作備援。）
-    """
-    cmd = [
-        "agent-browser",
-        "--cdp",
-        str(CLOAK["cdp_port"]),
-        "--user-agent",
-        CLOAK["user_agent"],
-        "cookies",
-        "get",
-    ]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except FileNotFoundError:
-        log.error("agent-browser not found on PATH")
-        return None
-    if out.returncode != 0:
-        log.error("agent-browser cookies get failed: %s", out.stderr[:300])
-        return None
-    cookies = []
-    for line in out.stdout.splitlines():
-        line = line.strip()
-        if "=" not in line or line.startswith("#"):
-            continue
-        name, _, value = line.partition("=")
-        cookies.append(
-            {
-                "name": name.strip(),
-                "value": value.strip(),
-                "domain": "partsouq.com",
-                "path": "/",
-            }
-        )
-    return cookies if cookies else None
-
-
-def _export_cookies_via_eval() -> list | None:
-    """備援二：用 agent-browser eval 從頁面讀 document.cookie。"""
-    cmd = [
-        "agent-browser",
-        "--cdp",
-        str(CLOAK["cdp_port"]),
-        "--user-agent",
-        CLOAK["user_agent"],
-        "eval",
-        "document.cookie",
-    ]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except FileNotFoundError:
-        return None
-    if out.returncode != 0 or "=" not in out.stdout:
-        return None
-    cookies = []
-    for part in out.stdout.split(";"):
-        if "=" in part:
-            name, _, value = part.strip().partition("=")
-            cookies.append(
-                {
-                    "name": name.strip(),
-                    "value": value.strip(),
-                    "domain": "partsouq.com",
-                    "path": "/",
-                }
-            )
-    return cookies or None
-
-
-def _page_has_content() -> bool:
-    """檢查目前頁面是否顯示真實內容（而非驗證頁）。"""
-    cmd = [
-        "agent-browser",
-        "--cdp",
-        str(CLOAK["cdp_port"]),
-        "--user-agent",
-        CLOAK["user_agent"],
-        "eval",
-        "(() => { const t = document.title || ''; const b = document.body ? document.body.innerText : ''; "
-        "return JSON.stringify({title: t, len: b.length, brand: /GENUINE CATALOGS/.test(b)}); })()",
-    ]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if out.returncode != 0:
-            return False
-        import re
-
-        m = re.search(r'"brand":\s*(true|false)', out.stdout)
-        return bool(m and m.group(1) == "true")
-    except Exception:
-        return False
-
-
-def _wait_challenge_resolved() -> bool:
-    """等待 Turnstile 自動通過（CloakBrowser 會自己解決驗證）。"""
-    deadline = time.time() + CHALLENGE_TIMEOUT
-    while time.time() < deadline:
-        if _page_has_content():
-            return True
-        time.sleep(TURNSTILE_CHECK_INTERVAL)
-    return False
-
-
 def _launch_cloak() -> bool:
     """啟動本程序擁有的 CloakBrowser process group 並等待 CDP。
 
@@ -310,7 +177,7 @@ def _launch_cloak() -> bool:
         log.error("CDP port %s is occupied by an unowned browser", CLOAK["cdp_port"])
         return False
     script = (
-        "import asyncio, json, time, cloakbrowser\n"
+        "import asyncio, json, os, time, cloakbrowser\n"
         "OUT = %r\n"
         "SITE = %r\n"
         "async def main():\n"
@@ -335,7 +202,8 @@ def _launch_cloak() -> bool:
         "    data = [{'name': c['name'], 'value': c['value'],\n"
         "             'domain': c.get('domain', ''), 'path': c.get('path', '/')}\n"
         "            for c in cookies]\n"
-        "    with open(OUT, 'w') as f:\n"
+        "    fd = os.open(OUT, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
+        "    with os.fdopen(fd, 'w') as f:\n"
         "        json.dump(data, f)\n"
         "    print('COOKIES_EXPORTED', len(data), flush=True)\n"
         "    await b.close()\n"
@@ -343,8 +211,14 @@ def _launch_cloak() -> bool:
     ) % (str(CLOAK["cookie_export_file"]), SITE["genuine"], CLOAK["cdp_port"])  # noqa: UP031
     err_log = None
     try:
-        # 只保留最後一次的 stderr（"w"），避免無上限增長
-        err_log = open("/tmp/cloak_launch_err.log", "w")
+        # 只保留最後一次的 stderr，並在寫入前設為 owner-only。
+        err_fd = os.open(
+            "/tmp/cloak_launch_err.log",
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        os.fchmod(err_fd, 0o600)
+        err_log = os.fdopen(err_fd, "w")
         proc = subprocess.Popen(
             [CLOAK["venv_python"], "-u", "-c", script],
             stdout=subprocess.DEVNULL,
@@ -413,6 +287,8 @@ def refresh_session() -> list | None:
                     _session_state["retry_after"] = 0.0
                     _session_state["failures"] = 0
                     _session_state["version"] = _cf_value(cookies)
+                    # 新版本已生效；舊的被拒版本不再需要防重播。
+                    _rejected_versions.clear()
             return cookies
         finally:
             with _SESSION_COND:
@@ -451,6 +327,9 @@ def force_refresh_session(rejected_version: str | None = None) -> list | None:
     主動重試，但若這次又失敗，退避計數必須繼續累積（否則連續失敗
     永遠停在 60 秒第一階，變成固定的 60/60/60 打點）。退避由
     refresh_session 在發起前檢查，force 只是清掉「可用 cookie」。
+
+    被拒版本記入 _rejected_versions：清掉快取後，_seed_from_disk 就
+    不會把同一份被拒 cookie 從磁碟重新載入（SOL review P3 修復）。
     """
     with _SESSION_COND:
         if (
@@ -462,6 +341,9 @@ def force_refresh_session(rejected_version: str | None = None) -> list | None:
             # 全域 session 已是更新版本（且仍在 TTL 內）：直接沿用，
             # 不再清掉重刷
             return _session_state["cookies"]
+        rejected = rejected_version or _session_state.get("version")
+        if rejected:
+            _rejected_versions.add(rejected)
         _session_state["cookies"] = None
         _session_state["ok_ts"] = 0.0
         _session_state["version"] = None
@@ -552,6 +434,8 @@ def _seed_from_disk() -> None:
     短時間內連續重解會觸發 Cloudflare 標記，正是 2026-08-20 首次
     成功後連續 5 次 403 的原因。以檔案 mtime 當成功時間：TTL 內的
     話直接沿用，到期/被拒時才由 refresh_session 重啟瀏覽器。
+    版本已在本程序被伺服器拒絕過的（_rejected_versions）跳過不載入，
+    否則 force_refresh 白清快取、403 迴圈重演。
     """
     if _session_state["cookies"] is not None:
         return
@@ -559,23 +443,38 @@ def _seed_from_disk() -> None:
         if not CLOAK["cookie_file"].exists():
             return
         mtime = CLOAK["cookie_file"].stat().st_mtime
-        if time.time() - mtime >= COOKIE_TTL:
+        age = time.time() - mtime
+        if age < 0 or age >= COOKIE_TTL:
             return
         cookies = json.loads(CLOAK["cookie_file"].read_text())
-        if not cookies:
+        if (
+            not isinstance(cookies, list)
+            or not cookies
+            or not all(
+                isinstance(cookie, dict)
+                and isinstance(cookie.get("name"), str)
+                and isinstance(cookie.get("value"), str)
+                for cookie in cookies
+            )
+            or not _cf_value(cookies)
+        ):
             return
     except (OSError, json.JSONDecodeError):
+        return
+    version = _cf_value(cookies)
+    if version in _rejected_versions:
+        log.info("skipping persisted session cookies previously rejected by server")
         return
     with _SESSION_COND:
         if _session_state["cookies"] is not None:
             return
         _session_state["cookies"] = cookies
-        _session_state["ok_ts"] = time.monotonic()
-        _session_state["version"] = _cf_value(cookies)
+        _session_state["ok_ts"] = time.monotonic() - age
+        _session_state["version"] = version
         log.info(
             "reusing persisted session cookies (%s, %ds old)",
-            "cf_clearance" if _cf_value(cookies) else "no cf_clearance",
-            int(time.time() - mtime),
+            "cf_clearance" if version else "no cf_clearance",
+            int(age),
         )
 
 

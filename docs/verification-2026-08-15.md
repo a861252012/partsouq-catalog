@@ -1,14 +1,13 @@
-# 爬蟲、mapping 與站方後台驗證紀錄（更新至 2026-08-20）
+# 爬蟲、mapping 與站方後台驗證紀錄（更新至 2026-08-21）
 
 ## 結論
 
 - NHTSA：合成 fixture 已驗證逐欄解析、共用 MySQL 寫入與讀回；沒有使用者授權 VIN，因此不能宣稱 live 成功解碼。
 - Mapping：以 fixture 走過 PartSouq parser、repository、publish、VIN 車款確認與後台查詢，端到端成功。
-- PartSouq live：一般 requests 已確認被 Cloudflare challenge 擋下（403）；
-  2026-08-20 改以 CloakBrowser 產生的 session cookie（`cf_clearance` +
-  `PHPSESSID`，自動刷新）附於 HTTP client 請求後，bounded E2E 與
-  `partsouq-scheduler --job catalog --daemon` 無人值守執行均完成並寫入
-  MySQL（`crawl_runs.status=sample`、`scheduled_job_runs=completed`）。
+- PartSouq live：host 上的 CloakBrowser session 曾完成兩次 60 筆 sample；
+  這不是 10,000 筆 bounded publish。2026-08-21 查核時，Compose 內的正式
+  scheduler image 仍是舊版透明 HTTP 路徑並持續 403；正式 server-like
+  排程尚未驗證成功，不能把 host sample 當成部署完成。
 
 ## 全新 MySQL
 
@@ -19,6 +18,7 @@
 3. `db/admin.sql`
 4. `db/station_admin.sql`
 5. `migrations/catalog/009_bounded_production_dataset.sql`
+6. `migrations/catalog/010_group_uid_identity.sql`
 
 結果：container healthy；共用 DB 同時包含型錄、NHTSA、mapping、站方後台
 overlay／audit tables 與 10 個 compatibility views。`nhtsa_vin_decodes`、
@@ -30,19 +30,24 @@ snapshot 才會回填；無法唯一判定者保留但不進 mapping view。
 
 ## 自動測試
 
-2026-08-20 最終重跑時，在名稱以 `_test` 結尾的獨立資料庫啟用所有
+2026-08-21 review 重跑時，在名稱以 `_test` 結尾的獨立資料庫啟用所有
 MySQL 測試：
 
 ```text
-263 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
+320 passed; 0 skipped; MySQL and browser E2E gates enabled; pytest exit code 0
 ruff check: passed
-ruff format --check: 126 files already formatted
-mypy src/partsouq_station_admin: passed
+ruff format --check: 130 files already formatted
+mypy src/partsouq_catalog/scheduler.py: passed
 ```
 
-JUnit 結果：`/private/tmp/partsouq-final-20260820.xml`。此輪以
-`partsouq_final_20260820_test` 執行 shared MySQL gates；Browser E2E 另建立
+JUnit 結果：`/private/tmp/partsouq-403-review-all-green.xml`。此輪以
+`partsouq_review_20260821_test` 執行 shared MySQL gates；Browser E2E 另建立
 隨機命名的 `_test` 資料庫，結束後刪除。
+
+catalog 舊模組目前不是全專案 strict-mypy baseline；直接檢查本次涉及的六個
+catalog 模組仍會讀出 236 個既有 typing errors，因此不能宣稱全專案 mypy
+通過。本輪維持最小修改，以 runtime、MySQL E2E、Ruff 與 scheduler scoped
+mypy 作為 gate。
 
 端到端案例驗證：
 
@@ -157,10 +162,12 @@ session cookie（`cf_clearance` + `PHPSESSID`，TTL 25 分鐘自動刷新，存�
 - 60 筆全部是**更新既有樣本列**（`parts_new=0`），不是新增；`parts` 總數為
   1060（含較早的 1000 筆 browser-assisted sample）。未發布
   （`published_parts=0`、`v_current_catalog_parts=0`）。
-- daemon 完成後的**下一次 interval run 又回到 HTTP 403 challenge**：之後
-  連續 5 次 daemon run 失敗（exit=1），退避 480→960→1920→3600 秒持續增長；
-  失敗路徑仍是重試而非穩定的 interval 等待。cookie 機制只讓單次 run 通過，
-  尚未證明可持續無人值守完成 10,000 筆 bounded 目標。
+- 同一日稍早的另一段 daemon 嘗試（scheduled ids 12–16，11:19→13:15 UTC，
+  退避間隔 486→966→1928→3606 秒 ≈ 480→960→1920→3600）**先於**這次
+  成功的 run（id 20）發生，且全數 exit=1。成功 run（id 20）之後，daemon
+  再跑 id 21、22 仍失敗（exit=1，間隔回到 3600 秒）—— 403 迴圈在單次
+  成功後依然重演。cookie 機制只讓單次 run 通過，尚未證明可持續無人值守
+  完成 10,000 筆 bounded 目標。
 
 **2026-08-21 針對上述 403 迴圈修正並重新實測**：根因不是爬取頻率
 （crawl 維持 0.5 req/s），而是**每次新 process 都重啟 CloakBrowser 重解一次
@@ -172,13 +179,28 @@ daemon 又以 480→960→1920→3600 無限重試。修正：
   話直接沿用（`_seed_from_disk`），不再每個 run 重啟瀏覽器。
 - daemon 連續失敗達 `MAX_CONSECUTIVE_FAILURES=5` 後停止指數重試，等下一次
   interval 再檢查，不再每小時重啟瀏覽器錘站。
+- **被拒 cookie 不再復活**：`force_refresh_session` 記下被伺服器拒絕的
+  `cf_clearance` 版本，`_seed_from_disk` 跳過同一份（否則清了快取又從磁碟
+  撈回，403 迴圈重演）。
+- **上限只計站台失敗**：鎖衝突（75）、scheduler DB 紀錄失敗（改以
+  `SCHEDULER_DB_ERROR_EXIT_CODE=2` 區分）、子程序無法啟動（127）都不計入
+  `MAX_CONSECUTIVE_FAILURES` —— 這些原因會自癒，計入只會讓 catalog 在
+  無辜的狀況下靜默整個 interval（預設 30 天）。
 
-重新實測：先跑一趟完整 sample E2E（`PSQ_LIMIT_PARTS=60`，24 分 23:54:51 起，
-瀏覽器重啟 + 解驗證），完成後緊接跑第二趟（23:59:34 起）：日誌顯示
-`reusing persisted session cookies (cf_clearance, 127s old)`，**未重啟瀏覽器**，
-38 秒完成 60/60。兩趟 `scheduled_job_runs` 皆 `completed`（exit_code=3）、
-`crawl_runs` 皆 `sample` 60/60（id 25、26）。尚未證明可持續無人值守完成
-10,000 筆 bounded 目標，但每趟 run 不再無謂重啟瀏覽器。
+重新實測：先跑一趟完整 sample E2E（`PSQ_LIMIT_PARTS=60`，23:54:51 起、
+3 分 12 秒、瀏覽器重啟 + 解驗證），完成後緊接跑第二趟（23:59:34 起）：
+日誌顯示 `reusing persisted session cookies (cf_clearance, 127s old)`，
+**未重啟瀏覽器**，38 秒完成 60/60。兩趟 `scheduled_job_runs` 皆
+`completed`（exit_code=3）、`crawl_runs` 皆 `sample` 60/60（id 25、26）。
+注意：其後一次 daemon run（id 25，00:15 CST）仍失敗（exit=1），來源程序
+不明，cookie 復用只證明「單次連續執行」而非完整無人值守；尚未證明可持續
+完成 10,000 筆 bounded 目標。
+
+**2026-08-21 review 修正**：上述 `exit_code=3` 記為 completed 是歷史行為，
+會讓測試 sample 冒充正式排程成功。現行 scheduler 只接受 exit `0`；sample
+exit `3` 會保留為 failed。另解析器雖已保留同 code、不同 `uid` 的變體，舊 DB
+唯一鍵與 receipt 曾只使用 `(category, code)`，會覆蓋／誤跳過第二個變體；
+migration 010 與 crawler/repository 已統一改用 `(category, code, uid)`。
 
 同日以已自然通過站方驗證的 Codex 可見瀏覽器，沿頁面真實連結唯讀走訪
 Suzuki／Chevrolet Cruize/MW（HR52S-2，2003-11 至 2005-03），擷取 47 個

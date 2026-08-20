@@ -221,29 +221,29 @@ class VehicleRepository:
     def upsert_group(
         self, category_id: int, code: str | None, name: str | None, uid: str | None, url: str | None
     ) -> int:
-        """新增或更新零件組（以 category_id + code 唯一）。回傳零件組 id。
+        """新增或更新零件組（以 category_id + code + uid 唯一）。回傳 id。
 
-        code 為 None 時以空字串寫入：MySQL 唯一索引視 NULL 為「互不相等」，
-        若放任 NULL 會在同一個分類下長出無限多筆重複零件組。
+        code／uid 為 None 時以空字串寫入：MySQL 唯一索引視 NULL 為
+        「互不相等」，若放任 NULL 會長出無限多筆重複零件組。
         """
         cur = self.db._execute(
             "INSERT INTO groups_t (category_id, code, name, uid, url) "
             "VALUES (%s, %s, %s, %s, %s) AS new "
-            "ON DUPLICATE KEY UPDATE name = new.name, uid = new.uid, "
-            "url = new.url, fetched_at = NOW(), id = LAST_INSERT_ID(id)",
-            (category_id, code or "", name, uid, url),
+            "ON DUPLICATE KEY UPDATE name = new.name, url = new.url, "
+            "fetched_at = NOW(), id = LAST_INSERT_ID(id)",
+            (category_id, code or "", name, uid or "", url),
         )
         return cur.lastrowid
 
-    def list_group_codes_for_category(self, vehicle_id: int, cid: str) -> set[str]:
-        """回傳某車輛某 cid 下 DB 已知的所有 group code（group manifest 對帳用）。"""
+    def list_group_identities_for_category(self, vehicle_id: int, cid: str) -> set[tuple[str, str]]:
+        """回傳某車輛某 cid 下 DB 已知的 (group code, uid)。"""
         cur = self.db._execute(
-            "SELECT DISTINCT g.code FROM groups_t g "
+            "SELECT DISTINCT g.code, g.uid FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
-            "WHERE c.vehicle_id = %s AND c.cid = %s",
+            "WHERE c.vehicle_id = %s AND c.cid = %s AND g.uid <> ''",
             (vehicle_id, cid),
         )
-        return {r["code"] for r in cur.fetchall()}
+        return {(r["code"], r["uid"]) for r in cur.fetchall()}
 
 
 class PartRepository:
@@ -472,7 +472,13 @@ class CrawlRepository:
         )
         return cur.fetchone()["n"]
 
-    def is_group_fetched(self, vehicle_id: int, group_code: str, run_key: str = "") -> bool:
+    def is_group_fetched(
+        self,
+        vehicle_id: int,
+        group_code: str,
+        group_uid: str,
+        run_key: str = "",
+    ) -> bool:
         """判斷某車的某零件組是否已在「本 run」抓取完成（有零件或 404）。
 
         續爬/重試優化用：重試一台失敗車時，只補抓「尚未完成的組」，
@@ -489,18 +495,17 @@ class CrawlRepository:
         cur = self.db._execute(
             "SELECT 1 FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
-            "WHERE c.vehicle_id = %s AND g.code = %s "
+            "WHERE c.vehicle_id = %s AND g.code = %s AND g.uid = %s "
             "AND g.fetched_run_key = %s LIMIT 1",
-            (vehicle_id, group_code, run_key),
+            (vehicle_id, group_code, group_uid, run_key),
         )
         return cur.fetchone() is not None
 
     def fetched_group_map(self, vehicle_id: int, run_key: str = "") -> dict:
         """一次載入某車「本 run 已抓完」的所有零件組（F5 優化）。
 
-        回傳 {(cid, code): row_count, ...}（存在即代表已抓過）。
-        以 (cid, code) 為鍵：DB 的 group 唯一身分是
-        (category_id, code)，只用 code 當鍵會讓不同分類的同 code 組
+        回傳 {(cid, code, uid): row_count, ...}（存在即代表已抓過）。
+        以 (cid, code, uid) 為鍵，避免同分類、同 code 的變體零件組
         互相覆蓋、誤 skip。receipt 的 status 詳情留在 DB
         （fetched_status），這裡只做 skip 判斷。
         續爬一臺失敗車時，用這張 map 在記憶體判斷每組是否已完成，
@@ -509,20 +514,21 @@ class CrawlRepository:
         if not run_key:
             return {}
         cur = self.db._execute(
-            "SELECT c.cid, g.code, g.fetched_row_count "
+            "SELECT c.cid, g.code, g.uid, g.fetched_row_count "
             "FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
             "WHERE c.vehicle_id = %s AND g.fetched_run_key = %s",
             (vehicle_id, run_key),
         )
         return {
-            (str(r["cid"] or ""), r["code"]): r["fetched_row_count"] or 0 for r in cur.fetchall()
+            (str(r["cid"] or ""), r["code"], r["uid"]): r["fetched_row_count"] or 0
+            for r in cur.fetchall()
         }
 
     def previous_row_count_map(self, vehicle_id: int, run_key: str = "") -> dict:
         """一次載入某車每個組已驗證的歷史最高 row_count。
 
-        回傳 {(cid, code): verified_row_count}。
+        回傳 {(cid, code, uid): verified_row_count}。
         縮水偵測的參考點：crawl_group 解析出「格式完整但數量遠少於
         歷史最高成功值」的零件時，據此拒絕寫 terminal receipt。
         high-water 只升不降，因此逐月小幅縮水也無法改寫基準。
@@ -530,13 +536,15 @@ class CrawlRepository:
         if not run_key:
             return {}
         cur = self.db._execute(
-            "SELECT c.cid, g.code, g.verified_row_count AS row_count "
+            "SELECT c.cid, g.code, g.uid, g.verified_row_count AS row_count "
             "FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
             "WHERE c.vehicle_id = %s AND g.verified_row_count > 0",
             (vehicle_id,),
         )
-        return {(str(r["cid"] or ""), r["code"]): r["row_count"] or 0 for r in cur.fetchall()}
+        return {
+            (str(r["cid"] or ""), r["code"], r["uid"]): r["row_count"] or 0 for r in cur.fetchall()
+        }
 
     def previous_row_count(self, group_id: int) -> int:
         """回傳某零件組歷史上已驗證的最高 row_count（無則 0）。

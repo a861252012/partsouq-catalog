@@ -81,14 +81,14 @@ CREATE TABLE IF NOT EXISTS groups_t (
   category_id INT NOT NULL,
   code        VARCHAR(16) NOT NULL DEFAULT '',  -- 0901, 1101...
   name        VARCHAR(256) NULL,             -- STANDARD TOOL
-  uid         VARCHAR(32) NULL,              -- uid param
+  uid         VARCHAR(32) NOT NULL DEFAULT '', -- uid param；同 code 的變體身分
   url         VARCHAR(1024) NULL,
   fetched_at  DATETIME NULL,
   fetched_run_key VARCHAR(32) NULL,          -- 最後一次抓取零件的 run_key（group terminal state，F1b）
   fetched_status VARCHAR(16) NULL,           -- done / not_found（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt）
   fetched_row_count INT DEFAULT 0,           -- 本組零件筆數（F5 receipt，content hash 基礎）
   verified_row_count INT NOT NULL DEFAULT 0, -- 歷次 done 的最高筆數；縮水偵測基準，只升不降
-  UNIQUE KEY uq_group (category_id, code),
+  UNIQUE KEY uq_group (category_id, code, uid),
   CONSTRAINT fk_group_cat FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
