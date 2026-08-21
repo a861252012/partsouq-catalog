@@ -4,8 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PARTSOUQ_HOME=/app
 
-# CloakBrowser 是 Linux x64 的指紋修補版 Chromium：需要標準 Chromium
-# 系統依賴，且 headless=False 需要虛擬顯示（Xvfb）才能啟動。
+# CloakBrowser 0.4.0 提供 Linux x64 / arm64 的指紋修補版 Chromium：
+# 需要標準 Chromium 系統依賴，且 headless=False 需要虛擬顯示（Xvfb）
+# 才能啟動（xvfb-run 依賴 xauth）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
         libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \

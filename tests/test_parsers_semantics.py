@@ -203,11 +203,20 @@ def test_parts_skips_nameless_row_not_malformed() -> None:
         ["IMG10001", "", "B10", "02", "CHECK FIT"],
     )
 
-    parts, malformed, skipped = parse_parts(html, diagnostics=True)
+    parts, malformed, skipped, _skipped_rows = parse_parts(html, diagnostics=True)
 
     assert malformed == 0
     assert skipped == 1
     assert parts == []
+    assert _skipped_rows == [
+        {
+            "part_number": "IMG10001",
+            "code": "B10",
+            "quantity": "02",
+            "range_str": "",
+            "note": "CHECK FIT",
+        }
+    ]
 
 
 def test_parts_nameless_row_with_range_is_skipped() -> None:
@@ -217,11 +226,20 @@ def test_parts_nameless_row_with_range_is_skipped() -> None:
         ["IMG20002", "", "C20", "01", "01.2018 - 12.2019"],
     )
 
-    parts, malformed, skipped = parse_parts(html, diagnostics=True)
+    parts, malformed, skipped, _skipped_rows = parse_parts(html, diagnostics=True)
 
     assert malformed == 0
     assert skipped == 1
     assert parts == []
+    assert _skipped_rows == [
+        {
+            "part_number": "IMG20002",
+            "code": "C20",
+            "quantity": "01",
+            "range_str": "01.2018 - 12.2019",
+            "note": "",
+        }
+    ]
 
 
 def test_parts_nameless_row_with_unexpected_text_is_malformed() -> None:
@@ -231,7 +249,7 @@ def test_parts_nameless_row_with_unexpected_text_is_malformed() -> None:
         ["IMG30003", "", "E30", "01", "SURPRISE"],
     )
 
-    parts, malformed, skipped = parse_parts(html, diagnostics=True)
+    parts, malformed, skipped, _skipped_rows = parse_parts(html, diagnostics=True)
 
     assert malformed == 1
     assert skipped == 0
@@ -245,7 +263,7 @@ def test_parts_nameless_row_without_code_is_malformed() -> None:
         ["IMG40004", "", "", "01", "CHECK FIT"],
     )
 
-    parts, malformed, skipped = parse_parts(html, diagnostics=True)
+    parts, malformed, skipped, _skipped_rows = parse_parts(html, diagnostics=True)
 
     assert malformed == 1
     assert skipped == 0

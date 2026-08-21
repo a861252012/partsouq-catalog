@@ -609,7 +609,7 @@ def parse_parts(html: str, soup=None, diagnostics: bool = False):
     避免巢狀 table 的儲存格竄入造成欄位錯位。
 
     回傳 (parts, malformed)，diagnostics=True 時回傳
-    (parts, malformed, skipped_nameless)：
+    (parts, malformed, skipped_nameless, skipped_rows)：
     - parts：結構完整、Number 與 Name 非空，且能辨認 Code、Quantity 的
       零件列。Unified／Filter Note／Specification 只合併進 note；只有
       明確名為 Range／Prod period 的欄位才會寫入日期範圍。
@@ -622,11 +622,14 @@ def parse_parts(html: str, soup=None, diagnostics: bool = False):
       （純料號列，連圖片 alt 都沒有）。發布資料必須能把料號對到產品
       名稱，因此不落庫；但這**不是**版型異常，呼叫端不得因此失敗整台
       車（實測 Toyota 等車型的部分 unit 頁固定含有此類列）。
+    - skipped_rows：上述被跳過列的原始欄位 dict（SOL review P1）。
+      呼叫端把它們寫入 quarantine 表，避免「整組標 done、料號永久漏掉」。
     """
     soup = soup if soup is not None else _soup(html)
     parts_by_key = {}
     malformed = 0
     skipped_nameless = 0
+    skipped_rows = []
     for table in soup.find_all("table"):
         # 巢狀 table（包在另一個 table 的 td 裡）不是零件表本身，
         # 必須排除 —— 否則其內層列會被當成獨立的零件列（P2 修復，
@@ -748,6 +751,15 @@ def parse_parts(html: str, soup=None, diagnostics: bool = False):
                     malformed += 1
                     continue
                 skipped_nameless += 1
+                skipped_rows.append(
+                    {
+                        "part_number": part_number,
+                        "code": code,
+                        "quantity": quantity,
+                        "range_str": range_str,
+                        "note": note,
+                    }
+                )
                 continue
             part = {
                 "part_number": part_number,
@@ -765,7 +777,7 @@ def parse_parts(html: str, soup=None, diagnostics: bool = False):
             # ON DUPLICATE KEY UPDATE 語意一致，覆蓋同鍵的前一列 payload。
             parts_by_key[(part_number, range_str)] = part
     if diagnostics:
-        return list(parts_by_key.values()), malformed, skipped_nameless
+        return list(parts_by_key.values()), malformed, skipped_nameless, skipped_rows
     return list(parts_by_key.values()), malformed
 
 

@@ -44,6 +44,7 @@ from .parsers import (
 from .repositories import (
     BrandRepository,
     CrawlRepository,
+    GroupIdentity,
     PartRepository,
     VehicleRepository,
     vehicle_identity_hash,
@@ -57,6 +58,59 @@ BRAND_PAUSE_SECONDS = 120
 
 class SampleLimitReached(Exception):
     """代表筆數受限 run 已達零件上限；不是網站或解析錯誤。"""
+
+
+def _group_closure_mismatches(
+    known_codes: dict[str, set[str]],
+    parsed_groups: list[dict],
+    default_cid: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """比對 DB 已知的 group 身分與本次解析結果，回傳三份差異。
+
+    SOL review P1：以「uid → code 集合」對帳（不只看 uid）—— 同 uid
+    不同 code 的多筆 group 是變體專屬資料；其中一個 code 變體從頁面
+    消失時必須偵測得到。
+
+    回傳 (missing_uids, missing_codes, downgraded)：
+    - missing_uids：整個 uid 都沒出現（group 消失）。
+    - missing_codes：uid 有出現，但某個已知文字 code 既沒以同 code
+      出現、也沒以圖片-only 出現（code 變體消失）。
+    - downgraded：已知文字 code 這月只以圖片-only（code 空）出現 =
+      呈現降級；group 仍在，不視為消失，但該 code 文字版無可驗證資料。
+
+    刻意取捨：若站方把 group code 重新編號（已知 0901、解析只有 0902），
+    會被判為 missing_codes 而 fail-closed（vehicle 不標 done、整趟 run
+    error、需要人工對帳）—— 與「同 uid 的 code 變體消失」無法從單頁
+    區分，寧可 brick 也不靜默漏資料（SOL review P1 的明確要求）。
+    """
+    parsed_by_uid: dict[str, set[str]] = {}
+    for g in parsed_groups:
+        if str(g.get("cid") or default_cid) != str(default_cid):
+            continue
+        uid = g.get("uid") or ""
+        if not uid:
+            continue
+        parsed_by_uid.setdefault(uid, set()).add(g.get("group_code") or "")
+    missing_uids = sorted(set(known_codes) - set(parsed_by_uid))
+    missing_codes: list[str] = []
+    downgraded: list[str] = []
+    for uid, known_set in known_codes.items():
+        parsed_set = parsed_by_uid.get(uid, set())
+        if not parsed_set:
+            # uid 完全沒出現：已列入 missing_uids，不要再重複列它的 code
+            continue
+        for code in known_set:
+            if code in parsed_set:
+                continue
+            if code == "":
+                # 圖片-only 已知列：uid 已出現即滿足（任何呈現形式）
+                continue
+            if "" in parsed_set:
+                # 文字 code 這月只以圖片-only 出現 = 呈現降級
+                downgraded.append(f"{code}@{uid}")
+                continue
+            missing_codes.append(f"{code}@{uid}")
+    return missing_uids, missing_codes, downgraded
 
 
 class Crawler:
@@ -119,6 +173,9 @@ class Crawler:
         # run() 的最終狀態，供 CLI 決定 exit code。
         self.last_status = "error"
         self._sample_limit_reached = threading.Event()
+        # SOL review P2：每 category 的 group 身分快取（避免每組多一次
+        # image-row SELECT）。key = category_id；進出分類時載入/更新。
+        self._group_identities: dict[int, GroupIdentity] = {}
         # 本 run 實際處理過的品牌（閉合檢查用，F1b）：_brands() 縮水時
         # 未被回傳的品牌不在這集合裡，光查歷史 done 會被上個月的
         # 完成狀態誤導成 success。
@@ -582,6 +639,13 @@ class Crawler:
                 f"{vehicle.get('name', '?')}/{vehicle.get('model_code', '?')}; cannot fetch"
             )
 
+        # SOL review P2：group 身分快取以「一台車」為生命週期。並行
+        # worker 各自爬不同車（category_id 不重疊），先清空再依需 preload
+        # 可把記憶體限制在當下 in-flight 的幾台車；被並行車清掉後續組
+        # 會重新 preload（永遠讀 DB，正確），頂多多一次查詢。
+        with self.lock:
+            self._group_identities = {}
+
         vehicle_id = self.vehicles.upsert_vehicle(model_id, vehicle)
         self.db.commit()
         self._bump("vehicles")
@@ -776,23 +840,37 @@ class Crawler:
         # 若未全部出現在本次解析結果中（頁面縮水、版型變更），視為
         # 解析異常而非合法刪減，拋錯讓 vehicle 不標 done（避免缺漏
         # 被續爬固定）。
-        # 以 uid（站方每組的穩定身分）對帳，不比 code：同一組在不同
-        # 月份可能以圖片-only（code 空）或文字（code 有值）呈現，
-        # 用 (code, uid) 比對會把呈現格式轉換誤判成「group 消失」，
-        # 永久 brick 該車型。
-        known_uids = self.vehicles.list_group_identities_for_category(vehicle_id, default_cid)
-        if known_uids:
-            parsed_uids = {
-                g.get("uid") or ""
-                for g in groups
-                if str(g.get("cid") or default_cid) == str(default_cid)
-            }
-            missing = known_uids - parsed_uids
-            if missing:
-                examples = ", ".join(sorted(missing)[:5])
+        # SOL review P1：以「uid → code 集合」對帳，不只看 uid ——
+        # parser 與 DB 唯一鍵都允許同 uid 不同 code 的多筆 group
+        # （變體專屬資料），只看 uid 會漏掉「其中一個 code 變體消失」。
+        # 圖片-only（code 空）↔ 文字（code 有值）的呈現格式轉換仍要
+        # 容忍，不能誤判成 group 消失。
+        known_codes = self.vehicles.list_group_identities_for_category(vehicle_id, default_cid)
+        if known_codes:
+            missing_uids, missing_codes, downgraded = _group_closure_mismatches(
+                known_codes, groups, default_cid
+            )
+            if missing_uids:
+                examples = ", ".join(missing_uids[:5])
                 raise RuntimeError(
-                    f"[{brand} vehicle={vehicle_id} cid={default_cid}] {len(missing)} known "
+                    f"[{brand} vehicle={vehicle_id} cid={default_cid}] {len(missing_uids)} known "
                     f"group uid(s) missing from this parse: {examples}"
+                )
+            if missing_codes:
+                examples = ", ".join(missing_codes[:5])
+                raise RuntimeError(
+                    f"[{brand} vehicle={vehicle_id} cid={default_cid}] "
+                    f"{len(missing_codes)} known group code variant(s) missing from this "
+                    f"parse: {examples}"
+                )
+            if downgraded:
+                log.warning(
+                    "[%s vehicle=%s cid=%s] %d known text group code(s) now image-only: %s",
+                    brand,
+                    vehicle_id,
+                    default_cid,
+                    len(downgraded),
+                    ", ".join(downgraded[:5]),
                 )
         truncated = 0
         limit = CRAWL["limit_groups"]
@@ -909,12 +987,21 @@ class Crawler:
             category_id = self.vehicles.upsert_category(vehicle_id, category_name, group["cid"])
             if category_ids is not None:
                 category_ids[category_key] = category_id
+        # SOL review P2：同一 category 只 preload 一次 group 身分，省掉
+        # 每組的 image-row SELECT；快取隨 upsert_group 就地更新。加鎖
+        # 避免並行 worker 清空快取時，本車身分被誤拿/KeyError。
+        with self.lock:
+            identity = self._group_identities.get(category_id)
+            if identity is None:
+                identity = self.vehicles.preload_group_identity(category_id)
+                self._group_identities[category_id] = identity
         group_id = self.vehicles.upsert_group(
             category_id,
             group["group_code"],
             group["group_name"],
             group["uid"],
             group["url"],
+            identity=identity,
         )
         self.db.commit()
         self._bump("groups")
@@ -941,7 +1028,7 @@ class Crawler:
             if fetched is not None:
                 fetched[map_key] = 0
             return False
-        parts, malformed, skipped_nameless = parse_parts(html, diagnostics=True)
+        parts, malformed, skipped_nameless, skipped_rows = parse_parts(html, diagnostics=True)
         # 站方合法存在、但完全沒有可驗證文字名稱的純料號列：不落庫
         # （發布資料必須能把料號對到產品名稱），但也不是版型異常 ——
         # 只警告、不失敗整台車（實測多個車型的 unit 頁固定含有此類列，
@@ -989,6 +1076,12 @@ class Crawler:
                 len(parts),
                 shrink_ratio * 100,
             )
+            # SOL review P1：即使縮水檢查失敗（fail-closed、不寫 receipt），
+            # 頁面上合法存在但無法發布的無名稱列仍要列進 quarantine，
+            # 否則它們既不落庫、也不被追蹤，下次重抓前完全消失在記錄中。
+            if skipped_rows:
+                self.parts.quarantine_parts(group_id, run_key, skipped_rows)
+                self.db.commit()
             raise RuntimeError(
                 f"[{brand} group={group.get('group_code')}] row count shrank "
                 f"{prev_count} -> {len(parts)} (< {shrink_ratio:.0%})"
@@ -997,15 +1090,19 @@ class Crawler:
         # 視為失敗（P0 修復），不能當成「這組沒零件」靜默跳過。
         # 例外：整頁都是站方合法存在的無名稱列（skipped_nameless>0）
         # 時，頁面本身有內容且結構正常，只是沒有可發布的零件 ——
-        # 視為完成（0 列），否則含此類頁的車型永遠爬不完。
+        # 列進 quarantine 並標 partial（SOL review P1），不可標 done：
+        # done 是 terminal receipt，下次排程不再重抓，這些料號會永久
+        # 漏掉。partial 讓下次排程重抓，直到站方補上名稱或人工處置。
         if not parts and skipped_nameless:
             log.warning(
-                "[%s group=%s] all %d row(s) lack product name; group marked done with 0 parts",
+                "[%s group=%s] all %d row(s) lack product name; quarantined and "
+                "group marked partial (retried next run)",
                 brand,
                 group.get("group_code"),
                 skipped_nameless,
             )
-            self.crawl.mark_group_fetched(group_id, run_key, status="done", row_count=0)
+            self.parts.quarantine_parts(group_id, run_key, skipped_rows)
+            self.crawl.mark_group_fetched(group_id, run_key, status="partial", row_count=0)
             self.db.commit()
             if fetched is not None:
                 fetched[map_key] = 0
@@ -1063,8 +1160,16 @@ class Crawler:
                 if (part.get("part_number") or "", part.get("range_str") or "") not in already_seen
             ]
             if not parts:
+                # 本組的合法零件在本次 run 都已 seen（bounded resume）：
+                # 照常 receipt。若同頁仍含有無名稱純料號列，一樣列進
+                # quarantine 並標 partial，不能讓它們永久漏掉（P1）。
+                if skipped_nameless:
+                    self.parts.quarantine_parts(group_id, run_key, skipped_rows)
+                    status = "partial"
+                else:
+                    status = "done"
                 self.crawl.mark_group_fetched(
-                    group_id, run_key, status="done", row_count=parsed_row_count
+                    group_id, run_key, status=status, row_count=parsed_row_count
                 )
                 self.db.commit()
                 if fetched is not None:
@@ -1101,8 +1206,25 @@ class Crawler:
                     complete_group=complete_group,
                 )
                 if complete_group:
+                    # SOL review P1：同一組同時含有「合法零件」與「無名稱
+                    # 純料號列」時，零件照常 receipt，但無名稱列必須列進
+                    # quarantine，且組標 partial —— 否則 done 會把這批
+                    # 料號永久固定在「漏抓」狀態。partial 不更新
+                    # verified_row_count，下次排程仍會重抓本組。
+                    if skipped_nameless:
+                        self.parts.quarantine_parts(group_id, run_key, skipped_rows)
+                        status = "partial"
+                        log.warning(
+                            "[%s group=%s] %d row(s) lack product name; quarantined, "
+                            "group marked partial",
+                            brand,
+                            group.get("group_code"),
+                            skipped_nameless,
+                        )
+                    else:
+                        status = "done"
                     self.crawl.mark_group_fetched(
-                        group_id, run_key, status="done", row_count=parsed_row_count
+                        group_id, run_key, status=status, row_count=parsed_row_count
                     )
                 self.db.commit()
                 if complete_group and fetched is not None:

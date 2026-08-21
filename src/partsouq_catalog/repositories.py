@@ -13,6 +13,7 @@
 
 import hashlib
 import logging
+from dataclasses import dataclass, field
 
 from .db import Database
 
@@ -20,6 +21,26 @@ log = logging.getLogger("repos")
 
 # 零件的搜尋頁網址模板（PartSouq 的零件查詢入口）
 PART_URL_TEMPLATE = "https://partsouq.com/en/search/all?q={part_number}"
+
+
+@dataclass
+class GroupIdentity:
+    """單一 category 內 group 身分的記憶體快取（SOL review P2）。
+
+    - by_key：((code, uid) → id)，供「目標 (code, uid) 是否已存在」判斷。
+    - image_by_uid：(uid → id of the code='' 列)，供圖片→文字升級。
+    由 preload_group_identity 建立；upsert_group 會在升級/插入後就地
+    更新兩份 map，因此同一 category 內後續呼叫仍正確（不會把同一列
+    重複升級，也不會漏掉同月新插入的圖片列）。
+
+    注意：圖片→文字升級後，by_key 仍保留升級前的 ("", uid) → id 項目
+    （指向已變成文字列的同一列）。沒有程式碼會用空 code 查 by_key
+    （image_by_uid 才是空 code 的查詢入口），因此無害；但 by_key 不再
+    精確鏡像 DB，不要把它當成 DB 的完整快照。
+    """
+
+    by_key: dict[tuple[str, str], int] = field(default_factory=dict)
+    image_by_uid: dict[str, int] = field(default_factory=dict)
 
 
 def vehicle_identity_hash(model_id: int, vehicle: dict) -> str:
@@ -218,8 +239,36 @@ class VehicleRepository:
         )
         return cur.fetchall()
 
+    def preload_group_identity(self, category_id: int) -> GroupIdentity:
+        """一次載入某 category 下所有 group 身分，供同 category 內逐組
+        upsert_group 使用，避免每組都多一次 SELECT（SOL review P2）。
+
+        回傳的 GroupIdentity 會被 upsert_group 就地更新（升級/插入後
+        同步 map），因此同 category 內 image→text 的跨列升級仍正確。
+        """
+        cur = self.db._execute(
+            "SELECT id, code, uid FROM groups_t WHERE category_id = %s", (category_id,)
+        )
+        identity = GroupIdentity({}, {})
+        for row in cur.fetchall():
+            code = row["code"] or ""
+            uid = row["uid"] or ""
+            if uid == "":
+                # legacy NULL 回推列沒有站方身分可依，不參與 by-uid 對帳
+                continue
+            identity.by_key[(code, uid)] = row["id"]
+            if code == "":
+                identity.image_by_uid[uid] = row["id"]
+        return identity
+
     def upsert_group(
-        self, category_id: int, code: str | None, name: str | None, uid: str | None, url: str | None
+        self,
+        category_id: int,
+        code: str | None,
+        name: str | None,
+        uid: str | None,
+        url: str | None,
+        identity: GroupIdentity | None = None,
     ) -> int:
         """新增或更新零件組（以 category_id + code + uid 唯一）。回傳 id。
 
@@ -238,10 +287,28 @@ class VehicleRepository:
           IntegrityError 會回滾整個 transaction）。
         uid 為空的 legacy 列（migration 010 前的 NULL 回推）不參與
         此對帳：它們沒有站方身分可依，只能靠 (code, uid) 唯一鍵。
+
+        identity（SOL review P2）：呼叫端以 preload_group_identity 一次
+        載入該 category 的 GroupIdentity 後傳入，可省掉每組的 image-row
+        存在性 SELECT。map 會被就地更新，升級/插入後同 category 內的
+        後續呼叫仍然正確。None 時走原本的逐次 SELECT 路徑（測試/相容）。
         """
         code = code or ""
         uid = uid or ""
-        if code:
+        if code and identity is not None:
+            image_id = identity.image_by_uid.get(uid) if uid else None
+            if image_id is not None and (code, uid) not in identity.by_key:
+                # 目標 (code, uid) 已存在（identity 快取內）時不升級，
+                # 退回標準 upsert —— 避免撞唯一鍵（與無快取路徑一致）。
+                self.db._execute(
+                    "UPDATE groups_t SET code = %s, name = %s, url = %s, "
+                    "fetched_at = NOW() WHERE id = %s",
+                    (code, name, url, image_id),
+                )
+                identity.image_by_uid.pop(uid, None)
+                identity.by_key[(code, uid)] = image_id
+                return image_id
+        elif code:
             cur = self.db._execute(
                 "SELECT id FROM groups_t WHERE category_id = %s AND uid = %s AND uid <> '' "
                 "AND code = '' LIMIT 1",
@@ -272,22 +339,38 @@ class VehicleRepository:
             "fetched_at = NOW(), id = LAST_INSERT_ID(id)",
             (category_id, code, name, uid, url),
         )
-        return cur.lastrowid
+        row_id = cur.lastrowid
+        if identity is not None:
+            # 同步快取：無論是全新插入或 ON DUPLICATE 更新既有列，
+            # LAST_INSERT_ID(id) 都已回傳該身分真正的 id。
+            identity.by_key[(code, uid)] = row_id
+            if code == "" and uid != "":
+                identity.image_by_uid[uid] = row_id
+        return row_id
 
-    def list_group_identities_for_category(self, vehicle_id: int, cid: str) -> set[str]:
-        """回傳某車輛某 cid 下 DB 已知的 group uid 集合。
+    def list_group_identities_for_category(self, vehicle_id: int, cid: str) -> dict[str, set[str]]:
+        """回傳某車輛某 cid 下 DB 已知的 group 身分（uid → code 集合）。
 
-        只回 uid（站方每組的穩定身分）：closure 對帳不比 code，因為
-        同一組可能以圖片-only（code 空）或文字（code 有值）呈現，
-        呈現格式轉換不能誤判成 group 消失。
+        SOL review P1：closure 對帳必須以「uid → code 集合」為單位，不能
+        只看 uid —— parser 與資料庫唯一鍵 (category_id, code, uid) 都允許
+        同 uid 不同 code 的多筆 group（變體專屬資料）；若壓成 uid 集合，
+        其中一個 code 變體從頁面消失時 closure 仍會通過，缺漏偵測不到。
+
+        code 為 '' 代表圖片-only 列（站方合法版型）。呼叫端對帳時：
+        已知的圖片-only code（''）由「uid 出現」即滿足；已知的文字 code
+        必須以同 code 出現才滿足（uid 以圖片-only 出現 = 呈現降級，
+        另行告警，不算 group 消失）。
         """
         cur = self.db._execute(
-            "SELECT DISTINCT g.uid FROM groups_t g "
+            "SELECT g.uid, g.code FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
             "WHERE c.vehicle_id = %s AND c.cid = %s AND g.uid <> ''",
             (vehicle_id, cid),
         )
-        return {r["uid"] for r in cur.fetchall()}
+        identities: dict[str, set[str]] = {}
+        for row in cur.fetchall():
+            identities.setdefault(row["uid"], set()).add(row["code"] or "")
+        return identities
 
 
 class PartRepository:
@@ -369,6 +452,49 @@ class PartRepository:
     def clear_group_membership(self, group_id: int):
         """清除單一 group 的舊 run membership；與後續 upsert 同交易。"""
         self.db._execute("UPDATE parts SET seen_run_id = NULL WHERE group_id = %s", (group_id,))
+
+    def quarantine_parts(
+        self,
+        group_id: int,
+        run_key: str,
+        rows: list[dict],
+        reason: str = "nameless",
+    ) -> int:
+        """記錄站方合法存在但無法發布的零件列（SOL review P1）。
+
+        rows 為 parse_parts(diagnostics=True) 回傳的 skipped_rows（純料號
+        列，無可驗證產品名稱）。它們不落 parts 表（發布資料必須能把料號
+        對到名稱），但也不能讓該組標 done 後被永久忽略 —— 寫進
+        part_quarantine 供追蹤，且呼叫端應以 fetched_status='partial'
+        標記該組，讓下次排程重新抓取直到站方補上名稱或人工處置。
+
+        以 (group_id, part_number, range_str, reason) 為唯一鍵，重複發現
+        時就地更新（冪等）。
+        """
+        if not rows:
+            return 0
+        self.db._executemany(
+            "INSERT INTO part_quarantine (group_id, part_number, range_str, reason, "
+            "code, quantity, note, run_key) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) AS new "
+            "ON DUPLICATE KEY UPDATE reason = new.reason, code = new.code, "
+            "quantity = new.quantity, note = new.note, run_key = new.run_key, "
+            "updated_at = CURRENT_TIMESTAMP",
+            [
+                (
+                    group_id,
+                    row.get("part_number") or "",
+                    row.get("range_str") or "",
+                    reason,
+                    row.get("code"),
+                    row.get("quantity"),
+                    row.get("note"),
+                    run_key,
+                )
+                for row in rows
+            ],
+        )
+        return len(rows)
 
     def _clear_stale_group_membership(self, group_id: int, run_id: int):
         """只清除本次 payload 已不存在的 membership。"""
@@ -607,12 +733,20 @@ class CrawlRepository:
         """標記某零件組已在本次 run 抓取完成（durable receipt，F1b/F5）。
 
         status 區分完成種類：'done'（有零件）、'not_found'（404，網站
-        端「此組無資料」的合法訊號）。HTTP 200 但解析 0 零件一律視為
-        異常（反爬/版型變更）並拋錯，**不寫** receipt（SOL P2：沒有
+        端「此組無資料」的合法訊號）、'partial'（SOL review P1：本組含
+        站方合法存在但無法發布的無名稱料號列，已列進 part_quarantine；
+        不是 terminal receipt）。HTTP 200 但解析 0 零件一律視為異常
+        （反爬/版型變更）並拋錯，**不寫** receipt（SOL P2：沒有
         可驗證的「合法空組」DOM 訊號前不猜測，避免把封鎖頁當成空組
         標 done）。row_count 記錄本組零件筆數 —— 配合 fetched_run_key
         讓續爬「不再重抓 404 或已完成組」，也為 content hash 增量
         更新打基礎。
+
+        'partial' 與 fetched_run_key 的互動：同 run_key 內（含 bounded
+        resume）partial 組視為本 run 已抓、不重抓（quarantine 已記下
+        無名稱列）；換到新的 run_key（下個月/下次排程）時因為 status
+        不在 ('done','not_found') 會被重新抓取，直到站方補上名稱或
+        人工處置。只有 status='done' 會更新 verified_row_count。
 
         與零件的 upsert 同一交易提交（見 crawl_group）：避免「零件寫了
         但狀態沒寫」的靜默缺漏。

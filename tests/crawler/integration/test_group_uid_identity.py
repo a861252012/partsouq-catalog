@@ -102,8 +102,8 @@ def test_same_group_code_with_distinct_uids_keeps_both_units_and_receipts() -> N
         database.commit()
 
         assert vehicles.list_group_identities_for_category(vehicle_id, "1") == {
-            "UID-A",
-            "UID-B",
+            "UID-A": {"1101"},
+            "UID-B": {"1101"},
         }
         assert crawl.fetched_group_map(vehicle_id, "group-uid-fixture") == {
             ("1", "1101", "UID-A"): 1,
@@ -168,7 +168,7 @@ def test_group_code_transition_reconciles_by_uid() -> None:
             "SELECT code, name, url FROM groups_t WHERE id = %s", (image_id,)
         ).fetchone()
         assert row == {"code": "0901", "name": "ENGINE BLOCK", "url": "url-text"}
-        assert vehicles.list_group_identities_for_category(vehicle_id, "1") == {"UID-IMG"}
+        assert vehicles.list_group_identities_for_category(vehicle_id, "1") == {"UID-IMG": {"0901"}}
         assert database._execute(
             "SELECT COUNT(*) AS n FROM groups_t WHERE category_id = %s", (category_id,)
         ).fetchone() == {"n": 1}
@@ -381,7 +381,102 @@ def test_text_group_not_overwritten_by_image_only_month() -> None:
             "SELECT code, name FROM groups_t WHERE id = %s", (text_id,)
         ).fetchone()
         assert text_row == {"code": "0901", "name": "BRAKE"}
-        assert vehicles.list_group_identities_for_category(vehicle_id, "1") == {"UID-T"}
+        assert vehicles.list_group_identities_for_category(vehicle_id, "1") == {
+            "UID-T": {"0901", ""}
+        }
+    finally:
+        database.rollback()
+        database._execute("DELETE FROM crawl_state")
+        database._execute("DELETE FROM crawl_runs")
+        database._execute("DELETE FROM brands")
+        database.commit()
+        database.close()
+
+
+def test_identity_cache_path_matches_no_cache_path() -> None:
+    """SOL review P2：preload_group_identity + upsert_group(identity=...)
+    的快取路徑必須與逐次 SELECT 的無快取路徑行為一致（image→text 就地
+    升級、不長重複列、變體不 merge、快取就地更新）。"""
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        database._execute("DELETE FROM crawl_state")
+        database._execute("DELETE FROM crawl_runs")
+        database._execute("DELETE FROM brands")
+        database.commit()
+
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        brand_id = brands.upsert_brand("CACHE-BRAND", None)
+        model_id = brands.upsert_model(brand_id, "CACHE-MODEL", "MODEL-SSD", None)
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CACHE",
+                "model_code": "X",
+                "prod_period": "",
+                "production_from": None,
+                "production_to": None,
+                "vid": "SITE-VID-1",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+
+        identity = vehicles.preload_group_identity(category_id)
+        assert identity.by_key == {}
+        assert identity.image_by_uid == {}
+
+        # 1) image-only 插入 → 快取同步
+        image_id = vehicles.upsert_group(category_id, "", "", "UID-C", "url-img", identity=identity)
+        assert identity.image_by_uid["UID-C"] == image_id
+        assert identity.by_key[("", "UID-C")] == image_id
+
+        # 2) 同 uid 文字組經快取路徑就地升級同一列（不長重複列）
+        text_id = vehicles.upsert_group(
+            category_id, "0901", "BRAKE", "UID-C", "url-text", identity=identity
+        )
+        assert text_id == image_id
+        assert "UID-C" not in identity.image_by_uid
+        assert identity.by_key[("0901", "UID-C")] == image_id
+        assert (
+            database._execute(
+                "SELECT COUNT(*) AS n FROM groups_t WHERE category_id = %s", (category_id,)
+            ).fetchone()["n"]
+            == 1
+        )
+
+        # 3) 同 uid 第二個文字變體（不同 code）→ 新列，不 merge
+        variant_id = vehicles.upsert_group(
+            category_id, "0902", "BRAKE V2", "UID-C", "url-v2", identity=identity
+        )
+        assert variant_id != text_id
+        assert identity.by_key[("0902", "UID-C")] == variant_id
+        assert (
+            database._execute(
+                "SELECT COUNT(*) AS n FROM groups_t WHERE category_id = %s", (category_id,)
+            ).fetchone()["n"]
+            == 2
+        )
+
+        # 4) 重複 upsert 同一 (code, uid) → 同一列、快取仍一致
+        again = vehicles.upsert_group(
+            category_id, "0901", "BRAKE NEW", "UID-C", "url-text", identity=identity
+        )
+        assert again == text_id
+        assert identity.by_key[("0901", "UID-C")] == text_id
+        database.commit()
+
+        # 5) 全新 preload 與快取路徑在「真實存在的列」上一致；唯一差異是
+        # 快取在升級後保留 ("", uid) 的 stale 項目（文件已註明無害）。
+        fresh = vehicles.preload_group_identity(category_id)
+        assert fresh.image_by_uid == identity.image_by_uid
+        for key, row_id in fresh.by_key.items():
+            assert identity.by_key[key] == row_id
+        assert ("", "UID-C") not in fresh.by_key
+        assert ("", "UID-C") in identity.by_key
     finally:
         database.rollback()
         database._execute("DELETE FROM crawl_state")

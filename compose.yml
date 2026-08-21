@@ -82,10 +82,12 @@ services:
       PARTSOUQ_DB_PORT: 3306
       PSQ_LIMIT_PARTS: "0"
       PSQ_BOUNDED_PARTS: ${PSQ_BOUNDED_PARTS:-10000}
-      # CloakBrowser transport（Linux x64 版本）：用本 image 內建的
+      # CloakBrowser transport（Linux arm64/x64 版本）：用本 image 內建的
       # python 與 Chromium binary；headless=False 需要 Xvfb 虛擬顯示。
+      # server-args 含空白必須保持為單一參數（xvfb-run 才會正確解析），
+      # 因此用單引號包住整個 -screen 規格。
       PSQ_CLOAK_PYTHON: /usr/local/bin/python
-      PSQ_CLOAK_LAUNCHER: "xvfb-run -a --server-args=-screen 0 1366x900x24"
+      PSQ_CLOAK_LAUNCHER: "xvfb-run -a --server-args='-screen 0 1366x900x24'"
       CLOAKBROWSER_CACHE_DIR: /app/.cloakbrowser
       # Linux CloakBrowser 以 Windows fingerprint 呈現 Chrome/146；
       # HTTP 請求必須用同一身分 UA，cf_clearance 才會成立。

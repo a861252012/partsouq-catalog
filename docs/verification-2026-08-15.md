@@ -263,10 +263,10 @@ crawler 因此失敗整台車（raise RuntimeError → vehicle 不標 done → �
 2. **圖片-only 組連結**：部分車型（實測 Mitsubishi L300 整頁、Toyota
    部分車型 44 組）的組清單是 diagram 縮圖連結，無任何文字 anchor。
 
-### 修正（uncommitted，9 檔 +517/-45）
+### 修正（已提交 `7a50020`，14 檔 +715/-49）
 
 - `parsers.py parse_parts`：新增 `diagnostics` 回傳
-  `(parts, malformed, skipped_nameless)`。空名稱列若其餘欄位只含
+  `(parts, malformed, skipped_nameless, skipped_rows)`。空名稱列若其餘欄位只含
   料號/code/數量/日期/note → `skipped_nameless`（不落庫、不算 malformed）；
   含其他文字或缺 code → 仍 `malformed`。
 - `parsers.py parse_groups`：新增 `image_only`。圖片-only 連結（有 uid）
@@ -285,6 +285,10 @@ crawler 因此失敗整台車（raise RuntimeError → vehicle 不標 done → �
 - `http_client.py`：robots 雙身分 AND 檢查 —— 揭露的 crawler UA 與實際
   請求的 browser UA **都必須**允許才放行（只查 crawler 身分而用 browser
   身分送出等於繞過站方對一般流量的規則）。
+- `Dockerfile`／`compose.yml`：CloakBrowser 正式化（Linux arm64/x64 binary
+  預下載、Chromium 系統依賴、Xvfb + xauth、`PSQ_CLOAK_*` env、scheduler
+  data volume）。
+
 
 ### 自動測試
 
@@ -330,3 +334,41 @@ code 轉換對帳、變體不 merge、文字不被圖片月覆寫、1062 路徑�
   `Disallow: /cdn-cgi/`，兩身分皆通過；實測無阻。
 - sample exit=3 在 `scheduled_job_runs` 記 `failed` 是 `dbd9f53` 後的新
   語意（正式 daemon 無 limit 時 exit=0 才算 completed）。
+
+### SOL review 修正（2026-08-21，`7a50020` 之後）
+
+GPT5.6 SOL MAX 對 `7a50020` 的 review 指出 1 個 P0 + 2 個 P1 資料完整性
+風險 + 3 個 P2；已全數處理如下（review 未改檔，本輪修正仍未 commit）：
+
+1. **P0 Xvfb server-args 拆錯**（`compose.yml`）：`--server-args=-screen 0 1366x900x24`
+   經 `shlex.split` 後 `0` 會被 `xvfb-run` 當成要執行的 command。改為
+   `--server-args='-screen 0 1366x900x24'`（單一 argv 元素），並新增
+   `test_cloak.py::test_launch_cloak_keeps_server_args_as_single_argv`
+   直接驗證最終 `Popen` argv。
+2. **P1 無名稱料號不可標 done**：`parse_parts` diagnostics 多回傳
+   `skipped_rows`；新增 `part_quarantine` 表（migration 011 + `db/catalog.sql`）
+   與 `PartRepository.quarantine_parts`；`crawl_group` 在出現無名稱列時把
+   該組標 `fetched_status='partial'`（非 terminal done），下次排程重抓，
+   料號不再永久漏掉。新增
+   `tests/crawler/unit/test_group_closure_and_quarantine.py`（quarantine +
+   partial 三種情境）。
+3. **P1 group closure 改 UID→code 集合**：`list_group_identities_for_category`
+   回傳 `dict[uid, set[code]]`；`crawler._group_closure_mismatches` 偵測
+   「同 uid 的 code 變體消失」（review 範例 0902/0903），文字→圖片-only
+   呈現降級則告警不失敗。既有 MySQL 整合測試的斷言同步更新。
+4. **P2 group upsert round trip**：新增 `GroupIdentity` + `preload_group_identity`，
+   `upsert_group(identity=...)` 以記憶體快取取代每組一次 image-row SELECT；
+   快取隨升級/插入就地更新，正確性由 MySQL 整合測試（text→image→text、
+   同 uid 變體、legacy uid）覆蓋。
+5. **P2 動態 tuple 型別**：`parse_parts` diagnostics 固定為 4-tuple（不再
+   依 flag 變動形狀）；`parse_groups` 維持既有 4-tuple。完全 typed result
+   的大規模重構留待後續（專案 gate 為 ruff + pytest，非 mypy）。
+6. **P2 Docker/docs**：Dockerfile/compose 註解改為「Linux arm64/x64」、
+   scheduler 正式 image 維持共用 Dockerfile（多 stage 獨立 target 留待
+   後續）；README 補 migration 011；本文件補齊提交狀態。
+
+自動測試（本輪）：`PARTSOUQ_DB_NAME=partsouq_catalog_test +
+UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **338 passed, 1 skipped**
+（唯一 skip 為需 `STATION_ADMIN_E2E=1` + 本機 Chrome 的站方後台 E2E）；
+ruff check/format 全過。本機 `partsouq_catalog`（主 DB）與
+`partsouq_catalog_test` 均已套用 migration 011。

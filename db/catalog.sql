@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS groups_t (
   url         VARCHAR(1024) NULL,
   fetched_at  DATETIME NULL,
   fetched_run_key VARCHAR(32) NULL,          -- 最後一次抓取零件的 run_key（group terminal state，F1b）
-  fetched_status VARCHAR(16) NULL,           -- done / not_found（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt）
+  fetched_status VARCHAR(16) NULL,           -- done / not_found / partial（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt；partial = 有 quarantine 的非 terminal 狀態）
   fetched_row_count INT DEFAULT 0,           -- 本組零件筆數（F5 receipt，content hash 基礎）
   verified_row_count INT NOT NULL DEFAULT 0, -- 歷次 done 的最高筆數；縮水偵測基準，只升不降
   UNIQUE KEY uq_group (category_id, code, uid),
@@ -129,6 +129,29 @@ CREATE TABLE IF NOT EXISTS parts (
   CONSTRAINT chk_part_range_order CHECK (
     part_from IS NULL OR part_to IS NULL OR part_from <= part_to
   )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 站方合法存在、但無法發布的零件列（無可驗證產品名稱，SOL review P1）。
+-- 不落 parts（發布資料必須能把料號對到名稱），但也不能讓該組標 done 後
+-- 被永久忽略：寫入此表供追蹤，且該組以 fetched_status='partial' 標記，
+-- 下次排程重抓直到站方補上名稱或人工處置。
+CREATE TABLE IF NOT EXISTS part_quarantine (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  group_id    INT NOT NULL,
+  part_number VARCHAR(64) NOT NULL,
+  range_str   VARCHAR(64) NOT NULL DEFAULT '',
+  reason      VARCHAR(32) NOT NULL,            -- nameless / 其他未來類別
+  code        VARCHAR(64) NULL,
+  quantity    VARCHAR(16) NULL,
+  note        TEXT NULL,
+  run_key     VARCHAR(128) NOT NULL,           -- 發現時所在的 logical run
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_quarantine (group_id, part_number, range_str, reason),
+  KEY idx_quarantine_group (group_id),
+  CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id)
+    REFERENCES groups_t(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 最近一次完整 success 的不可變、反正規化 current snapshot。

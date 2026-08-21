@@ -377,3 +377,68 @@ def test_rejected_versions_are_forgotten_after_successful_refresh(monkeypatch) -
     assert cloak.force_refresh_session("v1") == NEW_COOKIES
     assert cloak._session_state["version"] == "v2"
     assert cloak._rejected_versions == set()
+
+
+def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch) -> None:
+    """P0 review: xvfb-run 的 --server-args 含空白時必須保持為單一 argv
+    元素，否則 shlex 會把 `0` 拆成 xvfb-run 要執行的 command，CloakBrowser
+    根本不會啟動。直接驗證最終 Popen argv。"""
+    captured: list[str] = []
+
+    class FakeProc:
+        pid = 99999
+        returncode = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setitem(
+        cloak.CLOAK,
+        "launcher",
+        config.shlex.split("xvfb-run -a --server-args='-screen 0 1366x900x24'"),
+    )
+    monkeypatch.setattr(
+        cloak.subprocess,
+        "Popen",
+        lambda argv, **kwargs: (captured.extend(argv), FakeProc())[1],
+    )
+    alive = iter([False, True])
+    monkeypatch.setattr(cloak, "_cdp_alive", lambda: next(alive, True))
+    monkeypatch.setattr(cloak, "_stop_owned_browser", lambda: None)
+
+    try:
+        assert cloak._launch_cloak() is True
+        assert captured[0:3] == [
+            "xvfb-run",
+            "-a",
+            "--server-args=-screen 0 1366x900x24",
+        ]
+        assert captured[3] == cloak.CLOAK["venv_python"]
+        assert captured[4:6] == ["-u", "-c"]
+        assert "cloakbrowser.launch_async" in captured[6]
+    finally:
+        cloak._browser_proc = None
+
+
+def test_psq_cloak_launcher_env_keeps_server_args_single_argv(monkeypatch) -> None:
+    """P0 review 的組態端防護：compose.yml 的 PSQ_CLOAK_LAUNCHER（含內層
+    引號）經 config 的 shlex.split 後，--server-args 必須是**單一** argv
+    元素。舊的未引號寫法會把 `0` 拆成 xvfb-run 要執行的 command；此測試
+    在 compose.yml 回退成舊寫法時會失敗（接住組態回歸，不只驗證
+    _launch_cloak 的轉發）。"""
+    import importlib
+
+    fixed = "xvfb-run -a --server-args='-screen 0 1366x900x24'"
+    monkeypatch.setenv("PSQ_CLOAK_LAUNCHER", fixed)
+    importlib.reload(config)
+    assert config.CLOAK["launcher"] == [
+        "xvfb-run",
+        "-a",
+        "--server-args=-screen 0 1366x900x24",
+    ]
+
+    broken = "xvfb-run -a --server-args=-screen 0 1366x900x24"
+    monkeypatch.setenv("PSQ_CLOAK_LAUNCHER", broken)
+    importlib.reload(config)
+    assert config.CLOAK["launcher"][2] == "--server-args=-screen"
+    assert config.CLOAK["launcher"][3] == "0"
