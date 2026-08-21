@@ -376,8 +376,8 @@ migration 011。
 ### SOL review 第二輪（2026-08-21，`6023ad4` 之後）
 
 GPT5.6 SOL MAX 覆核 `6023ad4`：確認 commit/push/P0/closure/341 tests 均
-正確，但指出 `partial` 語意仍有缺口（P1）+ 數個 P2，已全數處理如下
-（本輪修正尚未 commit）：
+正確，但指出 `partial` 語意仍有缺口（P1）+ 數個 P2，已全數處理並
+commit 為 `90d858e`：
 
 1. **P1 partial 是真正 non-terminal receipt**（語意統一 + 發布 gate）：
    - `fetched_group_map()` / `is_group_fetched()` 排除 `partial`（重試/
@@ -492,7 +492,7 @@ GPT5.6 SOL MAX 覆核 `ff66574` 後指出 2 個 P1 + 3 個 P2 + P3 文件；
 5. **P3 文件**：`db/catalog.sql` 移除過時的「組標 partial」敘述並
    同步索引定義；`docs/sources.md` 更新為「image 已含 CloakBrowser
    runtime + Chromium + Xvfb 且每次 build 後實測」；本文件第四輪
-   段落移除「尚未 commit」。
+   段落標頭改為實際 commit hash `ff66574`。
 6. **P1 使用者裁決文件化**：「無名稱料號列 = 忽略＋紀錄、不阻擋
    發布」政策為使用者 2026-08-21 明確裁定（回應「為什麼要把整批都
    標示成失敗?」）；原始「所有發現料號 100% 對應名稱」的嚴格標準
