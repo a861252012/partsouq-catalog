@@ -422,3 +422,26 @@ GPT5.6 SOL MAX 覆核 `6023ad4`：確認 commit/push/P0/closure/341 tests 均
 UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **345 passed, 1 skipped**；
 ruff check/format 全過。主 DB 與 `partsouq_catalog_test` 均已套用
 migration 012。
+
+### 政策決定：無名稱列改「忽略 + 紀錄」（2026-08-21，使用者決定）
+
+上述「partial 非 terminal + 發布 gate 阻擋」的嚴格設計，使用者覆核後
+決定改為：**不完整的無名稱料號列 = 忽略 + 紀錄即可，不該讓整批
+（bounded/full run）標成失敗。**
+
+- `crawl_group` 三個無名稱路徑（整頁無名稱 / bounded resume / 完整組）
+  與截斷路徑：無名稱列一律寫進 `part_quarantine` 記錄 + log warning，
+  組照常標 `done`（進 fetched map、同 run 不重抓、正常發布）。
+- 移除 `count_partial_groups` 與三個發布 gate（bounded 早收、bounded
+  收尾、full success 的 partial/quarantine/remaining_group_count 檢查）；
+  `count_quarantined` 保留為運維查詢（`resolved_at` 填上後不再計入）。
+- `fetched_group_map()` / `is_group_fetched()` 恢復單純以
+  `fetched_run_key` 判斷（不再排除 partial，partial 不再產生）。
+- migration 011/012 的註解同步更新（partial 為歷史設計；resolved_at /
+  resolution 保留為純審計紀錄）。
+- 測試更新：`test_bounded_run_publishes_despite_quarantined_rows`
+  （紀錄存在仍照常發布，固定此政策）、
+  `test_mysql_quarantine_records_nameless_rows_without_blocking`、
+  兩個 unit 測試改斷言 done + fetched map 含該組；移除三個 gate 測試。
+- 影響：10,000 bounded 正式驗證不會再因無名稱列而 error；有無名稱列
+  的組會以 warning 記錄在 log，料號列在 `part_quarantine` 可查詢。

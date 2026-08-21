@@ -77,8 +77,6 @@ def test_bounded_retry_resumes_db_membership_and_publishes_exact_target(monkeypa
     instance.crawl.purge_legacy_vehicle_state.return_value = 0
     instance.crawl.remaining_group_count.return_value = 0
     instance.crawl.count_failures.return_value = 0
-    instance.crawl.count_partial_groups.return_value = 0
-    instance.crawl.count_quarantined.return_value = 0
     instance._brands = mock.MagicMock(return_value=[{"name": "TOYOTA"}])
 
     def finish_remaining(_brand: str) -> None:
@@ -193,10 +191,10 @@ def test_bounded_partial_group_retry_removes_disappeared_membership(monkeypatch)
     assert written.kwargs == {"complete_group": True}
 
 
-def test_bounded_run_with_partial_group_never_publishes(monkeypatch) -> None:
-    """SOL review P1：partial 是非 terminal receipt —— 已達 target 且
-    無 crawl_state failure，但存在 partial 組/未處置 quarantine 列時，
-    bounded run 不得發布 bounded_success，收尾必須標 error。"""
+def test_bounded_run_publishes_despite_quarantined_rows(monkeypatch) -> None:
+    """「忽略 + 紀錄」政策（使用者決定）：quarantine 列是紀錄、不阻擋
+    發布 —— bounded run 達到 target 且無 crawl_state failure 時照常
+    bounded_success，即使存在 quarantine 列。"""
     _bounded_config(monkeypatch)
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
     instance.brands = mock.MagicMock()
@@ -209,8 +207,7 @@ def test_bounded_run_with_partial_group_never_publishes(monkeypatch) -> None:
     instance.crawl.purge_legacy_vehicle_state.return_value = 0
     instance.crawl.remaining_group_count.return_value = 0
     instance.crawl.count_failures.return_value = 0
-    instance.crawl.count_partial_groups.return_value = 1
-    instance.crawl.count_quarantined.return_value = 2
+    instance.crawl.count_quarantined.return_value = 3
     instance._brands = mock.MagicMock(return_value=[{"name": "TOYOTA"}])
     instance.crawl_brand = mock.MagicMock(return_value=0)
     try:
@@ -218,82 +215,9 @@ def test_bounded_run_with_partial_group_never_publishes(monkeypatch) -> None:
     finally:
         instance.close()
 
-    assert instance.last_status == "error"
-    instance.crawl.publish_bounded_parts.assert_not_called()
-    assert instance.crawl.finish_run.call_args.args[:3] == (17, "error", counts)
-    message = instance.crawl.finish_run.call_args.args[3]
-    assert "partial" in message and "quarantined" in message
-
-
-def test_bounded_run_with_unresolved_quarantine_never_publishes(monkeypatch) -> None:
-    """SOL review P1：與 partial 組相同的發布 gate —— 只有 quarantine
-    列（無 partial 組）也必須阻擋 bounded_success。"""
-    _bounded_config(monkeypatch)
-    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
-    instance.brands = mock.MagicMock()
-    instance.crawl = mock.MagicMock()
-    instance.crawl.start_run.return_value = 17
-    instance.crawl.run_status.return_value = "running"
-    instance.crawl.count_run_parts.return_value = 10
-    instance.crawl.discard_invalid_bounded_membership.return_value = 0
-    instance.crawl.resumable_bounded_run_key.return_value = None
-    instance.crawl.purge_legacy_vehicle_state.return_value = 0
-    instance.crawl.remaining_group_count.return_value = 0
-    instance.crawl.count_failures.return_value = 0
-    instance.crawl.count_partial_groups.return_value = 0
-    instance.crawl.count_quarantined.return_value = 1
-    instance._brands = mock.MagicMock(return_value=[{"name": "TOYOTA"}])
-    instance.crawl_brand = mock.MagicMock(return_value=0)
-    try:
-        counts = instance.run()
-    finally:
-        instance.close()
-
-    assert instance.last_status == "error"
-    instance.crawl.publish_bounded_parts.assert_not_called()
-    assert instance.crawl.finish_run.call_args.args[:3] == (17, "error", counts)
-
-
-def test_full_run_requires_group_closure_for_success(monkeypatch) -> None:
-    """SOL review P1：完整 run 的 success gate 也檢查 group 層閉合 ——
-    有任何組沒有 terminal receipt、partial 或 quarantine 未處置，
-    不得 publish_success。"""
-    monkeypatch.setitem(CRAWL, "limit_parts", 0)
-    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
-    monkeypatch.setitem(CRAWL, "min_brands", 1)
-    for key in (
-        "start_brand",
-        "limit_brands",
-        "limit_models",
-        "limit_vehicles",
-        "limit_groups",
-    ):
-        monkeypatch.setitem(CRAWL, key, "" if key == "start_brand" else 0)
-    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
-    instance.brands = mock.MagicMock()
-    instance.crawl = mock.MagicMock()
-    instance.crawl.start_run.return_value = 17
-    instance.crawl.run_status.return_value = "running"
-    instance.crawl.count_failures.return_value = 0
-    instance.crawl.count_errors.return_value = 0
-    instance.crawl.count_partial_groups.return_value = 0
-    instance.crawl.count_quarantined.return_value = 0
-    instance.crawl.remaining_group_count.return_value = 1
-    instance.crawl.is_done.return_value = True
-    instance._closure_errors = mock.MagicMock(return_value=[])
-    instance.brands.list_brands.return_value = ["TOYOTA"]
-    instance._visited_brands = {"TOYOTA"}
-    instance._brands = mock.MagicMock(return_value=[{"name": "TOYOTA"}])
-    instance.crawl_brand = mock.MagicMock(return_value=0)
-    try:
-        counts = instance.run()
-    finally:
-        instance.close()
-
-    assert instance.last_status == "error"
-    instance.crawl.publish_success_parts.assert_not_called()
-    assert instance.crawl.finish_run.call_args.args[:3] == (17, "error", counts)
-    assert "unreceipted" in instance.crawl.finish_run.call_args.args[3]
+    assert instance.last_status == "bounded_success"
+    instance.crawl.publish_bounded_parts.assert_called_once_with(17, 10)
+    assert instance.crawl.finish_run.call_args.args[:3] == (17, "bounded_success", counts)
 
 
 def test_bounded_and_sample_limits_are_mutually_exclusive(monkeypatch) -> None:
@@ -498,10 +422,10 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
     os.getenv("UNIFIED_TEST_MYSQL") != "1",
     reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
 )
-def test_mysql_partial_and_quarantine_counts_gate_publish() -> None:
-    """SOL review P1：count_partial_groups / count_quarantined 是發布
-    gate 的事實來源 —— partial receipt 使兩者正確反映、resolved 後
-    quarantine 不再計入、fetched_group_map 排除 partial。"""
+def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
+    """「忽略 + 紀錄」政策（使用者決定）：quarantine 列是紀錄、不阻擋
+    發布 —— 組照常標 done、進 fetched map；count_quarantined 可供
+    運維查詢（resolved_at 填上後不再計入）。"""
     if not str(DB_CONFIG["database"]).endswith("_test"):
         raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
 
@@ -537,32 +461,21 @@ def test_mysql_partial_and_quarantine_counts_gate_publish() -> None:
         run_key = "bounded-mysql-gate"
         database.commit()
 
-        # partial receipt + quarantine 列 → 兩個 gate 計數都 > 0
-        crawl.mark_group_fetched(group_id, run_key, status="partial", row_count=0)
+        # 組含無名稱列：quarantine 記錄 + 照常標 done（不阻擋發布）
         parts.quarantine_parts(group_id, run_key, [_parts(1)[0]])
+        crawl.mark_group_fetched(group_id, run_key, status="done", row_count=1)
         database.commit()
-        assert crawl.count_partial_groups(run_key) == 1
         assert crawl.count_quarantined(run_key) == 1
+        assert crawl.fetched_group_map(vehicle_id, run_key) == {("1", "1101", "10001"): 1}
+        assert crawl.is_group_fetched(vehicle_id, "1101", "10001", run_key) is True
 
-        # partial 組不得被當成已抓完（重試必須重抓）
-        assert crawl.fetched_group_map(vehicle_id, run_key) == {}
-        assert crawl.is_group_fetched(vehicle_id, "1101", "10001", run_key) is False
-
-        # 人工處置：resolved_at 填上後 quarantine 不再阻擋（但組仍 partial）
+        # 運維標記處置：resolved_at 填上後 count_quarantined 不再計入
         database._execute(
             "UPDATE part_quarantine SET resolved_at = NOW(), resolution = %s WHERE group_id = %s",
             ("verified removed from site", group_id),
         )
         database.commit()
         assert crawl.count_quarantined(run_key) == 0
-        assert crawl.count_partial_groups(run_key) == 1
-
-        # 站方補上名稱 → 重抓標 done → 組進入 fetched map、gate 全清
-        crawl.mark_group_fetched(group_id, run_key, status="done", row_count=1)
-        database.commit()
-        assert crawl.count_partial_groups(run_key) == 0
-        assert crawl.fetched_group_map(vehicle_id, run_key) != {}
-        assert crawl.is_group_fetched(vehicle_id, "1101", "10001", run_key) is True
     finally:
         database.rollback()
         _clear_mysql_fixture(database)

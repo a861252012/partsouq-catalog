@@ -1090,24 +1090,23 @@ class Crawler:
         # 視為失敗（P0 修復），不能當成「這組沒零件」靜默跳過。
         # 例外：整頁都是站方合法存在的無名稱列（skipped_nameless>0）
         # 時，頁面本身有內容且結構正常，只是沒有可發布的零件 ——
-        # 列進 quarantine 並標 partial（SOL review P1），不可標 done：
-        # done 是 terminal receipt，下次排程不再重抓，這些料號會永久
-        # 漏掉。partial 不是 terminal receipt：重試與下次排程都會重抓
-        # 本組，直到站方補上名稱或人工處置；發布 gate 也會因 partial
-        # 存在而拒絕（count_partial_groups / count_quarantined）。
+        # 列進 quarantine 記錄並照常標 done（使用者決定：這類不完整
+        # 資料「忽略 + 紀錄」即可，不阻擋發布、不讓整批失敗）。
+        # quarantine 表 + 本行 log 就是完整紀錄；下次排程仍會重新
+        # 拜訪（done 是 per run_key），站方補上名稱時自動落庫。
         if not parts and skipped_nameless:
             log.warning(
-                "[%s group=%s] all %d row(s) lack product name; quarantined and "
-                "group marked partial (retried until resolved)",
+                "[%s group=%s] all %d row(s) lack product name; quarantined, "
+                "group receipted as done",
                 brand,
                 group.get("group_code"),
                 skipped_nameless,
             )
             self.parts.quarantine_parts(group_id, run_key, skipped_rows)
-            self.crawl.mark_group_fetched(group_id, run_key, status="partial", row_count=0)
+            self.crawl.mark_group_fetched(group_id, run_key, status="done", row_count=0)
             self.db.commit()
-            # partial 不進 fetched map：同 run 的重試/續爬必須重新抓取
-            # 本組，不可 skip（SOL review P1）。
+            if fetched is not None:
+                fetched[map_key] = 0
             return False
         self._guard_parse(html, parts, "parts", f"{brand} group={group.get('group_code')}")
         parsed_row_count = len(parts)
@@ -1164,19 +1163,14 @@ class Crawler:
             if not parts:
                 # 本組的合法零件在本次 run 都已 seen（bounded resume）：
                 # 照常 receipt。若同頁仍含有無名稱純料號列，一樣列進
-                # quarantine 並標 partial，不能讓它們永久漏掉（P1）。
+                # quarantine 記錄（使用者決定：不完整資料忽略 + 紀錄）。
                 if skipped_nameless:
                     self.parts.quarantine_parts(group_id, run_key, skipped_rows)
-                    status = "partial"
-                else:
-                    status = "done"
                 self.crawl.mark_group_fetched(
-                    group_id, run_key, status=status, row_count=parsed_row_count
+                    group_id, run_key, status="done", row_count=parsed_row_count
                 )
                 self.db.commit()
-                # partial 不進 fetched map（非 terminal receipt，SOL
-                # review P1）：同 run 重試必須重抓本組。
-                if fetched is not None and status == "done":
+                if fetched is not None:
                     fetched[map_key] = parsed_row_count
                 return False
         complete_group = True
@@ -1192,11 +1186,8 @@ class Crawler:
             if not selected:
                 return True
             # SOL review P1（截斷路徑）：quota 截斷（complete_group=False）
-            # 時頁面上的無名稱列同樣要列進 quarantine —— 它們不落庫也
-            # 不會被 receipt，若不記錄就等同靜默丟棄，且 run 仍可能
-            # bounded_success。不標 partial（組未 receipt，resume 會
-            # 重抓本組）；quarantine 列會讓 count_quarantined > 0，
-            # 發布 gate 據此拒絕，直到人工處置。
+            # 時頁面上的無名稱列同樣要列進 quarantine 記錄 —— 它們
+            # 不落庫也不會被 receipt，若不記錄就等同靜默丟棄。
             if not complete_group and skipped_nameless:
                 self.parts.quarantine_parts(group_id, run_key, skipped_rows)
                 self.db.commit()
@@ -1219,30 +1210,23 @@ class Crawler:
                     complete_group=complete_group,
                 )
                 if complete_group:
-                    # SOL review P1：同一組同時含有「合法零件」與「無名稱
-                    # 純料號列」時，零件照常 receipt，但無名稱列必須列進
-                    # quarantine，且組標 partial —— 否則 done 會把這批
-                    # 料號永久固定在「漏抓」狀態。partial 不更新
-                    # verified_row_count，重試/下次排程仍會重抓本組。
+                    # 同一組同時含有「合法零件」與「無名稱純料號列」時，
+                    # 零件照常 receipt，無名稱列列進 quarantine 記錄
+                    # （使用者決定：不完整資料忽略 + 紀錄，不阻擋發布）。
                     if skipped_nameless:
                         self.parts.quarantine_parts(group_id, run_key, skipped_rows)
-                        status = "partial"
                         log.warning(
                             "[%s group=%s] %d row(s) lack product name; quarantined, "
-                            "group marked partial",
+                            "group receipted as done",
                             brand,
                             group.get("group_code"),
                             skipped_nameless,
                         )
-                    else:
-                        status = "done"
                     self.crawl.mark_group_fetched(
-                        group_id, run_key, status=status, row_count=parsed_row_count
+                        group_id, run_key, status="done", row_count=parsed_row_count
                     )
                 self.db.commit()
-                # partial 不進 fetched map（非 terminal receipt，SOL
-                # review P1）：同 run 重試必須重抓本組。
-                if complete_group and status == "done" and fetched is not None:
+                if complete_group and fetched is not None:
                     fetched[map_key] = parsed_row_count
                 # 計數在 commit 成功後才累加：重跑時不重複計。
                 self._bump("parts", len(parts))
@@ -1385,13 +1369,7 @@ class Crawler:
                 )
             if bounded_mode and self.counts["parts"] == self.part_limit:
                 errors = self.crawl.count_failures(run_key)
-                partial_groups = self.crawl.count_partial_groups(run_key)
-                quarantined = self.crawl.count_quarantined(run_key)
-                # SOL review P1：partial 不是 terminal receipt —— 有
-                # partial 組或未處置 quarantine 列時，即使達到 target 且
-                # 沒有 crawl_state failure 也不得發布，繼續爬（重試會
-                # 重抓 partial 組），直到收尾 gate 判定 error。
-                if not errors and not partial_groups and not quarantined:
+                if not errors:
                     finalizing = True
                     self.crawl.publish_bounded_parts(run_id, self.part_limit)
                     self.crawl.finish_run(run_id, "bounded_success", self.counts)
@@ -1399,18 +1377,10 @@ class Crawler:
                     finalizing = False
                     self.last_status = "bounded_success"
                     return self.counts
-                if errors:
-                    log.warning(
-                        "bounded run reached target with %d crawl error(s); retrying failed scope",
-                        errors,
-                    )
-                else:
-                    log.warning(
-                        "bounded run reached target but %d partial group(s) / "
-                        "%d quarantined row(s) remain; not publishing yet",
-                        partial_groups,
-                        quarantined,
-                    )
+                log.warning(
+                    "bounded run reached target with %d crawl error(s); retrying failed scope",
+                    errors,
+                )
             self._check_capacity(run_key)
             brands = self._brands()
             if not brands:
@@ -1498,23 +1468,6 @@ class Crawler:
                     self.counts,
                     f"bounded run did not reach exact target: "
                     f"{self.counts['parts']}/{self.part_limit}",
-                )
-                self.db.commit()
-            elif bounded_mode and (
-                self.crawl.count_partial_groups(run_key) or self.crawl.count_quarantined(run_key)
-            ):
-                # SOL review P1：partial 是非 terminal receipt，不得滿足
-                # 發布 gate —— 收尾時仍有 partial 組/未處置 quarantine
-                # 列 → error（重跑時這些組會重抓，直到站方補上名稱或
-                # 人工處置）。
-                partial_groups = self.crawl.count_partial_groups(run_key)
-                quarantined = self.crawl.count_quarantined(run_key)
-                self.crawl.finish_run(
-                    run_id,
-                    "error",
-                    self.counts,
-                    f"bounded run has {partial_groups} partial group(s) and "
-                    f"{quarantined} quarantined row(s); not publishing",
                 )
                 self.db.commit()
             elif bounded_mode:
@@ -1607,41 +1560,16 @@ class Crawler:
                     )
                     self.db.commit()
                 else:
-                    # SOL review P1：完整 run 的 success gate 也必須檢查
-                    # group 層的閉合 —— 任何組沒有 terminal receipt
-                    # （remaining_group_count）、或標 partial /
-                    # quarantine 未處置，都代表資料來源不完整，不得
-                    # publish_success。
-                    remaining_groups = self.crawl.remaining_group_count(run_key)
-                    partial_groups = self.crawl.count_partial_groups(run_key)
-                    quarantined = self.crawl.count_quarantined(run_key)
-                    if remaining_groups or partial_groups or quarantined:
-                        log.warning(
-                            "full run closure incomplete: %d group(s) without terminal "
-                            "receipt, %d partial, %d quarantined row(s); marking run as error",
-                            remaining_groups,
-                            partial_groups,
-                            quarantined,
-                        )
-                        self.crawl.finish_run(
-                            run_id,
-                            "error",
-                            self.counts,
-                            f"incomplete group closure: {remaining_groups} unreceipted, "
-                            f"{partial_groups} partial, {quarantined} quarantined",
-                        )
-                        self.db.commit()
-                    else:
-                        # current snapshot 與 success row 必須是同一交易：先重建
-                        # snapshot，再寫 success，commit 成功後才更新記憶體狀態。
-                        # publish/finish 任一步失敗都會由 except rollback，不會
-                        # 留下「run success 但 view 空掉」的矛盾狀態。
-                        finalizing = True
-                        self.crawl.publish_success_parts(run_id)
-                        self.crawl.finish_run(run_id, "success", self.counts)
-                        self.db.commit()
-                        finalizing = False
-                        self.last_status = "success"
+                    # current snapshot 與 success row 必須是同一交易：先重建
+                    # snapshot，再寫 success，commit 成功後才更新記憶體狀態。
+                    # publish/finish 任一步失敗都會由 except rollback，不會
+                    # 留下「run success 但 view 空掉」的矛盾狀態。
+                    finalizing = True
+                    self.crawl.publish_success_parts(run_id)
+                    self.crawl.finish_run(run_id, "success", self.counts)
+                    self.db.commit()
+                    finalizing = False
+                    self.last_status = "success"
             log.info("DONE: %s", self.counts)
             return self.counts
         except Exception as e:

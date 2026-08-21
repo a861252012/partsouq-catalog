@@ -1,8 +1,8 @@
 """SOL review P1 修正的單元測試。
 
 1. group closure 改「uid → code 集合」：同 uid 的 code 變體消失必須偵測到。
-2. 無名稱純料號列：不得標 done（terminal receipt），必須 quarantine +
-   標 partial，讓下次排程重抓。
+2. 無名稱純料號列：quarantine 記錄 + 照常標 done（「忽略 + 紀錄」政策，
+   使用者決定：不完整資料不阻擋發布）。
 """
 
 from unittest import mock
@@ -114,11 +114,11 @@ def test_closure_ignores_foreign_cid() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 無名稱純料號列：quarantine + partial，不得標 done
+# 無名稱純料號列：quarantine 記錄 + 照常標 done（「忽略 + 紀錄」政策）
 # ---------------------------------------------------------------------------
 
 
-def test_all_nameless_page_quarantines_and_marks_partial(sample_crawler) -> None:
+def test_all_nameless_page_quarantines_and_marks_done(sample_crawler) -> None:
     sample_crawler._get.return_value = _parts_html([("IMG10001", "", "B10")])
     fetched = {}
 
@@ -133,14 +133,12 @@ def test_all_nameless_page_quarantines_and_marks_partial(sample_crawler) -> None
         {"part_number": "IMG10001", "code": "B10", "quantity": "01", "range_str": "", "note": ""}
     ]
     sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
-        41, "2026-08-fixture", status="partial", row_count=0
+        41, "2026-08-fixture", status="done", row_count=0
     )
-    # partial 不進 fetched map（非 terminal receipt，SOL review P1 修訂）：
-    # 同 run 重試/續爬必須重抓本組，不可 skip。
-    assert fetched == {}
+    assert fetched == {("1", "1101", "10001"): 0}
 
 
-def test_mixed_page_quarantines_nameless_and_marks_partial(sample_crawler) -> None:
+def test_mixed_page_quarantines_nameless_and_marks_done(sample_crawler) -> None:
     sample_crawler._get.return_value = _parts_html(
         [("P00001", "ENGINE BOLT", "11000"), ("IMG20002", "", "C20")]
     )
@@ -155,10 +153,9 @@ def test_mixed_page_quarantines_nameless_and_marks_partial(sample_crawler) -> No
         {"part_number": "IMG20002", "code": "C20", "quantity": "01", "range_str": "", "note": ""}
     ]
     sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
-        41, "2026-08-fixture", status="partial", row_count=1
+        41, "2026-08-fixture", status="done", row_count=1
     )
-    # partial 不進 fetched map（非 terminal receipt，SOL review P1 修訂）。
-    assert fetched == {}
+    assert fetched == {("1", "1101", "10001"): 1}
 
 
 def test_truncated_group_still_quarantines_nameless_rows(monkeypatch) -> None:
@@ -206,7 +203,7 @@ def test_truncated_group_still_quarantines_nameless_rows(monkeypatch) -> None:
             "note": "",
         }
     ]
-    # 組未 receipt（截斷）：不標 partial/done，resume 會重抓本組
+    # 組未 receipt（截斷）：不標 done，resume 會重抓本組
     instance.crawl.mark_group_fetched.assert_not_called()
 
 

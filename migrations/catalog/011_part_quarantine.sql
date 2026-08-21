@@ -11,10 +11,9 @@
 -- 本 migration：
 --   1. 建立 part_quarantine 表，記錄被跳過的料號原始欄位，供追蹤/後續
 --      手動處置（UNIQUE(group_id, part_number, range_str, reason) 冪等）。
---   2. groups_t.fetched_status 為 VARCHAR(16)，'partial'（有 quarantine
---      的組，非完整完成）可直接放入；closure 續爬邏輯以
---      fetched_status NOT IN ('done','not_found') 視為「未完成、需重抓」，
---      partial 組下次排程會重新抓取，直到站方補上名稱或人工處置。
+--   2. groups_t.fetched_status 為 VARCHAR(16)，'partial' 曾用於「有
+--      quarantine 的組」；policy 已改為「忽略 + 紀錄」（組照常標
+--      done、quarantine 表為完整紀錄，見 012），partial 不再產生。
 --   3. 基線：把既有 done/not_found 之外的重抓組（例如舊 run 留下的
 --      fetched_status 異常值）維持原樣，不自動改寫任何既有 receipt。
 
