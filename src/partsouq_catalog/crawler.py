@@ -740,7 +740,7 @@ class Crawler:
         if self._sample_limit_reached.is_set():
             return 1
 
-        groups, malformed, skipped_groups = parse_groups(
+        groups, malformed, skipped_groups, image_only = parse_groups(
             html,
             brand,
             default_cid=default_cid,
@@ -750,6 +750,14 @@ class Crawler:
             expected_vid=expected_vid,
             expected_cid=default_cid,
         )
+        if image_only:
+            log.warning(
+                "[%s vehicle=%s cid=%s] %d image-only group link(s) accepted without text name",
+                brand,
+                vehicle_id,
+                default_cid,
+                image_only,
+            )
         if malformed:
             raise RuntimeError(
                 f"[{brand} vehicle={vehicle_id} cid={default_cid}] "
@@ -768,19 +776,23 @@ class Crawler:
         # 若未全部出現在本次解析結果中（頁面縮水、版型變更），視為
         # 解析異常而非合法刪減，拋錯讓 vehicle 不標 done（避免缺漏
         # 被續爬固定）。
-        known_groups = self.vehicles.list_group_identities_for_category(vehicle_id, default_cid)
-        if known_groups:
-            parsed_groups = {
-                (g.get("group_code") or "", g.get("uid") or "")
+        # 以 uid（站方每組的穩定身分）對帳，不比 code：同一組在不同
+        # 月份可能以圖片-only（code 空）或文字（code 有值）呈現，
+        # 用 (code, uid) 比對會把呈現格式轉換誤判成「group 消失」，
+        # 永久 brick 該車型。
+        known_uids = self.vehicles.list_group_identities_for_category(vehicle_id, default_cid)
+        if known_uids:
+            parsed_uids = {
+                g.get("uid") or ""
                 for g in groups
                 if str(g.get("cid") or default_cid) == str(default_cid)
             }
-            missing = known_groups - parsed_groups
+            missing = known_uids - parsed_uids
             if missing:
-                examples = ", ".join(f"{code}/{uid}" for code, uid in sorted(missing)[:5])
+                examples = ", ".join(sorted(missing)[:5])
                 raise RuntimeError(
                     f"[{brand} vehicle={vehicle_id} cid={default_cid}] {len(missing)} known "
-                    f"group(s) missing from this parse: {examples}"
+                    f"group uid(s) missing from this parse: {examples}"
                 )
         truncated = 0
         limit = CRAWL["limit_groups"]
@@ -929,7 +941,18 @@ class Crawler:
             if fetched is not None:
                 fetched[map_key] = 0
             return False
-        parts, malformed = parse_parts(html)
+        parts, malformed, skipped_nameless = parse_parts(html, diagnostics=True)
+        # 站方合法存在、但完全沒有可驗證文字名稱的純料號列：不落庫
+        # （發布資料必須能把料號對到產品名稱），但也不是版型異常 ——
+        # 只警告、不失敗整台車（實測多個車型的 unit 頁固定含有此類列，
+        # 若當 malformed 處理，整台車永遠爬不完）。
+        if skipped_nameless:
+            log.warning(
+                "[%s group=%s] %d part row(s) without product name skipped; not receipted",
+                brand,
+                group.get("group_code"),
+                skipped_nameless,
+            )
         # SOL P1：結構缺欄/空料號的 candidate 列代表版型異常或反爬變體，
         # 不得寫 terminal receipt —— 否則殘缺列以 NULL 落庫後該組
         # 本月不再重抓，缺漏被固定。檢查在 guard 之前：全 malformed 的
@@ -972,6 +995,21 @@ class Crawler:
             )
         # parts 也走統一空解析檢查：空白 200 或異常頁解析 0 零件必須
         # 視為失敗（P0 修復），不能當成「這組沒零件」靜默跳過。
+        # 例外：整頁都是站方合法存在的無名稱列（skipped_nameless>0）
+        # 時，頁面本身有內容且結構正常，只是沒有可發布的零件 ——
+        # 視為完成（0 列），否則含此類頁的車型永遠爬不完。
+        if not parts and skipped_nameless:
+            log.warning(
+                "[%s group=%s] all %d row(s) lack product name; group marked done with 0 parts",
+                brand,
+                group.get("group_code"),
+                skipped_nameless,
+            )
+            self.crawl.mark_group_fetched(group_id, run_key, status="done", row_count=0)
+            self.db.commit()
+            if fetched is not None:
+                fetched[map_key] = 0
+            return False
         self._guard_parse(html, parts, "parts", f"{brand} group={group.get('group_code')}")
         parsed_row_count = len(parts)
         # bounded retry 可能在 commit 已成功、process 尚未更新記憶體計數

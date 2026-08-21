@@ -76,6 +76,26 @@ services:
 
   scheduler:
     <<: *scheduler-base
+    environment:
+      PARTSOUQ_HOME: /app
+      PARTSOUQ_DB_HOST: mysql
+      PARTSOUQ_DB_PORT: 3306
+      PSQ_LIMIT_PARTS: "0"
+      PSQ_BOUNDED_PARTS: ${PSQ_BOUNDED_PARTS:-10000}
+      # CloakBrowser transport（Linux x64 版本）：用本 image 內建的
+      # python 與 Chromium binary；headless=False 需要 Xvfb 虛擬顯示。
+      PSQ_CLOAK_PYTHON: /usr/local/bin/python
+      PSQ_CLOAK_LAUNCHER: "xvfb-run -a --server-args=-screen 0 1366x900x24"
+      CLOAKBROWSER_CACHE_DIR: /app/.cloakbrowser
+      # Linux CloakBrowser 以 Windows fingerprint 呈現 Chrome/146；
+      # HTTP 請求必須用同一身分 UA，cf_clearance 才會成立。
+      PSQ_CLOAK_USER_AGENT: >-
+        Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+        (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36
+    volumes:
+      - ./output:/app/output
+      - ./logs:/app/logs
+      - ./data:/app/data
     command:
       [
         "partsouq-scheduler",

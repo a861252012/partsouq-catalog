@@ -176,7 +176,7 @@ def test_bounded_partial_group_retry_removes_disappeared_membership(monkeypatch)
     instance._get = mock.MagicMock(return_value="<table></table>")
     with mock.patch(
         "partsouq_catalog.crawler.parse_parts",
-        return_value=(_parts(10)[1:], 0),
+        return_value=(_parts(10)[1:], 0, 0),
     ):
         try:
             truncated = instance.crawl_group("TOYOTA", 7, _group(), fetched={})

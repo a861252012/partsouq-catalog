@@ -363,6 +363,28 @@ Disallow:
     assert manager.session.get.call_count == 1
 
 
+def test_robots_wildcard_rule_also_binds_browser_ua_traffic() -> None:
+    """合規語意統一：實際請求以 browser UA 送出，`*` 規則也必須允許。"""
+    manager = SessionManager()
+    manager.session.get = Mock(
+        return_value=response(
+            200,
+            """User-agent: partsouq-catalog-crawler
+Disallow:
+
+User-agent: *
+Disallow: /en/catalog/
+""",
+            "https://partsouq.com/robots.txt",
+        )
+    )
+
+    with pytest.raises(RobotsPolicyError, match="disallows"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert manager.session.get.call_count == 1
+
+
 @pytest.mark.parametrize(
     "robots_text",
     [

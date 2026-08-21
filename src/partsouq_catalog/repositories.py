@@ -225,25 +225,69 @@ class VehicleRepository:
 
         code／uid 為 None 時以空字串寫入：MySQL 唯一索引視 NULL 為
         「互不相等」，若放任 NULL 會長出無限多筆重複零件組。
+
+        圖片↔文字跨月轉換：同一組先以圖片-only 呈現（code 空字串）、
+        後以文字呈現（code 有值）時，若 DB 只有那一列空 code 列，
+        就地更新 code/name/url，避免長出重複 group 列（否則舊列
+        殘留）。**只**對「既有列 code 為空字串」做此對帳：
+        - 同 uid 不同非空 code 的列是變體專屬資料（parser 刻意保留），
+          不得互相覆寫或合併。
+        - 文字列不得被圖片月覆寫成空名稱（名稱是已取得的資料）。
+        - 目標 (category_id, code, uid) 已被另一列佔用時退回標準
+          upsert（不試 UPDATE，避免唯一鍵衝突 —— db._execute 對
+          IntegrityError 會回滾整個 transaction）。
+        uid 為空的 legacy 列（migration 010 前的 NULL 回推）不參與
+        此對帳：它們沒有站方身分可依，只能靠 (code, uid) 唯一鍵。
         """
+        code = code or ""
+        uid = uid or ""
+        if code:
+            cur = self.db._execute(
+                "SELECT id FROM groups_t WHERE category_id = %s AND uid = %s AND uid <> '' "
+                "AND code = '' LIMIT 1",
+                (category_id, uid),
+            )
+            image_row = cur.fetchone()
+            if image_row:
+                # 目標 (category_id, code, uid) 已被另一列佔用（同 uid 的
+                # 變體文字列）時不升級、也不試 UPDATE 觸發唯一鍵衝突 ——
+                # db._execute 對 IntegrityError 會回滾整個 transaction，
+                # 不能走「try UPDATE 再吞例外」的路線。
+                exists = self.db._execute(
+                    "SELECT id FROM groups_t WHERE category_id = %s AND code = %s "
+                    "AND uid = %s LIMIT 1",
+                    (category_id, code, uid),
+                ).fetchone()
+                if not exists:
+                    self.db._execute(
+                        "UPDATE groups_t SET code = %s, name = %s, url = %s, "
+                        "fetched_at = NOW() WHERE id = %s",
+                        (code, name, url, image_row["id"]),
+                    )
+                    return image_row["id"]
         cur = self.db._execute(
             "INSERT INTO groups_t (category_id, code, name, uid, url) "
             "VALUES (%s, %s, %s, %s, %s) AS new "
             "ON DUPLICATE KEY UPDATE name = new.name, url = new.url, "
             "fetched_at = NOW(), id = LAST_INSERT_ID(id)",
-            (category_id, code or "", name, uid or "", url),
+            (category_id, code, name, uid, url),
         )
         return cur.lastrowid
 
-    def list_group_identities_for_category(self, vehicle_id: int, cid: str) -> set[tuple[str, str]]:
-        """回傳某車輛某 cid 下 DB 已知的 (group code, uid)。"""
+    def list_group_identities_for_category(self, vehicle_id: int, cid: str) -> set[str]:
+        """回傳某車輛某 cid 下 DB 已知的 group uid 集合。
+
+        只回 uid（站方每組的穩定身分）：closure 對帳不比 code，因為
+        同一組可能以圖片-only（code 空）或文字（code 有值）呈現，
+        呈現格式轉換不能誤判成 group 消失。
+        """
         cur = self.db._execute(
-            "SELECT DISTINCT g.code, g.uid FROM groups_t g "
+            "SELECT DISTINCT g.uid FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
             "WHERE c.vehicle_id = %s AND c.cid = %s AND g.uid <> ''",
             (vehicle_id, cid),
         )
-        return {(r["code"], r["uid"]) for r in cur.fetchall()}
+        return {r["uid"] for r in cur.fetchall()}
 
 
 class PartRepository:

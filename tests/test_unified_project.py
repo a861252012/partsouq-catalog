@@ -36,9 +36,10 @@ def test_catalog_part_without_product_name_is_rejected() -> None:
     </tr></table>
     """
 
-    parts, malformed = parse_parts(html)
+    parts, malformed, skipped = parse_parts(html, diagnostics=True)
 
-    assert malformed == 1
+    assert malformed == 0
+    assert skipped == 1
     assert parts == []
 
 

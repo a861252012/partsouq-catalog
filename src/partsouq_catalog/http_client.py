@@ -7,9 +7,13 @@
 本層只負責「把 HTML 拿回來」；解析與資料寫入分別屬於解析器層
 與 Repository 層。
 
-正式 catalog 請求（partsouq.com /en/catalog）在送出前會先以可識別
-crawler UA 檢查 robots.txt 與 origin/path 合法性；robots 無法確認
-允許、origin 不符或回應為 redirect 時一律停止（fail-closed）。
+正式 catalog 請求（partsouq.com /en/catalog）在送出前會先以**雙重身分**
+檢查 robots.txt 與 origin/path 合法性：我們對站方揭露 crawler 身分
+（CATALOG_USER_AGENT）取得 robots.txt，但實際請求以 CloakBrowser 的
+browser UA 送出（為了維持 cf_clearance session）；因此 robots 規則對
+**這兩個身分都必須允許**才放行 —— 不能只查 crawler 身分、卻用 browser
+身分送出請求（production 合規語意）。robots 無法確認允許、origin 不符
+或回應為 redirect 時一律停止（fail-closed）。
 
 穩定性與限流的兩個關鍵設計：
 1. 連線池刻意只開 2 條（pool_connections / pool_maxsize）：多 worker
@@ -424,7 +428,12 @@ class SessionManager:
                 raise RobotsPolicyError(f"robots has no explicit applicable rules at {robots_url}")
             self._robots = parse_robots(robots_url, text.encode(), "utf-8")
 
-        if not self._robots.allows(CATALOG_USER_AGENT, url):
+        if not self._robots.allows(CATALOG_USER_AGENT, url) or not self._robots.allows(
+            CLOAK["user_agent"], url
+        ):
+            # 兩個身分都必須允許：揭露的 crawler 身分與實際送出的
+            # browser UA。只查 crawler 身分而用 browser 身分送出，
+            # 等於繞過站方對一般流量的 robots 規則。
             raise RobotsPolicyError(f"robots disallows catalog URL: {url[:100]}")
 
     @staticmethod

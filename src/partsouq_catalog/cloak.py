@@ -220,7 +220,7 @@ def _launch_cloak() -> bool:
         os.fchmod(err_fd, 0o600)
         err_log = os.fdopen(err_fd, "w")
         proc = subprocess.Popen(
-            [CLOAK["venv_python"], "-u", "-c", script],
+            [*CLOAK["launcher"], CLOAK["venv_python"], "-u", "-c", script],
             stdout=subprocess.DEVNULL,
             stderr=err_log,
             start_new_session=True,

@@ -450,17 +450,29 @@ def parse_groups(
     expected_ssd: str | None = None,
     expected_vid: str | None = None,
     expected_cid: str | None = None,
-) -> list[dict] | tuple[list[dict], int] | tuple[list[dict], int, int]:
+) -> (
+    list[dict]
+    | tuple[list[dict], int]
+    | tuple[list[dict], int, int]
+    | tuple[list[dict], int, int, int]
+):
     """解析 vehicle 頁面 → 零件組連結（NNNN: NAME → /unit?...）。
 
     零件組位於目前啟用的分類區塊；每個都連結到
     /en/catalog/genuine/unit?c=..&ssd=..&vid=..&cid=N&uid=M&q=
+
+    diagnostics=True 時回傳 (groups, malformed, skipped_context, image_only)。
+    image_only = 圖片-only 連結（diagram 縮圖、無任何文字 anchor）的組數：
+    站方合法版型（實測 Mitsubishi 部分車型的整頁都是此類連結），依
+    cid+uid 仍可爬取，接受為空 code/name 的 group，不是版型異常。
     """
     soup = soup if soup is not None else _soup(html)
     groups = []
     malformed = 0
     skipped_context = 0
+    image_only = 0
     seen = {}
+    seen_uids = set()
     candidates = set()
     valid_candidates = set()
     candidate_specs = {}
@@ -497,8 +509,29 @@ def parse_groups(
             continue
         text = a.get_text(strip=True)
         if not text:
-            # 圖片與文字可能同時連到同一組；最後以 cid+uid 對帳，只有
-            # 沒有任何可解析文字 anchor 的 candidate 才算 malformed。
+            # 圖片-only 連結（diagram 縮圖、無任何文字 anchor）：站方
+            # 合法版型（實測 Mitsubishi 部分車型的整頁都是此類連結）。
+            # 沒有可解析的 group code/name，但仍可依 cid+uid 爬取
+            # unit 頁 —— 接受為空 code/name 的 group，不計 malformed。
+            # 圖片與文字可能同時連到同一組；以 (cid, uid) 去重，文字
+            # anchor 已收錄時不重複 append。
+            valid_candidates.add(candidate)
+            if (cid, uid) in seen_uids:
+                continue
+            seen_uids.add((cid, uid))
+            image_only += 1
+            groups.append(
+                {
+                    "group_code": "",
+                    "group_name": "",
+                    "category_name": CATEGORY_NAMES.get(cid, f"CATEGORY {cid}"),
+                    "cid": cid,
+                    "uid": uid,
+                    "ssd": _qs(href, "ssd"),
+                    "vid": _qs(href, "vid"),
+                    "url": href,
+                }
+            )
             continue
         m = GROUP_LINK_RE.match(text)
         if not m:
@@ -521,6 +554,22 @@ def parse_groups(
                 malformed += 1
             continue
         seen[identity] = group_name
+        uid_key = (cid, uid)
+        if uid_key in seen_uids:
+            # 同一組先前已以圖片-only 收錄（空 code/name）：就地升級，
+            # 不重複 append。注意：只升級「仍是圖片-only」的 group ——
+            # 若同 uid 已有不同 code 的文字 group（變體專屬資料），
+            # 照舊 append（HEAD 語意，不能靜默丟掉）。
+            upgraded = False
+            for g in groups:
+                if g["cid"] == cid and g["uid"] == uid and not g["group_code"]:
+                    g["group_code"] = m.group(1)
+                    g["group_name"] = group_name
+                    upgraded = True
+                    break
+            if upgraded:
+                continue
+        seen_uids.add(uid_key)
         groups.append(
             {
                 "group_code": m.group(1),
@@ -535,14 +584,14 @@ def parse_groups(
         )
     malformed += len(candidates - valid_candidates)
     if diagnostics:
-        return groups, malformed, skipped_context
+        return groups, malformed, skipped_context, image_only
     return groups
 
 
 # ----------------------------------------------------------------- unit
 
 
-def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
+def parse_parts(html: str, soup=None, diagnostics: bool = False):
     """解析 unit 頁面的零件表。
 
     unit 頁面有兩張表：先是車型資訊的標題表，再來才是零件表
@@ -559,7 +608,8 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
     不會自動補），直接以 table 的直接子 `tr` 為準；td 也只取直接子層，
     避免巢狀 table 的儲存格竄入造成欄位錯位。
 
-    回傳 (parts, malformed)：
+    回傳 (parts, malformed)，diagnostics=True 時回傳
+    (parts, malformed, skipped_nameless)：
     - parts：結構完整、Number 與 Name 非空，且能辨認 Code、Quantity 的
       零件列。Unified／Filter Note／Specification 只合併進 note；只有
       明確名為 Range／Prod period 的欄位才會寫入日期範圍。
@@ -568,10 +618,15 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
       `/en/search/all`、q 為空，或顯示料號與 q 不同。這代表頁面版型
       異常（或反爬變體）仍解析出「看似零件」的殘缺列；呼叫端必須拒絕
       寫 terminal receipt。
+    - skipped_nameless：站方合法存在、但完全沒有可驗證文字名稱的列
+      （純料號列，連圖片 alt 都沒有）。發布資料必須能把料號對到產品
+      名稱，因此不落庫；但這**不是**版型異常，呼叫端不得因此失敗整台
+      車（實測 Toyota 等車型的部分 unit 頁固定含有此類列）。
     """
     soup = soup if soup is not None else _soup(html)
     parts_by_key = {}
     malformed = 0
+    skipped_nameless = 0
     for table in soup.find_all("table"):
         # 巢狀 table（包在另一個 table 的 td 裡）不是零件表本身，
         # 必須排除 —— 否則其內層列會被當成獨立的零件列（P2 修復，
@@ -679,9 +734,20 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
                 malformed += 1
                 continue
             if not part_name:
-                # 需求的發布資料必須能把料號對到產品名稱。圖片列若沒有
-                # 可驗證的文字名稱，就不能猜名稱或當成完整零件列。
-                malformed += 1
+                # 站方合法存在、但沒有可驗證文字名稱的純料號列
+                # （無名稱文字、無圖片 alt）。發布資料必須能把料號對到
+                # 產品名稱，因此不落庫；但這不是版型異常，不能算進
+                # malformed —— 否則含此類列的 unit 頁整台車永遠失敗。
+                # 例外：其餘欄位若含有料號/code/數量/日期/note 以外的
+                # 文字，或連 code 都缺，代表欄位錯位/版型異常，仍算
+                # malformed。
+                allowed_cells = {part_number, code, quantity, range_str, ""}
+                for index in note_indexes:
+                    allowed_cells.add(cells[index])
+                if not code or any(c for c in cells if c not in allowed_cells):
+                    malformed += 1
+                    continue
+                skipped_nameless += 1
                 continue
             part = {
                 "part_number": part_number,
@@ -698,6 +764,8 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
             # DOM row 不得把 fetched_row_count 灌大。後出現的列與 MySQL
             # ON DUPLICATE KEY UPDATE 語意一致，覆蓋同鍵的前一列 payload。
             parts_by_key[(part_number, range_str)] = part
+    if diagnostics:
+        return list(parts_by_key.values()), malformed, skipped_nameless
     return list(parts_by_key.values()), malformed
 
 

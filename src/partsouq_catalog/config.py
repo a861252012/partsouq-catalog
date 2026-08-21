@@ -6,6 +6,7 @@
 
 import json
 import os
+import shlex
 import tempfile
 from pathlib import Path
 
@@ -55,9 +56,20 @@ CLOAK = {
     ),
     "cookie_file": COOKIE_FILE,  # 持久化 session cookie（程序啟動時沿用，見 cloak.get_session）
     "lock_file": COOKIE_FILE.parent / ".cloak-refresh.lock",
-    "user_agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    # 啟動瀏覽器子程序時附加的前綴命令。headless=False 在無顯示環境
+    # （如 Compose 的 Linux container）需要虛擬顯示，容器內設
+    # PSQ_CLOAK_LAUNCHER="xvfb-run -a"；macOS host 留空即可。
+    "launcher": shlex.split(os.environ.get("PSQ_CLOAK_LAUNCHER", "")),
+    # HTTP 請求必須使用與瀏覽器一致的身分 UA，cf_clearance 才會成立。
+    # macOS host 瀏覽器是 Chrome/145 Mac；Linux container 的 CloakBrowser
+    # 以 Windows fingerprint 呈現 Chrome/146，需用 PSQ_CLOAK_USER_AGENT
+    # 覆寫成對應的 Windows UA。
+    "user_agent": os.environ.get(
+        "PSQ_CLOAK_USER_AGENT",
+        (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        ),
     ),
 }
 

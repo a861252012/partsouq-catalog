@@ -248,3 +248,85 @@ NHTSA 中斷留下的 scheduler-owned running row
 修正前兩個首頁會展開 `nhtsa_current_records` 的多表 view 掃描 137,140 列，
 p50 分別約 `776.56 ms` 與 `629.55 ms`。修正後改以 current artifact metadata
 的 `source_rows` 聚合；主 DB 逐 dataset 與總數讀回皆與原 view 相同。
+
+## 2026-08-21 穩定度修正與實機 E2E（最終 code）
+
+### 根因（live E2E 暴露）
+
+站方合法存在兩種「看似異常」的資料，先前 parser 把它們計為 malformed、
+crawler 因此失敗整台車（raise RuntimeError → vehicle 不標 done → 該車型
+永遠爬不完、sample 永遠到不了 60 筆）：
+
+1. **空名稱零件列**：部分 unit 頁固定含有只有料號+code、完全沒有文字名稱
+   的列（連圖片 alt 都沒有）。實測 Toyota group 1104 每頁 3 列
+   （9161140612／9111140608／9328016008）。
+2. **圖片-only 組連結**：部分車型（實測 Mitsubishi L300 整頁、Toyota
+   部分車型 44 組）的組清單是 diagram 縮圖連結，無任何文字 anchor。
+
+### 修正（uncommitted，9 檔 +517/-45）
+
+- `parsers.py parse_parts`：新增 `diagnostics` 回傳
+  `(parts, malformed, skipped_nameless)`。空名稱列若其餘欄位只含
+  料號/code/數量/日期/note → `skipped_nameless`（不落庫、不算 malformed）；
+  含其他文字或缺 code → 仍 `malformed`。
+- `parsers.py parse_groups`：新增 `image_only`。圖片-only 連結（有 uid）
+  接受為空 code/name 的 group，以 `(cid, uid)` 去重；同 uid 的文字連結
+  就地升級；同 uid 不同非空 code 的文字列是變體專屬資料，兩者都保留。
+- `crawler.py crawl_group`：`skipped_nameless`／`image_only` 只警告；
+  只有真 malformed 才失敗整台車。整頁皆空名稱時標 done(0 列)（縮水
+  檢查仍在前面，已命名組縮成 0 仍會 raise）。
+- `crawler.py` closure 對帳改比 **uid**（不比 code）：圖片↔文字呈現格式
+  跨月轉換不再誤判成「group 消失」而永久 brick 車型。
+- `repositories.py upsert_group`：圖片月（code 空）→ 文字月（code 有值）
+  轉換時，只對「既有空 code 列」就地升級；目標鍵已被變體列佔用時退回
+  標準 upsert（不觸發唯一鍵衝突 —— `db._execute` 對 IntegrityError 會
+  回滾整個 transaction）。文字列不被圖片月覆寫成空名稱；uid 空字串的
+  legacy 列不參與對帳。
+- `http_client.py`：robots 雙身分 AND 檢查 —— 揭露的 crawler UA 與實際
+  請求的 browser UA **都必須**允許才放行（只查 crawler 身分而用 browser
+  身分送出等於繞過站方對一般流量的規則）。
+
+### 自動測試
+
+`330 passed`（`PARTSOUQ_DB_NAME=partsouq_catalog_test` +
+`UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1 STATION_ADMIN_E2E=1
+STATION_ADMIN_E2E_BROWSER_CHANNEL=chrome`）；ruff check/format 全過。
+新增/更新：`test_parsers_semantics.py`（空名稱列三態、圖片-only 組、變體
+同 uid 不同 code、升級/去重）、`test_group_uid_identity.py`（MySQL 整合：
+code 轉換對帳、變體不 merge、文字不被圖片月覆寫、1062 路徑完全不觸發
+例外、legacy uid 不參與）、`test_unified_project.py`、`test_partsouq_bounded_limit.py`、
+`test_catalog_http_compliance.py`（robots 雙身分）。
+
+三輪 subAgent 懷疑性審查 + 一輪實機證據稽核；審查發現的真 bug 均已修正
+並以測試 pin（跨月 closure brick、同 uid 變體被合併、text→image 名稱
+銷毀、IntegrityError 吞掉已回滾 transaction）。
+
+### 實機 E2E（2026-08-21 02:00–02:45 CST，主 DB）
+
+最終 code 兩趟連續 sample（Toyota、`PSQ_LIMIT_PARTS=60`、單 worker）：
+
+| 項目 | Run 1（全刷新） | Run 2（cookie 復用） |
+|---|---|---|
+| 起始 | 02:40:59 | 02:44:18 |
+| 瀏覽器 | CloakBrowser launching | 無（reusing persisted session cookies, 43s old） |
+| 結果 | DONE parts=60/60, parts_new=0 | DONE parts=60/60, parts_new=0 |
+| 耗時 | ~3m08s | ~36s |
+| ERROR/Traceback | 0 | 0 |
+
+兩趟 log 均有 `44 image-only group link(s) accepted` 與
+`3 part row(s) without product name skipped` 警告，不再失敗車型；
+`crawl_runs.status=sample`、`parts_ok=60`；`scheduled_job_runs` exit=3
+（樣本達上限的預期停止；依新語意 `success_codes=(0,)` 記為 failed ——
+這是設計，不是失敗）；DB 無空名稱零件列。migration 010 已套用主 DB、
+空名稱垃圾列已刪除。
+
+### 誠實邊界（不變）
+
+- 正式 Compose scheduler 仍是**舊 image**（透明 HTTP 路徑、無
+  CloakBrowser）並持續 403 —— 正式 10,000 筆 bounded publish 仍未在
+  正式環境驗證成功；host 上的 sample 是驗證 crawler 機制的證據，不是
+  部署完成證明。
+- robots 雙身分 AND 檢查：站方 robots.txt 目前只有 `User-agent: *`
+  `Disallow: /cdn-cgi/`，兩身分皆通過；實測無阻。
+- sample exit=3 在 `scheduled_job_runs` 記 `failed` 是 `dbd9f53` 後的新
+  語意（正式 daemon 無 limit 時 exit=0 才算 completed）。
