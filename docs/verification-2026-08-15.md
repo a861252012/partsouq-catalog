@@ -338,7 +338,7 @@ code 轉換對帳、變體不 merge、文字不被圖片月覆寫、1062 路徑�
 ### SOL review 修正（2026-08-21，`7a50020` 之後）
 
 GPT5.6 SOL MAX 對 `7a50020` 的 review 指出 1 個 P0 + 2 個 P1 資料完整性
-風險 + 3 個 P2；已全數處理如下（review 未改檔，本輪修正仍未 commit）：
+風險 + 3 個 P2；已全數處理並提交 `6023ad4`（15 檔 +779/-54，已 push）：
 
 1. **P0 Xvfb server-args 拆錯**（`compose.yml`）：`--server-args=-screen 0 1366x900x24`
    經 `shlex.split` 後 `0` 會被 `xvfb-run` 當成要執行的 command。改為
@@ -368,7 +368,57 @@ GPT5.6 SOL MAX 對 `7a50020` 的 review 指出 1 個 P0 + 2 個 P1 資料完整�
    後續）；README 補 migration 011；本文件補齊提交狀態。
 
 自動測試（本輪）：`PARTSOUQ_DB_NAME=partsouq_catalog_test +
-UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **338 passed, 1 skipped**
-（唯一 skip 為需 `STATION_ADMIN_E2E=1` + 本機 Chrome 的站方後台 E2E）；
-ruff check/format 全過。本機 `partsouq_catalog`（主 DB）與
-`partsouq_catalog_test` 均已套用 migration 011。
+UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **341 passed, 1 skipped**；
+加 `STATION_ADMIN_E2E=1`（真實 Chrome）→ **341 passed**；ruff check/format
+全過。本機 `partsouq_catalog`（主 DB）與 `partsouq_catalog_test` 均已套用
+migration 011。
+
+### SOL review 第二輪（2026-08-21，`6023ad4` 之後）
+
+GPT5.6 SOL MAX 覆核 `6023ad4`：確認 commit/push/P0/closure/341 tests 均
+正確，但指出 `partial` 語意仍有缺口（P1）+ 數個 P2，已全數處理如下
+（本輪修正尚未 commit）：
+
+1. **P1 partial 是真正 non-terminal receipt**（語意統一 + 發布 gate）：
+   - `fetched_group_map()` / `is_group_fetched()` 排除 `partial`（重試/
+     續爬會重抓 partial 組，不再當成本 run 已抓完）；`crawl_group` 的
+     記憶體 fetched map 也不放入 partial。
+   - bounded 早收（達 target）與收尾 gate、完整 run 的 success gate
+     都新增檢查：`count_partial_groups(run_key)` / `count_quarantined(run_key)`
+     （未處置列）/ `remaining_group_count(run_key)`（完整 run）任一 > 0
+     即標 error、不 publish —— 不會再出現
+     `part_quarantine > 0 + groups_t.partial + bounded_success` 的矛盾。
+   - 新增 mock 層 E2E：`test_bounded_run_with_partial_group_never_publishes`、
+     `test_bounded_run_with_unresolved_quarantine_never_publishes`、
+     `test_full_run_requires_group_closure_for_success`；MySQL 整合測試
+     `test_mysql_partial_and_quarantine_counts_gate_publish` 驗證 SQL 層
+     （partial 計數、resolved 後不再計入、fetched map 排除 partial）。
+   - `part_quarantine` 新增人工處置欄位 `resolved_at` / `resolution`
+     （migration 012 + `db/catalog.sql`），處置流程寫入文件。
+2. **P2 Xvfb 測試綁定 compose.yml**：`test_psq_cloak_launcher_env_keeps_server_args_single_argv`
+   改為直接讀取 `compose.yml` 的 `PSQ_CLOAK_LAUNCHER` 值做 `shlex.split`
+   斷言（不再硬編碼字串）；compose 回退舊寫法時測試會失敗。
+3. **P2 多 worker 快取清除**：`crawl_vehicle` 不再清空全域
+   `_group_identities`，改為只移除**本車**各 category 的快取（並行
+   worker 的快取不受影響，不會反覆 preload）。
+4. **P2 型別**：`parse_parts` 4-tuple 已固定（上一輪）；strict mypy 的
+   249 筆診斷多為既有問題，完全 typed result 重構仍留待後續（文件化）。
+5. **P2 共用 Dockerfile**：維持共用（含 Chromium），多 stage 獨立 target
+   留待後續（文件化）。
+6. **P2 image 實測**：`docker compose build scheduler` 成功；以
+   compose 相同的 `xvfb-run -a --server-args='-screen 0 1366x900x24'`
+   在容器內啟動 CloakBrowser → **CDP_READY Chrome/146.0.7680.177**、
+   正常關閉（容器內 CloakBrowser 真能啟動）。
+7. **P1 截斷路徑 quarantine**（第三輪 subagent 覆核發現）：quota 截斷
+   （`complete_group=False`）時頁面上的無名稱列原本被靜默丟棄且 run
+   仍可 bounded_success —— 已補上 quarantine（不標 partial，組未
+   receipt、resume 重抓）；新增
+   `test_truncated_group_still_quarantines_nameless_rows`。另把 partial
+   重抓時機（同 run 失敗車重試 / 下一個 run_key）與人工處置流程
+   （resolved_at + 組 receipt 需轉 done/not_found 兩步驟）寫進
+   repositories docstring。
+
+自動測試（本輪）：`PARTSOUQ_DB_NAME=partsouq_catalog_test +
+UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **345 passed, 1 skipped**；
+ruff check/format 全過。主 DB 與 `partsouq_catalog_test` 均已套用
+migration 012。

@@ -135,7 +135,9 @@ def test_all_nameless_page_quarantines_and_marks_partial(sample_crawler) -> None
     sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
         41, "2026-08-fixture", status="partial", row_count=0
     )
-    assert fetched == {("1", "1101", "10001"): 0}
+    # partial 不進 fetched map（非 terminal receipt，SOL review P1 修訂）：
+    # 同 run 重試/續爬必須重抓本組，不可 skip。
+    assert fetched == {}
 
 
 def test_mixed_page_quarantines_nameless_and_marks_partial(sample_crawler) -> None:
@@ -155,7 +157,57 @@ def test_mixed_page_quarantines_nameless_and_marks_partial(sample_crawler) -> No
     sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
         41, "2026-08-fixture", status="partial", row_count=1
     )
-    assert fetched == {("1", "1101", "10001"): 1}
+    # partial 不進 fetched map（非 terminal receipt，SOL review P1 修訂）。
+    assert fetched == {}
+
+
+def test_truncated_group_still_quarantines_nameless_rows(monkeypatch) -> None:
+    """SOL review P1（截斷路徑）：quota 截斷（complete_group=False）時，
+    頁面上的無名稱列仍要列進 quarantine —— 否則 bounded/sample run
+    可以在無名稱料號被靜默丟棄之下照常發布 bounded_success。"""
+    monkeypatch.setitem(CRAWL, "limit_parts", 1)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.parts.upsert_parts.side_effect = lambda _group, rows, _run, **_kwargs: len(rows)
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "2026-08-fixture"
+    instance.crawl.previous_row_count.return_value = 0
+    instance._get = mock.MagicMock(
+        return_value=_parts_html(
+            [
+                ("P00001", "ENGINE BOLT", "11000"),
+                ("P00002", "VALVE", "11001"),
+                ("P00003", "GASKET", "11002"),
+                ("IMG10004", "", "D10"),
+            ]
+        )
+    )
+    try:
+        truncated = instance.crawl_group("TOYOTA", 7, _group(), fetched={})
+    finally:
+        instance.close()
+
+    assert truncated is True
+    assert instance.counts["parts"] == 1
+    instance.parts.quarantine_parts.assert_called_once()
+    args = instance.parts.quarantine_parts.call_args.args
+    assert args[0] == 41
+    assert args[1] == "2026-08-fixture"
+    assert args[2] == [
+        {
+            "part_number": "IMG10004",
+            "code": "D10",
+            "quantity": "01",
+            "range_str": "",
+            "note": "",
+        }
+    ]
+    # 組未 receipt（截斷）：不標 partial/done，resume 會重抓本組
+    instance.crawl.mark_group_fetched.assert_not_called()
 
 
 def test_all_valid_page_marks_done_without_quarantine(sample_crawler) -> None:

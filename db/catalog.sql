@@ -145,11 +145,14 @@ CREATE TABLE IF NOT EXISTS part_quarantine (
   quantity    VARCHAR(16) NULL,
   note        TEXT NULL,
   run_key     VARCHAR(128) NOT NULL,           -- 發現時所在的 logical run
+  resolved_at DATETIME NULL,                   -- 人工處置時間（migration 012）
+  resolution  VARCHAR(255) NULL,               -- 處置說明（migration 012）
   created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_quarantine (group_id, part_number, range_str, reason),
   KEY idx_quarantine_group (group_id),
+  KEY idx_quarantine_resolved (run_key, resolved_at),
   CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id)
     REFERENCES groups_t(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -466,7 +466,18 @@ class PartRepository:
         列，無可驗證產品名稱）。它們不落 parts 表（發布資料必須能把料號
         對到名稱），但也不能讓該組標 done 後被永久忽略 —— 寫進
         part_quarantine 供追蹤，且呼叫端應以 fetched_status='partial'
-        標記該組，讓下次排程重新抓取直到站方補上名稱或人工處置。
+        標記該組，讓後續重試/下次排程重新抓取直到站方補上名稱或
+        人工處置。
+
+        人工處置流程（migration 012 的 resolved_at / resolution 欄位）：
+        1. 管理員核對 quarantine 列（站方補上名稱 → 下次重抓會自動
+           done；站方移除該料號 → 確認該列永遠無法發布）。
+        2. 對每列填 resolved_at + resolution（count_quarantined 不再
+           計入，解除 quarantine 阻擋）。
+        3. 解除 partial 組的阻擋：組 receipt 必須變成 terminal ——
+           站方補上名稱後由下次重抓自動 done；或管理員在 DB 將該組
+           改標 done/not_found（count_partial_groups 才歸零）。
+           只填 resolved_at 不會解除 partial 阻擋（兩者獨立）。
 
         以 (group_id, part_number, range_str, reason) 為唯一鍵，重複發現
         時就地更新（冪等）。
@@ -584,6 +595,37 @@ class CrawlRepository:
             cur = self.db._execute("SELECT COUNT(*) AS n FROM groups_t")
         return cur.fetchone()["n"]
 
+    def count_partial_groups(self, run_key: str = "") -> int:
+        """回傳指定 run 內仍標 partial 的 group 數。
+
+        partial（SOL review P1）是非 terminal receipt：組內有無名稱
+        料號列已列進 part_quarantine，資料來源不完整。任何 partial
+        存在都代表該 run 不得發布（bounded_success / success 的
+        前置條件之一）。
+        """
+        if not run_key:
+            return 0
+        cur = self.db._execute(
+            "SELECT COUNT(*) AS n FROM groups_t "
+            "WHERE fetched_run_key = %s AND fetched_status = 'partial'",
+            (run_key,),
+        )
+        return cur.fetchone()["n"]
+
+    def count_quarantined(self, run_key: str = "") -> int:
+        """回傳指定 run 列進 part_quarantine、尚未人工處置的料號列數。
+
+        resolved_at 已填的列視為已處置，不計入；仍 > 0 代表資料來源
+        不完整，發布 gate 必須拒絕。
+        """
+        if not run_key:
+            return 0
+        cur = self.db._execute(
+            "SELECT COUNT(*) AS n FROM part_quarantine WHERE run_key = %s AND resolved_at IS NULL",
+            (run_key,),
+        )
+        return cur.fetchone()["n"]
+
     def mark_done(self, scope: str, key: str):
         """把某範圍的某個鍵標記為「完成」。
 
@@ -659,6 +701,11 @@ class CrawlRepository:
         （groups_t.fetched_run_key）為準 —— 舊版用「任一零件
         updated_at >= run 起點」啟發式，頁面只解析出部分非空資料時
         重試會把缺漏固定下來。
+
+        'partial'（SOL review P1）不是 terminal receipt：本組含無名稱
+        料號列（已列進 part_quarantine），資料來源不完整 —— 重試不得
+        skip，要重新抓取直到站方補上名稱或人工處置。只有
+        ('done', 'not_found') 才視為已抓完。
         """
         if not run_key:
             return False
@@ -666,7 +713,8 @@ class CrawlRepository:
             "SELECT 1 FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
             "WHERE c.vehicle_id = %s AND g.code = %s AND g.uid = %s "
-            "AND g.fetched_run_key = %s LIMIT 1",
+            "AND g.fetched_run_key = %s "
+            "AND (g.fetched_status IS NULL OR g.fetched_status <> 'partial') LIMIT 1",
             (vehicle_id, group_code, group_uid, run_key),
         )
         return cur.fetchone() is not None
@@ -680,6 +728,10 @@ class CrawlRepository:
         （fetched_status），這裡只做 skip 判斷。
         續爬一臺失敗車時，用這張 map 在記憶體判斷每組是否已完成，
         不必每組各查一次 DB —— 一臺車約 200 組，原本是 200 次往返。
+
+        'partial'（SOL review P1）不是 terminal receipt，**不進**這張
+        map：組內有無名稱料號列（part_quarantine）代表來源不完整，
+        續爬/重試必須重新抓取，直到站方補上名稱或人工處置。
         """
         if not run_key:
             return {}
@@ -687,7 +739,8 @@ class CrawlRepository:
             "SELECT c.cid, g.code, g.uid, g.fetched_row_count "
             "FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
-            "WHERE c.vehicle_id = %s AND g.fetched_run_key = %s",
+            "WHERE c.vehicle_id = %s AND g.fetched_run_key = %s "
+            "AND (g.fetched_status IS NULL OR g.fetched_status <> 'partial')",
             (vehicle_id, run_key),
         )
         return {
@@ -742,11 +795,13 @@ class CrawlRepository:
         讓續爬「不再重抓 404 或已完成組」，也為 content hash 增量
         更新打基礎。
 
-        'partial' 與 fetched_run_key 的互動：同 run_key 內（含 bounded
-        resume）partial 組視為本 run 已抓、不重抓（quarantine 已記下
-        無名稱列）；換到新的 run_key（下個月/下次排程）時因為 status
-        不在 ('done','not_found') 會被重新抓取，直到站方補上名稱或
-        人工處置。只有 status='done' 會更新 verified_row_count。
+        'partial' 與 fetched_run_key 的互動（SOL review P1 修訂）：
+        partial **不是 terminal receipt** —— 重試不會 skip（見
+        fetched_group_map / is_group_fetched）。實際重抓時機：(a) 同
+        run_key 內「失敗車」的重試（成功車已標 done，同 run 不會再
+        拜訪）；(b) 下一個 run_key（下個月/下次排程）。發布 gate 因
+        partial 存在而拒絕（count_partial_groups / count_quarantined）。
+        只有 status='done' 會更新 verified_row_count。
 
         與零件的 upsert 同一交易提交（見 crawl_group）：避免「零件寫了
         但狀態沒寫」的靜默缺漏。

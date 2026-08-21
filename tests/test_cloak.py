@@ -8,6 +8,7 @@
 import fcntl
 import json
 import os
+import shlex
 import threading
 import time
 from unittest import mock
@@ -421,21 +422,31 @@ def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch) -> None:
 
 
 def test_psq_cloak_launcher_env_keeps_server_args_single_argv(monkeypatch) -> None:
-    """P0 review 的組態端防護：compose.yml 的 PSQ_CLOAK_LAUNCHER（含內層
-    引號）經 config 的 shlex.split 後，--server-args 必須是**單一** argv
-    元素。舊的未引號寫法會把 `0` 拆成 xvfb-run 要執行的 command；此測試
-    在 compose.yml 回退成舊寫法時會失敗（接住組態回歸，不只驗證
-    _launch_cloak 的轉發）。"""
-    import importlib
+    """P0 review 的組態端防護：compose.yml 的 scheduler env
+    PSQ_CLOAK_LAUNCHER（含內層引號）經 config 的 shlex.split 後，
+    --server-args 必須是**單一** argv 元素。舊的未引號寫法會把 `0`
+    拆成 xvfb-run 要執行的 command。
 
-    fixed = "xvfb-run -a --server-args='-screen 0 1366x900x24'"
-    monkeypatch.setenv("PSQ_CLOAK_LAUNCHER", fixed)
-    importlib.reload(config)
-    assert config.CLOAK["launcher"] == [
+    直接讀 compose.yml（不硬編碼字串）：日後 compose.yml 回退成舊
+    寫法時此測試會失敗。"""
+    import importlib
+    import re
+    from pathlib import Path
+
+    compose_text = (Path(__file__).resolve().parents[1] / "compose.yml").read_text(encoding="utf-8")
+    match = re.search(r'PSQ_CLOAK_LAUNCHER:\s*"([^"]*)"', compose_text)
+    assert match is not None, "compose.yml must define PSQ_CLOAK_LAUNCHER"
+    compose_value = match.group(1)
+    parsed = shlex.split(compose_value)
+    assert parsed == [
         "xvfb-run",
         "-a",
         "--server-args=-screen 0 1366x900x24",
-    ]
+    ], "compose.yml PSQ_CLOAK_LAUNCHER must quote --server-args as one argv element"
+
+    monkeypatch.setenv("PSQ_CLOAK_LAUNCHER", compose_value)
+    importlib.reload(config)
+    assert config.CLOAK["launcher"] == parsed
 
     broken = "xvfb-run -a --server-args=-screen 0 1366x900x24"
     monkeypatch.setenv("PSQ_CLOAK_LAUNCHER", broken)
