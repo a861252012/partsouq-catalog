@@ -778,8 +778,8 @@ class AdminRepository:
             FROM part_quarantine
             JOIN groups_t ON groups_t.id = part_quarantine.group_id
             {clause}
-            ORDER BY part_quarantine.resolved_at IS NOT NULL,
-                     part_quarantine.updated_at DESC
+            ORDER BY part_quarantine.updated_at DESC,
+                     part_quarantine.id DESC
             LIMIT %s OFFSET %s
             """,
             (*params, limit, offset),

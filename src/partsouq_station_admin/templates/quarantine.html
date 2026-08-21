@@ -42,6 +42,10 @@
             {% if not row.resolved_at %}
               <form class="inline-form" method="post" action="{{ url_for('admin.quarantine_resolve', row_id=row.id) }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="state" value="{{ state }}">
+                <input type="hidden" name="run_key" value="{{ run_key }}">
+                <input type="hidden" name="page" value="{{ page.page }}">
+                <input type="hidden" name="pageSize" value="{{ page.pageSize }}">
                 <input type="text" name="resolution" maxlength="255" placeholder="處置說明（可留空）">
                 <button type="submit">標記處置</button>
               </form>

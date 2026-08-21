@@ -240,7 +240,15 @@ def quarantine_resolve(row_id: int) -> ResponseReturnValue:
     resolution = request.form.get("resolution", "").strip()
     _repository().resolve_quarantine(row_id, resolution)
     flash("已標記處置（同一料號後續 run 再現時會自動重開）。", "success")
-    return redirect(url_for("admin.quarantine_list", state=request.args.get("state", "unresolved")))
+    return redirect(
+        url_for(
+            "admin.quarantine_list",
+            state=request.form.get("state", "unresolved"),
+            run_key=request.form.get("run_key") or None,
+            page=request.form.get("page", "1"),
+            pageSize=request.form.get("pageSize"),
+        )
+    )
 
 
 @bp.get("/entities/<entity_type>")

@@ -467,7 +467,7 @@ suite 349 passed（含 MySQL gated + station-admin 真實 Chrome E2E）。
 ### SOL review 第五輪（2026-08-22，`ff66574` 之後）
 
 GPT5.6 SOL MAX 覆核 `ff66574` 後指出 2 個 P1 + 3 個 P2 + P3 文件；
-已全數修正（本節尚未 commit）：
+已全數修正並 commit 為 `d3142d2`（已 push 到 origin/main）：
 
 1. **P1 Quarantine 分頁接通**：`GET /api/quarantine` 的
    `page_size` 改為 FastAPI `Query(alias="pageSize")`，HTTP 層
@@ -522,3 +522,43 @@ GPT5.6 SOL MAX 覆核 `ff66574` 後指出 2 個 P1 + 3 個 P2 + P3 文件；
   兩個 unit 測試改斷言 done + fetched map 含該組；移除三個 gate 測試。
 - 影響：10,000 bounded 正式驗證不會再因無名稱列而 error；有無名稱列
   的組會以 warning 記錄在 log，料號列在 `part_quarantine` 可查詢。
+
+### SOL review 第六輪（2026-08-22，`d3142d2` 之後）
+
+GPT5.6 SOL MAX 覆核 `d3142d2` 後指出 1 個 P1 + 2 個 P2 + P3 文件 +
+FastAPI 處置列欄位錯位；已全數修正並 commit 為本節末尾 hash（已 push
+到 origin/main）：
+
+1. **P1 無 token 初次載入會破壞 Quarantine 分頁狀態**：`refresh()` 在
+   無 token 時把 `quarantine` 設成 `[]`，但 `renderQuarantine()` 預期
+   `{items, page, pageSize, total, totalPages}` 物件 —— 真實 Chrome
+   初次載入即 `result.items is not iterable`，且分頁狀態被污染成
+   `undefined`，填 token 後送出 `page=undefined&pageSize=undefined`
+   取得 422。修正：無 token 時改傳明確的空分頁物件
+   `{items: [], page: 1, pageSize: 50, total: 0, totalPages: 0}`。
+   新增真實瀏覽器回歸測試（Playwright + uvicorn 起 admin）：
+   無 token 載入斷言「無紀錄」渲染且無 `is not iterable`、填 token
+   重新整理後斷言料號列出現且分頁參數為 page=1&pageSize=50（無 422）。
+   另做 mutation check：暫時還原成 `[]` 時測試如預期失敗，錯誤訊息
+   正是 reviewer 回報的 `result.items is not iterable`。
+2. **P2 unresolved 查詢仍有 filesort**：`ORDER BY resolved_at IS NOT
+   NULL, updated_at DESC` 的常數排序讓 EXPLAIN 停在
+   `Using index condition; Using filesort`。修正為
+   `ORDER BY updated_at DESC, id DESC`（同步修正 :8000 admin 與
+   :8086 station-admin 兩處 SQL），實測 EXPLAIN 變成
+   `ref idx_quarantine_list + Backward index scan`、無 filesort；
+   `id DESC` 確保跨頁排序穩定。SQL 斷言加入兩個測試。
+3. **P2 station-admin 處置後遺失分頁與篩選**：resolve form 加
+   `state / run_key / page / pageSize` hidden inputs，
+   redirect 完整保留使用者所在頁面（含 run_key 篩選、第 N 頁、
+   每頁筆數）；route 測試斷言 redirect Location 保留全部參數。
+4. **FastAPI 已處置列欄位錯位**：表頭 8 欄但已處置列只有 7 個 `<td>`
+   （缺少動作欄的空白格），已處置列補空 `<td>`；瀏覽器回歸測試斷言
+   未處置與已處置列都是 8 個 `<td>`。
+5. **P3 文件**：第五輪章節更新為「已全數修正並 commit 為 `d3142d2`
+   （已 push）」；新增本第六輪章節，附本輪 commit hash。
+
+完整 gate：`359 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
+ruff check/format 全過、`git diff --check` 無輸出、migration 012 兩次
+重跑 exit 0、三個 image 的執行中檔案 hash 與 HEAD 一致、CloakBrowser
+容器實測 `CDP_READY 146.0.7680.177`。

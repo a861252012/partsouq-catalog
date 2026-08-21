@@ -40,6 +40,8 @@ def test_quarantine_list_filters_unresolved_and_paginates(
     assert count_params == ("bounded-1",)
     assert "LIMIT %s OFFSET %s" in list_sql
     assert list_params == ("bounded-1", 25, 0)
+    assert "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC" in list_sql
+    assert "resolved_at IS NOT NULL" not in list_sql
 
 
 def test_quarantine_list_all_state_has_no_resolved_filter(
@@ -52,6 +54,7 @@ def test_quarantine_list_all_state_has_no_resolved_filter(
         return {"n": 0}
 
     def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        captured.append(sql)
         return []
 
     monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
@@ -60,6 +63,8 @@ def test_quarantine_list_all_state_has_no_resolved_filter(
     admin_app.list_quarantine(state="all", page=1, page_size=10)
 
     assert "resolved_at IS NULL" not in captured[0]
+    assert "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC" in captured[1]
+    assert "resolved_at IS NOT NULL" not in captured[1]
 
 
 def test_quarantine_resolve_marks_row(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -193,10 +193,20 @@ def test_quarantine_resolve_requires_csrf_and_redirects() -> None:
 
     response = client.post(
         "/quarantine/1/resolve",
-        data={"csrf_token": token, "resolution": "checked, removed from site"},
+        data={
+            "csrf_token": token,
+            "resolution": "checked, removed from site",
+            "state": "all",
+            "run_key": "bounded-20260822-007",
+            "page": "3",
+            "pageSize": "25",
+        },
     )
 
     assert response.status_code == 302
+    assert response.headers["Location"] == (
+        "/quarantine?state=all&run_key=bounded-20260822-007&page=3&pageSize=25"
+    )
     assert [call.tag for call in databases[-1].calls] == [
         "quarantine.lock-row",
         "quarantine.resolve",

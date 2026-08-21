@@ -432,6 +432,8 @@
             });
             cell.append(button);
             tr.append(cell);
+          } else {
+            tr.append(document.createElement('td'));
           }
           quarantineTableBody.append(tr);
         }
@@ -470,7 +472,7 @@
           ]);
           const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs, quarantine] = token() ? await Promise.all([
             call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs'), call(quarantinePath())
-          ]) : [[], [], [], [], [], [], []];
+          ]) : [[], [], [], [], [], [], { items: [], page: 1, pageSize: 50, total: 0, totalPages: 0 }];
           renderSummary(summary);
           renderPartsPage(partsPage);
           renderQuarantine(quarantine);

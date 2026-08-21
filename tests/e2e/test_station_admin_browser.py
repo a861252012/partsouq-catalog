@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -311,6 +312,30 @@ def _running_server(database: E2EDatabase) -> Iterator[str]:
         thread.join(timeout=5)
 
 
+@contextmanager
+def _running_admin_server(database: E2EDatabase) -> Iterator[str]:
+    import uvicorn
+
+    config = uvicorn.Config(
+        data_admin_app.app,
+        host="127.0.0.1",
+        port=0,
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        while not server.started:
+            time.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
 def _launch_chromium(playwright: Playwright) -> Browser:
     channel = os.getenv("STATION_ADMIN_E2E_BROWSER_CHANNEL", "").strip()
     try:
@@ -325,6 +350,89 @@ def _launch_chromium(playwright: Playwright) -> Browser:
             pytrace=False,
         )
         raise AssertionError from error
+
+
+def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
+    e2e_database: E2EDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_config = {
+        "host": e2e_database.host,
+        "port": e2e_database.port,
+        "user": e2e_database.user,
+        "password": e2e_database.password,
+        "database": e2e_database.database,
+    }
+    for key, value in database_config.items():
+        monkeypatch.setitem(data_admin_app.DB_CONFIG, key, value)
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "e2e-admin-token")
+    connection = e2e_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO part_quarantine("
+                "group_id, part_number, range_str, reason, run_key"
+                ") SELECT id, 'E2E-Q0001', 'E2E-RANGE', 'nameless', 'e2e-run' "
+                "FROM groups_t WHERE code = 'E2E1' LIMIT 1"
+            )
+            cursor.execute(
+                "INSERT INTO part_quarantine("
+                "group_id, part_number, range_str, reason, run_key, "
+                "resolved_at, resolution"
+                ") SELECT id, 'E2E-Q0002', 'E2E-RANGE', 'nameless', 'e2e-run', "
+                "UTC_TIMESTAMP(), 'resolved in e2e' "
+                "FROM groups_t WHERE code = 'E2E1' LIMIT 1"
+            )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    with (
+        _running_admin_server(e2e_database) as admin_url,
+        sync_playwright() as playwright,
+    ):
+        browser = _launch_chromium(playwright)
+        try:
+            page = browser.new_page()
+            console_errors: list[str] = []
+            page.on(
+                "pageerror",
+                lambda error: console_errors.append(str(error)),
+            )
+            page.on(
+                "console",
+                lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+            )
+
+            page.goto(admin_url)
+            expect(page.locator("#quarantine-table-body")).to_contain_text("無紀錄")
+            assert not any("is not iterable" in text for text in console_errors)
+            expect(page.locator("#quarantine-page-number")).to_have_value("1")
+            expect(page.locator("#quarantine-total-pages")).to_have_text("共 0 頁")
+
+            page.locator("#token").fill("e2e-admin-token")
+            page.locator("#refresh").click()
+            expect(page.locator("#quarantine-table-body")).to_contain_text("E2E-Q0001")
+            assert not any("422" in text for text in console_errors)
+            expect(page.locator("#quarantine-page-number")).to_have_value("1")
+            expect(page.locator("#quarantine-total-pages")).to_have_text("共 1 頁")
+            expect(page.locator("#quarantine-range-label")).to_have_text("顯示 1 到 1，共 1 筆")
+            expect(
+                page.locator("#quarantine-table-body").get_by_role("button", name="標記處置")
+            ).to_be_visible()
+
+            page.locator("#quarantine-state").select_option("all")
+            page.locator("#quarantine-refresh").click()
+            expect(page.locator("#quarantine-table-body")).to_contain_text("E2E-Q0002")
+            expect(page.locator("#quarantine-total-pages")).to_have_text("共 1 頁")
+            unresolved_row = page.locator("#quarantine-table-body tr").filter(has_text="E2E-Q0001")
+            resolved_row = page.locator("#quarantine-table-body tr").filter(has_text="E2E-Q0002")
+            expect(unresolved_row.locator("td")).to_have_count(8)
+            expect(resolved_row.locator("td")).to_have_count(8)
+        finally:
+            browser.close()
 
 
 def _read_database_evidence(database: E2EDatabase) -> dict[str, object]:

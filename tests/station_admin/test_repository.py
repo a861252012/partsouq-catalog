@@ -307,6 +307,9 @@ def test_quarantine_list_filters_unresolved_and_run_key() -> None:
     assert count_call.params == ("bounded-1",)
     assert "part_quarantine.resolved_at IS NULL" in list_call.sql
     assert "JOIN groups_t" in list_call.sql
+    assert "ORDER BY part_quarantine.updated_at DESC," in list_call.sql
+    assert "part_quarantine.id DESC" in list_call.sql
+    assert "resolved_at IS NOT NULL" not in list_call.sql
     assert list_call.params == ("bounded-1", 25, 0)
 
 

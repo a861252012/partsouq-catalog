@@ -1311,8 +1311,8 @@ def list_quarantine(
         f"part_quarantine.updated_at, groups_t.code AS group_code, groups_t.uid "
         f"FROM part_quarantine "
         f"JOIN groups_t ON groups_t.id = part_quarantine.group_id {clause} "
-        f"ORDER BY part_quarantine.resolved_at IS NOT NULL, "
-        f"part_quarantine.updated_at DESC LIMIT %s OFFSET %s",
+        f"ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC "
+        f"LIMIT %s OFFSET %s",
         (*params, page_size, (page - 1) * page_size),
     )
     return {
