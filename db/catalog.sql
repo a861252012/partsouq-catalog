@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS groups_t (
   url         VARCHAR(1024) NULL,
   fetched_at  DATETIME NULL,
   fetched_run_key VARCHAR(32) NULL,          -- 最後一次抓取零件的 run_key（group terminal state，F1b）
-  fetched_status VARCHAR(16) NULL,           -- done / not_found / partial（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt；partial = 有 quarantine 的非 terminal 狀態）
+  fetched_status VARCHAR(16) NULL,           -- done / not_found（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt；partial 為歷史值，不再產生）
   fetched_row_count INT DEFAULT 0,           -- 本組零件筆數（F5 receipt，content hash 基礎）
   verified_row_count INT NOT NULL DEFAULT 0, -- 歷次 done 的最高筆數；縮水偵測基準，只升不降
   UNIQUE KEY uq_group (category_id, code, uid),

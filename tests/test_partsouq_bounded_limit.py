@@ -476,6 +476,22 @@ def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
         )
         database.commit()
         assert crawl.count_quarantined(run_key) == 0
+
+        # SOL review P1：同一料號在**後續 run 再次出現**時必須重開
+        # 處置狀態 —— resolved_at / resolution 清空、新的 run_key 計入
+        # count_quarantined，不能藏在舊的「已處置」紀錄下。
+        second_run_key = "bounded-mysql-gate-2"
+        parts.quarantine_parts(group_id, second_run_key, [_parts(1)[0]])
+        database.commit()
+        row = database._execute(
+            "SELECT run_key, resolved_at, resolution FROM part_quarantine "
+            "WHERE group_id = %s AND part_number = %s",
+            (group_id, "P-00000"),
+        ).fetchone()
+        assert row["run_key"] == second_run_key
+        assert row["resolved_at"] is None
+        assert row["resolution"] is None
+        assert crawl.count_quarantined(second_run_key) == 1
     finally:
         database.rollback()
         _clear_mysql_fixture(database)

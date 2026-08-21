@@ -475,7 +475,10 @@ class PartRepository:
         管理員核對後可填寫，作為審計紀錄；純紀錄用途，不影響流程。
 
         以 (group_id, part_number, range_str, reason) 為唯一鍵，重複發現
-        時就地更新（冪等）。
+        時就地更新（冪等）。同一料號在後續 run **再次出現**時（新的
+        occurrence），會重開處置狀態：清掉 resolved_at / resolution，
+        讓 count_quarantined 重新計入（SOL review P1：不能把新發生的
+        異常藏在舊的「已處置」紀錄下）。
         """
         if not rows:
             return 0
@@ -485,6 +488,7 @@ class PartRepository:
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) AS new "
             "ON DUPLICATE KEY UPDATE reason = new.reason, code = new.code, "
             "quantity = new.quantity, note = new.note, run_key = new.run_key, "
+            "resolved_at = NULL, resolution = NULL, "
             "updated_at = CURRENT_TIMESTAMP",
             [
                 (

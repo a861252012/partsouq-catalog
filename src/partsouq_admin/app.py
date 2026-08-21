@@ -152,6 +152,10 @@ class CrawlRequestInput(InputModel):
     requested_scope: str = Field(default="all", min_length=1, max_length=64)
 
 
+class QuarantineResolveInput(InputModel):
+    resolution: str = Field(default="", max_length=255)
+
+
 def _connect() -> pymysql.connections.Connection:
     return pymysql.connect(**DB_CONFIG, cursorclass=DictCursor, autocommit=True)
 
@@ -275,6 +279,9 @@ def database_summary() -> dict:
             "(SELECT COUNT(*) FROM admin_reconciliation_items) AS admin_reconciliation_items, "
             "(SELECT COUNT(*) FROM admin_crawl_requests) AS admin_crawl_requests, "
             "(SELECT COUNT(*) FROM scheduled_job_runs) AS scheduled_job_runs, "
+            "(SELECT COUNT(*) FROM part_quarantine) AS quarantine_total, "
+            "(SELECT COUNT(*) FROM part_quarantine WHERE resolved_at IS NULL) "
+            "AS quarantine_unresolved, "
             "current_catalog.*, bounded.* FROM ("
             "SELECT MAX(dataset_scope) AS current_catalog_scope, "
             "MAX(source_crawl_run_id) AS current_catalog_crawl_run_id, "
@@ -816,6 +823,10 @@ def database_summary() -> dict:
             "crawl_requests": counts.get("admin_crawl_requests", 0),
             "scheduled_job_runs": counts.get("scheduled_job_runs", 0),
         },
+        "quarantine": {
+            "total": int(counts.get("quarantine_total", 0)),
+            "unresolved": int(counts.get("quarantine_unresolved", 0)),
+        },
         "data_quality": {
             "published": published_quality,
             "sample": sample_quality,
@@ -1272,6 +1283,63 @@ def update_vin_vehicle_mapping(row_id: int, payload: VinVehicleMappingInput) -> 
         (*values, row_id),
     )
     return _row_or_404("admin_vehicle_mappings", row_id)
+
+
+@app.get("/api/quarantine", dependencies=[Depends(require_admin_token)])
+def list_quarantine(
+    state: Literal["unresolved", "all"] = "unresolved",
+    run_key: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    """列出 part_quarantine（無名稱料號列的紀錄，使用者決定的
+    「忽略 + 紀錄」政策）。state=unresolved 只回未處置列。"""
+    _validate_page_size(page_size)
+    clause = "WHERE 1=1"
+    params: list[object] = []
+    if state == "unresolved":
+        clause += " AND part_quarantine.resolved_at IS NULL"
+    if run_key:
+        clause += " AND part_quarantine.run_key = %s"
+        params.append(run_key)
+    total = _fetch_one(f"SELECT COUNT(*) AS n FROM part_quarantine {clause}", tuple(params))["n"]
+    rows = _fetch_all(
+        f"SELECT part_quarantine.id, part_quarantine.part_number, "
+        f"part_quarantine.range_str, part_quarantine.reason, part_quarantine.code, "
+        f"part_quarantine.quantity, part_quarantine.note, part_quarantine.run_key, "
+        f"part_quarantine.resolved_at, part_quarantine.resolution, "
+        f"part_quarantine.updated_at, groups_t.code AS group_code, groups_t.uid "
+        f"FROM part_quarantine "
+        f"JOIN groups_t ON groups_t.id = part_quarantine.group_id {clause} "
+        f"ORDER BY part_quarantine.resolved_at IS NOT NULL, "
+        f"part_quarantine.updated_at DESC LIMIT %s OFFSET %s",
+        (*params, page_size, (page - 1) * page_size),
+    )
+    return {
+        "items": rows,
+        "page": page,
+        "pageSize": page_size,
+        "total": int(total),
+        "totalPages": (int(total) + page_size - 1) // page_size,
+    }
+
+
+@app.post(
+    "/api/quarantine/{row_id}/resolve",
+    dependencies=[Depends(require_admin_token)],
+)
+def resolve_quarantine(row_id: int, payload: QuarantineResolveInput) -> dict:
+    """把 quarantine 列標記為已處置（resolved_at = now）。
+
+    同一料號在後續 run 再次出現時，爬蟲會重開處置狀態
+    （resolved_at / resolution 清空），重新回到未處置清單。
+    """
+    _row_or_404("part_quarantine", row_id)
+    _execute(
+        "UPDATE part_quarantine SET resolved_at = NOW(), resolution = %s WHERE id = %s",
+        (payload.resolution, row_id),
+    )
+    return _row_or_404("part_quarantine", row_id)
 
 
 def _validated_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> tuple[object, ...]:

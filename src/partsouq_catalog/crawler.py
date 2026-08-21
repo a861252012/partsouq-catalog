@@ -712,68 +712,76 @@ class Crawler:
         # 零件數相較前次大幅縮水（格式完整但內容縮水）時拒絕 receipt。
         prev_rows = self.crawl.previous_row_count_map(vehicle_id, self.crawl.run_key or "")
         category_ids = {}
-        truncated = self.crawl_groups(
-            brand,
-            vehicle_id,
-            html,
-            default_cid="1",
-            soup=soup,
-            skip=True,
-            fetched=fetched,
-            prev_rows=prev_rows,
-            category_ids=category_ids,
-            expected_ssd=ssd,
-            expected_vid=base_vid,
-        )
-
-        remaining_categories = categories[1:]
-        for index, category in enumerate(remaining_categories):
-            if self._sample_limit_reached.is_set():
-                truncated += len(remaining_categories) - index
-                break
-            category_url = category["url"]
-            if not category_url.startswith("http"):
-                category_url = SITE["base"] + category_url
-            category_html = self._get(category_url)
-            category_soup = _soup(category_html)
-            truncated += self.crawl_groups(
+        try:
+            truncated = self.crawl_groups(
                 brand,
                 vehicle_id,
-                category_html,
-                default_cid=category["cid"],
-                soup=category_soup,
+                html,
+                default_cid="1",
+                soup=soup,
                 skip=True,
                 fetched=fetched,
                 prev_rows=prev_rows,
                 category_ids=category_ids,
-                expected_ssd=str(category.get("ssd") or ssd),
-                expected_vid=str(category.get("vid") or base_vid),
+                expected_ssd=ssd,
+                expected_vid=base_vid,
             )
 
-        # SOL review P1：分類縮水對帳 —— DB 已知但本次完全沒解析到的
-        # 分類（vehicle 頁縮水/反爬頁只回部分分類連結）代表該分類的
-        # 零件組本 run 沒有機會被爬，車不得標 done。
-        parsed_cids = {c["cid"] for c in categories}
-        parsed_names = {c["category_name"] for c in categories}
-        missing = [
-            name
-            for cid, name in known_categories.items()
-            if cid not in parsed_cids and name not in parsed_names
-        ]
-        if missing:
-            raise RuntimeError(
-                f"[{brand} vehicle={vehicle_id}] {len(missing)} known category(ies) never "
-                f"parsed this run: {', '.join(missing[:4])}"
-            )
-        if truncated:
-            if self._sample_limit_reached.is_set():
-                raise SampleLimitReached
-            # 有零件組被 limit_groups 截斷：這台車沒有爬完整，
-            # 拋出例外讓該 vehicle 標 error、不標 done —— 否則同月
-            # 全量續爬會把缺零件的車當成已完成而跳過（P0 修復）。
-            raise RuntimeError(
-                f"[{brand} vehicle={vehicle_id}] {truncated} group(s) truncated by limit_groups"
-            )
+            remaining_categories = categories[1:]
+            for index, category in enumerate(remaining_categories):
+                if self._sample_limit_reached.is_set():
+                    truncated += len(remaining_categories) - index
+                    break
+                category_url = category["url"]
+                if not category_url.startswith("http"):
+                    category_url = SITE["base"] + category_url
+                category_html = self._get(category_url)
+                category_soup = _soup(category_html)
+                truncated += self.crawl_groups(
+                    brand,
+                    vehicle_id,
+                    category_html,
+                    default_cid=category["cid"],
+                    soup=category_soup,
+                    skip=True,
+                    fetched=fetched,
+                    prev_rows=prev_rows,
+                    category_ids=category_ids,
+                    expected_ssd=str(category.get("ssd") or ssd),
+                    expected_vid=str(category.get("vid") or base_vid),
+                )
+
+            # SOL review P1：分類縮水對帳 —— DB 已知但本次完全沒解析到的
+            # 分類（vehicle 頁縮水/反爬頁只回部分分類連結）代表該分類的
+            # 零件組本 run 沒有機會被爬，車不得標 done。
+            parsed_cids = {c["cid"] for c in categories}
+            parsed_names = {c["category_name"] for c in categories}
+            missing = [
+                name
+                for cid, name in known_categories.items()
+                if cid not in parsed_cids and name not in parsed_names
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"[{brand} vehicle={vehicle_id}] {len(missing)} known category(ies) never "
+                    f"parsed this run: {', '.join(missing[:4])}"
+                )
+            if truncated:
+                if self._sample_limit_reached.is_set():
+                    raise SampleLimitReached
+                # 有零件組被 limit_groups 截斷：這台車沒有爬完整，
+                # 拋出例外讓該 vehicle 標 error、不標 done —— 否則同月
+                # 全量續爬會把缺零件的車當成已完成而跳過（P0 修復）。
+                raise RuntimeError(
+                    f"[{brand} vehicle={vehicle_id}] {truncated} group(s) truncated by limit_groups"
+                )
+        finally:
+            # SOL review P2：本車爬完（成功或失敗）後清除本車各 category
+            # 的 GroupIdentity 快取 —— 否則完整全站爬取時記憶體隨所有
+            # 已處理 category 持續成長（本車快取在爬完後不再被使用）。
+            with self.lock:
+                for category_id in category_ids.values():
+                    self._group_identities.pop(category_id, None)
 
     def crawl_groups(
         self,
@@ -1371,6 +1379,16 @@ class Crawler:
                 errors = self.crawl.count_failures(run_key)
                 if not errors:
                     finalizing = True
+                    # 「忽略 + 紀錄」政策：quarantine 列不阻擋發布，但
+                    # 每次發布都在 log 留下未處置紀錄的數量（可查
+                    # part_quarantine）。
+                    quarantined = self.crawl.count_quarantined(run_key)
+                    if quarantined:
+                        log.warning(
+                            "publishing bounded snapshot with %d quarantined row(s) "
+                            "(part_quarantine, unresolved)",
+                            quarantined,
+                        )
                     self.crawl.publish_bounded_parts(run_id, self.part_limit)
                     self.crawl.finish_run(run_id, "bounded_success", self.counts)
                     self.db.commit()
@@ -1474,6 +1492,13 @@ class Crawler:
                 # bounded snapshot 與 terminal status 必須是同一個交易。
                 # Repository 會再次核對 target、來源關聯與必填欄位；
                 # 任一失敗會 rollback，上一版 bounded dataset 仍可讀。
+                quarantined = self.crawl.count_quarantined(run_key)
+                if quarantined:
+                    log.warning(
+                        "publishing bounded snapshot with %d quarantined row(s) "
+                        "(part_quarantine, unresolved)",
+                        quarantined,
+                    )
                 finalizing = True
                 self.crawl.publish_bounded_parts(run_id, self.part_limit)
                 self.crawl.finish_run(run_id, "bounded_success", self.counts)
@@ -1564,6 +1589,13 @@ class Crawler:
                     # snapshot，再寫 success，commit 成功後才更新記憶體狀態。
                     # publish/finish 任一步失敗都會由 except rollback，不會
                     # 留下「run success 但 view 空掉」的矛盾狀態。
+                    quarantined = self.crawl.count_quarantined(run_key)
+                    if quarantined:
+                        log.warning(
+                            "publishing full snapshot with %d quarantined row(s) "
+                            "(part_quarantine, unresolved)",
+                            quarantined,
+                        )
                     finalizing = True
                     self.crawl.publish_success_parts(run_id)
                     self.crawl.finish_run(run_id, "success", self.counts)

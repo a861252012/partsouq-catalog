@@ -419,9 +419,50 @@ GPT5.6 SOL MAX 覆核 `6023ad4`：確認 commit/push/P0/closure/341 tests 均
    repositories docstring。
 
 自動測試（本輪）：`PARTSOUQ_DB_NAME=partsouq_catalog_test +
-UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **345 passed, 1 skipped**；
+UNIFIED_TEST_MYSQL=1 NHTSA_TEST_MYSQL=1` → **343 passed, 1 skipped**；
 ruff check/format 全過。主 DB 與 `partsouq_catalog_test` 均已套用
 migration 012。
+
+### SOL review 第四輪（2026-08-21，`3cf22d0` 之後）
+
+GPT5.6 SOL MAX 覆核後指出 2 個 P1 + 數個 P2；已全數處理如下（尚未
+commit）：
+
+1. **P1 驗收標準重新定義（文件化）**：原始「PartSouq 發現的每個料號
+   都能 mapping 到名稱」的 100% 嚴格標準，因站方資料本身不提供名稱
+   而無法達成；使用者已明示「忽略 + 紀錄」政策。現行驗收標準 =
+   (a) 已發布的每一列都有名稱；(b) 發現但無法發布的料號列**全部**
+   記錄在 `part_quarantine`（可查、可處置）；(c) 每次發布在 log 留下
+   未處置 quarantine 數量（bounded 早收/收尾、full success 三處）。
+2. **P1 本機執行環境套用最新程式**：`docker compose build scheduler`
+   重建 image，並以 grep 驗證 image 內 == HEAD（無
+   `count_partial_groups`、含 `resolved_at = NULL` 重開邏輯、含 admin
+   quarantine endpoint）；容器內 CloakBrowser 再測 CDP ready；
+   `admin`（:8000）與 `station-admin`（:8086）已啟動並回應 health。
+   scheduler 未啟動（10,000 正式爬取待使用者 OK）。
+3. **P1 quarantine 重現時重開處置狀態**：`quarantine_parts` 的
+   ON DUPLICATE 更新增加 `resolved_at = NULL, resolution = NULL` ——
+   同一料號在後續 run 再次出現時重新計入 `count_quarantined`，不會
+   藏在舊的「已處置」紀錄下。MySQL 測試覆蓋（resolve → 新 run 重現
+   → 重開 + 計入）。
+4. **P2 快取清理**：`crawl_vehicle` 以 try/finally 在本車爬完（成功或
+   失敗）後清除本車各 category 的 GroupIdentity 快取，完整全站爬取
+   記憶體不再隨所有 category 持續成長。
+5. **P2 migration 012 可重複執行**：改為 009/010 的條件式 procedure
+   模式（information_schema 檢查 + postflight assert），已在主 DB 與
+   `_test` DB 各重跑兩次驗證（rc=0）。
+6. **P2 後台處置入口**：admin 新增 `GET /api/quarantine`（state/
+   run_key 篩選、分頁）、`POST /api/quarantine/{id}/resolve`、
+   `database-summary` 新增 `quarantine.total / unresolved` 計數；
+   `admin.html` 新增 Quarantine 紀錄區塊（列表 + 「標記處置」按鈕，
+   需 admin token）。
+7. **P2 文件修正**：README 移除「image 不含 CloakBrowser」的過時說法
+   （改為已內建並實測）；`db/catalog.sql` 的 `fetched_status` 註解
+   移除舊 partial 語意（改為「partial 為歷史值，不再產生」）。
+
+自動測試（本輪）：`tests/test_admin_quarantine.py`（5 個新測試）+ MySQL
+quarantine 重開測試 + 既有 bounded/closure 測試 → **49 passed**；完整
+suite 待最後一輪確認。migration 012 重跑 rc=0。
 
 ### 政策決定：無名稱列改「忽略 + 紀錄」（2026-08-21，使用者決定）
 

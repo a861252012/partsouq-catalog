@@ -80,6 +80,20 @@
         </div>
       </section>
 
+      <section class="panel" style="margin-bottom:16px">
+        <h2>Quarantine 紀錄（無名稱料號列，忽略＋紀錄政策）</h2>
+        <div class="table-controls">
+          <label>狀態<select id="quarantine-state"><option value="unresolved">未處置</option><option value="all">全部</option></select></label>
+          <button type="button" class="secondary" id="quarantine-refresh">重新整理</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>料號</th><th>Code</th><th>Qty</th><th>Range</th><th>組 code／uid</th><th>Run</th><th>處置</th><th></th></tr></thead>
+            <tbody id="quarantine-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <div class="grid">
         <section>
           <h2>車輛對照</h2>
@@ -359,18 +373,76 @@
           statusMessage('已刷新零件資料。');
         } catch (error) { statusMessage(error.message, true); }
       }
+      const quarantineTableBody = document.querySelector('#quarantine-table-body');
+      const quarantineStateSelect = document.querySelector('#quarantine-state');
+      function renderQuarantine(result) {
+        quarantineTableBody.replaceChildren();
+        for (const row of result.items) {
+          const tr = document.createElement('tr');
+          const resolved = row.resolved_at ? `已處置 ${row.resolved_at}` : '未處置';
+          const values = [
+            row.part_number ?? '—', row.code ?? '—', row.quantity ?? '—',
+            row.range_str || '—', `${row.group_code ?? '—'} / ${row.uid ?? '—'}`,
+            row.run_key ?? '—', `${resolved}${row.resolution ? `\n${row.resolution}` : ''}`,
+          ];
+          values.forEach(value => {
+            const cell = document.createElement('td');
+            cell.textContent = value;
+            cell.classList.add('wrap');
+            tr.append(cell);
+          });
+          if (!row.resolved_at) {
+            const cell = document.createElement('td');
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = '標記處置';
+            button.addEventListener('click', async () => {
+              const resolution = window.prompt('處置說明（可留空）', '');
+              if (resolution === null) return;
+              try {
+                await call(`/api/quarantine/${row.id}/resolve`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ resolution }),
+                });
+                statusMessage('已標記處置。');
+                await refreshQuarantine();
+              } catch (error) { statusMessage(error.message, true); }
+            });
+            cell.append(button);
+            tr.append(cell);
+          }
+          quarantineTableBody.append(tr);
+        }
+        if (!result.items.length) {
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 8;
+          td.textContent = '無紀錄';
+          tr.append(td);
+          quarantineTableBody.append(tr);
+        }
+      }
+      async function refreshQuarantine() {
+        if (!token()) { quarantineTableBody.replaceChildren(); return; }
+        try {
+          const result = await call(`/api/quarantine?state=${quarantineStateSelect.value}&page=1&pageSize=200`);
+          renderQuarantine(result);
+        } catch (error) { statusMessage(error.message, true); }
+      }
       async function refresh() {
         try {
           const [summary, partsPage, translations, categories] = await Promise.all([
             call('/api/database-summary'), call(partsPagePath()), call('/api/part-translations'),
             call('/api/categories')
           ]);
-          const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs] = token() ? await Promise.all([
-            call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs')
-          ]) : [[], [], [], [], [], []];
+          const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs, quarantine] = token() ? await Promise.all([
+            call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs'), call('/api/quarantine?state=unresolved&page=1&pageSize=200')
+          ]) : [[], [], [], [], [], [], []];
           renderSummary(summary);
           renderPartsPage(partsPage);
-          output.textContent = JSON.stringify({ summary, partsPage, vehicles, nhtsaVehicles, vinMappings, translations, categories, reconciliation, requests, jobs }, null, 2);
+          renderQuarantine(quarantine);
+          output.textContent = JSON.stringify({ summary, partsPage, vehicles, nhtsaVehicles, vinMappings, translations, categories, reconciliation, requests, jobs, quarantine }, null, 2);
           statusMessage('已刷新資料。');
         } catch (error) { statusMessage(error.message, true); output.textContent = ''; }
       }
@@ -392,6 +464,8 @@
         } catch (error) { statusMessage(error.message, true); }
       }));
       document.querySelector('#refresh').addEventListener('click', refresh);
+      document.querySelector('#quarantine-refresh').addEventListener('click', refreshQuarantine);
+      quarantineStateSelect.addEventListener('change', refreshQuarantine);
       partsDataset.addEventListener('change', () => { partsState.page = 1; refreshPartsPage(); });
       partsPageSize.addEventListener('change', () => { partsState.page = 1; partsState.pageSize = Number(partsPageSize.value); refreshPartsPage(); });
       partsFirst.addEventListener('click', () => { partsState.page = 1; refreshPartsPage(); });
