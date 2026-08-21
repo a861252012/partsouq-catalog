@@ -193,6 +193,7 @@ def dashboard() -> str:
         "dashboard.html",
         counts=repository.dashboard_counts(),
         system_summary=repository.system_data_summary(),
+        quarantine_summary=repository.quarantine_summary(),
     )
 
 
@@ -205,6 +206,41 @@ def health() -> dict[str, object]:
 @bp.get("/monitoring")
 def monitoring() -> str:
     return render_template("monitoring.html", monitor=_repository().crawl_monitoring())
+
+
+@bp.get("/quarantine")
+def quarantine_list() -> str:
+    state = request.args.get("state", "unresolved")
+    run_key = request.args.get("run_key") or None
+    try:
+        page_number = int(request.args.get("page", "1"))
+    except ValueError as error:
+        raise AdminDataError("頁碼格式錯誤") from error
+    requested_page_size = request.args.get("pageSize")
+    try:
+        page_size = int(requested_page_size) if requested_page_size else _config().page_size
+    except ValueError as error:
+        raise AdminDataError("每頁筆數格式錯誤") from error
+    page = _repository().list_quarantine(
+        state=state,
+        run_key=run_key,
+        page=page_number,
+        limit=page_size,
+    )
+    return render_template(
+        "quarantine.html",
+        page=page,
+        state=state,
+        run_key=run_key or "",
+    )
+
+
+@bp.post("/quarantine/<int:row_id>/resolve")
+def quarantine_resolve(row_id: int) -> ResponseReturnValue:
+    resolution = request.form.get("resolution", "").strip()
+    _repository().resolve_quarantine(row_id, resolution)
+    flash("已標記處置（同一料號後續 run 再現時會自動重開）。", "success")
+    return redirect(url_for("admin.quarantine_list", state=request.args.get("state", "unresolved")))
 
 
 @bp.get("/entities/<entity_type>")

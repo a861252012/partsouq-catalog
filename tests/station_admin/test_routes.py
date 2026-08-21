@@ -165,3 +165,51 @@ def test_create_appends_overlay_event_and_vin_request_records_actor() -> None:
     assert request_call.params == ("TEST0000000000000",)
     assert "admin_crawl_requests" in request_call.sql
     assert audit_call.params == (77, "tester", "request NHTSA VIN decode")
+
+
+def test_quarantine_page_lists_and_filters() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases, dataset_size=3)
+
+    response = app.test_client().get("/quarantine?state=all&pageSize=25")
+
+    assert response.status_code == 200
+    assert "Quarantine 紀錄".encode() in response.data
+    assert b"IMG00001" in response.data
+    assert b"IMG00003" in response.data
+    assert "已處置 2098-12-31".encode() in response.data
+    assert "未處置".encode() in response.data
+    assert "共 1 頁".encode() in response.data
+    sql = "\n".join(call.sql for call in databases[-1].calls)
+    assert "part_quarantine" in sql
+    assert "resolved_at IS NULL" not in sql
+
+
+def test_quarantine_resolve_requires_csrf_and_redirects() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases, dataset_size=3)
+    client = app.test_client()
+    token = _csrf_token(client, "/quarantine")
+
+    response = client.post(
+        "/quarantine/1/resolve",
+        data={"csrf_token": token, "resolution": "checked, removed from site"},
+    )
+
+    assert response.status_code == 302
+    assert [call.tag for call in databases[-1].calls] == [
+        "quarantine.lock-row",
+        "quarantine.resolve",
+    ]
+    resolve_call = databases[-1].calls[-1]
+    assert resolve_call.params == ("checked, removed from site", 1)
+
+
+def test_quarantine_rejects_unsupported_page_size_before_query() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases)
+
+    response = app.test_client().get("/quarantine?pageSize=15")
+
+    assert response.status_code == 400
+    assert not databases[-1].calls

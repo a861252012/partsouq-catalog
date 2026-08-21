@@ -1043,7 +1043,9 @@ class Crawler:
         # 若當 malformed 處理，整台車永遠爬不完）。
         if skipped_nameless:
             log.warning(
-                "[%s group=%s] %d part row(s) without product name skipped; not receipted",
+                "[%s group=%s] %d part row(s) without product name skipped; "
+                "they are recorded as quarantine and the group will still be "
+                "receipted as done (ignore-and-record policy)",
                 brand,
                 group.get("group_code"),
                 skipped_nameless,
@@ -1389,6 +1391,8 @@ class Crawler:
                             "(part_quarantine, unresolved)",
                             quarantined,
                         )
+                    else:
+                        log.info("publishing bounded snapshot with 0 quarantined row(s)")
                     self.crawl.publish_bounded_parts(run_id, self.part_limit)
                     self.crawl.finish_run(run_id, "bounded_success", self.counts)
                     self.db.commit()
@@ -1499,6 +1503,8 @@ class Crawler:
                         "(part_quarantine, unresolved)",
                         quarantined,
                     )
+                else:
+                    log.info("publishing bounded snapshot with 0 quarantined row(s)")
                 finalizing = True
                 self.crawl.publish_bounded_parts(run_id, self.part_limit)
                 self.crawl.finish_run(run_id, "bounded_success", self.counts)
@@ -1596,6 +1602,8 @@ class Crawler:
                             "(part_quarantine, unresolved)",
                             quarantined,
                         )
+                    else:
+                        log.info("publishing full snapshot with 0 quarantined row(s)")
                     finalizing = True
                     self.crawl.publish_success_parts(run_id)
                     self.crawl.finish_run(run_id, "success", self.counts)

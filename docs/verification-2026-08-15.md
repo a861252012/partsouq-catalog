@@ -425,8 +425,8 @@ migration 012。
 
 ### SOL review 第四輪（2026-08-21，`3cf22d0` 之後）
 
-GPT5.6 SOL MAX 覆核後指出 2 個 P1 + 數個 P2；已全數處理如下（尚未
-commit）：
+GPT5.6 SOL MAX 覆核後指出 2 個 P1 + 數個 P2；已全數處理並 commit
+為 `ff66574`（後續第五輪修正另見下節）：
 
 1. **P1 驗收標準重新定義（文件化）**：原始「PartSouq 發現的每個料號
    都能 mapping 到名稱」的 100% 嚴格標準，因站方資料本身不提供名稱
@@ -462,7 +462,43 @@ commit）：
 
 自動測試（本輪）：`tests/test_admin_quarantine.py`（5 個新測試）+ MySQL
 quarantine 重開測試 + 既有 bounded/closure 測試 → **49 passed**；完整
-suite 待最後一輪確認。migration 012 重跑 rc=0。
+suite 349 passed（含 MySQL gated + station-admin 真實 Chrome E2E）。
+
+### SOL review 第五輪（2026-08-22，`ff66574` 之後）
+
+GPT5.6 SOL MAX 覆核 `ff66574` 後指出 2 個 P1 + 3 個 P2 + P3 文件；
+已全數修正（本節尚未 commit）：
+
+1. **P1 Quarantine 分頁接通**：`GET /api/quarantine` 的
+   `page_size` 改為 FastAPI `Query(alias="pageSize")`，HTTP 層
+   `?pageSize=200` 真正生效；admin.html 補上完整分頁控制（首頁/
+   上一頁/頁碼/下一頁/末頁、每頁筆數 10–200、顯示範圍），
+   `refresh()` 與單獨重新整理都帶目前頁。API 層測試
+   （TestClient `?page=2&pageSize=200` → 回傳 page 2 / pageSize 200）
+   與 admin.html 結構 + `node --check` JS 語法測試覆蓋。
+2. **P1 原站方後台（:8086 station-admin）Quarantine 管理**：
+   新增 `GET /quarantine`（state/run_key 篩選、分頁、每頁筆數）、
+   `POST /quarantine/<id>/resolve`（CSRF + FOR UPDATE 交易）、
+   `quarantine.html` 模板、導覽列與總覽首頁未處置計數；
+   repository + routes + fakes 測試覆蓋。
+3. **P2 索引符合預設查詢**：migration 012 新增
+   `idx_quarantine_list (resolved_at, updated_at)`（保留
+   `(run_key, resolved_at)`），兩個 DB 重跑 rc=0；EXPLAIN 實測
+   預設列表由 `ALL + filesort` 變 `ref + Using index condition`。
+4. **P2 每次發布都記錄數量**：bounded 早收/收尾/full success 三處
+   發布 log 不再只在大於 0 時輸出 —— 0 筆也記 info；「忽略＋紀錄」
+   政策下「skipped; not receipted」的誤導 log 改為明確說明
+   「記錄為 quarantine、組仍標 done」。
+5. **P3 文件**：`db/catalog.sql` 移除過時的「組標 partial」敘述並
+   同步索引定義；`docs/sources.md` 更新為「image 已含 CloakBrowser
+   runtime + Chromium + Xvfb 且每次 build 後實測」；本文件第四輪
+   段落移除「尚未 commit」。
+6. **P1 使用者裁決文件化**：「無名稱料號列 = 忽略＋紀錄、不阻擋
+   發布」政策為使用者 2026-08-21 明確裁定（回應「為什麼要把整批都
+   標示成失敗?」）；原始「所有發現料號 100% 對應名稱」的嚴格標準
+   因站方資料本身不含名稱而無法達成，現行驗收標準改為：(a) 已發布
+   列 100% 有名稱；(b) 無法發布的料號列全部記錄於 part_quarantine
+   且可在兩個後台查閱/處置；(c) 每次發布 log 記錄未處置數量。
 
 ### 政策決定：無名稱列改「忽略 + 紀錄」（2026-08-21，使用者決定）
 

@@ -1290,7 +1290,7 @@ def list_quarantine(
     state: Literal["unresolved", "all"] = "unresolved",
     run_key: str | None = None,
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=200),
+    page_size: int = Query(default=50, alias="pageSize", ge=1, le=200),
 ) -> dict:
     """列出 part_quarantine（無名稱料號列的紀錄，使用者決定的
     「忽略 + 紀錄」政策）。state=unresolved 只回未處置列。"""

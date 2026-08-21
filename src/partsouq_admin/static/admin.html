@@ -84,6 +84,7 @@
         <h2>Quarantine 紀錄（無名稱料號列，忽略＋紀錄政策）</h2>
         <div class="table-controls">
           <label>狀態<select id="quarantine-state"><option value="unresolved">未處置</option><option value="all">全部</option></select></label>
+          <label>每頁筆數<select id="quarantine-page-size"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
           <button type="button" class="secondary" id="quarantine-refresh">重新整理</button>
         </div>
         <div class="table-wrap">
@@ -91,6 +92,10 @@
             <thead><tr><th>料號</th><th>Code</th><th>Qty</th><th>Range</th><th>組 code／uid</th><th>Run</th><th>處置</th><th></th></tr></thead>
             <tbody id="quarantine-table-body"></tbody>
           </table>
+        </div>
+        <div class="pagination">
+          <div class="pagination-actions"><button type="button" class="secondary" id="quarantine-first">首頁</button><button type="button" class="secondary" id="quarantine-prev">上一頁</button><span>第</span><input id="quarantine-page-number" class="page-number" type="number" min="1" value="1" aria-label="頁碼"><span id="quarantine-total-pages">共 0 頁</span><button type="button" class="secondary" id="quarantine-next">下一頁</button><button type="button" class="secondary" id="quarantine-last">末頁</button></div>
+          <span id="quarantine-range-label">顯示 0 到 0，共 0 筆</span>
         </div>
       </section>
 
@@ -375,7 +380,23 @@
       }
       const quarantineTableBody = document.querySelector('#quarantine-table-body');
       const quarantineStateSelect = document.querySelector('#quarantine-state');
+      const quarantinePageSize = document.querySelector('#quarantine-page-size');
+      const quarantinePageNumber = document.querySelector('#quarantine-page-number');
+      const quarantineTotalPages = document.querySelector('#quarantine-total-pages');
+      const quarantineRangeLabel = document.querySelector('#quarantine-range-label');
+      const quarantineFirst = document.querySelector('#quarantine-first');
+      const quarantinePrev = document.querySelector('#quarantine-prev');
+      const quarantineNext = document.querySelector('#quarantine-next');
+      const quarantineLast = document.querySelector('#quarantine-last');
+      const quarantineState = { page: 1, pageSize: 50, totalPages: 0 };
+      function quarantinePath() {
+        return `/api/quarantine?state=${quarantineStateSelect.value}&page=${quarantineState.page}&pageSize=${quarantineState.pageSize}`;
+      }
       function renderQuarantine(result) {
+        quarantineState.page = result.page;
+        quarantineState.pageSize = result.pageSize;
+        quarantineState.totalPages = result.totalPages;
+        quarantinePageSize.value = String(result.pageSize);
         quarantineTableBody.replaceChildren();
         for (const row of result.items) {
           const tr = document.createElement('tr');
@@ -422,11 +443,22 @@
           tr.append(td);
           quarantineTableBody.append(tr);
         }
+        const start = result.total ? (result.page - 1) * result.pageSize + 1 : 0;
+        const end = result.total ? Math.min(result.page * result.pageSize, result.total) : 0;
+        quarantinePageNumber.value = String(result.totalPages ? result.page : 1);
+        quarantinePageNumber.max = String(Math.max(result.totalPages, 1));
+        quarantinePageNumber.disabled = result.totalPages === 0;
+        quarantineTotalPages.textContent = `共 ${result.totalPages} 頁`;
+        quarantineRangeLabel.textContent = `顯示 ${start.toLocaleString()} 到 ${end.toLocaleString()}，共 ${Number(result.total).toLocaleString()} 筆`;
+        quarantineFirst.disabled = result.page <= 1 || result.totalPages === 0;
+        quarantinePrev.disabled = result.page <= 1 || result.totalPages === 0;
+        quarantineNext.disabled = result.totalPages === 0 || result.page >= result.totalPages;
+        quarantineLast.disabled = result.totalPages === 0 || result.page >= result.totalPages;
       }
       async function refreshQuarantine() {
         if (!token()) { quarantineTableBody.replaceChildren(); return; }
         try {
-          const result = await call(`/api/quarantine?state=${quarantineStateSelect.value}&page=1&pageSize=200`);
+          const result = await call(quarantinePath());
           renderQuarantine(result);
         } catch (error) { statusMessage(error.message, true); }
       }
@@ -437,7 +469,7 @@
             call('/api/categories')
           ]);
           const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs, quarantine] = token() ? await Promise.all([
-            call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs'), call('/api/quarantine?state=unresolved&page=1&pageSize=200')
+            call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs'), call(quarantinePath())
           ]) : [[], [], [], [], [], [], []];
           renderSummary(summary);
           renderPartsPage(partsPage);
@@ -465,7 +497,24 @@
       }));
       document.querySelector('#refresh').addEventListener('click', refresh);
       document.querySelector('#quarantine-refresh').addEventListener('click', refreshQuarantine);
-      quarantineStateSelect.addEventListener('change', refreshQuarantine);
+      quarantineStateSelect.addEventListener('change', () => { quarantineState.page = 1; refreshQuarantine(); });
+      quarantinePageSize.addEventListener('change', () => { quarantineState.page = 1; quarantineState.pageSize = Number(quarantinePageSize.value); refreshQuarantine(); });
+      quarantineFirst.addEventListener('click', () => { quarantineState.page = 1; refreshQuarantine(); });
+      quarantinePrev.addEventListener('click', () => { if (quarantineState.page > 1) { quarantineState.page -= 1; refreshQuarantine(); } });
+      quarantinePageNumber.addEventListener('change', () => {
+        const requestedPage = Number(quarantinePageNumber.value);
+        if (Number.isInteger(requestedPage) && requestedPage >= 1 && requestedPage <= quarantineState.totalPages) {
+          quarantineState.page = requestedPage;
+          refreshQuarantine();
+        } else {
+          quarantinePageNumber.value = String(quarantineState.page);
+        }
+      });
+      quarantinePageNumber.addEventListener('keydown', event => {
+        if (event.key === 'Enter') quarantinePageNumber.dispatchEvent(new Event('change'));
+      });
+      quarantineNext.addEventListener('click', () => { if (quarantineState.page < quarantineState.totalPages) { quarantineState.page += 1; refreshQuarantine(); } });
+      quarantineLast.addEventListener('click', () => { if (quarantineState.totalPages) { quarantineState.page = quarantineState.totalPages; refreshQuarantine(); } });
       partsDataset.addEventListener('change', () => { partsState.page = 1; refreshPartsPage(); });
       partsPageSize.addEventListener('change', () => { partsState.page = 1; partsState.pageSize = Number(partsPageSize.value); refreshPartsPage(); });
       partsFirst.addEventListener('click', () => { partsState.page = 1; refreshPartsPage(); });

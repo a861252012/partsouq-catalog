@@ -12,6 +12,7 @@ from partsouq_station_admin.repository import (
     PAGE_SIZES,
     AdminDataError,
     AdminRepository,
+    RecordNotFoundError,
     RevisionConflictError,
 )
 
@@ -288,3 +289,57 @@ def test_fitment_adapter_uses_date_intersection_and_marks_unpublished_rows() -> 
         assert f"CREATE OR REPLACE VIEW {view_name}" in schema
     assert schema.count("FROM v_current_catalog_parts") >= 4
     assert "SELECT id FROM crawl_runs WHERE status = 'sample'" in schema
+
+
+def test_quarantine_list_filters_unresolved_and_run_key() -> None:
+    trace = QueryTrace()
+    database = ScriptedDatabase(trace)
+    repository = AdminRepository(database)
+
+    page = repository.list_quarantine(state="unresolved", run_key="bounded-1", limit=25)
+
+    assert page["pageSize"] == 25
+    assert page["total"] == 1
+    assert page["totalPages"] == 1
+    count_call, list_call = [call for call in database.calls if call.tag.startswith("quarantine.")]
+    assert "part_quarantine.resolved_at IS NULL" in count_call.sql
+    assert "part_quarantine.run_key = %s" in count_call.sql
+    assert count_call.params == ("bounded-1",)
+    assert "part_quarantine.resolved_at IS NULL" in list_call.sql
+    assert "JOIN groups_t" in list_call.sql
+    assert list_call.params == ("bounded-1", 25, 0)
+
+
+def test_quarantine_list_all_state_has_no_resolved_filter() -> None:
+    trace = QueryTrace()
+    database = ScriptedDatabase(trace)
+
+    AdminRepository(database).list_quarantine(state="all", limit=10)
+
+    sql = "\n".join(call.sql for call in database.calls)
+    assert "resolved_at IS NULL" not in sql
+
+
+def test_quarantine_resolve_updates_row_in_transaction() -> None:
+    trace = QueryTrace()
+    database = ScriptedDatabase(trace)
+
+    AdminRepository(database).resolve_quarantine(7, "verified removed from site")
+
+    tags = [call.tag for call in database.calls]
+    assert tags == ["quarantine.lock-row", "quarantine.resolve"]
+    resolve_call = database.calls[-1]
+    assert "SET resolved_at = NOW(), resolution = %s" in resolve_call.sql
+    assert resolve_call.params == ("verified removed from site", 7)
+
+
+def test_quarantine_resolve_unknown_row_raises_record_not_found() -> None:
+    trace = QueryTrace()
+    database = ScriptedDatabase(trace)
+
+    def deny_lock(tag: str, sql: str, params: object = None) -> dict | None:
+        return None
+
+    database.fetch_one = deny_lock  # type: ignore[method-assign]
+    with pytest.raises(RecordNotFoundError):
+        AdminRepository(database).resolve_quarantine(999, "checked")

@@ -24,10 +24,10 @@ TTL 自動刷新，只存本機 `data/cookies.json`），HTTP client 一律附�
 請求。此機制本質是瀏覽器指紋規避與驗證自動通過，非站方授權；challenge
 未成功刷新時仍算 `blocked`，不會被重新解讀成成功。不輪替 proxy。正式
 catalog 請求仍先檢查 robots.txt 與 origin（fail-closed），不跟隨 redirect。
-目前 Compose image 尚未安裝 CloakBrowser runtime、Chromium 或顯示環境；
-原生 host 的 Python venv 路徑也不能直接在 container 中使用。因此
-現有 host sample 只能證明程式路徑，不能當成正式 Compose 排程的 live
-部署驗收。
+目前 Compose image 已安裝 CloakBrowser runtime、Chromium 與 Xvfb 顯示
+環境，容器內以 `xvfb-run` 啟動，並已在每次 build 後用真實 Chrome 實測
+CDP ready；原生 host 的 Python venv 路徑不能在 container 中使用。
+host sample 只用於程式路徑驗證，正式排程一律走 Compose image。
 
 NHTSA vPIC 不提供可列舉的完整 VIN 名冊。完整 VIN 僅能由合法持有者提供後送交官方 `DecodeVinValues` 解碼；bulk complaints 內的 11 碼 VIN 欄位不會被當成完整 VIN。
 

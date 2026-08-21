@@ -717,6 +717,102 @@ class AdminRepository:
                 (result.lastrowid, actor, reason),
             )
 
+    def quarantine_summary(self) -> dict[str, int]:
+        row = (
+            self.database.fetch_one(
+                "dashboard.quarantine-summary",
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(resolved_at IS NULL), 0) AS unresolved
+                FROM part_quarantine
+                """,
+            )
+            or {}
+        )
+        return {
+            "total": int(row.get("total", 0)),
+            "unresolved": int(row.get("unresolved", 0)),
+        }
+
+    def list_quarantine(
+        self,
+        *,
+        state: str = "unresolved",
+        run_key: str | None = None,
+        page: int = 1,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """列出 part_quarantine（無名稱料號列，使用者決定的「忽略＋紀錄」政策）。"""
+        if state not in {"unresolved", "all"}:
+            raise AdminDataError("狀態只接受 unresolved 或 all")
+        if limit not in PAGE_SIZES:
+            raise AdminDataError("每頁筆數只接受 10、25、30、50、100 或 200")
+        if page < 1:
+            raise AdminDataError("頁碼不可小於 1")
+        clause = "WHERE 1=1"
+        params: list[object] = []
+        if state == "unresolved":
+            clause += " AND part_quarantine.resolved_at IS NULL"
+        if run_key:
+            clause += " AND part_quarantine.run_key = %s"
+            params.append(run_key)
+        total_row = self.database.fetch_one(
+            "quarantine.count",
+            f"SELECT COUNT(*) AS total FROM part_quarantine {clause}",
+            tuple(params),
+        )
+        total = int((total_row or {}).get("total", 0))
+        total_pages = max(1, math.ceil(total / limit))
+        current_page = min(page, total_pages)
+        offset = (current_page - 1) * limit
+        rows = self.database.fetch_all(
+            "quarantine.list",
+            f"""
+            SELECT part_quarantine.id, part_quarantine.part_number,
+                   part_quarantine.range_str, part_quarantine.reason,
+                   part_quarantine.code, part_quarantine.quantity,
+                   part_quarantine.note, part_quarantine.run_key,
+                   part_quarantine.resolved_at, part_quarantine.resolution,
+                   part_quarantine.updated_at,
+                   groups_t.code AS group_code, groups_t.uid
+            FROM part_quarantine
+            JOIN groups_t ON groups_t.id = part_quarantine.group_id
+            {clause}
+            ORDER BY part_quarantine.resolved_at IS NOT NULL,
+                     part_quarantine.updated_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            (*params, limit, offset),
+        )
+        return {
+            "items": tuple(rows),
+            "page": current_page,
+            "pageSize": limit,
+            "total": total,
+            "totalPages": total_pages,
+        }
+
+    def resolve_quarantine(self, row_id: int, resolution: str) -> None:
+        if len(resolution) > 255:
+            raise AdminDataError("處置說明不可超過 255 字元")
+        with self.database.transaction():
+            existing = self.database.fetch_one(
+                "quarantine.lock-row",
+                "SELECT id FROM part_quarantine WHERE id = %s FOR UPDATE",
+                (row_id,),
+            )
+            if existing is None:
+                raise RecordNotFoundError("找不到這筆 quarantine 紀錄")
+            self.database.execute(
+                "quarantine.resolve",
+                """
+                UPDATE part_quarantine
+                SET resolved_at = NOW(), resolution = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (resolution, row_id),
+            )
+
     def dashboard_counts(self) -> dict[str, dict[str, int]]:
         source_columns = ",\n".join(
             f"(SELECT COUNT(*) FROM {_FORMAL_SOURCE_TABLES.get(spec.key, spec.table)}) "

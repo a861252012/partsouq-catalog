@@ -122,3 +122,74 @@ def test_database_summary_includes_quarantine_counts(
     summary = admin_app.database_summary()
 
     assert summary["quarantine"] == {"total": 5, "unresolved": 3}
+
+
+def test_quarantine_http_accepts_pageSize_alias_and_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SOL review P1：前端送 pageSize / page 參數，HTTP 層必須真正接通
+    （FastAPI Query alias），不能只作用在函式呼叫層。"""
+    from fastapi.testclient import TestClient
+
+    queries: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
+        queries.append((sql, params))
+        return {"n": 260}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        queries.append((sql, params))
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+
+    with TestClient(admin_app.app) as client:
+        response = client.get(
+            "/api/quarantine?state=all&page=2&pageSize=200",
+            headers={"X-Admin-Token": "test-token"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["page"] == 2
+    assert body["pageSize"] == 200
+    assert body["total"] == 260
+    assert body["totalPages"] == 2
+    list_sql, list_params = queries[1]
+    assert "LIMIT %s OFFSET %s" in list_sql
+    assert list_params == (200, 200)
+    assert "resolved_at IS NULL" not in queries[0][0]
+
+
+def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
+    """SOL review P1：前端必須有真正的分頁控制（頁碼、上一頁／下一頁、
+    每頁筆數），且整份 inline JS 語法正確。"""
+    import subprocess
+    import tempfile
+
+    html_path = "src/partsouq_admin/static/admin.html"
+    html = open(html_path, encoding="utf-8").read()
+    for element in (
+        'id="quarantine-page-size"',
+        'id="quarantine-first"',
+        'id="quarantine-prev"',
+        'id="quarantine-page-number"',
+        'id="quarantine-next"',
+        'id="quarantine-last"',
+        'id="quarantine-total-pages"',
+        'id="quarantine-range-label"',
+    ):
+        assert element in html, f"admin.html 缺少 {element}"
+    script = html.split("<script>")[1].split("</script>")[0]
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+        fh.write(script)
+        js_path = fh.name
+    try:
+        result = subprocess.run(["node", "--check", js_path], capture_output=True, text=True)
+    finally:
+        import os
+
+        os.unlink(js_path)
+    assert result.returncode == 0, result.stderr

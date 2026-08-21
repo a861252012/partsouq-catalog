@@ -132,9 +132,10 @@ CREATE TABLE IF NOT EXISTS parts (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 站方合法存在、但無法發布的零件列（無可驗證產品名稱，SOL review P1）。
--- 不落 parts（發布資料必須能把料號對到名稱），但也不能讓該組標 done 後
--- 被永久忽略：寫入此表供追蹤，且該組以 fetched_status='partial' 標記，
--- 下次排程重抓直到站方補上名稱或人工處置。
+-- 不落 parts（發布資料必須能把料號對到名稱），也不能讓該組標 done 後
+-- 被永久忽略：寫入此表供追蹤（使用者決定的「忽略＋紀錄」政策，組照常
+-- 標 done、發布照常進行）。resolved_at / resolution 供運維標記處置
+-- 狀態；同一料號在後續 run 再次出現時會重開處置狀態。
 CREATE TABLE IF NOT EXISTS part_quarantine (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   group_id    INT NOT NULL,
@@ -153,6 +154,7 @@ CREATE TABLE IF NOT EXISTS part_quarantine (
   UNIQUE KEY uq_quarantine (group_id, part_number, range_str, reason),
   KEY idx_quarantine_group (group_id),
   KEY idx_quarantine_resolved (run_key, resolved_at),
+  KEY idx_quarantine_list (resolved_at, updated_at),
   CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id)
     REFERENCES groups_t(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

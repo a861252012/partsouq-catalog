@@ -57,6 +57,12 @@ class ScriptedDatabase:
             return None
         if tag == "dashboard.source-counts":
             return {key: self.dataset_size for key in ENTITY_SPECS}
+        if tag == "dashboard.quarantine-summary":
+            return {"total": 3, "unresolved": 1}
+        if tag == "quarantine.count":
+            return {"total": self.dataset_size}
+        if tag == "quarantine.lock-row":
+            return {"id": int(params[0])} if isinstance(params, Sequence) and params else None
         if tag == "dashboard.system-data-summary":
             return {
                 "partsouq_normalized_rows": 1000,
@@ -145,6 +151,25 @@ class ScriptedDatabase:
             ]
         if tag == "dashboard.override-counts":
             return []
+        if tag == "quarantine.list":
+            return [
+                {
+                    "id": row_id,
+                    "part_number": f"IMG{row_id:05d}",
+                    "range_str": None,
+                    "reason": "no name on site",
+                    "code": None,
+                    "quantity": 1,
+                    "note": None,
+                    "run_key": "bounded-1",
+                    "resolved_at": None if row_id % 2 else "2098-12-31 17:00:00",
+                    "resolution": None if row_id % 2 else "verified",
+                    "updated_at": "2098-12-31 17:00:00",
+                    "group_code": "GC-1",
+                    "uid": "U-1",
+                }
+                for row_id in (1, 2, 3)
+            ]
         if tag == "monitor.scheduled-job-runs":
             return [
                 {

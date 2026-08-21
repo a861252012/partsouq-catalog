@@ -49,6 +49,16 @@ BEGIN
   ) THEN
     ALTER TABLE part_quarantine ADD KEY idx_quarantine_resolved (run_key, resolved_at);
   END IF;
+  -- SOL review P2：預設列表只篩 resolved_at 並依 updated_at 排序（沒有
+  -- run_key），必須有以 (resolved_at, updated_at) 開頭的索引，否則
+  -- 資料累積後會全表掃描 + filesort。
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+      AND INDEX_NAME = 'idx_quarantine_list'
+  ) THEN
+    ALTER TABLE part_quarantine ADD KEY idx_quarantine_list (resolved_at, updated_at);
+  END IF;
 END//
 DELIMITER ;
 CALL upgrade_partsouq_012_quarantine_resolution();
@@ -73,6 +83,14 @@ BEGIN
   ) THEN
     SIGNAL SQLSTATE '45000'
       SET MESSAGE_TEXT = 'migration 012: quarantine resolution index postflight failed';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+      AND INDEX_NAME = 'idx_quarantine_list'
+  ) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'migration 012: quarantine list index postflight failed';
   END IF;
 END//
 DELIMITER ;
