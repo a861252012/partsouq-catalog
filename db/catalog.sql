@@ -152,8 +152,6 @@ CREATE TABLE IF NOT EXISTS part_quarantine (
   updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_quarantine (group_id, part_number, range_str, reason),
-  KEY idx_quarantine_group (group_id),
-  KEY idx_quarantine_resolved (run_key, resolved_at),
   KEY idx_quarantine_list (resolved_at, updated_at),
   KEY idx_quarantine_run_key_resolved_updated (run_key, resolved_at, updated_at),
   CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id)

@@ -1,13 +1,13 @@
-# 爬蟲、mapping 與站方後台驗證紀錄（更新至 2026-08-21）
+# 爬蟲、mapping 與站方後台驗證紀錄（更新至 2026-08-22）
 
 ## 結論
 
 - NHTSA：合成 fixture 已驗證逐欄解析、共用 MySQL 寫入與讀回；沒有使用者授權 VIN，因此不能宣稱 live 成功解碼。
 - Mapping：以 fixture 走過 PartSouq parser、repository、publish、VIN 車款確認與後台查詢，端到端成功。
 - PartSouq live：host 上的 CloakBrowser session 曾完成兩次 60 筆 sample；
-  這不是 10,000 筆 bounded publish。2026-08-21 查核時，Compose 內的正式
-  scheduler image 仍是舊版透明 HTTP 路徑並持續 403；正式 server-like
-  排程尚未驗證成功，不能把 host sample 當成部署完成。
+  這不是 10,000 筆 bounded publish。2026-08-22 已重建 Compose scheduler
+  image 並完成容器內 CloakBrowser CDP smoke；但正式 server-like 10,000 筆
+  排程仍未執行，不能把 image smoke 或 host sample 當成部署完成。
 
 ## 全新 MySQL
 
@@ -92,11 +92,12 @@ mypy 作為 gate。
 
 兩個 `.localhost` domain 的 health 均回 HTTP 200，並讀取同一個 MySQL database；
 `.localhost` 為標準 loopback domain，不需修改 `/etc/hosts`。
-目前畫面顯示 sample `1000/1000`、923 個不重複料號、3 個大分類與 47 個
-Group 中分類；預設每頁 30 筆，支援 10／25／30／50／100／200 筆、頁碼輸入與
-首頁／前後頁／末頁。sample 尚未發布，NHTSA VIN 與已確認 mapping 仍為 0，因此
-正式 production gate 尚未通過；NHTSA 官方 reference sync 則已完成
-137,140 筆、377 個 current artifacts、0 rejected。
+2026-08-21 當輪畫面曾顯示 sample `1000/1000`、923 個不重複料號、3 個
+大分類與 47 個 Group 中分類；預設每頁 30 筆，支援
+10／25／30／50／100／200 筆、頁碼輸入與首頁／前後頁／末頁。當時 sample
+尚未發布，NHTSA VIN 與已確認 mapping 為 0，因此正式 production gate
+未通過；該輪 NHTSA 官方 reference sync 為 137,140 筆、377 個 current
+artifacts、0 rejected。這些是歷史快照，不代表目前 DB 筆數。
 
 8086 的 `part_numbers` 是現有 normalized `parts` 的 compatibility adapter，
 1000 列代表 1000 個料件出現／適用列，其中只有 923 個不重複料號，不能把
@@ -104,7 +105,8 @@ Group 中分類；預設每頁 30 筆，支援 10／25／30／50／100／200 筆
 呼叫碼，不是車型或料件 model ID。來源追溯目前只有共用 DB 的 source URL 與
 時間；沒有保存可重算的 raw HTTP body／hash。
 
-中分類來自 PartSouq Group／diagram，目前 sample 已有 47 個 Group。現有
+中分類來自 PartSouq Group／diagram；2026-08-21 當輪 sample 有 47 個
+Group。現有
 型錄路徑沒有可證明的第三層小分類來源，所以後台明確標示為 unavailable，
 只能人工補充，不能用其他欄位冒充爬回的小分類。
 
@@ -324,12 +326,12 @@ code 轉換對帳、變體不 merge、文字不被圖片月覆寫、1062 路徑�
 這是設計，不是失敗）；DB 無空名稱零件列。migration 010 已套用主 DB、
 空名稱垃圾列已刪除。
 
-### 誠實邊界（不變）
+### 當輪誠實邊界（後續已修正 image）
 
-- 正式 Compose scheduler 仍是**舊 image**（透明 HTTP 路徑、無
-  CloakBrowser）並持續 403 —— 正式 10,000 筆 bounded publish 仍未在
-  正式環境驗證成功；host 上的 sample 是驗證 crawler 機制的證據，不是
-  部署完成證明。
+- 當輪正式 Compose scheduler 仍是**舊 image**（透明 HTTP 路徑、無
+  CloakBrowser）並持續 403；後續已重建並完成 CloakBrowser smoke（見下方
+  Round-5）。正式 10,000 筆 bounded publish 至今仍未驗收；host 上的 sample
+  是驗證 crawler 機制的歷史證據，不是正式 10,000 筆完成證明。
 - robots 雙身分 AND 檢查：站方 robots.txt 目前只有 `User-agent: *`
   `Disallow: /cdn-cgi/`，兩身分皆通過；實測無阻。
 - sample exit=3 在 `scheduled_job_runs` 記 `failed` 是 `dbd9f53` 後的新
@@ -661,18 +663,17 @@ ruff check/format 全過、`git diff --check` 無輸出、migration 013/014
 
 ### SOL review 第九輪（2026-08-22，`81724bd` 之後）
 
-GPT5.6 SOL MAX 覆核 `81724bd` 後指出 2 個 P2 + 1 個 P2（scheduler
-image）+ 4 個 P3；已全數修正並 commit（本節末尾 hash，已 push 到
+GPT5.6 SOL MAX 覆核 `81724bd` 後指出 3 個 P2 + 4 個 P3；已全數修正並
+commit（`07d4227`，後續清除 probe 檔為 `d693df9`，均已 push 到
 origin/main）：
 
 1. **P2 索引契約只驗名稱**：migration 014 與 preflight 測試原先只檢查
    `INDEX_NAME`，同名但欄位順序錯誤或 `INVISIBLE` 的索引仍會通過（且
-   `FORCE INDEX` 對 INVISIBLE 索引回 MySQL 1176）。修正：migration 014
-   與 postflight 對 `idx_quarantine_run_key_resolved_updated` 與
-   `idx_quarantine_list` 都驗完整 signature
-   （`GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)`）與
-   `IS_VISIBLE = 'YES'`，不符時 drop 重建；preflight 測試同步斷言
-   signature 與可見性。mutation 驗證：錯誤 signature
+   `FORCE INDEX` 對 INVISIBLE 索引回 MySQL 1176）。當輪修正範圍是讓
+   migration 014 與 postflight 對
+   `idx_quarantine_run_key_resolved_updated` 與 `idx_quarantine_list` 驗欄位
+   名稱／順序（signature）與 `IS_VISIBLE = 'YES'`，不符時 drop 重建；
+   preflight 測試同步斷言 signature 與可見性。mutation 驗證：錯誤 signature
    （run_key, updated_at）套 014 後修正為
    （run_key, resolved_at, updated_at）；兩索引設 INVISIBLE 套 014 後
    回復 visible；重跑 exit 0。
@@ -707,3 +708,160 @@ origin/main）：
 ruff check/format 全過、`git diff --check` 無輸出、migration 014 在主
 DB 與測試 DB 重跑 exit 0、五個 service image 全部 rebuild 且核心檔案
 hash 與 HEAD 一致。
+
+### SOL review 第十輪（2026-08-22，以 `d693df9` 為 base 的本機工作樹）
+
+本輪直接 review 最新工作樹，經五個平行 subagent、mutation 與實機 MySQL
+反向驗證後完成下列修正。本輪沒有執行 commit 或 push：
+
+1. **既有 migration 不可回改**：013／014 已發布，改舊檔無法修復已跑過
+   的 volume。兩檔維持與 `origin/main` 相同；新增 forward-only migration
+   015，對既有狀態執行 exact contract repair，並可重複執行。
+2. **索引契約與效能**：015 對兩個查詢索引驗欄位數量／順序、unique、
+   prefix、ASC、BTREE、functional key part 與 visibility。缺少或形狀錯誤
+   時用單一 atomic DROP + ADD 修復；只有 invisible 時只改 metadata；
+   正確索引重跑時 `INDEX_ID` 不變。所有 secondary-index DDL 明列
+   `ALGORITHM=INPLACE, LOCK=NONE`，metadata lock timeout 為 30 秒。
+3. **移除重複索引**：fresh schema 與 015 移除
+   `idx_quarantine_group`、`idx_quarantine_resolved`、
+   `idx_quarantine_run_key_updated`。前兩者分別被 `uq_quarantine` 與
+   `(run_key, resolved_at, updated_at)` 的 left prefix 涵蓋；MySQL
+   `sys.schema_redundant_indexes` 最終為 0，FK 與 cascade 行為保留。
+4. **UQ／FK fail-closed**：015 同時驗 `uq_quarantine` 的完整 ordered
+   unique shape，以及 `fk_quarantine_group` 的單一 key part、child／target
+   schema/table/column、PRIMARY、`NO ACTION`／`CASCADE`。missing、錯誤
+   shape、錯誤 update/delete rule 與錯誤 referenced table 都會在任何
+   part_quarantine DDL 前失敗。
+5. **FULLTEXT／hidden FTS 防護**：五個 migration-owned index 任一被改成
+   FULLTEXT 時拒絕自動修復；若舊 014 已把表面索引修回 BTREE，但仍留下
+   `FTS_DOC_ID_INDEX`／FTS auxiliary tables，015 也會偵測 orphaned hidden
+   metadata 並要求另排 table rebuild。當輪以 `SHOW CREATE TABLE`、全部
+   InnoDB index metadata／ID 與 FTS tables snapshot 證明表結構未變；當輪
+   尚未涵蓋 row snapshot 與失敗後暫留 procedure，後續第十一輪補齊。
+6. **測試可信度**：`EXPLAIN ANALYZE` parser 改算 `rows * loops`，支援小數
+   與 engineering notation；pure tests 不再被 MySQL module gate 一併 skip。
+   cleanup 會繼續跑完 child-first 六層刪除，並把 cleanup error 加到原始
+   exception note，不再遮蔽真正失敗。
+7. **升級 runbook**：README 補 001–006 prerequisite、停止／只恢復原本
+   running services、015 順序、tmpdir／volume 空間估算、FULLTEXT
+   preflight 與 `preflight_status`。現有 Compose 原樣執行回
+   `owned_fulltext=0, visible_fulltext=0, hidden_fts=0, status=OK`。
+
+驗證結果：
+
+- migration-focused：`23 passed`；涵蓋 wrong order、UNIQUE、prefix、DESC、
+  functional、SPATIAL、missing、visibility-only、legacy replay、idempotency、
+  UQ／FK fail-closed、target／obsolete FULLTEXT 與 orphan hidden FTS。
+- quarantine query-plan：`12 passed`；另在未設定 `UNIFIED_TEST_MYSQL` 時，
+  pure parser／cleanup 測試 `3 passed`，證明不會假 skip。
+- 完整 gate：`399 passed`、0 failed（MySQL gated + 真實 Chrome E2E）；
+  JUnit：`/private/tmp/partsouq-review-round10-final.xml`。JUnit 能證明測試
+  計數與結果；該輪未保存完整 console log，因此本紀錄不宣稱 warning 數量。
+- ruff check／format、`git diff --check`、Compose config 全過。
+- migration 015 已套用本機主 DB 與測試 DB，兩者只保留兩個目標索引與
+  `uq_quarantine`／PRIMARY；FK 為 `NO ACTION / CASCADE`，redundant index
+  為 0。主 DB 與測試 DB 的 quarantine 目前皆為 0 列。
+- 本輪沒有啟動任何 scheduler，也沒有執行正式 10,000 筆 live crawl；
+  因此本節只證明 code／migration／後台環境 gate，不宣稱正式爬取驗收。
+
+### SOL review 第十一輪（2026-08-22，以 `d693df9` 為 base 的本機工作樹）
+
+本輪依多組獨立 subagent review、MySQL 實機反向案例與 mutation check，補齊
+第十輪仍可能假綠的契約。本輪沒有 commit 或 push：
+
+1. **父表 PRIMARY exact contract**：migration 015 的 preflight／postflight
+   除了驗證 FK 指向 `groups_t(id)`，也要求父表 PRIMARY 只能有一個 key
+   part。MySQL 8.0／8.4 都能建立 legacy `PRIMARY(id, category_id)` +
+   prefix-reference FK；實測刪除其中一筆重複 id 的父列，會錯誤 cascade
+   quarantine 子列。新 guard 對此狀態會在任何 quarantine DDL 前 fail-closed。
+2. **資料與復原可信度**：migration case 先建立完整 brand → group →
+   quarantine sentinel，所有 repair、visibility、idempotency 與 fail-closed
+   路徑都比較前後資料。另覆蓋 pre-011 的 `011 → 012 → 015`、preflight
+   失敗留下 routine 後修正再重跑，以及 populated SPATIAL drift；SPATIAL
+   欄位型態、nullable、SRS、WKT 與 SRID 都必須保持不變。
+3. **索引與 online DDL gate**：wrong-shape repair 會確認未受影響索引的
+   `INDEX_ID` 不變；visibility-only repair 則要求兩個目標 `INDEX_ID` 都
+   不變。靜態 gate 以 SQL statement parser + case-insensitive／optional
+   backtick pattern 找出所有 `ALTER TABLE part_quarantine`，逐條要求
+   `ALGORITHM=INPLACE, LOCK=NONE`，而且未設定 MySQL gate 時也會執行。
+4. **EXPLAIN 與分頁測試**：`EXPLAIN ANALYZE` parser 只計算實際
+   `on part_quarantine` access node，對多節點累加 `rows * loops`，支援小數與
+   engineering notation。兩套後台的 `state=all` 皆直接覆蓋有／無 run_key，
+   並維持未處置列優先；cleanup 測試驗證多重 child-first 刪除錯誤會聚合，
+   不遮蔽原始例外。
+5. **操作文件與本機後台**：README 的首次啟動只含 mysql／admin／
+   station-admin；既有 volume runbook 會先停止 writer、fail-fast 執行
+   migration、按現況略過已淘汰的 013／014、只恢復原先 running services。
+   pre-011、FULLTEXT preflight、空間估算與 health check 都已實機驗證。
+   `.env.example`、repository visibility、歷史 sample 數字與舊 image 敘述
+   也已改成與目前證據一致。
+
+驗證結果：
+
+- mutation：暫時移除父表 PRIMARY cardinality guard 後，composite-parent
+  regression 會失敗；暫時加入刪除 quarantine 資料後，sentinel snapshot
+  會失敗；加入反引號 unsafe ALTER 後，靜態 gate 由 9 筆變 10 筆並失敗。
+  三項 mutation 均已還原。
+- focused MySQL／query-plan：`39 passed`；最後兩項 assertion 縮減後另跑
+  `12 passed`。
+- 最終完整 gate：`403 passed`、0 failed、0 skipped（MySQL gated +
+  兩個真實 Chrome E2E）；JUnit：
+  `/private/tmp/partsouq-review-round11-final.xml`。JUnit 能證明測試計數與
+  結果；該輪未保存完整 console log，因此本紀錄不宣稱 warning 數量。
+- ruff check、133 檔 format check、`git diff --check`、Compose config 全過。
+- admin／station-admin 已由最終工作樹 rebuild；兩個 image 內的 README 與
+  `db/catalog.sql` sha256 均與 host 相同。`partsouq.localhost:8000`、
+  `admin.partsouq.localhost:8086` health 都回 `ok`；running services 只有
+  mysql、admin、station-admin。
+- 主 DB 的 `parts`、`published_parts`、`part_quarantine`、
+  `nhtsa_vin_decodes`、confirmed VIN↔PartSouq mapping 都是 0。quarantine
+  最終只保留兩個目標 BTREE、PRIMARY 與 `uq_quarantine`；父表 PRIMARY
+  是單欄 `id`，FK 為 `NO ACTION / CASCADE`，redundant index、暫留 015
+  routine、隔離 scratch DB 均為 0。
+
+本輪仍未啟動 scheduler，也未執行正式 10,000 筆 live crawl；因此目前可
+確認的是 code、migration、後台與 E2E gate，不能宣稱正式資料爬取或 mapping
+已驗收。migration 015 目前仍是未追蹤檔案，提交時必須一併納入。
+
+### SOL review 第十二輪（2026-08-22，以 `d693df9` 為 base 的本機工作樹）
+
+本輪延續獨立 subagent review、room-of-doubt 與 mutation check，修正第十一輪
+之後仍可能出現的假綠與錯誤狀態文案。本輪沒有 commit 或 push：
+
+1. **migration 015 最終 fail-closed 契約**：新增 child `part_quarantine`
+   PRIMARY 單欄 `id` 與 orphan row 檢查。composite／DESC child PRIMARY、
+   缺失 parent 與 orphan quarantine row 都會在 DDL 前拒絕，不會修一半才失敗。
+2. **Quarantine resolve 原子性**：FastAPI 後台的 lock、update、readback 與
+   commit 改在同一 connection／transaction；錯誤會 rollback，最後一定關閉
+   connection，避免 `SELECT FOR UPDATE` 鎖在不同 session 而失效。
+3. **health fail-closed**：兩套後台 health 都實際解析自身直接依賴的 table／
+   view，並驗證兩個 quarantine 查詢索引。station-admin health 即使啟用登入
+   仍公開，但不會繞過 DB readiness；Compose healthcheck 會解析 JSON status，
+   不再把登入 redirect 或空殼 HTTP 200 當成 healthy。
+4. **本機服務邊界**：所有 scheduler service 改為 opt-in profile；一般
+   `docker compose up` 只啟動 mysql、admin、station-admin，不會在尚未批准
+   10,000 live crawl 時意外啟動爬蟲排程。
+5. **後台狀態真實性**：站方總覽在 `nhtsa_current_records=0` 時顯示
+   「目前沒有已發布的 NHTSA 參考資料」；只有 current records 大於 0 且尚無
+   VIN decode 時，才顯示「目前已有已發布的 NHTSA 參考資料」。文案不再把
+   部分 scope 的資料暗示成全量同步。
+6. **測試可信度**：新增／強化 transaction、health schema fault injection、
+   app-user migration repair、migration exact contract、兩種 NHTSA 顯示分支與
+   真實瀏覽器欄位／分頁 readback。暫時移除 FOR UPDATE、health schema query、
+   scheduler profile、migration guard 與 NHTSA 判斷時，對應 regression 都會
+   失敗；mutation 均已還原。
+
+驗證結果：
+
+- 最終完整 gate：`428 passed`、0 failed、0 skipped、1 個既有 Starlette
+  deprecation warning（MySQL gated、10,000 synthetic performance gate、
+  兩個真實 Chrome E2E）；JUnit：
+  `/private/tmp/partsouq-review-round12-final6.xml`。
+- 10,000 synthetic performance gate 保持 p95 `< 500 ms` 原門檻；完整 gate
+  與無競爭單獨重跑都通過，沒有放寬門檻。受限沙箱內 Chrome 會以 SIGABRT
+  結束；改在允許啟動本機 Chrome 的環境後，兩個 E2E 都通過。
+- 主 DB 的 `parts`、`published_parts`、`part_quarantine`、
+  `nhtsa_vin_decodes` 與 confirmed VIN↔PartSouq mapping 仍都是 0。
+- 本輪沒有啟動 scheduler，也沒有執行正式 10,000 筆 live crawl；以上結果只
+  證明 code、migration、後台、合成效能與 E2E 契約，不能當成正式資料爬取或
+  mapping 驗收。

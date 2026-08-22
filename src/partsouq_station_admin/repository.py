@@ -734,6 +734,56 @@ class AdminRepository:
             "unresolved": int(row.get("unresolved", 0)),
         }
 
+    def check_readiness(self) -> None:
+        self.database.fetch_one(
+            "health.quarantine-list",
+            """
+            SELECT part_quarantine.id
+            FROM part_quarantine FORCE INDEX (idx_quarantine_list)
+            STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id
+            WHERE part_quarantine.resolved_at IS NULL
+            ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC
+            LIMIT 1
+            """,
+        )
+        self.database.fetch_one(
+            "health.quarantine-run-key",
+            """
+            SELECT part_quarantine.id
+            FROM part_quarantine FORCE INDEX (idx_quarantine_run_key_resolved_updated)
+            STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id
+            WHERE part_quarantine.resolved_at IS NULL
+              AND part_quarantine.run_key = %s
+            ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC
+            LIMIT 1
+            """,
+            ("__health__",),
+        )
+        source_tables = (
+            _FORMAL_SOURCE_TABLES.get(spec.key, spec.table) for spec in ENTITY_SPECS.values()
+        )
+        readiness_tables = "\nCROSS JOIN ".join(
+            (
+                *source_tables,
+                *_HISTORICAL_SAMPLE_TABLES.values(),
+                "admin_override_heads",
+                "admin_override_events",
+                "admin_crawl_requests",
+                "admin_crawl_request_audits",
+                "scheduled_job_runs",
+                "nhtsa_current_artifacts",
+                "nhtsa_source_artifacts",
+            )
+        )
+        self.database.fetch_one(
+            "health.backoffice-schema",
+            f"""
+            SELECT 1 AS ready
+            FROM {readiness_tables}
+            LIMIT 0
+            """,
+        )
+
     def list_quarantine(
         self,
         *,

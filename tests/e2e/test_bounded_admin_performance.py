@@ -29,11 +29,6 @@ from partsouq_catalog.repositories import (
 from partsouq_station_admin.app import create_app
 from partsouq_station_admin.config import AdminConfig
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("UNIFIED_TEST_MYSQL") != "1",
-    reason="set UNIFIED_TEST_MYSQL=1 to run the isolated 10,000-row performance gate",
-)
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRESH_SCHEMA_PATHS = (
     PROJECT_ROOT / "db" / "catalog.sql",
@@ -42,6 +37,20 @@ FRESH_SCHEMA_PATHS = (
     PROJECT_ROOT / "db" / "station_admin.sql",
 )
 MIGRATION_009_PATH = PROJECT_ROOT / "migrations" / "catalog" / "009_bounded_production_dataset.sql"
+MIGRATION_011_PATH = PROJECT_ROOT / "migrations" / "catalog" / "011_part_quarantine.sql"
+MIGRATION_012_PATH = PROJECT_ROOT / "migrations" / "catalog" / "012_part_quarantine_resolution.sql"
+MIGRATION_013_PATH = (
+    PROJECT_ROOT / "migrations" / "catalog" / "013_part_quarantine_run_key_updated_index.sql"
+)
+MIGRATION_014_PATH = (
+    PROJECT_ROOT
+    / "migrations"
+    / "catalog"
+    / "014_part_quarantine_run_key_resolved_updated_index.sql"
+)
+MIGRATION_015_PATH = (
+    PROJECT_ROOT / "migrations" / "catalog" / "015_quarantine_index_contract_cleanup.sql"
+)
 DATABASE_NAME_PATTERN = re.compile(r"^partsouq_bounded_perf_[0-9a-f]{12}_test$")
 LOCAL_DATABASE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 TARGET_PARTS = 10_000
@@ -90,6 +99,8 @@ class PerformanceDatabase:
 
 @pytest.fixture
 def performance_database() -> Iterator[PerformanceDatabase]:
+    if os.getenv("UNIFIED_TEST_MYSQL") != "1":
+        pytest.skip("set UNIFIED_TEST_MYSQL=1 to run the isolated MySQL gate")
     host = os.environ["PARTSOUQ_DB_HOST"]
     if host not in LOCAL_DATABASE_HOSTS:
         raise ValueError("performance database host must be local loopback")
@@ -113,8 +124,7 @@ def performance_database() -> Iterator[PerformanceDatabase]:
                 "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
             )
         database = PerformanceDatabase(host, port, database_name, "root", root_password)
-        _apply_sql_paths(database, FRESH_SCHEMA_PATHS)
-        _apply_sql_paths(database, (MIGRATION_009_PATH,))
+        _apply_sql_paths(database, (FRESH_SCHEMA_PATHS[0],))
         yield database
     finally:
         _validate_test_database_name(database_name)
@@ -164,6 +174,892 @@ def _mysql_statements(script: str) -> Iterator[str]:
         raise ValueError("SQL script ended with an incomplete statement")
 
 
+def test_quarantine_index_migration_keeps_online_ddl_contract() -> None:
+    script = MIGRATION_015_PATH.read_text(encoding="utf-8")
+    sql_statements = tuple(_mysql_statements(script))
+    alter_pattern = re.compile(
+        r"\bALTER\s+TABLE\s+`?part_quarantine`?\b.*?(?=;|$)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    alter_statements = [
+        match.group(0)
+        for sql_statement in sql_statements
+        for match in alter_pattern.finditer(sql_statement)
+    ]
+
+    assert alter_statements
+    assert (
+        len(
+            re.findall(
+                r"(?im)^\s*SET\s+SESSION\s+lock_wait_timeout\s*=\s*30\s*;",
+                script,
+            )
+        )
+        == 1
+    )
+    assert (
+        len(
+            re.findall(
+                r"(?im)^\s*SET\s+SESSION\s+innodb_lock_wait_timeout\s*=\s*30\s*;",
+                script,
+            )
+        )
+        == 1
+    )
+    for statement in alter_statements:
+        assert re.search(r"\bALGORITHM\s*=\s*INPLACE\b", statement, re.IGNORECASE)
+        assert re.search(r"\bLOCK\s*=\s*NONE\b", statement, re.IGNORECASE)
+
+
+def test_quarantine_migration_runs_with_schema_scoped_app_user(
+    performance_database: PerformanceDatabase,
+) -> None:
+    username = f"psq_mig_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+    root_connection = performance_database.connect(autocommit=True)
+    try:
+        with root_connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE part_quarantine DROP INDEX idx_quarantine_list")
+            cursor.execute(f"CREATE USER '{username}'@'%%' IDENTIFIED BY %s", (password,))
+            cursor.execute(
+                f"GRANT ALL PRIVILEGES ON `{performance_database.database}`.* TO '{username}'@'%'"
+            )
+        app_database = PerformanceDatabase(
+            performance_database.host,
+            performance_database.port,
+            performance_database.database,
+            username,
+            password,
+        )
+        _apply_sql_paths(app_database, (MIGRATION_015_PATH,))
+        _apply_sql_paths(app_database, (MIGRATION_015_PATH,))
+        _assert_quarantine_index_contract(performance_database)
+    finally:
+        with root_connection.cursor() as cursor:
+            cursor.execute(f"DROP USER IF EXISTS '{username}'@'%'")
+        root_connection.close()
+
+
+@pytest.fixture
+def quarantine_sentinel(performance_database: PerformanceDatabase) -> None:
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO brands(id, name, code) VALUES (900001, 'MIGRATION SENTINEL', 'MIG')"
+            )
+            cursor.execute(
+                "INSERT INTO models(id, brand_id, name) "
+                "VALUES (900001, 900001, 'MIGRATION SENTINEL')"
+            )
+            cursor.execute(
+                "INSERT INTO vehicles(id, model_id, identity_hash, name, model_code) "
+                "VALUES (900001, 900001, %s, 'MIGRATION SENTINEL', 'MIG-001')",
+                ("9" * 64,),
+            )
+            cursor.execute(
+                "INSERT INTO categories(id, vehicle_id, name, cid) "
+                "VALUES (900001, 900001, 'MIGRATION SENTINEL', 'MIG-CID')"
+            )
+            cursor.execute(
+                "INSERT INTO groups_t(id, category_id, code, name, uid) "
+                "VALUES (900001, 900001, 'MIG', 'MIGRATION SENTINEL', 'MIG-UID')"
+            )
+            cursor.execute(
+                "INSERT INTO part_quarantine("
+                "id, group_id, part_number, range_str, reason, code, quantity, note, run_key"
+                ") VALUES (900001, 900001, 'MIG-PART-001', '01.2020 - 12.2020', "
+                "'nameless', 'MIG-CODE', '01', 'migration sentinel', 'migration-sentinel')"
+            )
+            cursor.execute(
+                "INSERT INTO part_quarantine("
+                "id, group_id, part_number, range_str, reason, code, quantity, note, run_key, "
+                "resolved_at, resolution"
+                ") VALUES (900002, 900001, 'MIG-PART-002', '01.2021 - 12.2021', "
+                "'nameless', 'MIG-CODE-2', '02', 'resolved migration sentinel', "
+                "'migration-sentinel', '2026-08-22 00:00:00', 'verified historical row')"
+            )
+    finally:
+        connection.close()
+
+
+def _quarantine_rows(database: PerformanceDatabase) -> tuple[dict[str, Any], ...]:
+    connection = database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, group_id, part_number, range_str, reason, code, quantity, note, "
+                "run_key, resolved_at, resolution, created_at, updated_at "
+                "FROM part_quarantine ORDER BY id"
+            )
+            return tuple(dict(row) for row in cursor.fetchall())
+    finally:
+        connection.close()
+
+
+EXPECTED_QUARANTINE_INDEX_COLUMNS = {
+    "idx_quarantine_list": ["resolved_at", "updated_at"],
+    "idx_quarantine_run_key_resolved_updated": [
+        "run_key",
+        "resolved_at",
+        "updated_at",
+    ],
+}
+EXPECTED_QUARANTINE_UNIQUE_COLUMNS = ["group_id", "part_number", "range_str", "reason"]
+QUARANTINE_INDEX_METADATA_SQL = (
+    "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE, SUB_PART, "
+    "COLLATION, INDEX_TYPE, IS_VISIBLE, EXPRESSION "
+    "FROM information_schema.STATISTICS "
+    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
+    "AND INDEX_NAME IN ("
+    "'idx_quarantine_list', "
+    "'idx_quarantine_run_key_resolved_updated', "
+    "'idx_quarantine_run_key_updated', "
+    "'idx_quarantine_resolved', "
+    "'idx_quarantine_group'"
+    ") ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+)
+
+
+def _assert_quarantine_index_contract(database: PerformanceDatabase) -> dict[str, int]:
+    connection = database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(QUARANTINE_INDEX_METADATA_SQL)
+            index_rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE, SUB_PART, "
+                "COLLATION, INDEX_TYPE, IS_VISIBLE, EXPRESSION "
+                "FROM information_schema.STATISTICS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
+                "AND INDEX_NAME = 'uq_quarantine' ORDER BY SEQ_IN_INDEX"
+            )
+            unique_rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE, SUB_PART, "
+                "COLLATION, INDEX_TYPE, IS_VISIBLE, EXPRESSION "
+                "FROM information_schema.STATISTICS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
+                "AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX"
+            )
+            primary_rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT key_columns.ORDINAL_POSITION AS key_ordinal, "
+                "key_columns.POSITION_IN_UNIQUE_CONSTRAINT AS unique_position, "
+                "key_columns.COLUMN_NAME AS column_name, "
+                "key_columns.REFERENCED_TABLE_SCHEMA AS referenced_schema, "
+                "key_columns.REFERENCED_TABLE_NAME AS referenced_table, "
+                "key_columns.REFERENCED_COLUMN_NAME AS referenced_column, "
+                "referential_constraints.UNIQUE_CONSTRAINT_SCHEMA AS unique_schema, "
+                "referential_constraints.UNIQUE_CONSTRAINT_NAME AS unique_name, "
+                "referential_constraints.UPDATE_RULE AS update_rule, "
+                "referential_constraints.DELETE_RULE AS delete_rule "
+                "FROM information_schema.KEY_COLUMN_USAGE AS key_columns "
+                "JOIN information_schema.REFERENTIAL_CONSTRAINTS "
+                "AS referential_constraints "
+                "ON referential_constraints.CONSTRAINT_SCHEMA = "
+                "key_columns.CONSTRAINT_SCHEMA "
+                "AND referential_constraints.CONSTRAINT_NAME = "
+                "key_columns.CONSTRAINT_NAME "
+                "AND referential_constraints.TABLE_NAME = key_columns.TABLE_NAME "
+                "WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE() "
+                "AND key_columns.TABLE_SCHEMA = DATABASE() "
+                "AND key_columns.TABLE_NAME = 'part_quarantine' "
+                "AND key_columns.CONSTRAINT_NAME = 'fk_quarantine_group'"
+            )
+            fk_rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'groups_t' AND CONSTRAINT_NAME = 'PRIMARY' "
+                "ORDER BY ORDINAL_POSITION"
+            )
+            parent_primary_columns = [str(row["COLUMN_NAME"]) for row in cursor.fetchall()]
+            cursor.execute(
+                "SELECT COUNT(*) AS n FROM sys.schema_redundant_indexes "
+                "WHERE table_schema = DATABASE() AND table_name = 'part_quarantine'"
+            )
+            redundant_count = int(cursor.fetchone()["n"])
+            cursor.execute(
+                "SELECT innodb_indexes.NAME, innodb_indexes.INDEX_ID "
+                "FROM information_schema.INNODB_INDEXES AS innodb_indexes "
+                "JOIN information_schema.INNODB_TABLES AS innodb_tables "
+                "ON innodb_tables.TABLE_ID = innodb_indexes.TABLE_ID "
+                "WHERE innodb_tables.NAME = CONCAT(DATABASE(), '/part_quarantine') "
+                "AND innodb_indexes.NAME IN ("
+                "'idx_quarantine_list', "
+                "'idx_quarantine_run_key_resolved_updated'"
+                ")"
+            )
+            index_ids = {str(row["NAME"]): int(row["INDEX_ID"]) for row in cursor.fetchall()}
+    finally:
+        connection.close()
+
+    actual_columns: dict[str, list[str]] = {}
+    for row in index_rows:
+        index_name = str(row["INDEX_NAME"])
+        actual_columns.setdefault(index_name, []).append(str(row["COLUMN_NAME"]))
+        assert row["NON_UNIQUE"] == 1, index_name
+        assert row["SUB_PART"] is None, index_name
+        assert row["COLLATION"] == "A", index_name
+        assert row["INDEX_TYPE"] == "BTREE", index_name
+        assert row["IS_VISIBLE"] == "YES", index_name
+        assert row["EXPRESSION"] is None, index_name
+    assert actual_columns == EXPECTED_QUARANTINE_INDEX_COLUMNS
+    assert [str(row["COLUMN_NAME"]) for row in unique_rows] == (EXPECTED_QUARANTINE_UNIQUE_COLUMNS)
+    for row in unique_rows:
+        assert row["NON_UNIQUE"] == 0
+        assert row["SUB_PART"] is None
+        assert row["COLLATION"] == "A"
+        assert row["INDEX_TYPE"] == "BTREE"
+        assert row["IS_VISIBLE"] == "YES"
+        assert row["EXPRESSION"] is None
+    assert primary_rows == [
+        {
+            "INDEX_NAME": "PRIMARY",
+            "SEQ_IN_INDEX": 1,
+            "COLUMN_NAME": "id",
+            "NON_UNIQUE": 0,
+            "SUB_PART": None,
+            "COLLATION": "A",
+            "INDEX_TYPE": "BTREE",
+            "IS_VISIBLE": "YES",
+            "EXPRESSION": None,
+        }
+    ]
+    assert fk_rows == [
+        {
+            "key_ordinal": 1,
+            "unique_position": 1,
+            "column_name": "group_id",
+            "referenced_schema": database.database,
+            "referenced_table": "groups_t",
+            "referenced_column": "id",
+            "unique_schema": database.database,
+            "unique_name": "PRIMARY",
+            "update_rule": "NO ACTION",
+            "delete_rule": "CASCADE",
+        }
+    ]
+    assert parent_primary_columns == ["id"]
+    assert redundant_count == 0
+    assert index_ids.keys() == EXPECTED_QUARANTINE_INDEX_COLUMNS.keys()
+    return index_ids
+
+
+@pytest.mark.parametrize(
+    ("mutated_index", "mutation_sql"),
+    (
+        pytest.param(
+            "idx_quarantine_run_key_resolved_updated",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "ADD KEY idx_quarantine_run_key_resolved_updated "
+            "(run_key, updated_at, resolved_at)",
+            id="run-key-wrong-order",
+        ),
+        pytest.param(
+            "idx_quarantine_list",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_list, "
+            "ADD KEY idx_quarantine_list (updated_at, resolved_at)",
+            id="list-wrong-order",
+        ),
+        pytest.param(
+            "idx_quarantine_run_key_resolved_updated",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "ADD UNIQUE KEY idx_quarantine_run_key_resolved_updated "
+            "(run_key, resolved_at, updated_at)",
+            id="unique",
+        ),
+        pytest.param(
+            "idx_quarantine_run_key_resolved_updated",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "ADD KEY idx_quarantine_run_key_resolved_updated "
+            "(run_key(32), resolved_at, updated_at)",
+            id="prefix",
+        ),
+        pytest.param(
+            "idx_quarantine_run_key_resolved_updated",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "ADD KEY idx_quarantine_run_key_resolved_updated "
+            "(run_key, resolved_at, updated_at DESC)",
+            id="descending",
+        ),
+        pytest.param(
+            "idx_quarantine_run_key_resolved_updated",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "ADD KEY idx_quarantine_run_key_resolved_updated "
+            "(run_key, resolved_at, updated_at, ((LENGTH(run_key))))",
+            id="functional-key-part",
+        ),
+        pytest.param(
+            "idx_quarantine_list",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_list, "
+            "ADD UNIQUE KEY idx_quarantine_list (resolved_at, updated_at)",
+            id="list-unique",
+        ),
+        pytest.param(
+            "idx_quarantine_list",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_list, "
+            "ADD KEY idx_quarantine_list (resolved_at, updated_at DESC)",
+            id="list-descending",
+        ),
+        pytest.param(
+            "idx_quarantine_list",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_list, "
+            "ADD KEY idx_quarantine_list "
+            "(resolved_at, updated_at, ((LENGTH(reason))))",
+            id="list-functional-key-part",
+        ),
+        pytest.param(
+            "idx_quarantine_list",
+            (
+                "ALTER TABLE part_quarantine ADD COLUMN spatial_probe POINT NULL SRID 0",
+                "UPDATE part_quarantine SET spatial_probe = ST_SRID(POINT(0, 0), 0)",
+                "ALTER TABLE part_quarantine "
+                "MODIFY COLUMN spatial_probe POINT NOT NULL SRID 0, "
+                "DROP KEY idx_quarantine_list, "
+                "ADD SPATIAL KEY idx_quarantine_list (spatial_probe)",
+            ),
+            id="list-spatial",
+        ),
+        pytest.param(
+            "idx_quarantine_run_key_resolved_updated",
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "DROP KEY idx_quarantine_list",
+            id="missing-indexes",
+        ),
+    ),
+)
+@pytest.mark.usefixtures("quarantine_sentinel")
+def test_quarantine_index_migrations_repair_existing_volume(
+    performance_database: PerformanceDatabase,
+    mutated_index: str,
+    mutation_sql: str | tuple[str, ...],
+) -> None:
+    _assert_quarantine_index_contract(performance_database)
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            mutation_statements = (mutation_sql,) if isinstance(mutation_sql, str) else mutation_sql
+            for statement in mutation_statements:
+                cursor.execute(statement)
+            cursor.execute(QUARANTINE_INDEX_METADATA_SQL)
+            mutated_metadata = cursor.fetchall()
+            mutated_rows = [row for row in mutated_metadata if row["INDEX_NAME"] == mutated_index]
+            cursor.execute(
+                "SELECT innodb_indexes.NAME, innodb_indexes.INDEX_ID "
+                "FROM information_schema.INNODB_INDEXES AS innodb_indexes "
+                "JOIN information_schema.INNODB_TABLES AS innodb_tables "
+                "ON innodb_tables.TABLE_ID = innodb_indexes.TABLE_ID "
+                "WHERE innodb_tables.NAME = CONCAT(DATABASE(), '/part_quarantine') "
+                "AND innodb_indexes.NAME IN ("
+                "'idx_quarantine_list', "
+                "'idx_quarantine_run_key_resolved_updated'"
+                ")"
+            )
+            mutated_index_ids = {
+                str(row["NAME"]): int(row["INDEX_ID"]) for row in cursor.fetchall()
+            }
+            spatial_state = None
+            if isinstance(mutation_sql, tuple) and any(
+                "spatial_probe" in statement for statement in mutation_sql
+            ):
+                cursor.execute(
+                    "SELECT DATA_TYPE, IS_NULLABLE, SRS_ID "
+                    "FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
+                    "AND COLUMN_NAME = 'spatial_probe'"
+                )
+                spatial_column = cursor.fetchone()
+                cursor.execute(
+                    "SELECT id, ST_AsText(spatial_probe) AS point_text, "
+                    "ST_SRID(spatial_probe) AS srid "
+                    "FROM part_quarantine ORDER BY id"
+                )
+                spatial_state = (spatial_column, cursor.fetchall())
+    finally:
+        connection.close()
+
+    mutated_contract_is_valid = [str(row["COLUMN_NAME"]) for row in mutated_rows] == (
+        EXPECTED_QUARANTINE_INDEX_COLUMNS[mutated_index]
+    ) and all(
+        row["NON_UNIQUE"] == 1
+        and row["SUB_PART"] is None
+        and row["COLLATION"] == "A"
+        and row["INDEX_TYPE"] == "BTREE"
+        and row["IS_VISIBLE"] == "YES"
+        and row["EXPRESSION"] is None
+        for row in mutated_rows
+    )
+    assert not mutated_contract_is_valid, "mutation must break the target index contract"
+    before_rows = _quarantine_rows(performance_database)
+
+    _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+    after_index_ids = _assert_quarantine_index_contract(performance_database)
+    for index_name, index_id in mutated_index_ids.items():
+        if index_name != mutated_index:
+            assert after_index_ids[index_name] == index_id
+    assert _quarantine_rows(performance_database) == before_rows
+    if spatial_state is not None:
+        connection = performance_database.connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT DATA_TYPE, IS_NULLABLE, SRS_ID "
+                    "FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
+                    "AND COLUMN_NAME = 'spatial_probe'"
+                )
+                spatial_column = cursor.fetchone()
+                cursor.execute(
+                    "SELECT id, ST_AsText(spatial_probe) AS point_text, "
+                    "ST_SRID(spatial_probe) AS srid "
+                    "FROM part_quarantine ORDER BY id"
+                )
+                assert (spatial_column, cursor.fetchall()) == spatial_state
+        finally:
+            connection.close()
+
+
+@pytest.mark.parametrize("index_name", tuple(EXPECTED_QUARANTINE_INDEX_COLUMNS))
+@pytest.mark.usefixtures("quarantine_sentinel")
+def test_quarantine_index_visibility_repair_does_not_rebuild(
+    performance_database: PerformanceDatabase,
+    index_name: str,
+) -> None:
+    before_ids = _assert_quarantine_index_contract(performance_database)
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"ALTER TABLE part_quarantine ALTER INDEX {index_name} INVISIBLE")
+    finally:
+        connection.close()
+    before_rows = _quarantine_rows(performance_database)
+
+    _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+    after_ids = _assert_quarantine_index_contract(performance_database)
+    assert after_ids == before_ids
+    assert _quarantine_rows(performance_database) == before_rows
+
+
+@pytest.mark.usefixtures("quarantine_sentinel")
+def test_quarantine_index_migration_is_idempotent_after_legacy_replay(
+    performance_database: PerformanceDatabase,
+) -> None:
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE part_quarantine ADD KEY idx_quarantine_group (group_id)")
+    finally:
+        connection.close()
+    _apply_sql_paths(
+        performance_database,
+        (MIGRATION_011_PATH, MIGRATION_012_PATH, MIGRATION_013_PATH),
+    )
+
+    connection = performance_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(QUARANTINE_INDEX_METADATA_SQL)
+            legacy_index_names = {str(row["INDEX_NAME"]) for row in cursor.fetchall()}
+    finally:
+        connection.close()
+    assert {
+        "idx_quarantine_group",
+        "idx_quarantine_resolved",
+        "idx_quarantine_run_key_updated",
+    }.issubset(legacy_index_names)
+    before_rows = _quarantine_rows(performance_database)
+
+    _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+    first_index_ids = _assert_quarantine_index_contract(performance_database)
+    assert _quarantine_rows(performance_database) == before_rows
+    _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+    assert _assert_quarantine_index_contract(performance_database) == first_index_ids
+    assert _quarantine_rows(performance_database) == before_rows
+
+    _apply_sql_paths(
+        performance_database,
+        (
+            MIGRATION_011_PATH,
+            MIGRATION_012_PATH,
+            MIGRATION_013_PATH,
+            MIGRATION_014_PATH,
+            MIGRATION_015_PATH,
+        ),
+    )
+    assert _assert_quarantine_index_contract(performance_database) == first_index_ids
+    assert _quarantine_rows(performance_database) == before_rows
+
+
+def test_quarantine_migrations_build_final_contract_from_pre_011_schema(
+    performance_database: PerformanceDatabase,
+) -> None:
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE part_quarantine")
+    finally:
+        connection.close()
+
+    _apply_sql_paths(
+        performance_database,
+        (MIGRATION_011_PATH, MIGRATION_012_PATH, MIGRATION_015_PATH),
+    )
+    _assert_quarantine_index_contract(performance_database)
+
+
+@pytest.mark.usefixtures("quarantine_sentinel")
+def test_quarantine_migration_recovers_after_failed_preflight(
+    performance_database: PerformanceDatabase,
+) -> None:
+    before_rows = _quarantine_rows(performance_database)
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group")
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        pymysql.MySQLError,
+        match="migration 015: quarantine key/FK/data preflight failed",
+    ):
+        _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS n FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = DATABASE() "
+                "AND ROUTINE_NAME = "
+                "'upgrade_partsouq_015_quarantine_index_contract_cleanup'"
+            )
+            assert cursor.fetchone()["n"] == 1
+            cursor.execute(
+                "ALTER TABLE part_quarantine "
+                "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES groups_t(id) ON DELETE CASCADE"
+            )
+    finally:
+        connection.close()
+
+    _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+    _assert_quarantine_index_contract(performance_database)
+    assert _quarantine_rows(performance_database) == before_rows
+
+    connection = performance_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS n FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = DATABASE() "
+                "AND ROUTINE_NAME LIKE '%partsouq_015%'"
+            )
+            assert cursor.fetchone()["n"] == 0
+    finally:
+        connection.close()
+
+
+def test_station_health_fails_closed_when_backoffice_schema_is_missing(
+    performance_database: PerformanceDatabase,
+) -> None:
+    station_app = create_app(performance_database.station_admin_config())
+    station_app.testing = True
+
+    with pytest.raises(pymysql.MySQLError) as error:
+        station_app.test_client().get("/health")
+
+    assert error.value.args[0] == 1146
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
+
+    response = station_app.test_client().get("/health")
+
+    assert response.status_code == 200
+    assert response.json == {"entities": 10, "status": "ok"}
+
+
+def test_data_admin_health_fails_closed_when_backoffice_schema_is_missing(
+    performance_database: PerformanceDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_catalog_database(monkeypatch, performance_database)
+
+    with pytest.raises(pymysql.MySQLError) as error:
+        data_admin_app.health()
+
+    assert error.value.args[0] == 1146
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
+    assert data_admin_app.health() == {"status": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("object_type", "object_name"),
+    (
+        ("TABLE", "admin_override_events"),
+        ("TABLE", "admin_crawl_requests"),
+        ("TABLE", "admin_crawl_request_audits"),
+        ("TABLE", "scheduled_job_runs"),
+        ("TABLE", "nhtsa_current_artifacts"),
+        ("TABLE", "nhtsa_source_artifacts"),
+        ("VIEW", "station_admin_historical_sample_part_numbers"),
+        ("VIEW", "station_admin_historical_sample_part_occurrences"),
+        ("VIEW", "station_admin_historical_sample_fitments"),
+    ),
+)
+def test_station_health_fails_closed_when_backoffice_object_is_missing(
+    performance_database: PerformanceDatabase,
+    object_type: str,
+    object_name: str,
+) -> None:
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SET SESSION FOREIGN_KEY_CHECKS = 0")
+            try:
+                cursor.execute(f"DROP {object_type} {object_name}")
+            finally:
+                cursor.execute("SET SESSION FOREIGN_KEY_CHECKS = 1")
+    finally:
+        connection.close()
+
+    station_app = create_app(performance_database.station_admin_config())
+    station_app.testing = True
+    with pytest.raises(pymysql.MySQLError) as error:
+        station_app.test_client().get("/health")
+
+    assert error.value.args[0] in {1146, 1356}
+
+
+@pytest.mark.parametrize(
+    ("object_type", "object_name"),
+    (
+        ("TABLE", "nhtsa_sync_runs"),
+        ("VIEW", "station_admin_effective_parts"),
+    ),
+)
+def test_data_admin_health_fails_closed_when_schema_object_is_missing(
+    performance_database: PerformanceDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    object_type: str,
+    object_name: str,
+) -> None:
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
+    _configure_catalog_database(monkeypatch, performance_database)
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"DROP {object_type} {object_name}")
+    finally:
+        connection.close()
+
+    with pytest.raises(pymysql.MySQLError) as error:
+        data_admin_app.health()
+
+    assert error.value.args[0] == 1146
+
+
+@pytest.mark.parametrize(
+    ("mutation_sql", "expected_error"),
+    (
+        pytest.param(
+            "ALTER TABLE part_quarantine DROP KEY uq_quarantine",
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="missing-unique-contract",
+        ),
+        pytest.param(
+            (
+                "ALTER TABLE part_quarantine DROP KEY uq_quarantine",
+                "ALTER TABLE part_quarantine "
+                "ADD UNIQUE KEY uq_quarantine "
+                "(group_id, part_number, range_str, code)",
+            ),
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="wrong-unique-contract",
+        ),
+        pytest.param(
+            "ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group",
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="missing-foreign-key",
+        ),
+        pytest.param(
+            (
+                "ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group",
+                "ALTER TABLE part_quarantine "
+                "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES groups_t(id) ON DELETE RESTRICT",
+            ),
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="wrong-delete-rule",
+        ),
+        pytest.param(
+            (
+                "ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group",
+                "ALTER TABLE part_quarantine "
+                "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES groups_t(id) ON UPDATE CASCADE ON DELETE CASCADE",
+            ),
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="wrong-update-rule",
+        ),
+        pytest.param(
+            (
+                "ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group",
+                "ALTER TABLE part_quarantine "
+                "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES categories(id) ON DELETE CASCADE",
+            ),
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="wrong-referenced-table",
+        ),
+        pytest.param(
+            (
+                "SET SESSION restrict_fk_on_non_standard_key = OFF",
+                "ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group",
+                "ALTER TABLE parts DROP FOREIGN KEY fk_part_group",
+                "ALTER TABLE groups_t DROP PRIMARY KEY, ADD PRIMARY KEY (id, category_id)",
+                "ALTER TABLE part_quarantine "
+                "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES groups_t(id) ON DELETE CASCADE",
+            ),
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="composite-parent-primary",
+        ),
+        pytest.param(
+            "ALTER TABLE part_quarantine DROP PRIMARY KEY, ADD PRIMARY KEY (id, group_id)",
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="composite-quarantine-primary",
+        ),
+        pytest.param(
+            "ALTER TABLE part_quarantine DROP PRIMARY KEY, ADD PRIMARY KEY (id DESC)",
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="descending-quarantine-primary",
+        ),
+        pytest.param(
+            (
+                "SET FOREIGN_KEY_CHECKS = 0",
+                "INSERT INTO part_quarantine("
+                "id, group_id, part_number, range_str, reason, run_key"
+                ") VALUES (900003, 999999, 'MIG-ORPHAN', '', 'nameless', "
+                "'migration-sentinel')",
+                "SET FOREIGN_KEY_CHECKS = 1",
+            ),
+            "migration 015: quarantine key/FK/data preflight failed",
+            id="orphan-quarantine-row",
+        ),
+        pytest.param(
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_run_key_resolved_updated, "
+            "ADD FULLTEXT KEY idx_quarantine_run_key_resolved_updated (note)",
+            "migration 015: FULLTEXT drift requires table rebuild",
+            id="target-fulltext-drift",
+        ),
+        pytest.param(
+            "ALTER TABLE part_quarantine "
+            "DROP KEY idx_quarantine_group, "
+            "ADD FULLTEXT KEY idx_quarantine_group (note)",
+            "migration 015: FULLTEXT drift requires table rebuild",
+            id="obsolete-fulltext-drift",
+        ),
+        pytest.param(
+            (
+                "ALTER TABLE part_quarantine "
+                "DROP KEY idx_quarantine_run_key_resolved_updated, "
+                "ADD FULLTEXT KEY idx_quarantine_run_key_resolved_updated (note)",
+                "ALTER TABLE part_quarantine "
+                "DROP KEY idx_quarantine_run_key_resolved_updated, "
+                "ADD KEY idx_quarantine_run_key_resolved_updated "
+                "(run_key, resolved_at, updated_at)",
+            ),
+            "migration 015: hidden FTS artifacts require table rebuild",
+            id="orphan-hidden-fts",
+        ),
+    ),
+)
+@pytest.mark.usefixtures("quarantine_sentinel")
+def test_quarantine_index_migration_fails_closed_before_changes(
+    performance_database: PerformanceDatabase,
+    mutation_sql: str | tuple[str, ...],
+    expected_error: str,
+) -> None:
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE part_quarantine "
+                "ADD KEY idx_quarantine_group (group_id), "
+                "ADD KEY idx_quarantine_resolved (run_key, resolved_at)"
+            )
+            cursor.execute("ALTER TABLE part_quarantine ALTER INDEX idx_quarantine_list INVISIBLE")
+            mutation_statements = (mutation_sql,) if isinstance(mutation_sql, str) else mutation_sql
+            for statement in mutation_statements:
+                cursor.execute(statement)
+    finally:
+        connection.close()
+
+    schema_snapshots: list[dict[str, Any]] = []
+    for execute_migration in (False, True):
+        if execute_migration:
+            with pytest.raises(pymysql.MySQLError, match=re.escape(expected_error)):
+                _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
+        connection = performance_database.connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW CREATE TABLE part_quarantine")
+                quarantine_create = cursor.fetchone()
+                cursor.execute("SHOW CREATE TABLE groups_t")
+                groups_create = cursor.fetchone()
+                cursor.execute("SHOW CREATE TABLE parts")
+                parts_create = cursor.fetchone()
+                cursor.execute(
+                    "SELECT innodb_indexes.NAME, innodb_indexes.INDEX_ID, "
+                    "innodb_indexes.TYPE, innodb_indexes.N_FIELDS, "
+                    "innodb_indexes.PAGE_NO, innodb_indexes.SPACE "
+                    "FROM information_schema.INNODB_INDEXES AS innodb_indexes "
+                    "JOIN information_schema.INNODB_TABLES AS innodb_tables "
+                    "ON innodb_tables.TABLE_ID = innodb_indexes.TABLE_ID "
+                    "WHERE innodb_tables.NAME = CONCAT(DATABASE(), '/part_quarantine') "
+                    "ORDER BY innodb_indexes.NAME, innodb_indexes.INDEX_ID"
+                )
+                index_metadata = cursor.fetchall()
+                cursor.execute(
+                    "SELECT TABLE_ID, NAME, SPACE "
+                    "FROM information_schema.INNODB_TABLES "
+                    "WHERE NAME LIKE CONCAT(DATABASE(), '/FTS_%') "
+                    "ORDER BY NAME"
+                )
+                fts_tables = cursor.fetchall()
+                cursor.execute("SELECT * FROM groups_t WHERE id = 900001")
+                sentinel_groups = cursor.fetchall()
+        finally:
+            connection.close()
+        schema_snapshots.append(
+            {
+                "quarantine_create": quarantine_create,
+                "groups_create": groups_create,
+                "parts_create": parts_create,
+                "index_metadata": index_metadata,
+                "fts_tables": fts_tables,
+                "sentinel_groups": sentinel_groups,
+                "quarantine_rows": _quarantine_rows(performance_database),
+            }
+        )
+
+    assert schema_snapshots[1] == schema_snapshots[0]
+
+
 def _configure_catalog_database(
     monkeypatch: pytest.MonkeyPatch,
     database: PerformanceDatabase,
@@ -176,6 +1072,37 @@ def _configure_catalog_database(
         "database": database.database,
     }.items():
         monkeypatch.setitem(DB_CONFIG, key, value)
+
+
+@pytest.mark.parametrize(
+    "index_name",
+    ("idx_quarantine_list", "idx_quarantine_run_key_resolved_updated"),
+)
+def test_health_endpoints_fail_closed_when_quarantine_index_is_missing(
+    performance_database: PerformanceDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    index_name: str,
+) -> None:
+    _configure_catalog_database(monkeypatch, performance_database)
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"ALTER TABLE part_quarantine DROP KEY {index_name}")
+    finally:
+        connection.close()
+
+    try:
+        with pytest.raises(pymysql.OperationalError) as fastapi_error:
+            data_admin_app.health()
+        assert fastapi_error.value.args[0] == 1176
+
+        station_app = create_app(performance_database.station_admin_config())
+        station_app.testing = True
+        with pytest.raises(pymysql.OperationalError) as station_error:
+            station_app.test_client().get("/health")
+        assert station_error.value.args[0] == 1176
+    finally:
+        _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
 
 
 def _seed_synthetic_bounded_dataset(database: PerformanceDatabase) -> dict[str, int]:
@@ -391,6 +1318,7 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
     performance_database: PerformanceDatabase,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _apply_sql_paths(performance_database, (*FRESH_SCHEMA_PATHS[1:], MIGRATION_009_PATH))
     _configure_catalog_database(monkeypatch, performance_database)
     setup_started = time.perf_counter()
     seeded = _seed_synthetic_bounded_dataset(performance_database)
@@ -590,7 +1518,7 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         for name, metrics in section.items():
             if name in {"summary", "synthetic_readiness"} or name.endswith("_explain"):
                 continue
-            assert float(metrics["p95_ms"]) < PAGE_P95_LIMIT_MS
+            assert float(metrics["p95_ms"]) < PAGE_P95_LIMIT_MS, f"{name}: {metrics}"
 
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     assert all(

@@ -428,18 +428,53 @@ def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
             expect(page.locator("#quarantine-page-number")).to_have_value("1")
             expect(page.locator("#quarantine-total-pages")).to_have_text("共 1 頁")
             expect(page.locator("#quarantine-range-label")).to_have_text("顯示 1 到 1，共 1 筆")
-            expect(
-                page.locator("#quarantine-table-body").get_by_role("button", name="標記處置")
-            ).to_be_visible()
+            page.locator("#quarantine-page-size").select_option("30")
+            page.locator("#quarantine-run-key").fill("missing-run")
+            page.locator("#quarantine-refresh").click()
+            expect(page.locator("#quarantine-table-body")).to_contain_text("無紀錄")
+
+            page.locator("#quarantine-run-key").fill("e2e-run")
+            page.locator("#quarantine-refresh").click()
+            resolve_button = page.locator("#quarantine-table-body").get_by_role(
+                "button", name="標記處置"
+            )
+            expect(resolve_button).to_be_visible()
+            page.once("dialog", lambda dialog: dialog.accept("verified in browser e2e"))
+            resolve_button.click()
+            expect(page.locator("#quarantine-table-body")).to_contain_text("無紀錄")
+
+            connection = e2e_database.connect()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT resolved_at, resolution FROM part_quarantine "
+                        "WHERE part_number = 'E2E-Q0001'"
+                    )
+                    resolved = cursor.fetchone()
+            finally:
+                connection.close()
+            assert resolved is not None
+            assert resolved["resolved_at"] is not None
+            assert resolved["resolution"] == "verified in browser e2e"
 
             page.locator("#quarantine-state").select_option("all")
             page.locator("#quarantine-refresh").click()
             expect(page.locator("#quarantine-table-body")).to_contain_text("E2E-Q0002")
             expect(page.locator("#quarantine-total-pages")).to_have_text("共 1 頁")
-            unresolved_row = page.locator("#quarantine-table-body tr").filter(has_text="E2E-Q0001")
+            newly_resolved_row = page.locator("#quarantine-table-body tr").filter(
+                has_text="E2E-Q0001"
+            )
             resolved_row = page.locator("#quarantine-table-body tr").filter(has_text="E2E-Q0002")
-            expect(unresolved_row.locator("td")).to_have_count(8)
+            expect(newly_resolved_row.locator("td")).to_have_count(8)
             expect(resolved_row.locator("td")).to_have_count(8)
+            expect(newly_resolved_row).to_contain_text("verified in browser e2e")
+
+            page.locator("#token").fill("")
+            page.locator("#quarantine-refresh").click()
+            expect(page.locator("#quarantine-table-body")).to_contain_text("無紀錄")
+            expect(page.locator("#quarantine-page-size")).to_have_value("50")
+            expect(page.locator("#quarantine-total-pages")).to_have_text("共 0 頁")
+            expect(page.locator("#quarantine-range-label")).to_have_text("顯示 0 到 0，共 0 筆")
         finally:
             browser.close()
 

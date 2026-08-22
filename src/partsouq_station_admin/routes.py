@@ -49,6 +49,7 @@ bp = Blueprint(
 )
 
 PUBLIC_ENDPOINTS = frozenset({"admin.login", "admin.static"})
+AUTHENTICATION_EXEMPT_ENDPOINTS = PUBLIC_ENDPOINTS | {"admin.health"}
 
 
 def _config() -> AdminConfig:
@@ -70,7 +71,7 @@ def _csrf_token() -> str:
 @bp.before_app_request
 def require_login() -> ResponseReturnValue | None:
     config = _config()
-    if not config.auth_required or request.endpoint in PUBLIC_ENDPOINTS:
+    if not config.auth_required or request.endpoint in AUTHENTICATION_EXEMPT_ENDPOINTS:
         return None
     if session.get("admin_authenticated") is True:
         return None
@@ -199,8 +200,9 @@ def dashboard() -> str:
 
 @bp.get("/health")
 def health() -> dict[str, object]:
-    counts = _repository().dashboard_counts()
-    return {"status": "ok", "entities": len(counts)}
+    repository = _repository()
+    repository.check_readiness()
+    return {"status": "ok", "entities": len(ENTITY_SPECS)}
 
 
 @bp.get("/monitoring")

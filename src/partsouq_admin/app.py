@@ -242,7 +242,50 @@ def admin_page() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    _fetch_one("SELECT 1 AS ok")
+    _fetch_one(
+        "SELECT part_quarantine.id FROM part_quarantine "
+        "FORCE INDEX (idx_quarantine_list) "
+        "STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id "
+        "WHERE part_quarantine.resolved_at IS NULL "
+        "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC LIMIT 1"
+    )
+    _fetch_one(
+        "SELECT part_quarantine.id FROM part_quarantine "
+        "FORCE INDEX (idx_quarantine_run_key_resolved_updated) "
+        "STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id "
+        "WHERE part_quarantine.resolved_at IS NULL "
+        "AND part_quarantine.run_key = %s "
+        "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC LIMIT 1",
+        ("__health__",),
+    )
+    readiness_tables = "\nCROSS JOIN ".join(
+        (
+            "brands",
+            "models",
+            "vehicles",
+            "categories",
+            "parts",
+            "published_parts",
+            "bounded_parts",
+            "crawl_runs",
+            "nhtsa_sync_runs",
+            "nhtsa_source_artifacts",
+            "nhtsa_current_artifacts",
+            "nhtsa_vin_decodes",
+            "admin_vehicle_mappings",
+            "admin_part_translations",
+            "admin_part_fitments",
+            "admin_category_labels",
+            "admin_reconciliation_items",
+            "admin_crawl_requests",
+            "scheduled_job_runs",
+            "v_current_catalog_parts",
+            "v_vin_part_fitments",
+            "admin_override_heads",
+            "station_admin_effective_parts",
+        )
+    )
+    _fetch_one(f"SELECT 1 AS ready FROM {readiness_tables} LIMIT 0")
     return {"status": "ok"}
 
 
@@ -1359,12 +1402,31 @@ def resolve_quarantine(row_id: int, payload: QuarantineResolveInput) -> dict:
     同一料號在後續 run 再次出現時，爬蟲會重開處置狀態
     （resolved_at / resolution 清空），重新回到未處置清單。
     """
-    _row_or_404("part_quarantine", row_id)
-    _execute(
-        "UPDATE part_quarantine SET resolved_at = NOW(), resolution = %s WHERE id = %s",
-        (payload.resolution, row_id),
-    )
-    return _row_or_404("part_quarantine", row_id)
+    connection = _connect()
+    try:
+        connection.begin()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM part_quarantine WHERE id = %s FOR UPDATE",
+                (row_id,),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到資料")
+            cursor.execute(
+                "UPDATE part_quarantine "
+                "SET resolved_at = NOW(), resolution = %s, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = %s",
+                (payload.resolution, row_id),
+            )
+            cursor.execute("SELECT * FROM part_quarantine WHERE id = %s", (row_id,))
+            updated = cursor.fetchone()
+        connection.commit()
+        return dict(updated)
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _validated_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> tuple[object, ...]:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
 import uuid
 from collections.abc import Iterator
+from unittest import mock
 
 import pymysql
 import pytest
@@ -20,15 +22,12 @@ from partsouq_station_admin.db import AdminDatabase
 from partsouq_station_admin.query_trace import QueryTrace
 from partsouq_station_admin.repository import AdminRepository
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("UNIFIED_TEST_MYSQL") != "1",
-    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL quarantine plan tests",
-)
-
 RUN_KEY_RESOLVED_UPDATED_INDEX = "idx_quarantine_run_key_resolved_updated"
 
 
 def _connect() -> Connection[DictCursor]:
+    if os.getenv("UNIFIED_TEST_MYSQL") != "1":
+        pytest.skip("set UNIFIED_TEST_MYSQL=1 to run shared MySQL quarantine plan tests")
     database_name = str(DB_CONFIG["database"])
     if not database_name.endswith("_test"):
         raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
@@ -120,21 +119,26 @@ def _explain_analyze_part_quarantine_rows(
     sql: str,
     params: tuple[object, ...],
 ) -> int:
-    """Run EXPLAIN ANALYZE (which executes the query) and return the actual
-    rows examined at the part_quarantine node. Unlike EXPLAIN FORMAT=JSON's
-    rows_examined_per_scan this is an executed measurement, not an
-    optimizer estimate (an empty result can be estimated as 1)."""
+    """Run EXPLAIN ANALYZE and return part_quarantine rows across all loops.
+
+    Unlike EXPLAIN FORMAT=JSON's rows_examined_per_scan, rows * loops is an
+    executed measurement rather than an optimizer estimate.
+    """
     with connection.cursor() as cursor:
         cursor.execute("EXPLAIN ANALYZE " + sql, params)
         text = str(cursor.fetchone()["EXPLAIN"])
-    examined: list[int] = []
+    examined: list[float] = []
+    number = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
     for line in text.splitlines():
-        if "part_quarantine" not in line:
+        if re.search(r"\bon part_quarantine\b", line) is None:
             continue
-        match = re.search(r"\(actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", line)
+        match = re.search(
+            rf"\(actual time={number}\.\.{number} rows=({number}) loops=({number})\)",
+            line,
+        )
         if match:
-            examined.append(int(match.group(1)))
-    return max(examined) if examined else -1
+            examined.append(float(match.group(1)) * float(match.group(2)))
+    return math.ceil(sum(examined)) if examined else -1
 
 
 def _seed_chain(
@@ -218,8 +222,8 @@ def _cleanup_chain(connection: Connection[DictCursor], rows: dict[str, object]) 
     id having been produced, so a partial seed never leaves orphaned rows.
     Each statement is isolated: a failed DELETE records the error and the
     remaining tables are still cleaned up. Cleanup errors are re-raised only
-    when no original exception is in flight, so they never mask the error
-    the test body raised."""
+    when no original exception is in flight; otherwise they are attached to
+    the original error as a note instead of masking it."""
     cleanup_errors: list[str] = []
     statements: list[tuple[str, str, tuple[object, ...]]] = []
     if "group_id" in rows:
@@ -247,8 +251,13 @@ def _cleanup_chain(connection: Connection[DictCursor], rows: dict[str, object]) 
                 cursor.execute(statement, params)
             except Exception as error:
                 cleanup_errors.append(f"{table}: {error}")
-    if cleanup_errors and sys.exc_info()[0] is None:
-        raise RuntimeError("cleanup failed: " + "; ".join(cleanup_errors))
+    if cleanup_errors:
+        message = "cleanup failed: " + "; ".join(cleanup_errors)
+        original_error = sys.exception()
+        if original_error is not None:
+            original_error.add_note(message)
+        else:
+            raise RuntimeError(message)
 
 
 @pytest.fixture
@@ -381,36 +390,117 @@ def _station_list_quarantine_sql(state: str, run_key: str | None) -> tuple[str, 
 
 def test_quarantine_index_preflight(seeded_quarantine_rows: dict[str, object]) -> None:
     """Both FORCE INDEX names used by app.py and repository.py must exist
-    with their exact column order and stay visible; the superseded 013
-    index must be gone. Guards round-8 P1 (MySQL 1176, both backends 500
-    on run_key queries) and round-9 P2: a name-only check would pass a
-    same-name index with the wrong column order or an INVISIBLE index,
-    which still makes FORCE INDEX fail with 1176."""
+    with their exact ordered, non-unique, unprefixed, ascending BTREE shape
+    and stay visible; all superseded quarantine indexes must be gone."""
     connection = seeded_quarantine_rows["connection"]
     expected = {
-        "idx_quarantine_list": "resolved_at,updated_at",
-        RUN_KEY_RESOLVED_UPDATED_INDEX: "run_key,resolved_at,updated_at",
+        "idx_quarantine_list": ["resolved_at", "updated_at"],
+        RUN_KEY_RESOLVED_UPDATED_INDEX: ["run_key", "resolved_at", "updated_at"],
     }
     with connection.cursor() as cursor:
-        for index_name, columns in expected.items():
-            cursor.execute(
-                "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols, "
-                "MAX(IS_VISIBLE) AS visible "
-                "FROM information_schema.STATISTICS "
-                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
-                "AND INDEX_NAME = %s",
-                (index_name,),
-            )
-            row = cursor.fetchone()
-            assert row is not None, index_name
-            assert row["cols"] == columns, index_name
-            assert row["visible"] == "YES", index_name
         cursor.execute(
-            "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
+            "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SUB_PART, COLLATION, "
+            "INDEX_TYPE, IS_VISIBLE, EXPRESSION "
+            "FROM information_schema.STATISTICS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
-            "AND INDEX_NAME = 'idx_quarantine_run_key_updated'"
+            "AND INDEX_NAME IN ("
+            "'idx_quarantine_list', "
+            "'idx_quarantine_run_key_resolved_updated', "
+            "'idx_quarantine_run_key_updated', "
+            "'idx_quarantine_resolved', "
+            "'idx_quarantine_group'"
+            ") ORDER BY INDEX_NAME, SEQ_IN_INDEX"
         )
-        assert cursor.fetchone()["n"] == 0
+        index_rows = cursor.fetchall()
+
+    actual: dict[str, list[str]] = {}
+    for row in index_rows:
+        index_name = str(row["INDEX_NAME"])
+        actual.setdefault(index_name, []).append(str(row["COLUMN_NAME"]))
+        assert row["NON_UNIQUE"] == 1, index_name
+        assert row["SUB_PART"] is None, index_name
+        assert row["COLLATION"] == "A", index_name
+        assert row["INDEX_TYPE"] == "BTREE", index_name
+        assert row["IS_VISIBLE"] == "YES", index_name
+        assert row["EXPRESSION"] is None, index_name
+    assert actual == expected
+
+
+def test_explain_analyze_uses_total_executed_part_quarantine_rows() -> None:
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {
+        "EXPLAIN": (
+            "-> Index lookup on groups_t (actual time=0.01..0.02 rows=1 loops=1)\n"
+            "    -> Filter: (part_quarantine.resolved_at is null) "
+            "(actual time=0.01..0.02 rows=99 loops=1)\n"
+            "    -> Index lookup on part_quarantine "
+            "(actual time=934e-6..1.2e-3 rows=5e-1 loops=3.4e1)\n"
+            "    -> Table scan on part_quarantine "
+            "(actual time=0.01..0.02 rows=1 loops=2)"
+        )
+    }
+
+    examined = _explain_analyze_part_quarantine_rows(
+        connection,
+        "SELECT * FROM part_quarantine WHERE run_key = %s",
+        ("run-1",),
+    )
+
+    assert examined == 19
+    cursor.execute.assert_called_once_with(
+        "EXPLAIN ANALYZE SELECT * FROM part_quarantine WHERE run_key = %s",
+        ("run-1",),
+    )
+
+
+def test_cleanup_chain_raises_when_no_original_error() -> None:
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.execute.side_effect = RuntimeError("delete failed")
+
+    with pytest.raises(RuntimeError, match="cleanup failed: part_quarantine: delete failed"):
+        _cleanup_chain(connection, {"group_id": 1})
+
+    assert cursor.execute.call_count == 2
+
+
+def test_cleanup_chain_preserves_original_error_with_note() -> None:
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.execute.side_effect = [
+        RuntimeError("quarantine delete failed"),
+        RuntimeError("group delete failed"),
+        None,
+        None,
+        None,
+        None,
+    ]
+    rows = {
+        "group_id": 1,
+        "category_id": 2,
+        "vehicle_id": 3,
+        "model_id": 4,
+        "brand_id": 5,
+    }
+
+    with pytest.raises(ValueError, match="seed failed") as captured:
+        try:
+            raise ValueError("seed failed")
+        finally:
+            _cleanup_chain(connection, rows)
+
+    assert cursor.execute.call_args_list == [
+        mock.call("DELETE FROM part_quarantine WHERE group_id = %s", (1,)),
+        mock.call("DELETE FROM groups_t WHERE id = %s", (1,)),
+        mock.call("DELETE FROM categories WHERE id = %s", (2,)),
+        mock.call("DELETE FROM vehicles WHERE id = %s", (3,)),
+        mock.call("DELETE FROM models WHERE id = %s", (4,)),
+        mock.call("DELETE FROM brands WHERE id = %s", (5,)),
+    ]
+    assert captured.value.__notes__ == [
+        "cleanup failed: part_quarantine: quarantine delete failed; groups_t: group delete failed"
+    ]
 
 
 def test_admin_unresolved_queries_have_no_filesort(
@@ -480,14 +570,21 @@ def test_station_admin_all_state_run_key_does_not_force_plan(
 def test_admin_all_state_keeps_unresolved_first(
     seeded_quarantine_rows: dict[str, object],
 ) -> None:
+    expected = [
+        seeded_quarantine_rows["unresolved_number"],
+        seeded_quarantine_rows["resolved_number"],
+    ]
     for run_key in (None, str(seeded_quarantine_rows["run_key"])):
-        rows = data_admin_app.list_quarantine(state="all", run_key=run_key, page=1, page_size=50)
-        part_numbers = [row["part_number"] for row in rows["items"]]
-        assert seeded_quarantine_rows["unresolved_number"] in part_numbers
-        assert seeded_quarantine_rows["resolved_number"] in part_numbers
-        assert part_numbers.index(
-            str(seeded_quarantine_rows["unresolved_number"])
-        ) < part_numbers.index(str(seeded_quarantine_rows["resolved_number"]))
+        rows = data_admin_app.list_quarantine(
+            state="all",
+            run_key=run_key,
+            page=1,
+            page_size=200,
+        )
+        part_numbers = [
+            row["part_number"] for row in rows["items"] if row["part_number"] in expected
+        ]
+        assert part_numbers == expected
 
 
 def test_station_admin_all_state_keeps_unresolved_first(
@@ -495,16 +592,21 @@ def test_station_admin_all_state_keeps_unresolved_first(
 ) -> None:
     database = AdminDatabase.connect(_admin_config(), QueryTrace())
     try:
+        expected = [
+            seeded_quarantine_rows["unresolved_number"],
+            seeded_quarantine_rows["resolved_number"],
+        ]
         for run_key in (None, str(seeded_quarantine_rows["run_key"])):
             page = AdminRepository(database).list_quarantine(
-                state="all", run_key=run_key, page=1, limit=50
+                state="all",
+                run_key=run_key,
+                page=1,
+                limit=200,
             )
-            part_numbers = [row["part_number"] for row in page["items"]]
-            assert seeded_quarantine_rows["unresolved_number"] in part_numbers
-            assert seeded_quarantine_rows["resolved_number"] in part_numbers
-            assert part_numbers.index(
-                str(seeded_quarantine_rows["unresolved_number"])
-            ) < part_numbers.index(str(seeded_quarantine_rows["resolved_number"]))
+            part_numbers = [
+                row["part_number"] for row in page["items"] if row["part_number"] in expected
+            ]
+            assert part_numbers == expected
     finally:
         database.close()
 

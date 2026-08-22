@@ -315,6 +315,47 @@ def test_quarantine_list_filters_unresolved_and_run_key() -> None:
     assert list_call.params == ("bounded-1", 25, 0)
 
 
+def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
+    trace = QueryTrace()
+    database = ScriptedDatabase(trace)
+
+    AdminRepository(database).check_readiness()
+
+    assert [call.tag for call in database.calls] == [
+        "health.quarantine-list",
+        "health.quarantine-run-key",
+        "health.backoffice-schema",
+    ]
+    assert "FORCE INDEX (idx_quarantine_list)" in database.calls[0].sql
+    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in database.calls[1].sql
+    assert database.calls[1].params == ("__health__",)
+    readiness_sql = database.calls[2].sql
+    for table in (
+        "station_admin_formal_vehicle_configurations",
+        "station_admin_formal_taxonomy_nodes",
+        "station_admin_formal_diagrams",
+        "station_admin_formal_part_numbers",
+        "station_admin_formal_part_occurrences",
+        "station_admin_formal_fitments",
+        "station_admin_part_term_mappings",
+        "station_admin_vin_vehicle_mappings",
+        "station_admin_vin_part_fitments",
+        "station_admin_reconciliation_cases",
+        "station_admin_historical_sample_part_numbers",
+        "station_admin_historical_sample_part_occurrences",
+        "station_admin_historical_sample_fitments",
+        "admin_override_heads",
+        "admin_override_events",
+        "admin_crawl_requests",
+        "admin_crawl_request_audits",
+        "scheduled_job_runs",
+        "nhtsa_current_artifacts",
+        "nhtsa_source_artifacts",
+    ):
+        assert table in readiness_sql
+    assert "LIMIT 0" in readiness_sql
+
+
 def test_quarantine_list_all_state_has_no_resolved_filter() -> None:
     trace = QueryTrace()
     database = ScriptedDatabase(trace)

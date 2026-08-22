@@ -84,7 +84,8 @@
         <h2>Quarantine 紀錄（無名稱料號列，忽略＋紀錄政策）</h2>
         <div class="table-controls">
           <label>狀態<select id="quarantine-state"><option value="unresolved">未處置</option><option value="all">全部</option></select></label>
-          <label>每頁筆數<select id="quarantine-page-size"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
+          <label>Run key<input id="quarantine-run-key" type="search" placeholder="全部 run"></label>
+          <label>每頁筆數<select id="quarantine-page-size"><option value="10">10</option><option value="25">25</option><option value="30">30</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
           <button type="button" class="secondary" id="quarantine-refresh">重新整理</button>
         </div>
         <div class="table-wrap">
@@ -380,6 +381,7 @@
       }
       const quarantineTableBody = document.querySelector('#quarantine-table-body');
       const quarantineStateSelect = document.querySelector('#quarantine-state');
+      const quarantineRunKey = document.querySelector('#quarantine-run-key');
       const quarantinePageSize = document.querySelector('#quarantine-page-size');
       const quarantinePageNumber = document.querySelector('#quarantine-page-number');
       const quarantineTotalPages = document.querySelector('#quarantine-total-pages');
@@ -390,7 +392,14 @@
       const quarantineLast = document.querySelector('#quarantine-last');
       const quarantineState = { page: 1, pageSize: 50, totalPages: 0 };
       function quarantinePath() {
-        return `/api/quarantine?state=${quarantineStateSelect.value}&page=${quarantineState.page}&pageSize=${quarantineState.pageSize}`;
+        const params = new URLSearchParams({
+          state: quarantineStateSelect.value,
+          page: String(quarantineState.page),
+          pageSize: String(quarantineState.pageSize),
+        });
+        const runKey = quarantineRunKey.value.trim();
+        if (runKey) params.set('run_key', runKey);
+        return `/api/quarantine?${params}`;
       }
       function renderQuarantine(result) {
         quarantineState.page = result.page;
@@ -458,7 +467,10 @@
         quarantineLast.disabled = result.totalPages === 0 || result.page >= result.totalPages;
       }
       async function refreshQuarantine() {
-        if (!token()) { quarantineTableBody.replaceChildren(); return; }
+        if (!token()) {
+          renderQuarantine({ items: [], page: 1, pageSize: 50, total: 0, totalPages: 0 });
+          return;
+        }
         try {
           const result = await call(quarantinePath());
           renderQuarantine(result);
@@ -500,6 +512,7 @@
       document.querySelector('#refresh').addEventListener('click', refresh);
       document.querySelector('#quarantine-refresh').addEventListener('click', refreshQuarantine);
       quarantineStateSelect.addEventListener('change', () => { quarantineState.page = 1; refreshQuarantine(); });
+      quarantineRunKey.addEventListener('change', () => { quarantineState.page = 1; refreshQuarantine(); });
       quarantinePageSize.addEventListener('change', () => { quarantineState.page = 1; quarantineState.pageSize = Number(quarantinePageSize.value); refreshQuarantine(); });
       quarantineFirst.addEventListener('click', () => { quarantineState.page = 1; refreshQuarantine(); });
       quarantinePrev.addEventListener('click', () => { if (quarantineState.page > 1) { quarantineState.page -= 1; refreshQuarantine(); } });

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,19 @@ from partsouq_catalog import scheduler
 from partsouq_catalog.http_client import ChallengeError, SessionManager
 from partsouq_catalog.parsers import parse_parts
 from partsouq_crawler.nhtsa.config import NhtsaConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_compose_requires_explicit_scheduler_profile_and_checks_admin_health() -> None:
+    compose = (PROJECT_ROOT / "compose.yml").read_text(encoding="utf-8")
+    scheduler_anchor = compose.split("services:", 1)[0]
+
+    assert 'profiles: ["scheduler"]' in scheduler_anchor
+    assert compose.count("<<: *scheduler-base") == 3
+    assert "http://127.0.0.1:8000/api/health" in compose
+    assert "http://127.0.0.1:8086/health" in compose
+    assert "json.load(response).get('status') == 'ok'" in compose
 
 
 def test_catalog_challenge_stops_without_cookie_refresh() -> None:

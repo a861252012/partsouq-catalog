@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
 from partsouq_admin import app as admin_app
@@ -141,24 +143,27 @@ def test_quarantine_out_of_range_page_clamped(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_quarantine_resolve_marks_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    executed: list[tuple[str, tuple[object, ...]]] = []
-
-    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
-        return {"id": 7, "part_number": "IMG10001", "resolved_at": None}
-
-    def capture_execute(sql: str, params: tuple[object, ...]) -> int:
-        executed.append((sql, params))
-        return 1
-
-    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
-    monkeypatch.setattr(admin_app, "_execute", capture_execute)
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [
+        {"id": 7, "part_number": "IMG10001", "resolved_at": None},
+        {"id": 7, "part_number": "IMG10001", "resolved_at": "2026-08-22 12:00:00"},
+    ]
+    monkeypatch.setattr(admin_app, "_connect", lambda: connection)
 
     row = admin_app.resolve_quarantine(
         7, QuarantineResolveInput(resolution="checked: site removed")
     )
 
-    assert row == {"id": 7, "part_number": "IMG10001", "resolved_at": None}
-    update_sql, update_params = executed[0]
+    assert row["resolved_at"] == "2026-08-22 12:00:00"
+    connection.begin.assert_called_once_with()
+    connection.commit.assert_called_once_with()
+    connection.rollback.assert_not_called()
+    connection.close.assert_called_once_with()
+    lock_sql, lock_params = cursor.execute.call_args_list[0].args
+    assert "FOR UPDATE" in lock_sql
+    assert lock_params == (7,)
+    update_sql, update_params = cursor.execute.call_args_list[1].args
     assert "SET resolved_at = NOW(), resolution = %s" in update_sql
     assert update_params == ("checked: site removed", 7)
 
@@ -166,11 +171,59 @@ def test_quarantine_resolve_marks_row(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_quarantine_resolve_unknown_row_404s(monkeypatch: pytest.MonkeyPatch) -> None:
     from fastapi import HTTPException
 
-    monkeypatch.setattr(admin_app, "_fetch_one", lambda sql, params=(): None)
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = None
+    monkeypatch.setattr(admin_app, "_connect", lambda: connection)
 
     with pytest.raises(HTTPException) as exc_info:
         admin_app.resolve_quarantine(999, QuarantineResolveInput(resolution=""))
     assert exc_info.value.status_code == 404
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
+    connection.close.assert_called_once_with()
+
+
+def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    queries: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> None:
+        queries.append((sql, params))
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+
+    assert admin_app.health() == {"status": "ok"}
+    assert "FORCE INDEX (idx_quarantine_list)" in queries[0][0]
+    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in queries[1][0]
+    assert queries[1][1] == ("__health__",)
+    readiness_sql = queries[2][0]
+    for table in (
+        "brands",
+        "models",
+        "vehicles",
+        "categories",
+        "parts",
+        "published_parts",
+        "bounded_parts",
+        "crawl_runs",
+        "nhtsa_sync_runs",
+        "nhtsa_source_artifacts",
+        "nhtsa_current_artifacts",
+        "nhtsa_vin_decodes",
+        "admin_vehicle_mappings",
+        "admin_part_translations",
+        "admin_part_fitments",
+        "admin_category_labels",
+        "admin_reconciliation_items",
+        "admin_crawl_requests",
+        "scheduled_job_runs",
+        "v_current_catalog_parts",
+        "v_vin_part_fitments",
+        "admin_override_heads",
+        "station_admin_effective_parts",
+    ):
+        assert table in readiness_sql
+    assert "LIMIT 0" in readiness_sql
 
 
 def test_database_summary_includes_quarantine_counts(
@@ -287,6 +340,7 @@ def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
     html_path = "src/partsouq_admin/static/admin.html"
     html = open(html_path, encoding="utf-8").read()
     for element in (
+        'id="quarantine-run-key"',
         'id="quarantine-page-size"',
         'id="quarantine-first"',
         'id="quarantine-prev"',
@@ -297,6 +351,7 @@ def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
         'id="quarantine-range-label"',
     ):
         assert element in html, f"admin.html 缺少 {element}"
+    assert '<option value="30">30</option>' in html
     script = html.split("<script>")[1].split("</script>")[0]
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
         fh.write(script)

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from partsouq_station_admin.app import create_app
 from partsouq_station_admin.config import AdminConfig
 from partsouq_station_admin.query_trace import QueryTrace
+from partsouq_station_admin.repository import AdminRepository
 
 from .fakes import ScriptedDatabase
 
@@ -13,6 +16,7 @@ def _app(
     databases: list[ScriptedDatabase],
     *,
     dataset_size: int = 1,
+    config: AdminConfig | None = None,
 ) -> object:
     def factory(_config: AdminConfig, trace: QueryTrace) -> ScriptedDatabase:
         database = ScriptedDatabase(trace, dataset_size=dataset_size)
@@ -20,7 +24,7 @@ def _app(
         return database
 
     app = create_app(
-        AdminConfig(secret_key="test-secret", page_size=25),
+        config or AdminConfig(secret_key="test-secret", page_size=25),
         database_factory=factory,
     )
     app.testing = True
@@ -32,6 +36,46 @@ def _csrf_token(client: object, path: str) -> str:
     match = re.search(rb'name="csrf_token" value="([^"]+)"', response.data)
     assert match is not None
     return match.group(1).decode()
+
+
+def test_health_exercises_database_readiness_before_reporting_ok() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases)
+
+    response = app.test_client().get("/health")
+
+    assert response.status_code == 200
+    assert response.json["status"] == "ok"
+    assert response.json["entities"] == 10
+    tags = [call.tag for call in databases[-1].calls]
+    assert tags == [
+        "health.quarantine-list",
+        "health.quarantine-run-key",
+        "health.backoffice-schema",
+    ]
+
+
+def test_authenticated_health_stays_public_but_opens_database() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(
+        databases,
+        config=AdminConfig(
+            secret_key="test-secret",
+            username="admin",
+            password="password",
+            page_size=25,
+        ),
+    )
+
+    response = app.test_client().get("/health")
+
+    assert response.status_code == 200
+    assert response.json == {"entities": 10, "status": "ok"}
+    assert [call.tag for call in databases[-1].calls] == [
+        "health.quarantine-list",
+        "health.quarantine-run-key",
+        "health.backoffice-schema",
+    ]
 
 
 def test_list_allows_supported_page_size_and_keeps_it_on_next_link() -> None:
@@ -112,7 +156,29 @@ def test_dashboard_separates_sample_published_and_nhtsa_vin_layers() -> None:
     assert b"scheduler run 77" in response.data
     assert "完整全量 snapshot 尚未發布".encode() in response.data
     assert "目前正式不重複料號".encode() in response.data
+    assert "目前已有已發布的 NHTSA 參考資料".encode() in response.data
+    assert "目前沒有已發布的 NHTSA 參考資料".encode() not in response.data
     assert "逐 VIN 解碼需由站方輸入合法 VIN".encode() in response.data
+
+
+def test_dashboard_does_not_claim_empty_nhtsa_reference_is_synced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = AdminRepository.system_data_summary
+
+    def empty_nhtsa_reference(repository: AdminRepository) -> dict[str, object]:
+        summary = original(repository)
+        summary["nhtsa_current_records"] = 0
+        summary["nhtsa_vin_decodes"] = 0
+        return summary
+
+    monkeypatch.setattr(AdminRepository, "system_data_summary", empty_nhtsa_reference)
+    databases: list[ScriptedDatabase] = []
+    response = _app(databases).test_client().get("/")
+
+    assert response.status_code == 200
+    assert "目前沒有已發布的 NHTSA 參考資料".encode() in response.data
+    assert "目前已有已發布的 NHTSA 參考資料".encode() not in response.data
 
 
 def test_part_detail_does_not_present_adapter_metadata_as_raw_http_evidence() -> None:

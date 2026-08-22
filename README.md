@@ -1,6 +1,6 @@
 # PartSouq Catalog
 
-將下列兩個 private repository 整併為一個專案：
+將下列兩個 repository 整併為一個專案：
 
 - `a861252012/partsouq-catalog-crawler`：正式 PartSouq 型錄資料。
 - `a861252012/partsouq-crawler`：NHTSA 官方資料同步，以及 PartSouq 歷史證據工具。
@@ -37,8 +37,8 @@ PartSouq 的舊 SQLite 工具保留在 `partsouq_crawler` 套件中，僅作為�
 - 將解碼後的 VIN 人工確認到明確的 PartSouq `vehicle_id`。
 - 零件英文、中文與常用中文名稱。
 - 零件號碼與適用車型的人工補充關係。
-- 顯示共用 DB 各層資料總筆數、1000 筆 sample 進度與資料品質阻擋原因。
-- 零件列表採 DB 分頁，可選每頁 10／25／50／100／200 筆並直接輸入頁碼。
+- 顯示共用 DB 各層資料總筆數、環境變數指定的 sample／bounded 目標進度與資料品質阻擋原因。
+- 零件列表採 DB 分頁，可選每頁 10／25／30／50／100／200 筆並直接輸入頁碼。
 - 零件大分類、Group 中分類，以及僅由人工維護的小分類中文標籤。
 - 對帳頻道與排程要求。
 
@@ -61,33 +61,112 @@ PartSouq 成功發布後，後台的 VIN mapping 列表會把已不在 current s
 
 ## 本機啟動
 
+全新 MySQL volume：
+
 ```bash
 cp .env.example .env
+chmod 600 .env
 # 先把 .env 中的 password 與 PARTSOUQ_ADMIN_TOKEN 改成非預設值
-docker compose up -d --build
+docker compose up -d --build mysql admin station-admin
 ```
 
 MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、`db/admin.sql` 與 `db/station_admin.sql`。現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，先確認無需保留資料後再使用 `docker compose down -v`。
 
-既有 volume 升級前，先停止後台、排程與 crawler，並完成資料庫備份，再執行：
+既有 MySQL volume 不要先啟動後台；先只啟動資料庫，再完成下列升級與 health
+check：
 
 ```bash
+docker compose up -d mysql
+```
+
+以下流程適用至少已完成 catalog migration 001–006 的既有 volume。更舊的
+schema 必須先逐檔閱讀並執行 001–006；不可直接略過，且 migration 005
+可能要求備份後顯式授權重建 normalized vehicle tree。
+
+升級前先記錄目前 running services，停止後台、排程與 crawler：
+
+```bash
+docker compose ps --services --filter status=running
+docker compose stop admin station-admin scheduler nhtsa-scheduler queue-scheduler
+```
+
+確認沒有額外執行中的 crawler／one-off writer，並完成資料庫備份。若 015
+需要修復大型既有索引，還要先確認 MySQL 資料卷與
+temporary directory 有足夠空間。先查實際路徑與資料量，再對查到的路徑
+執行 `df -h`；online index repair 可先以該表資料與索引總和作為估算
+基準，並另外保留餘裕：
+
+```bash
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "SELECT @@tmpdir AS tmpdir, @@innodb_tmpdir AS innodb_tmpdir; SELECT COUNT(*) AS part_quarantine_exists, MAX(DATA_LENGTH) AS data_bytes, MAX(INDEX_LENGTH) AS index_bytes, MAX(DATA_LENGTH + INDEX_LENGTH) AS estimated_bytes FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '\''part_quarantine'\'';" "$MYSQL_DATABASE"'
+docker compose exec mysql df -h /tmp /var/lib/mysql
+```
+
+若 SQL 顯示的 temporary directory 不是 `/tmp`，第二行要改查該實際路徑。
+第一行若顯示 `part_quarantine_exists=0`，代表尚未執行 011，可略過下列
+FULLTEXT preflight；若為 1，則執行：
+
+```bash
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "SHOW EXTENDED INDEX FROM part_quarantine WHERE Key_name = '\''FTS_DOC_ID_INDEX'\'' AND Column_name = '\''FTS_DOC_ID'\''; SET @hidden_fts = FOUND_ROWS(); SET @owned_fulltext = (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '\''part_quarantine'\'' AND INDEX_TYPE = '\''FULLTEXT'\'' AND INDEX_NAME IN ('\''idx_quarantine_list'\'', '\''idx_quarantine_run_key_resolved_updated'\'', '\''idx_quarantine_run_key_updated'\'', '\''idx_quarantine_resolved'\'', '\''idx_quarantine_group'\'')); SET @visible_fulltext = (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '\''part_quarantine'\'' AND INDEX_TYPE = '\''FULLTEXT'\''); SELECT @owned_fulltext AS owned_fulltext, @visible_fulltext AS visible_fulltext, @hidden_fts AS hidden_fts, IF(@owned_fulltext > 0 OR (@hidden_fts > 0 AND @visible_fulltext = 0), '\''BLOCK_REBUILD_REQUIRED'\'', '\''OK'\'') AS preflight_status;" "$MYSQL_DATABASE"'
+```
+
+最後的 `preflight_status` 必須是 `OK` 才可繼續。若為
+`BLOCK_REBUILD_REQUIRED`，先停止升級並另排維護時段重建該表。不可先執行
+013／014，否則表面索引可能已修正，但 hidden FTS artifacts 仍會留下。
+若現有 volume 只完成到
+006，使用同一個 fail-fast subshell 依序執行：
+
+```bash
+(
+set -e
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/007_unified_vin_mapping.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/008_admin_source_ids.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/009_bounded_production_dataset.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/010_group_uid_identity.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/011_part_quarantine.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/012_part_quarantine_resolution.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/013_part_quarantine_run_key_updated_index.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/014_part_quarantine_run_key_resolved_updated_index.sql
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/015_quarantine_index_contract_cleanup.sql
 docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
+)
 ```
 
-migration 可重複執行。它只會為能唯一證明關聯的舊 snapshot 回填
-`vehicle_id` 與來源 ID；無法唯一確認的列會保留但不進 VIN mapping，須等
-下一次完整成功的 PartSouq publish 更新。
+若 volume 停在 007–011，從下一個尚未執行的檔案補到 012，再接 015；不可
+略過 007–012 的資料／schema migration。若已確認完成 012（包含已完成
+013／014），或只是重跑最新版，則不要重播 012–014；它們會重新建立已淘汰
+索引，增加不必要的 I/O 與 metadata lock。只執行：
 
-`db/station_admin.sql` 可重複執行，用來建立 8086 後台的 compatibility views、overlay heads 與 append-only audit events。現有 volume 升級完後，以 `docker compose up -d --build station-admin` 啟動站方後台。
+```bash
+(
+set -e
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/015_quarantine_index_contract_cleanup.sql
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
+)
+```
+
+本專案目前沒有 migration ledger。若沒有可信的部署紀錄可判定停在哪一版，
+不可憑印象略過；應在備份與維護時段內，以前述 fail-fast 方式從 007 依序重跑
+到 012，再執行 015。這會增加 I/O，但可避免漏套資料 migration。
+
+上述 migration 都可重複執行；013／014 是已由 015 取代的歷史索引
+migration，新升級不必重播。從 006 升級時依序執行 007–012，再執行 015；
+015 可單獨重跑並收斂成目前 schema。涉及舊 snapshot 關聯回填
+時，只回填能唯一證明的 `vehicle_id` 與來源 ID；無法唯一確認的列會保留
+但不進 VIN mapping，須等下一次完整成功的 PartSouq publish 更新。
+若 migration-owned 索引被改成 FULLTEXT，或已存在 orphaned hidden FTS
+metadata，015 也會拒絕自動修復，避免在 online migration 偷做 table
+rebuild。
+
+`db/station_admin.sql` 可重複執行，用來建立 8086 後台的 compatibility
+views、overlay heads 與 append-only audit events。升級完成後，只恢復升級
+前原本 running 的服務；不要因本段文件而啟動原先未執行的 scheduler。
+若升級前兩套後台都有執行，可使用
+`docker compose up -d --build admin station-admin`。恢復後要核對原 running
+services；以下 health check 只執行原本已啟動的後台：
+
+```bash
+docker compose ps --services --filter status=running
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://partsouq.localhost:8000/api/health
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://admin.partsouq.localhost:8086/health
+```
 
 8086 首頁會分開顯示 PartSouq normalized sample、published snapshot、NHTSA current reference records 與逐 VIN decode。Sample 筆數不等於已發布筆數；NHTSA reference records 已同步也不代表已有使用者提供的 VIN decode。
 
@@ -99,7 +178,9 @@ DB 內部 ID；`vehicle_vid`、`category_cid`、`group_uid` 是 PartSouq URL
 
 ## 統一排程入口
 
-本機 Compose 直接用三個常駐服務模擬 server 排程。它們共用同一個 MySQL，
+本機 Compose 用三個常駐服務模擬 server 排程。三者都屬 opt-in 的
+`scheduler` profile；一般 `docker compose up -d` 不會啟動爬蟲。明確指定
+下列 service 時才會啟動。它們共用同一個 MySQL，
 但分開執行，避免數小時的 PartSouq 爬取阻塞 NHTSA 與後台佇列：
 
 ```bash
