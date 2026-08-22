@@ -865,3 +865,53 @@ hash 與 HEAD 一致。
 - 本輪沒有啟動 scheduler，也沒有執行正式 10,000 筆 live crawl；以上結果只
   證明 code、migration、後台、合成效能與 E2E 契約，不能當成正式資料爬取或
   mapping 驗收。
+
+### Cloudflare 執行環境修正（2026-08-22，以 `23be014` 為 base 的本機工作樹）
+
+1. **challenge 頁不再假成功**：CloakBrowser 只有在最終 URL 仍是 genuine
+   catalog 且找到至少 18 個品牌連結時才匯出 cookie。僅有 `cf_clearance`、
+   browser ready、逾時或子程序提前結束都會 fail-closed。
+2. **403 不再重啟瀏覽器迴圈**：新 session 的第一個 HTTP follow-up 若仍是
+   challenge，該請求立即失敗；不再連續啟動四次瀏覽器。
+3. **中斷狀態一致**：scheduler 收到中斷碼或負 signal return code 時，在同一
+   transaction 關閉對應的 running `crawl_runs`；更新失敗會 rollback。
+4. **本機排程路由**：恢復 CloakBrowser 預設 stealth arguments。相同網路與
+   同一頁 smoke 中，Linux arm64/Xvfb v146 等待 90 秒後仍是
+   `Just a moment...`、品牌連結 0；macOS host v145 約 9 秒取得 18 個品牌連結。
+   host cookie 交給現有 HTTP client 後，再次取得 18 個品牌連結與 139,596-byte
+   HTML。因此本機 PartSouq 應改走 Aqua LaunchAgent + host scheduler；Linux
+   Compose scheduler 保留 fail-closed，不以 browser ready 冒充可爬。
+5. **Chromium 啟動生命週期**：移除固定 `9242` CDP port 與輪詢，改由子程序在
+   `launch_async()` 成功後原子寫入一次性 readiness marker；啟動前與回收後都
+   清掉 marker，避免 port 衝突及殘留檔誤判。macOS GUI/Aqua smoke 可正常啟動
+   並回收；同一測試在禁止 GUI 的 sandbox 會於 AppKit `RegisterApplication`
+   以 `SIGABRT` 失敗，故 host 排程只能由 Aqua LaunchAgent 執行。
+6. **部署檔**：新增 `deploy/run-macos-catalog-scheduler.zsh` 與 launchd plist
+   template。host 入口強制 `PSQ_LIMIT_PARTS=0`，bounded 預設 10,000；本輪未
+   bootstrap，避免在驗證修正時意外開始正式 crawl。
+7. **strict mypy 技術債**：本輪實際重跑 `cloak.py` 與 `http_client.py` 時為
+   87 個錯誤（不是舊紀錄的 82 個），已用 `TypedDict`、cookie 輸入驗證、
+   session state 與結構化 `Protocol` 補齊型別邊界；沒有加入 `Any` 或
+   `# type: ignore`。兩個目標模組及其共用 `config.py` 現在都通過
+   `mypy --strict`。
+
+驗證結果：
+
+- 六組 mutation（型錄頁驗證、原子 cookie 發布、單次 refresh、interrupted
+  收斂、stealth 預設、禁止 sample）都先轉紅、還原後轉綠。
+- Chromium 與 strict mypy 修正後的最終完整 gate：438 個測試全部通過、0 failed、
+  0 skipped，包含隔離 MySQL、10,000 synthetic performance 與兩個真實
+  Chrome E2E；只有既有的 Starlette deprecation warning。
+- macOS Aqua host 的 `about:blank` 與真實 PartSouq genuine catalog smoke 都通過；
+  後者取得經頁面結構驗證後才匯出的 cookie（只驗 cookie 名稱，不輸出值）。重建後
+  Linux/Xvfb image 的 `about:blank` 啟動／回收也通過，image 內 `cloak.py`
+  SHA-256 與工作樹一致；Linux live catalog 仍沿用前述 fail-closed 結論。
+- `mypy --strict`（兩個目標模組與共用 config）、ruff check／format、shell
+  syntax、plist、`git diff --check` 與 Compose config 通過。scheduler image
+  已重建，本輪三個型別修正檔 SHA-256 與 host 一致。
+- 最終唯讀主 DB：parts／published／bounded／未處置 quarantine／VIN decode／
+  confirmed mapping 全為 0。歷史 `crawl_runs.id=1` 仍是 running，但其 scheduler
+  run 已是 failed/-2；本輪未直接修改主 DB，第一次啟動新版 scheduler 時會先走
+  既有 recovery 將它收斂為 interrupted。
+- 本輪沒有執行正式 10,000 筆 live crawl；因此不能把上述單頁 live smoke 或
+  合成 10,000 筆測試宣稱為正式資料與 mapping 驗收。

@@ -178,24 +178,52 @@ DB 內部 ID；`vehicle_vid`、`category_cid`、`group_uid` 是 PartSouq URL
 
 ## 統一排程入口
 
-本機 Compose 用三個常駐服務模擬 server 排程。三者都屬 opt-in 的
-`scheduler` profile；一般 `docker compose up -d` 不會啟動爬蟲。明確指定
-下列 service 時才會啟動。它們共用同一個 MySQL，
-但分開執行，避免數小時的 PartSouq 爬取阻塞 NHTSA 與後台佇列：
+三個排程共用同一個 MySQL，但分開執行，避免數小時的 PartSouq 爬取阻塞
+NHTSA 與後台佇列。Compose 內的排程都屬 opt-in `scheduler` profile；一般
+`docker compose up -d` 不會啟動爬蟲：
 
 ```bash
-docker compose up -d --build scheduler nhtsa-scheduler queue-scheduler
+docker compose up -d --build nhtsa-scheduler queue-scheduler
 ```
 
 Compose image 已包含 CloakBrowser runtime、Chromium、Xvfb 與顯示環境
 （Linux arm64/x64 版本），scheduler 在容器內以
 `xvfb-run -a --server-args='-screen 0 1366x900x24'` 啟動 CloakBrowser；
 `PSQ_CLOAK_PYTHON` 指向容器內 `/usr/local/bin/python`，不使用 macOS
-host 路徑。容器內 CloakBrowser 啟動已實測（CDP ready）。
+host 路徑。browser readiness marker 只代表瀏覽器已啟動，不代表 Cloudflare
+challenge 已通過；只有實際型錄頁出現完整品牌連結後才接受並保存 session cookie。
+2026-08-22 實測同一網路下，Linux/Xvfb image 仍停在 challenge（0 個品牌連結），
+macOS host 則取得 18 個品牌連結，且 cookie 交給 HTTP client 後可讀回完整型錄頁。
+因此目前本機正式 PartSouq 排程應使用 Aqua LaunchAgent 在 host 執行；Compose
+`scheduler` 只保留給未來已通過相同 smoke 的 Linux 環境，不得只以 browser ready
+或 cookie 檔存在就啟動 10,000 筆驗收。
+
+host 入口是 `deploy/run-macos-catalog-scheduler.zsh`，會讀取 `.env`、強制
+`PSQ_LIMIT_PARTS=0`、預設 `PSQ_BOUNDED_PARTS=10000`，並使用 host
+CloakBrowser Python。`deploy/com.partsouq.catalog-scheduler.plist.template` 是
+launchd 範本；將 `__PROJECT_ROOT__` 換成此 repository 的絕對路徑後，再安裝成
+使用者 LaunchAgent。範本的 `RunAtLoad` 會在 bootstrap 後立即開始正式 10,000
+筆排程，因此只有在準備執行正式驗收時才能 bootstrap。
+
+headed Chromium 必須從 macOS Aqua session 啟動；範本已用
+`LimitLoadToSessionType=Aqua` 限制執行環境。不要從 SSH、LaunchDaemon 或其他
+無 GUI session 的 runner 直接執行 host scheduler，否則 AppKit 可能在啟動時
+以 `SIGABRT` 結束 Chromium。
+
+```bash
+project_root="$PWD"
+agent="$HOME/Library/LaunchAgents/com.partsouq.catalog-scheduler.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+sed "s|__PROJECT_ROOT__|$project_root|g" \
+  deploy/com.partsouq.catalog-scheduler.plist.template > "$agent"
+plutil -lint "$agent"
+# 下一行會立即開始正式 10,000 筆排程：
+launchctl bootstrap "gui/$(id -u)" "$agent"
+```
 
 預設排程如下；都可用同名環境變數調整，不需要人工逐次觸發：
 
-- `scheduler`：啟動後自動執行正式 10,000 筆 bounded PartSouq crawl，之後每 30 天執行。
+- host catalog scheduler：啟動後自動執行正式 10,000 筆 bounded PartSouq crawl，之後每 30 天執行。
 - `nhtsa-scheduler`：依序同步 NHTSA bulk 與 allowlist API，完成後每 24 小時執行。
 - `queue-scheduler`：每 30 秒消費 8086 建立的要求；VIN 只處理使用者提供或獲授權的 17 碼值，不枚舉 VIN。
 
@@ -218,7 +246,8 @@ scheduler 在完成紀錄前中斷，下一個 daemon 會先核對筆數與關�
 檔案 lock 適用本機單主機，三個 Compose 服務必須共用 `./logs` volume。若改為
 多主機部署，需另外使用跨主機的 DB lease，不能把這套 flock 當成分散式鎖。
 
-Compose 明確使用 `PSQ_BOUNDED_PARTS=10000` 並覆寫 `PSQ_LIMIT_PARTS=0`。
+host catalog scheduler 明確使用 `PSQ_BOUNDED_PARTS=10000` 並覆寫
+`PSQ_LIMIT_PARTS=0`；Compose service 也維持相同資料契約。
 bounded dataset 必須精確 10,000 筆且通過來源／欄位／關聯品質關卡才會
 `bounded_success` 與 exit `0`；它是可驗證的正式限量資料，不冒充全站完整 snapshot。
 
@@ -279,11 +308,9 @@ API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器�
 
 - PartSouq catalog 請求前先以可識別 crawler UA 檢查 robots.txt 與 origin；robots
   無法確認允許、origin 不符或 redirect 一律停止（fail-closed），不跟隨 redirect。
-- Cloudflare challenge 的處理方式：`cloak.py` 啟動 CloakBrowser（指紋修補版
-  Chromium，其指紋隱匿讓 Turnstile 人機驗證在無人操作下自動通過），匯出 session
-  cookie（`cf_clearance` + `PHPSESSID`）供 HTTP client 使用。此機制本質上是
-  瀏覽器指紋規避與驗證自動通過，非站方授權；cookie 只存本機 `data/cookies.json`，
-  不會提交。
+- Cloudflare challenge 的處理方式：`cloak.py` 啟動 CloakBrowser，等待並驗證實際
+  型錄頁。逾時或仍停在 challenge 頁時不匯出 cookie，並以失敗／退避收尾；不能
+  只因出現 `cf_clearance` 就宣告成功。cookie 只存本機 `data/cookies.json`，不會提交。
 - challenge 未成功刷新時是 `blocked`／失敗證據，不可報為完成；challenge 一律
   以刷新 cookie 後的 follow-up 請求重試，不輪替 proxy。
 - NHTSA bulk／collection API 與單筆 `DecodeVinValues` 分流；bulk 資料不能冒充完整 VIN 車輛名冊。

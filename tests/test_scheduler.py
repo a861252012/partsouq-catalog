@@ -60,6 +60,56 @@ def test_api_progress_persists_actual_stage_completion_time(monkeypatch) -> None
     )
 
 
+def test_record_finish_closes_matching_interrupted_catalog_run(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    scheduler._record_finish(79, -2, "KeyboardInterrupt\n")
+
+    assert cursor.execute.call_count == 2
+    scheduled_call, crawl_call = cursor.execute.call_args_list
+    assert "UPDATE scheduled_job_runs" in scheduled_call.args[0]
+    assert scheduled_call.args[1][-1] == 79
+    assert "SET status = 'interrupted'" in crawl_call.args[0]
+    assert "scheduled_job_run_id = %s" in crawl_call.args[0]
+    assert crawl_call.args[1] == (79,)
+    connection.begin.assert_called_once_with()
+    connection.commit.assert_called_once_with()
+    connection.rollback.assert_not_called()
+
+
+def test_record_finish_does_not_interrupt_crawl_for_normal_failure(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    scheduler._record_finish(80, 1, "HTTP 403\n")
+
+    assert cursor.execute.call_count == 1
+    assert "UPDATE scheduled_job_runs" in cursor.execute.call_args.args[0]
+    connection.commit.assert_called_once_with()
+
+
+def test_record_finish_rolls_back_if_interrupted_crawl_update_fails(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.execute.side_effect = [None, scheduler.pymysql.OperationalError("update failed")]
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    with pytest.raises(scheduler.pymysql.OperationalError, match="update failed"):
+        scheduler._record_finish(81, scheduler.INTERRUPTED_EXIT_CODE, "stopped\n")
+
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
+
+
 def test_run_records_scheduler_id_in_child_environment(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

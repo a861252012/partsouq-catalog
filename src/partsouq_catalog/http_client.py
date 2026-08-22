@@ -1,8 +1,8 @@
-"""HTTP 傳輸層（基礎設施）：高速爬蟲 + Cloudflare 驗證自動處理。
+"""HTTP 傳輸層（基礎設施）：高速爬蟲 + Cloudflare challenge fail-closed。
 
 使用 CloakBrowser 取得的 Cookie 進行請求。若請求碰到 Cloudflare
-驗證頁（cf_clearance 過期），會自動透過 CloakBrowser 刷新 session
-並重試 —— 全程無人介入。
+驗證頁（例如 cf_clearance 過期），會透過 CloakBrowser 刷新一次 session
+並送出 follow-up。follow-up 仍被拒時立即停止，不把重複刷新誤報為成功。
 
 本層只負責「把 HTML 拿回來」；解析與資料寫入分別屬於解析器層
 與 Repository 層。
@@ -32,6 +32,7 @@ import random
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from typing import Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
@@ -46,7 +47,7 @@ from .cloak import (
     get_session,
     session_backoff_remaining,
 )
-from .config import CLOAK, CRAWL
+from .config import CLOAK, CRAWL, Cookies
 
 log = logging.getLogger("http")
 
@@ -55,7 +56,25 @@ CATALOG_PRODUCT_TOKEN = "partsouq-catalog-crawler"
 CATALOG_HOSTS = frozenset({"partsouq.com", "www.partsouq.com"})
 
 
-def _cf_value(cookies) -> str:
+class RequestGovernor(Protocol):
+    def acquire(self) -> None: ...
+
+    def throttle(self, seconds: float) -> None: ...
+
+
+class RobotEntry(Protocol):
+    useragents: list[str]
+    rulelines: list[object]
+
+    def applies_to(self, useragent: str) -> bool: ...
+
+
+class RobotParser(Protocol):
+    entries: list[RobotEntry]
+    default_entry: RobotEntry | None
+
+
+def _cf_value(cookies: Cookies | None) -> str:
     """從 cookie 列表取出 cf_clearance 的值（無則回傳空字串）。
 
     作為 cookie 版本的訊號：cf_clearance 每次刷新必然改變。
@@ -112,7 +131,12 @@ class SessionManager:
     每個 worker 執行緒一個實例，共用同一份 cookie 來源。
     """
 
-    def __init__(self, cookies=None, no_browser=False, gov=None):
+    def __init__(
+        self,
+        cookies: Cookies | None = None,
+        no_browser: bool = False,
+        gov: RequestGovernor | None = None,
+    ) -> None:
         self.session = requests.Session()
         # 傳輸層不得沿用環境代理（避免流量被本機 proxy 攔截/改寫）。
         self.session.trust_env = False
@@ -140,11 +164,11 @@ class SessionManager:
         # max_retries=0 —— 重試統一由 get() 的迴圈控制，每次迭代都會
         # 重新 acquire 全域時槽，否則 urllib3 層的重試會繞過限流。
         self._mount_adapter()
-        self.cookies = cookies
+        self.cookies: Cookies | None = cookies
         if cookies:
             self._apply_cookies()
 
-    def _mount_adapter(self):
+    def _mount_adapter(self) -> None:
         """掛上連線池 adapter（2 條連線，adapter 層不做重試）。"""
         adapter = HTTPAdapter(
             pool_connections=2,
@@ -154,7 +178,7 @@ class SessionManager:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-    def _apply_cookies(self):
+    def _apply_cookies(self) -> None:
         """把 cookie 列表**整份**套進 requests 的 cookie jar。
 
         SOL review P2：先清空 jar 再套用新快照 —— 舊碼用
@@ -173,7 +197,7 @@ class SessionManager:
         self.session.cookies.clear()
         self.session.cookies.update(jar)
 
-    def _wire_get(self, url: str, headers: dict | None = None) -> requests.Response:
+    def _wire_get(self, url: str, headers: dict[str, str] | None = None) -> requests.Response:
         """送出「不跟隨 redirect」的單一 GET；cookie jar 會暫時清空。
 
         robots.txt 與其他不應帶 session cookie 的請求走這條路；請求
@@ -211,7 +235,7 @@ class SessionManager:
         self._apply_cookies()
         return True
 
-    def ensure_fresh(self):
+    def ensure_fresh(self) -> None:
         """在 cookie 快到期前主動刷新（每次請求前呼叫）。
 
         get_session() 是 single-flight 且 TTL 感知的，所以成本極低：
@@ -248,14 +272,14 @@ class SessionManager:
         F4 修復：
         - 重試預算與刷新預算分開：刷新成功**不消耗** HTTP attempt，
           保證刷新後必有 follow-up 請求 —— 舊碼最後一次 attempt 刷新
-          成功後迴圈已耗盡，新 cookie 從未被使用就直接拋舊錯誤。
-          （單一請求內成功刷新上限 max_refresh_per_request，防一直
-          給 challenge 時無限刷新。）
+          成功後迴圈已耗盡，新 cookie 從未被使用就直接拋舊錯誤。若
+          follow-up 仍是 challenge，立即停止；同一請求不得反覆重啟
+          瀏覽器取得無法被 HTTP transport 接受的 cookie。
         - 驗證偵測優先於 429：429 + cf-mitigated challenge 標頭先當
           驗證處理（刷新 cookie），不被當一般限流 —— 舊碼 429 檢查
           在前，5 次請求 0 次刷新，永遠過不了。
         """
-        last_err = None
+        last_err: Exception | None = None
         refresh_failures = 0
         refresh_successes = 0
         attempt = 0
@@ -311,6 +335,16 @@ class SessionManager:
                     # no_browser 模式：不允許啟動瀏覽器刷新，直接放棄
                     log.error("challenge while no-browser mode; giving up on %s", url[:100])
                     break
+                if refresh_successes:
+                    last_err = ChallengeError(
+                        f"fresh browser session still challenged at {url[:100]}"
+                    )
+                    log.error(
+                        "fresh browser session still challenged; refusing another "
+                        "browser refresh for %s",
+                        url[:100],
+                    )
+                    break
                 if refresh_failures >= CRAWL["challenge_retries"]:
                     log.error(
                         "too many failed refreshes (%d); giving up on %s",
@@ -337,16 +371,6 @@ class SessionManager:
                 # challenge_retries 而提前放棄，即使刷新已恢復。
                 refresh_failures = 0
                 refresh_successes += 1
-                # 刻意保留的 off-by-one：第 max_refresh_per_request+1 次
-                # 刷新成功後直接放棄，不帶新 cookie 發 follow-up 請求。
-                # 修正會讓規避路徑更有效率，故維持現狀並以註解記錄決策。
-                if refresh_successes > CRAWL["max_refresh_per_request"]:
-                    log.error(
-                        "too many successful refreshes (%d); giving up on %s",
-                        refresh_successes,
-                        url[:100],
-                    )
-                    break
                 # F4 修復：刷新成功不消耗 attempt 預算 —— 保證下一輪
                 # 迭代用新 cookie 發 follow-up 請求（舊碼最後一次
                 # attempt 刷新成功後沒有第 6 次請求，直接拋舊錯誤）。
@@ -441,17 +465,18 @@ class SessionManager:
         """確認本 crawler 或萬用 UA group 具有 Allow／Disallow 指令。"""
         parser = RobotFileParser()
         parser.parse(text.splitlines())
-        for entry in parser.entries:
+        typed_parser = cast(RobotParser, parser)
+        for entry in typed_parser.entries:
             if entry.applies_to(CATALOG_PRODUCT_TOKEN):
                 return bool(entry.rulelines)
-        for entry in parser.entries:
+        for entry in typed_parser.entries:
             if any(agent.strip() == "*" for agent in entry.useragents):
                 return bool(entry.rulelines)
-        default_entry = getattr(parser, "default_entry", None)
+        default_entry = typed_parser.default_entry
         return bool(default_entry and default_entry.rulelines)
 
     @staticmethod
-    def _retry_after_seconds(r) -> float:
+    def _retry_after_seconds(r: requests.Response) -> float:
         """從 429 回應的 Retry-After 標頭取得建議等待秒數。
 
         F4 修復：
@@ -477,7 +502,7 @@ class SessionManager:
         return min(max(15.0, secs), CRAWL["retry_after_cap"])
 
     @staticmethod
-    def _is_challenge(r, text: str) -> bool:
+    def _is_challenge(r: requests.Response, text: str) -> bool:
         """判斷回應是否為 Cloudflare 驗證頁。
 
         除了檢查正文特徵片段，也檢查回應標頭：Cloudflare 的驗證回應
@@ -491,7 +516,7 @@ class SessionManager:
             return True
         return any(m in text[:8000] for m in CHALLENGE_MARKERS)
 
-    def _reset_connections(self):
+    def _reset_connections(self) -> None:
         """丟棄所有池化的 keep-alive socket（例如 CLOSE_WAIT 卡住後）。"""
         try:
             self.session.close()
@@ -499,7 +524,7 @@ class SessionManager:
             pass
         self._mount_adapter()
 
-    def _sleep_with_backoff(self, attempt: int):
+    def _sleep_with_backoff(self, attempt: int) -> None:
         """刷新失敗後的等待。
 
         P2 修復：與 cloak 的指數退避對齊 —— cloak 退避窗口
@@ -512,6 +537,6 @@ class SessionManager:
             return
         time.sleep(max(REFRESH_RETRY_BACKOFF + 5, 15 * (attempt + 1)))
 
-    def sleep(self):
+    def sleep(self) -> None:
         """依設定延遲隨機休息（2~5 秒），模擬人類瀏覽節奏。"""
         time.sleep(random.uniform(CRAWL["min_delay"], CRAWL["max_delay"]))

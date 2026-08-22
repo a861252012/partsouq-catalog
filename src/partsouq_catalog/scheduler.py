@@ -91,6 +91,7 @@ def _record_finish(
 ) -> None:
     connection = _connect()
     try:
+        connection.begin()
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE scheduled_job_runs "
@@ -103,6 +104,17 @@ def _record_finish(
                     run_id,
                 ),
             )
+            if return_code == INTERRUPTED_EXIT_CODE or return_code < 0:
+                cursor.execute(
+                    "UPDATE crawl_runs SET status = 'interrupted', "
+                    "finished_at = COALESCE(finished_at, UTC_TIMESTAMP()) "
+                    "WHERE scheduled_job_run_id = %s AND status = 'running'",
+                    (run_id,),
+                )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 

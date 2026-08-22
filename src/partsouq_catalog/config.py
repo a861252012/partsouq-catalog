@@ -9,6 +9,54 @@ import os
 import shlex
 import tempfile
 from pathlib import Path
+from typing import TypedDict
+
+type Cookie = dict[str, str]
+type Cookies = list[Cookie]
+
+
+class SiteConfig(TypedDict):
+    base: str
+    genuine: str
+    locate: str
+    pick: str
+    vehicle: str
+    unit: str
+
+
+class CloakConfig(TypedDict):
+    venv_python: str
+    cookie_export_file: Path
+    cookie_file: Path
+    lock_file: Path
+    launcher: list[str]
+    user_agent: str
+
+
+class CrawlConfig(TypedDict):
+    min_delay: float
+    max_delay: float
+    http_timeout: int
+    max_retries: int
+    challenge_retries: int
+    retry_after_cap: int
+    start_brand: str
+    limit_brands: int
+    limit_models: int
+    limit_vehicles: int
+    workers: int
+    request_rate: float
+    request_burst: int
+    max_run_days: float
+    min_brands: int
+    limit_groups: int
+    limit_parts: int
+    bounded_parts: int
+    bounded_run_key: str
+    scheduled_job_run_id: int
+    row_count_shrink_ratio: float
+    block_breather: int
+
 
 # 專案根目錄。安裝成套件後仍可用 PARTSOUQ_HOME 指向實際資料目錄。
 BASE_DIR = (
@@ -34,7 +82,7 @@ DB_CONFIG = {
 }
 
 # PartSouq 的各層頁面網址模板
-SITE = {
+SITE: SiteConfig = {
     "base": "https://partsouq.com",
     "genuine": "https://partsouq.com/en/catalog/genuine",
     "locate": "https://partsouq.com/en/catalog/genuine/locate?c={brand}",
@@ -44,13 +92,11 @@ SITE = {
 }
 
 # CloakBrowser（隱匿瀏覽器）的整合設定
-CLOAK = {
+CLOAK: CloakConfig = {
     "venv_python": os.environ.get(
         "PSQ_CLOAK_PYTHON",
         str(Path(os.environ.get("CLOAK_VENV", "~/.venvs/partsouq-cloak/bin/python")).expanduser()),
     ),
-    "cdp_port": 9242,
-    "cdp_host": "http://127.0.0.1:9242",
     "cookie_export_file": Path(
         os.environ.get("PSQ_COOKIE_EXPORT_FILE", "/tmp/psq_cloak_cookies.json")
     ),
@@ -74,7 +120,7 @@ CLOAK = {
 }
 
 # 爬取行為參數（可用環境變數覆寫；0 代表不設上限）
-CRAWL = {
+CRAWL: CrawlConfig = {
     # 節奏：每個 worker 每個請求之間隨機休息 2~5 秒。
     # 全站總請求速率維持在低檔，避免被 Cloudflare 盯上。
     # 慢一點更安全；爬蟲本來就設計成可以連續跑好幾天。
@@ -83,7 +129,6 @@ CRAWL = {
     "http_timeout": 20,  # 單次 HTTP 請求逾時（秒）
     "max_retries": 5,  # 失敗重試次數
     "challenge_retries": 3,  # 碰到驗證時重新取得 cookie 的次數
-    "max_refresh_per_request": 3,  # 單一請求內「成功刷新 cookie」的上限（F4：重試與刷新預算分離）
     "retry_after_cap": 300,  # 429 Retry-After 等待上限（秒）（F4：防伺服器給巨額值）
     "start_brand": os.environ.get("PSQ_START_BRAND", ""),  # 只爬指定品牌（空=全部）
     "limit_brands": int(os.environ.get("PSQ_LIMIT_BRANDS", "0")),  # 品牌數上限
@@ -132,17 +177,43 @@ CRAWL = {
 LOG_DIR = BASE_DIR / "logs"
 
 
-def load_cookies():
+def load_cookies(path: Path = COOKIE_FILE) -> Cookies | None:
     """從磁碟載入已存 cookie。回傳 dict 列表或 None（不存在/解析失敗）。"""
-    if not COOKIE_FILE.exists():
+    if not path.exists():
         return None
     try:
-        return json.loads(COOKIE_FILE.read_text())
+        raw: object = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(raw, list):
+        return None
+    cookies: Cookies = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        value = item.get("value")
+        domain = item.get("domain", "partsouq.com")
+        cookie_path = item.get("path", "/")
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or not isinstance(domain, str)
+            or not isinstance(cookie_path, str)
+        ):
+            return None
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": cookie_path,
+            }
+        )
+    return cookies
 
 
-def save_cookies(cookies):
+def save_cookies(cookies: Cookies) -> None:
     """以 owner-only 暫存檔原子更新 cookie，避免半份 JSON 或權限窗口。"""
     COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None

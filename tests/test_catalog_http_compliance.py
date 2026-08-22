@@ -129,22 +129,20 @@ def test_challenge_with_failed_refresh_retries_then_gives_up(
     assert manager.session.get.call_count == 4
 
 
-def test_challenge_after_too_many_successful_refreshes_gives_up(
+def test_challenge_after_fresh_browser_session_is_rejected_stops_without_relaunch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = SessionManager(cookies=cookies())
     manager.session.get = Mock(return_value=CHALLENGE_RESPONSE)
-    monkeypatch.setattr(
-        "partsouq_catalog.http_client.force_refresh_session",
-        lambda _v: cookies(cf="fresh-v1"),
-    )
+    refresh = Mock(return_value=cookies(cf="fresh-v1"))
+    monkeypatch.setattr("partsouq_catalog.http_client.force_refresh_session", refresh)
     monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
-    with pytest.raises(ChallengeError):
+    with pytest.raises(ChallengeError, match="fresh browser session still challenged"):
         manager.get("https://partsouq.example/catalog")
 
-    # max_refresh_per_request=3：成功刷新 3 次後第 4 次仍被 challenge 就放棄
-    assert manager.session.get.call_count == 4
+    assert manager.session.get.call_count == 2
+    refresh.assert_called_once()
 
 
 def test_404_raises_not_found_error() -> None:

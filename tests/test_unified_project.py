@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import plistlib
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -29,6 +30,28 @@ def test_compose_requires_explicit_scheduler_profile_and_checks_admin_health() -
     assert "http://127.0.0.1:8000/api/health" in compose
     assert "http://127.0.0.1:8086/health" in compose
     assert "json.load(response).get('status') == 'ok'" in compose
+
+
+def test_macos_catalog_scheduler_uses_host_browser_and_formal_bounded_mode() -> None:
+    launcher_path = PROJECT_ROOT / "deploy/run-macos-catalog-scheduler.zsh"
+    launcher = launcher_path.read_text(encoding="utf-8")
+
+    assert launcher_path.stat().st_mode & 0o111
+    assert 'export PSQ_CLOAK_LAUNCHER=""' in launcher
+    assert "export PSQ_LIMIT_PARTS=0" in launcher
+    assert 'export PSQ_BOUNDED_PARTS="${PSQ_BOUNDED_PARTS:-10000}"' in launcher
+    assert "--job catalog" in launcher
+    assert "--daemon" in launcher
+
+    template = (PROJECT_ROOT / "deploy/com.partsouq.catalog-scheduler.plist.template").read_text(
+        encoding="utf-8"
+    )
+    config = plistlib.loads(template.replace("__PROJECT_ROOT__", str(PROJECT_ROOT)).encode())
+    assert config["Label"] == "com.partsouq.catalog-scheduler"
+    assert config["LimitLoadToSessionType"] == "Aqua"
+    assert config["RunAtLoad"] is True
+    assert config["KeepAlive"] is True
+    assert config["ProgramArguments"] == [str(launcher_path)]
 
 
 def test_catalog_challenge_stops_without_cookie_refresh() -> None:

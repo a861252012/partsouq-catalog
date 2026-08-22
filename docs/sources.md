@@ -18,16 +18,17 @@
 - `nhtsa_vin_decodes` 與 `v_vin_part_fitments`：保存已知 VIN 的官方解碼結果，並以人工確認的 PartSouq `vehicle_id` 建立零件適用關係。
 
 後續加入 CloakBrowser 機制（`src/partsouq_catalog/cloak.py`）處理 Cloudflare
-challenge：啟動指紋修補版 Chromium，靠指紋隱匿讓 Turnstile 人機驗證在無人
-操作下自動通過，匯出 session cookie（`cf_clearance` + `PHPSESSID`，25 分鐘
-TTL 自動刷新，只存本機 `data/cookies.json`），HTTP client 一律附上 cookie
-請求。此機制本質是瀏覽器指紋規避與驗證自動通過，非站方授權；challenge
-未成功刷新時仍算 `blocked`，不會被重新解讀成成功。不輪替 proxy。正式
+challenge：啟動 Chromium 並等待實際 PartSouq 型錄頁；只有頁面 URL 與完整
+品牌連結同時通過驗證後才匯出 session cookie（25 分鐘 TTL，自動刷新，只存
+本機 `data/cookies.json`）。仍停在 challenge 頁、逾時，或刷新後的 HTTP
+follow-up 仍被拒時，都會 fail-closed，不把 `cf_clearance` 存在誤報為成功，
+也不在同一請求反覆重啟瀏覽器。不輪替 proxy。正式
 catalog 請求仍先檢查 robots.txt 與 origin（fail-closed），不跟隨 redirect。
 目前 Compose image 已安裝 CloakBrowser runtime、Chromium 與 Xvfb 顯示
-環境，容器內以 `xvfb-run` 啟動，並已在每次 build 後用真實 Chrome 實測
-CDP ready；原生 host 的 Python venv 路徑不能在 container 中使用。
-host sample 只用於程式路徑驗證，正式排程一律走 Compose image。
+環境，容器內以 `xvfb-run` 啟動。browser readiness marker 只證明瀏覽器已啟動，不能證明
+型錄頁或 cookie 可被 HTTP transport 接受；原生 host 的 Python venv 路徑不能在 container 中使用。
+目前本機 PartSouq 正式排程走受限於 Aqua session 的 host LaunchAgent；Linux
+Compose scheduler 保留 fail-closed，需先通過相同 live smoke 才能取代 host 路徑。
 
 NHTSA vPIC 不提供可列舉的完整 VIN 名冊。完整 VIN 僅能由合法持有者提供後送交官方 `DecodeVinValues` 解碼；bulk complaints 內的 11 碼 VIN 欄位不會被當成完整 VIN。
 
