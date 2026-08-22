@@ -15,6 +15,8 @@
 
 import logging
 import threading
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Never, Protocol, Self, cast
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -22,6 +24,22 @@ from pymysql.cursors import DictCursor
 from .config import DB_CONFIG
 
 log = logging.getLogger("db")
+
+type Row = dict[str, object]
+type DBConnection = pymysql.connections.Connection[DictCursor]
+type SQLParams = tuple[object, ...] | Mapping[str, object] | None
+type SQLParamRows = Iterable[tuple[object, ...] | Mapping[str, object]]
+
+
+class DatabaseCursor(Protocol):
+    """Repository 實際使用的 DictCursor 最小契約。"""
+
+    lastrowid: int | None
+    rowcount: int
+
+    def fetchone(self) -> Row | None: ...
+
+    def fetchall(self) -> Sequence[Row]: ...
 
 
 class ConnectionLost(Exception):
@@ -44,11 +62,11 @@ class Database:
       ConnectionLost，由服務層重跑完整交易（絕不在本層重跑單一 SQL）
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._local = threading.local()
-        self.conn = None
+        self.conn: DBConnection | None = None
 
-    def connect(self):
+    def connect(self) -> Self:
         """初始化（回傳自身以便鏈式呼叫）。
 
         SOL review P3：**不建立** self.conn 主連線 —— 所有實際 SQL
@@ -59,10 +77,14 @@ class Database:
         """
         return self
 
-    def _new_conn(self):
+    def _new_conn(self) -> DBConnection:
         """建立一條新的 MySQL 連線，並設定合理的交易隔離層級。"""
         conn = pymysql.connect(
-            **DB_CONFIG,
+            host=cast(str, DB_CONFIG["host"]),
+            port=cast(int, DB_CONFIG["port"]),
+            user=cast(str, DB_CONFIG["user"]),
+            password=cast(str, DB_CONFIG["password"]),
+            database=cast(str, DB_CONFIG["database"]),
             cursorclass=DictCursor,
             autocommit=False,
             charset="utf8mb4",
@@ -73,7 +95,7 @@ class Database:
             cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
         return conn
 
-    def close(self):
+    def close(self) -> None:
         """關閉主連線與所有執行緒連線，並重置 thread-local 狀態。"""
         if self.conn:
             try:
@@ -82,25 +104,28 @@ class Database:
                 pass
             self.conn = None
         try:
-            for c in list(self._local.__dict__.values()):
-                if hasattr(c, "close"):
+            for connection in list(self._local.__dict__.values()):
+                if hasattr(connection, "close"):
                     try:
-                        c.close()
+                        cast(DBConnection, connection).close()
                     except Exception:
                         pass
         except Exception:
             pass
         self._local = threading.local()
 
-    def _thread_conn(self):
+    def _thread_conn(self) -> DBConnection:
         """取得目前執行緒的連線（若尚未建立則惰性建立）。"""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
+        conn = cast(DBConnection | None, getattr(self._local, "conn", None))
+        # admission lock 釋放失敗時會主動關閉 owner connection，確保
+        # session-scoped GET_LOCK 不殘留。thread-local 若仍指向該物件，
+        # 下一次 SQL 必須惰性換新，不能把「already closed」當業務錯誤。
+        if conn is None or not conn.open:
             conn = self._new_conn()
             self._local.conn = conn
         return conn
 
-    def _execute(self, sql, params=None):
+    def _execute(self, sql: str, params: SQLParams = None) -> DatabaseCursor:
         """執行單一 SQL（可帶參數）。回傳 cursor。
 
         Repository 層透過此方法執行所有語句；本方法不 commit，
@@ -117,7 +142,7 @@ class Database:
             conn = self._thread_conn()
             with conn.cursor() as cur:
                 cur.execute(sql, params)
-                return cur
+                return cast(DatabaseCursor, cur)
         except pymysql.err.OperationalError as e:
             code = e.args[0] if e.args else None
             if code in (1213, 1205):
@@ -137,7 +162,7 @@ class Database:
             self.rollback()
             raise
 
-    def _raise_connection_lost(self, code):
+    def _raise_connection_lost(self, code: object) -> Never:
         """斷線：捨棄目前執行緒的連線，並向服務層拋出 ConnectionLost。
 
         絕不「重連後重跑單一 SQL」：舊連線上未提交的交易已隨斷線
@@ -149,7 +174,7 @@ class Database:
         self._discard_thread_conn()
         raise ConnectionLost(code)
 
-    def _discard_thread_conn(self):
+    def _discard_thread_conn(self) -> None:
         """丟棄壞連線；下一次 SQL 由 _thread_conn 惰性重連。
 
         不在錯誤處理中同步建立連線：若 MySQL 暫時仍不可達，重連的
@@ -157,7 +182,7 @@ class Database:
         辨識「整個 transaction 必須重跑」。
         """
         try:
-            self._local.conn.close()
+            cast(DBConnection, self._local.conn).close()
         except Exception:
             pass
         try:
@@ -165,9 +190,9 @@ class Database:
         except AttributeError:
             pass
 
-    def rollback(self):
+    def rollback(self) -> None:
         """回滾目前執行緒的交易（deadlock 後清除殘留狀態，服務層重跑）。"""
-        conn = getattr(self._local, "conn", None)
+        conn = cast(DBConnection | None, getattr(self._local, "conn", None))
         if conn is None:
             conn = self.conn
         if conn:
@@ -176,7 +201,7 @@ class Database:
             except Exception:
                 pass
 
-    def commit(self):
+    def commit(self) -> None:
         """提交目前執行緒的交易。
 
         commit 失敗時記錄錯誤、重置該執行緒連線，並**重新丟出例外**。
@@ -191,7 +216,7 @@ class Database:
         落庫（伺服器可能已提交才斷線），重跑完整冪等區塊是最安全的
         恢復方式。
         """
-        conn = getattr(self._local, "conn", None)
+        conn = cast(DBConnection | None, getattr(self._local, "conn", None))
         if conn is None:
             conn = self.conn
         if not conn:
@@ -211,9 +236,9 @@ class Database:
             self._reset_conn_after_failure(conn, e)
             raise
 
-    def _reset_conn_after_failure(self, conn, e):
+    def _reset_conn_after_failure(self, conn: DBConnection, error: Exception) -> None:
         """commit 失敗後丟棄壞連線；下次 SQL 才惰性重連。"""
-        log.error("commit failed: %s; discarding thread connection", e)
+        log.error("commit failed: %s; discarding thread connection", error)
         try:
             conn.close()
         except Exception:
@@ -226,7 +251,7 @@ class Database:
         elif self.conn is conn:
             self.conn = None
 
-    def query_one(self, sql, params=None):
+    def query_one(self, sql: str, params: SQLParams = None) -> Row | None:
         """執行 SELECT 並回傳第一列（無結果則回傳 None）。
 
         主要供監督迴圈等需要直接查詢的場合使用。
@@ -235,7 +260,7 @@ class Database:
         row = cur.fetchone()
         return row
 
-    def _executemany(self, sql, rows):
+    def _executemany(self, sql: str, rows: SQLParamRows) -> None:
         """批次執行同一語句的多組參數（一次往返，效能最佳）。
 
         死結 1213 / 鎖等待逾時 1205 → rollback 後直接重拋；斷線

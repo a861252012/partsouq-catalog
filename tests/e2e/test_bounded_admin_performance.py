@@ -51,6 +51,12 @@ MIGRATION_014_PATH = (
 MIGRATION_015_PATH = (
     PROJECT_ROOT / "migrations" / "catalog" / "015_quarantine_index_contract_cleanup.sql"
 )
+MIGRATION_016_PATH = (
+    PROJECT_ROOT / "migrations" / "catalog" / "016_published_snapshot_provenance.sql"
+)
+MIGRATION_019_PATH = (
+    PROJECT_ROOT / "migrations" / "catalog" / "019_verified_bounded_catalog_view.sql"
+)
 DATABASE_NAME_PATTERN = re.compile(r"^partsouq_bounded_perf_[0-9a-f]{12}_test$")
 LOCAL_DATABASE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 TARGET_PARTS = 10_000
@@ -238,6 +244,197 @@ def test_quarantine_migration_runs_with_schema_scoped_app_user(
         with root_connection.cursor() as cursor:
             cursor.execute(f"DROP USER IF EXISTS '{username}'@'%'")
         root_connection.close()
+
+
+def test_published_snapshot_provenance_migration_upgrades_legacy_schema(
+    performance_database: PerformanceDatabase,
+) -> None:
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO published_parts("
+                "part_id, vehicle_id, brand, model, vehicle_name, vehicle_code, "
+                "part_name, part_number, part_number_normalized, category_main, "
+                "group_code, part_range, snapshot_at"
+                ") VALUES (900001, 900001, 'LEGACY', 'LEGACY MODEL', 'LEGACY VEHICLE', "
+                "'LEGACY-CODE', 'LEGACY PART', 'LEGACY-PART-001', 'LEGACYPART001', "
+                "'LEGACY CATEGORY', 'LEGACY-GROUP', '', UTC_TIMESTAMP())"
+            )
+            cursor.execute(
+                "ALTER TABLE published_parts DROP INDEX idx_published_crawl_run, "
+                "DROP COLUMN crawl_run_id"
+            )
+            cursor.execute("DROP TABLE published_parts_previous")
+        _apply_sql_paths(performance_database, (MIGRATION_016_PATH,))
+        _apply_sql_paths(performance_database, (MIGRATION_016_PATH,))
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts' "
+                "AND COLUMN_NAME = 'crawl_run_id'"
+            )
+            assert cursor.fetchone() == {"COLUMN_TYPE": "int", "IS_NULLABLE": "YES"}
+            cursor.execute(
+                "SELECT COLUMN_NAME, NON_UNIQUE, INDEX_TYPE, IS_VISIBLE "
+                "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'published_parts' "
+                "AND INDEX_NAME = 'idx_published_crawl_run'"
+            )
+            assert cursor.fetchone() == {
+                "COLUMN_NAME": "crawl_run_id",
+                "NON_UNIQUE": 1,
+                "INDEX_TYPE": "BTREE",
+                "IS_VISIBLE": "YES",
+            }
+            cursor.execute(
+                "SELECT REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
+                "FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts' "
+                "AND CONSTRAINT_NAME = 'fk_published_crawl_run'"
+            )
+            assert cursor.fetchone() == {
+                "REFERENCED_TABLE_NAME": "crawl_runs",
+                "REFERENCED_COLUMN_NAME": "id",
+            }
+            cursor.execute(
+                "SELECT COLUMN_NAME, NON_UNIQUE, INDEX_TYPE, IS_VISIBLE "
+                "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'published_parts_previous' "
+                "AND INDEX_NAME = 'idx_published_crawl_run'"
+            )
+            assert cursor.fetchone() == {
+                "COLUMN_NAME": "crawl_run_id",
+                "NON_UNIQUE": 1,
+                "INDEX_TYPE": "BTREE",
+                "IS_VISIBLE": "YES",
+            }
+            cursor.execute(
+                "SELECT REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
+                "FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'published_parts_previous' "
+                "AND CONSTRAINT_NAME = 'fk_published_previous_crawl_run'"
+            )
+            assert cursor.fetchone() == {
+                "REFERENCED_TABLE_NAME": "crawl_runs",
+                "REFERENCED_COLUMN_NAME": "id",
+            }
+            cursor.execute(
+                "SELECT part_number, crawl_run_id FROM published_parts WHERE part_id = 900001"
+            )
+            assert cursor.fetchone() == {
+                "part_number": "LEGACY-PART-001",
+                "crawl_run_id": None,
+            }
+            cursor.execute("SELECT COUNT(*) AS n FROM v_current_catalog_parts")
+            assert cursor.fetchone() == {"n": 0}
+            cursor.execute("SELECT COUNT(*) AS n FROM v_parts")
+            assert cursor.fetchone() == {"n": 0}
+            cursor.execute("SHOW CREATE VIEW v_current_catalog_parts")
+            create_view = str(cursor.fetchone()["Create View"])
+            assert "`full_run`.`status` = 'success'" in create_view
+            assert "`full_scheduler_run`.`trigger_mode` = 'daemon'" in create_view
+            assert "`full_scheduler_run`.`status` = 'completed'" in create_view
+            assert "`full_scheduler_run`.`exit_code` = 0" in create_view
+            assert "`current_run`.`target_parts` = 10000" in create_view
+            assert "published_parts_previous" in create_view
+            assert "count(`published_parts`" not in create_view.lower()
+            assert "min(`published_parts`" not in create_view.lower()
+            assert "max(`published_parts`" not in create_view.lower()
+            cursor.execute("SHOW CREATE VIEW v_parts")
+            assert "v_current_catalog_parts" in str(cursor.fetchone()["Create View"])
+
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs(job_name, trigger_mode, status, started_at) "
+                "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+            )
+            running_job_id = int(cursor.lastrowid)
+        with pytest.raises(pymysql.MySQLError, match="running catalog jobs exist"):
+            _apply_sql_paths(performance_database, (MIGRATION_016_PATH,))
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE scheduled_job_runs SET status = 'completed', exit_code = 0, "
+                "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+                (running_job_id,),
+            )
+        _apply_sql_paths(performance_database, (MIGRATION_016_PATH,))
+
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE published_parts DROP FOREIGN KEY fk_published_crawl_run")
+            cursor.execute(
+                "ALTER TABLE published_parts DROP INDEX idx_published_crawl_run, "
+                "ADD INDEX idx_published_crawl_run (crawl_run_id, part_id)"
+            )
+            cursor.execute("SET SESSION FOREIGN_KEY_CHECKS = 0")
+            try:
+                cursor.execute(
+                    "UPDATE published_parts SET crawl_run_id = 2147483647 WHERE part_id = 900001"
+                )
+            finally:
+                cursor.execute("SET SESSION FOREIGN_KEY_CHECKS = 1")
+        with pytest.raises(pymysql.MySQLError, match="orphan run ids"):
+            _apply_sql_paths(performance_database, (MIGRATION_016_PATH,))
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS columns_in_index FROM information_schema.STATISTICS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts' "
+                "AND INDEX_NAME = 'idx_published_crawl_run'"
+            )
+            assert cursor.fetchone() == {"columns_in_index": 2}
+            cursor.execute("UPDATE published_parts SET crawl_run_id = NULL WHERE part_id = 900001")
+        _apply_sql_paths(performance_database, (MIGRATION_016_PATH,))
+    finally:
+        connection.close()
+
+
+def test_admin_schema_repairs_published_snapshot_foreign_key_contract(
+    performance_database: PerformanceDatabase,
+) -> None:
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:3])
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE published_parts DROP FOREIGN KEY fk_published_crawl_run")
+            cursor.execute(
+                "ALTER TABLE published_parts ADD CONSTRAINT fk_published_crawl_run "
+                "FOREIGN KEY (crawl_run_id) REFERENCES categories(id)"
+            )
+            cursor.execute(
+                "ALTER TABLE published_parts_previous "
+                "DROP FOREIGN KEY fk_published_previous_crawl_run"
+            )
+            cursor.execute(
+                "ALTER TABLE published_parts_previous "
+                "ADD CONSTRAINT fk_published_previous_crawl_run "
+                "FOREIGN KEY (crawl_run_id) REFERENCES categories(id)"
+            )
+
+        _apply_sql_paths(performance_database, (FRESH_SCHEMA_PATHS[2],))
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT TABLE_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
+                "FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME IN "
+                "('fk_published_crawl_run', 'fk_published_previous_crawl_run') "
+                "ORDER BY TABLE_NAME"
+            )
+            assert cursor.fetchall() == [
+                {
+                    "TABLE_NAME": "published_parts",
+                    "REFERENCED_TABLE_NAME": "crawl_runs",
+                    "REFERENCED_COLUMN_NAME": "id",
+                },
+                {
+                    "TABLE_NAME": "published_parts_previous",
+                    "REFERENCED_TABLE_NAME": "crawl_runs",
+                    "REFERENCED_COLUMN_NAME": "id",
+                },
+            ]
+    finally:
+        connection.close()
 
 
 @pytest.fixture
@@ -727,7 +924,18 @@ def test_quarantine_migration_recovers_after_failed_preflight(
     connection = performance_database.connect(autocommit=True)
     try:
         with connection.cursor() as cursor:
+            cursor.execute("SET SESSION restrict_fk_on_non_standard_key = OFF")
             cursor.execute("ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group")
+            cursor.execute("ALTER TABLE parts DROP FOREIGN KEY fk_part_group")
+            cursor.execute(
+                "ALTER TABLE groups_t ADD COLUMN shard INT NOT NULL DEFAULT 0, "
+                "DROP PRIMARY KEY, ADD PRIMARY KEY (id, shard)"
+            )
+            cursor.execute(
+                "ALTER TABLE part_quarantine "
+                "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES groups_t(id) ON DELETE CASCADE"
+            )
     finally:
         connection.close()
 
@@ -747,9 +955,18 @@ def test_quarantine_migration_recovers_after_failed_preflight(
                 "'upgrade_partsouq_015_quarantine_index_contract_cleanup'"
             )
             assert cursor.fetchone()["n"] == 1
+            cursor.execute("ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group")
+            cursor.execute(
+                "ALTER TABLE groups_t DROP PRIMARY KEY, ADD PRIMARY KEY (id), DROP COLUMN shard"
+            )
             cursor.execute(
                 "ALTER TABLE part_quarantine "
                 "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
+                "REFERENCES groups_t(id) ON DELETE CASCADE"
+            )
+            cursor.execute(
+                "ALTER TABLE parts "
+                "ADD CONSTRAINT fk_part_group FOREIGN KEY (group_id) "
                 "REFERENCES groups_t(id) ON DELETE CASCADE"
             )
     finally:
@@ -929,7 +1146,8 @@ def test_data_admin_health_fails_closed_when_schema_object_is_missing(
                 "SET SESSION restrict_fk_on_non_standard_key = OFF",
                 "ALTER TABLE part_quarantine DROP FOREIGN KEY fk_quarantine_group",
                 "ALTER TABLE parts DROP FOREIGN KEY fk_part_group",
-                "ALTER TABLE groups_t DROP PRIMARY KEY, ADD PRIMARY KEY (id, category_id)",
+                "ALTER TABLE groups_t ADD COLUMN shard INT NOT NULL DEFAULT 0, "
+                "DROP PRIMARY KEY, ADD PRIMARY KEY (id, shard)",
                 "ALTER TABLE part_quarantine "
                 "ADD CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id) "
                 "REFERENCES groups_t(id) ON DELETE CASCADE",
@@ -1212,7 +1430,38 @@ def _seed_synthetic_bounded_dataset(database: PerformanceDatabase) -> dict[str, 
                         )
                     parts.upsert_parts(group_id, fixture_parts, crawl_run_id)
         assert part_index == TARGET_PARTS
-        assert crawl.publish_bounded_parts(crawl_run_id, TARGET_PARTS) == TARGET_PARTS
+        # 這是隔離效能 fixture，不可偽造成 live HTTP evidence。直接建立
+        # snapshot，正式發布仍只能走 CrawlRepository 的 evidence gate。
+        catalog_database._execute(
+            "INSERT INTO bounded_parts ("
+            "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, "
+            "brand, model, vehicle_name, vehicle_code, prod_period, "
+            "production_from, production_to, engine, trim_name, part_name, "
+            "part_number, part_number_normalized, category_id, category_cid, "
+            "category_main, category_group, group_id, group_code, group_uid, "
+            "part_range, part_from, part_to, source_url, note, quantity, code, snapshot_at) "
+            "SELECT parts.id, %s, vehicles.id, models.id, vehicles.vid, brands.name, "
+            "models.name, vehicles.name, vehicles.model_code, vehicles.prod_period, "
+            "vehicles.production_from, vehicles.production_to, vehicles.engine, "
+            "vehicles.grade, parts.name, parts.part_number, "
+            "UPPER(REGEXP_REPLACE(parts.part_number, '[[:space:]-]+', '')), "
+            "categories.id, categories.cid, categories.name, groups_t.name, groups_t.id, "
+            "groups_t.code, groups_t.uid, parts.range_str, parts.part_from, parts.part_to, "
+            "groups_t.url, parts.note, parts.quantity, parts.code, NOW() "
+            "FROM parts "
+            "JOIN groups_t ON groups_t.id = parts.group_id "
+            "JOIN categories ON categories.id = groups_t.category_id "
+            "JOIN vehicles ON vehicles.id = categories.vehicle_id "
+            "JOIN models ON models.id = vehicles.model_id "
+            "JOIN brands ON brands.id = models.brand_id "
+            "WHERE parts.seen_run_id = %s",
+            (crawl_run_id, crawl_run_id),
+        )
+        snapshot = catalog_database._execute(
+            "SELECT COUNT(*) AS row_count FROM bounded_parts WHERE crawl_run_id = %s",
+            (crawl_run_id,),
+        ).fetchone()
+        assert snapshot == {"row_count": TARGET_PARTS}
         crawl.finish_run(
             crawl_run_id,
             "bounded_success",
@@ -1318,7 +1567,10 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
     performance_database: PerformanceDatabase,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _apply_sql_paths(performance_database, (*FRESH_SCHEMA_PATHS[1:], MIGRATION_009_PATH))
+    _apply_sql_paths(
+        performance_database,
+        (*FRESH_SCHEMA_PATHS[1:], MIGRATION_009_PATH, MIGRATION_019_PATH),
+    )
     _configure_catalog_database(monkeypatch, performance_database)
     setup_started = time.perf_counter()
     seeded = _seed_synthetic_bounded_dataset(performance_database)
@@ -1331,14 +1583,16 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         "(SELECT COUNT(*) FROM v_current_catalog_parts) AS current_rows, "
         "(SELECT COUNT(*) FROM v_current_catalog_parts "
         " WHERE dataset_scope = 'bounded') AS current_bounded_rows, "
+        "(SELECT COUNT(*) FROM v_parts) AS compatibility_rows, "
         "(SELECT COUNT(*) FROM published_parts) AS published_rows, "
         "(SELECT COUNT(*) FROM crawl_runs WHERE status = 'sample') AS sample_runs, "
         "(SELECT COUNT(*) FROM admin_override_heads) AS override_rows",
     )
     assert direct == {
         "bounded_rows": TARGET_PARTS,
-        "current_rows": TARGET_PARTS,
-        "current_bounded_rows": TARGET_PARTS,
+        "current_rows": 0,
+        "current_bounded_rows": 0,
+        "compatibility_rows": 0,
         "published_rows": 0,
         "sample_runs": 0,
         "override_rows": 0,
@@ -1394,7 +1648,7 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         assert summary_json["bounded"]["crawl_run_id"] == seeded["crawl_run_id"]
         assert summary_json["bounded"]["scheduler"]["run_id"] == seeded["scheduler_run_id"]
         assert summary_json["bounded"]["source_provenance"]["raw_http_artifact_status"] == (
-            "not_persisted_by_catalog_crawler"
+            "not_verified"
         )
         assert summary_json["production_ready"] is False
         data_admin_report["synthetic_readiness"] = {
@@ -1479,20 +1733,16 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
     station_app.testing = True
     station_client = station_app.test_client()
     for page_size in PAGE_SIZES:
-        total_pages = math.ceil(TARGET_PARTS / page_size)
-        for page_name, page in (("first", 1), ("last", total_pages)):
-            path = f"/entities/part_numbers?dataset=formal&page={page}&pageSize={page_size}"
+        path = f"/entities/part_numbers?dataset=formal&page=1&pageSize={page_size}"
 
-            def station_request(path: str = path) -> None:
-                response = station_client.get(path)
-                assert response.status_code == 200
-                assert response.headers["X-Admin-Query-Count"] == "4"
-
+        def station_request(path: str = path) -> None:
             response = station_client.get(path)
             assert response.status_code == 200
             assert response.headers["X-Admin-Query-Count"] == "4"
-            assert f"共 {TARGET_PARTS} 筆記錄".encode() in response.data
-            station_admin_report[f"formal_{page_size}_{page_name}"] = _measure(station_request)
+            assert "共 0 筆記錄".encode() in response.data
+
+        station_request()
+        station_admin_report[f"formal_fail_closed_{page_size}"] = _measure(station_request)
 
     def station_exact_request() -> None:
         response = station_client.get(
@@ -1500,17 +1750,11 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         )
         assert response.status_code == 200
         assert response.headers["X-Admin-Query-Count"] == "4"
-        assert SHARED_PART_NUMBER.encode() in response.data
-        assert f"共 {SHARED_PART_FITMENTS} 筆記錄".encode() in response.data
+        assert SHARED_PART_NUMBER.encode() not in response.data
+        assert "共 0 筆記錄".encode() in response.data
 
     station_exact_request()
-    station_exact_last = station_client.get(
-        f"/entities/part_numbers?dataset=formal&q={SHARED_PART_NORMALIZED}&pageSize=30&page=4"
-    )
-    assert station_exact_last.status_code == 200
-    assert station_exact_last.headers["X-Admin-Query-Count"] == "4"
-    assert f"顯示 91 到 100，共 {SHARED_PART_FITMENTS} 筆記錄".encode() in (station_exact_last.data)
-    station_admin_report["formal_exact_normalized"] = _measure(station_exact_request)
+    station_admin_report["formal_fail_closed_exact"] = _measure(station_exact_request)
 
     summary_p95 = float(data_admin_report["summary"]["p95_ms"])
     assert summary_p95 < SUMMARY_P95_LIMIT_MS

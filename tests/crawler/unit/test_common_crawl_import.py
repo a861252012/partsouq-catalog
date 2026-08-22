@@ -42,6 +42,7 @@ def _warc_response() -> bytes:
         DIAGRAM_URL,
         "response",
         payload=io.BytesIO(DIAGRAM_HTML),
+        length=len(DIAGRAM_HTML),
         http_headers=http_headers,
     )
     writer.write_record(record)

@@ -771,9 +771,11 @@ hash 與 HEAD 一致。
 
 1. **父表 PRIMARY exact contract**：migration 015 的 preflight／postflight
    除了驗證 FK 指向 `groups_t(id)`，也要求父表 PRIMARY 只能有一個 key
-   part。MySQL 8.0／8.4 都能建立 legacy `PRIMARY(id, category_id)` +
-   prefix-reference FK；實測刪除其中一筆重複 id 的父列，會錯誤 cascade
-   quarantine 子列。新 guard 對此狀態會在任何 quarantine DDL 前 fail-closed。
+   part。MySQL 8.0 可建立 legacy `PRIMARY(id, shard)` + prefix-reference FK；
+   MySQL 8.4 升級時可保留此狀態，測試以
+   `restrict_fk_on_non_standard_key=OFF` 重現。實測刪除其中一筆重複 id 的父列，
+   會錯誤 cascade quarantine 子列。新 guard 對此狀態會在任何 quarantine DDL
+   前 fail-closed。
 2. **資料與復原可信度**：migration case 先建立完整 brand → group →
    quarantine sentinel，所有 repair、visibility、idempotency 與 fail-closed
    路徑都比較前後資料。另覆蓋 pre-011 的 `011 → 012 → 015`、preflight
@@ -915,3 +917,89 @@ hash 與 HEAD 一致。
   既有 recovery 將它收斂為 interrupted。
 - 本輪沒有執行正式 10,000 筆 live crawl；因此不能把上述單頁 live smoke 或
   合成 10,000 筆測試宣稱為正式資料與 mapping 驗收。
+
+### 正式排程與 evidence 安全閘門收斂（2026-08-23）
+
+本輪以獨立 subagent、mutation 與完整 E2E 反覆檢查目前待提交工作樹，重點如下：
+
+1. host LaunchAgent 固定使用既有 `partsouq_catalog` 與 bounded 10,000；
+   migration、CloakBrowser import 與 crawler 都只接收必要 allowlist 環境。
+2. scheduler 會移除 child 的 `LAUNCHD_JOB`，讓 crawler log 成為 heartbeat；
+   Cloudflare 最長 20 分鐘 refresh backoff 也會每 60 秒回報，避免 600 秒
+   silent-stall watchdog 誤殺 Chromium。
+3. bounded live evidence 會保存原 scheduler attempt。A attempt 失敗後由 B
+   attempt 接續時，舊 artifact 不會改寫來源；各 attempt 都須符合自己的狀態與
+   時間窗，最後完整 replay、hash、精確 10,000 筆全部一致才可發布。
+4. bounded publish 已 commit、parent 隨後被記為 `failed`／非零 exit 的情況，
+   recovery 會重新 replay evidence，再將 parent 以條件更新收斂為
+   `completed`／0；一般 evidence audit 仍拒絕 failed scheduler。
+5. formal evidence CLI 與兩套後台只把 `partsouq_catalog` 視為正式 DB；
+   破壞性 MySQL／瀏覽器測試只允許 loopback 與 `_test` DB。舊 `PSQ_DB_*`
+   fallback 已移除，PartSouq、NHTSA 與後台只共用 `PARTSOUQ_DB_*`。
+
+驗證結果：
+
+- 最終 MySQL + Google Chrome 全開 gate：`671 passed`、0 failed、0 skipped；
+  JUnit：`/private/tmp/partsouq-final-all-gates.xml`，skip gate 回報 0。
+- 無 MySQL／瀏覽器的 CI 順序敏感 gate：`560 passed`、111 個白名單 gated skips；
+  skip allowlist 驗證通過。
+- A/B mixed artifact MySQL 案例實際保存 A=5、B=1 個 artifact，B 被記成
+  failed/125 後由真實 recovery 修成 completed/0，再由一般 audit 通過。
+- Ruff、144 檔 format、strict mypy 90 個 source files、lockfile、Compose、
+  shell、plist、`git diff --check` 全部通過。
+
+本輪仍未啟動正式 scheduler，也未執行正式 10,000 筆 live crawl；因此不能宣稱
+正式 PartSouq 資料、獨立小分類、英文品名語言或 VIN mapping 已完成驗收。
+
+### 正式 bounded view evidence gate 補強（2026-08-23）
+
+最終 staged audit 發現：migration 016 建立的 bounded view 早於 migration 017
+的 evidence schema，因此只憑 synthetic 10,000 筆與成功 scheduler marker 也會出現在
+正式後台。這違反「不可用 sample／fixture data 冒充正式資料」的驗收邊界。
+
+修正內容：
+
+1. 新增 forward-only migration 019；不改寫 immutable 的 016／017 checksum。
+2. `v_current_catalog_parts` 的 bounded 分支除原本 exact 10,000 與 daemon provenance
+   外，還要求 sealed evidence hash／bytes／verified time、六種 verified live HTTP
+   artifact、HTTP 200、非 challenge、HTML、零 malformed，以及 10,000 筆 accepted
+   record 逐筆綁回同一份 `bounded_parts` snapshot。
+3. admin 與 station-admin readiness 會檢查 view definition 已包含 migration 019 gate；
+   舊 view 不再回報 healthy。
+4. 無 evidence 的 synthetic 10,000 fixture 仍可透過 raw bounded API 做診斷與效能測試，
+   但 `v_current_catalog_parts`、`v_parts`、station formal list 與 VIN mapping 都是 0。
+5. 真正執行 record、parser replay、seal、publish 的 10,000 MySQL 測試，包含 A failed
+   後由 B retry 接續的 5+1 artifacts，仍可顯示 10,000；將 evidence status 改為
+   missing 或任一 active artifact 改為 fixture 時會立即變 0，還原並 audit 後恢復。
+6. evidence CTE 只聚合目前 `bounded_parts` 所屬 run，避免每次後台查詢掃描全部歷史
+   artifacts；每個 artifact 另綁回原 scheduler attempt 與 run/job 時間窗。舊 attempt
+   必須是 daemon failed/非零，current attempt 必須是 daemon completed/0。將舊 attempt
+   改為 completed/0 或 manual 時，正式 view 與 `v_parts` 會立即變 0，還原後才恢復。
+
+驗證結果：
+
+- 最新 staged working tree 的 MySQL + 真實 Google Chrome 完整 gate：`672 passed`、
+  0 failed、0 skipped；JUnit：`/private/tmp/partsouq-final-staged-full.xml`。
+- 無 MySQL／瀏覽器 gate：672 tests 中 561 passed、111 個文件化 gated skips；
+  skip allowlist 驗證通過。
+- migration 019 isolated replay、既有 `partsouq_catalog_test` apply/check、station-admin
+  readiness、synthetic fail-closed 與 verified-live positive gate 全部通過。
+- 在 verified 10,000 正向資料旁另放入 2,000 個歷史 artifacts 與 accepted records 後，
+  `EXPLAIN ANALYZE` 仍只從目前 bounded run 讀 6 個 active artifacts 與 10,000 筆
+  accepted records，沒有對 artifact table 做歷史全掃。
+- 同一份 verified 10,000 fixture 的正式 view 實測 20 次：200 筆首頁 p95
+  31.10ms、200 筆末頁 p95 32.12ms、精確料號搜尋 p95 8.56ms；三者皆低於
+  500ms gate，且執行計畫均未掃描歷史 artifact table。
+- 把 prior scheduler 改為 completed/0 或 manual，以及把 artifact 擷取時間改到該
+  attempt 結束 6 分鐘後，正式 view 都會立即變 0；逐項還原並重跑 evidence audit
+  後才恢復 10,000。
+- Ruff、144 檔 format、strict mypy 90 個 source files、lockfile、Compose、shell、plist、
+  `git diff --check` 全部通過。
+
+本輪仍未啟動正式 scheduler，也未執行正式 10,000 筆 live crawl；上述 10,000 筆是
+可重播的 MySQL 驗收 fixture，不是 PartSouq 正式資料，不能當成正式資料或 mapping
+完成證明。
+
+migration 019 的 live evidence gate 只處理本次驗收的 bounded 10,000 分支。現有 full
+snapshot 流程尚未 capture／seal 同級 HTTP evidence，仍只依 crawl + scheduler
+provenance；它不在本次 10,000 筆驗收範圍，不能由上述結果推論為 full live crawl 已驗證。

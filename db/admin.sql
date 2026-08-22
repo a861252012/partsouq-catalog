@@ -124,12 +124,198 @@ PREPARE add_scheduler_trigger_mode FROM @add_scheduler_trigger_mode;
 EXECUTE add_scheduler_trigger_mode;
 DEALLOCATE PREPARE add_scheduler_trigger_mode;
 
--- Full published snapshot is authoritative. Until it exists, the latest
--- successful bounded snapshot is the current server-grade catalog source.
+CREATE TABLE IF NOT EXISTS published_parts_previous LIKE published_parts;
+
+DROP PROCEDURE IF EXISTS ensure_published_snapshot_foreign_keys;
+DELIMITER //
+CREATE PROCEDURE ensure_published_snapshot_foreign_keys()
+BEGIN
+    DECLARE current_fk_valid INT DEFAULT 0;
+    DECLARE previous_fk_valid INT DEFAULT 0;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts'
+          AND COLUMN_NAME = 'crawl_run_id'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts_previous'
+          AND COLUMN_NAME = 'crawl_run_id'
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+          SET MESSAGE_TEXT = 'admin schema requires catalog migration 016';
+    END IF;
+
+    SELECT COUNT(*) = 1 INTO current_fk_valid
+    FROM information_schema.KEY_COLUMN_USAGE AS key_columns
+    JOIN information_schema.REFERENTIAL_CONSTRAINTS AS constraints_t
+      ON constraints_t.CONSTRAINT_SCHEMA = key_columns.CONSTRAINT_SCHEMA
+     AND constraints_t.TABLE_NAME = key_columns.TABLE_NAME
+     AND constraints_t.CONSTRAINT_NAME = key_columns.CONSTRAINT_NAME
+    WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE()
+      AND key_columns.TABLE_NAME = 'published_parts'
+      AND key_columns.CONSTRAINT_NAME = 'fk_published_crawl_run'
+      AND key_columns.COLUMN_NAME = 'crawl_run_id'
+      AND key_columns.REFERENCED_TABLE_SCHEMA = DATABASE()
+      AND key_columns.REFERENCED_TABLE_NAME = 'crawl_runs'
+      AND key_columns.REFERENCED_COLUMN_NAME = 'id'
+      AND constraints_t.UPDATE_RULE = 'NO ACTION'
+      AND constraints_t.DELETE_RULE = 'NO ACTION';
+    IF current_fk_valid <> 1 THEN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+            WHERE CONSTRAINT_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'published_parts'
+              AND CONSTRAINT_NAME = 'fk_published_crawl_run'
+        ) THEN
+            ALTER TABLE published_parts DROP FOREIGN KEY fk_published_crawl_run;
+        END IF;
+        ALTER TABLE published_parts ADD CONSTRAINT fk_published_crawl_run
+          FOREIGN KEY (crawl_run_id) REFERENCES crawl_runs(id);
+    END IF;
+
+    SELECT COUNT(*) = 1 INTO previous_fk_valid
+    FROM information_schema.KEY_COLUMN_USAGE AS key_columns
+    JOIN information_schema.REFERENTIAL_CONSTRAINTS AS constraints_t
+      ON constraints_t.CONSTRAINT_SCHEMA = key_columns.CONSTRAINT_SCHEMA
+     AND constraints_t.TABLE_NAME = key_columns.TABLE_NAME
+     AND constraints_t.CONSTRAINT_NAME = key_columns.CONSTRAINT_NAME
+    WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE()
+      AND key_columns.TABLE_NAME = 'published_parts_previous'
+      AND key_columns.CONSTRAINT_NAME = 'fk_published_previous_crawl_run'
+      AND key_columns.COLUMN_NAME = 'crawl_run_id'
+      AND key_columns.REFERENCED_TABLE_SCHEMA = DATABASE()
+      AND key_columns.REFERENCED_TABLE_NAME = 'crawl_runs'
+      AND key_columns.REFERENCED_COLUMN_NAME = 'id'
+      AND constraints_t.UPDATE_RULE = 'NO ACTION'
+      AND constraints_t.DELETE_RULE = 'NO ACTION';
+    IF previous_fk_valid <> 1 THEN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+            WHERE CONSTRAINT_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'published_parts_previous'
+              AND CONSTRAINT_NAME = 'fk_published_previous_crawl_run'
+        ) THEN
+            ALTER TABLE published_parts_previous
+              DROP FOREIGN KEY fk_published_previous_crawl_run;
+        END IF;
+        ALTER TABLE published_parts_previous
+          ADD CONSTRAINT fk_published_previous_crawl_run
+          FOREIGN KEY (crawl_run_id) REFERENCES crawl_runs(id);
+    END IF;
+END//
+DELIMITER ;
+CALL ensure_published_snapshot_foreign_keys();
+DROP PROCEDURE ensure_published_snapshot_foreign_keys;
+
+-- Full snapshot is authoritative only after both the crawl and its sole
+-- daemon scheduler run have completed successfully. Legacy snapshots without
+-- crawl_run_id stay hidden; a qualified bounded 10,000-row snapshot remains
+-- visible until a traceable full snapshot is ready.
 CREATE OR REPLACE VIEW v_current_catalog_parts AS
+WITH verified_bounded_evidence AS (
+SELECT
+    artifact.crawl_run_id,
+    COUNT(*) AS artifact_count,
+    SUM(
+        artifact.capture_kind = 'live_http'
+        AND evidence_job.job_name = 'catalog'
+        AND evidence_job.trigger_mode = 'daemon'
+        AND evidence_job.finished_at IS NOT NULL
+        AND artifact.fetched_at >= evidence_run.started_at
+        AND artifact.fetched_at >= evidence_job.started_at
+        AND artifact.fetched_at <= evidence_job.finished_at + INTERVAL 5 MINUTE
+        AND (
+          (
+            artifact.scheduled_job_run_id = evidence_run.scheduled_job_run_id
+            AND evidence_job.status = 'completed'
+            AND evidence_job.exit_code = 0
+          )
+          OR (
+            artifact.scheduled_job_run_id <> evidence_run.scheduled_job_run_id
+            AND evidence_job.status = 'failed'
+            AND evidence_job.exit_code IS NOT NULL
+            AND evidence_job.exit_code <> 0
+          )
+        )
+        AND artifact.http_status = 200
+        AND artifact.challenge_detected = 0
+        AND LOWER(artifact.content_type) LIKE 'text/html%'
+        AND artifact.malformed_row_count = 0
+        AND artifact.verified_at IS NOT NULL
+    ) AS live_artifact_count,
+    COUNT(DISTINCT artifact.page_type) AS page_type_count,
+    SUM(artifact.accepted_record_count) AS accepted_record_count,
+    SUM(body.original_bytes) AS original_bytes,
+    SUM(body.stored_bytes) AS stored_bytes
+FROM (
+    SELECT DISTINCT crawl_run_id
+    FROM bounded_parts
+) AS active_snapshot
+STRAIGHT_JOIN partsouq_http_artifacts AS artifact
+  FORCE INDEX (idx_partsouq_artifact_run_status)
+  ON artifact.crawl_run_id = active_snapshot.crawl_run_id
+ AND artifact.verification_status = 'verified'
+STRAIGHT_JOIN crawl_runs AS evidence_run
+  ON evidence_run.id = artifact.crawl_run_id
+STRAIGHT_JOIN scheduled_job_runs AS evidence_job
+  ON evidence_job.id = artifact.scheduled_job_run_id
+STRAIGHT_JOIN partsouq_response_bodies AS body
+  ON body.body_sha256 = artifact.body_sha256
+GROUP BY artifact.crawl_run_id
+),
+verified_bounded_records AS (
+SELECT
+    record.crawl_run_id,
+    COUNT(*) AS accepted_record_count,
+    COUNT(DISTINCT record.part_id) AS accepted_part_count
+FROM (
+    SELECT DISTINCT crawl_run_id
+    FROM bounded_parts
+) AS active_record_snapshot
+STRAIGHT_JOIN partsouq_artifact_records AS record
+  FORCE INDEX (idx_partsouq_record_run_accepted)
+  ON record.crawl_run_id = active_record_snapshot.crawl_run_id
+ AND record.accepted = 1
+STRAIGHT_JOIN partsouq_http_artifacts AS artifact
+  ON artifact.id = record.artifact_id
+ AND artifact.crawl_run_id = record.crawl_run_id
+ AND artifact.verification_status = 'verified'
+ AND artifact.capture_kind = 'live_http'
+STRAIGHT_JOIN bounded_parts AS evidence_part
+  ON evidence_part.crawl_run_id = record.crawl_run_id
+ AND evidence_part.part_id = record.part_id
+WHERE record.record_type = 'part'
+GROUP BY record.crawl_run_id
+),
+qualified_full_runs AS (
+SELECT full_run.id AS crawl_run_id
+FROM crawl_runs AS full_run
+JOIN scheduled_job_runs AS full_scheduler_run
+  ON full_scheduler_run.id = full_run.scheduled_job_run_id
+ AND full_scheduler_run.job_name = 'catalog'
+ AND full_scheduler_run.trigger_mode = 'daemon'
+ AND full_scheduler_run.status = 'completed'
+ AND full_scheduler_run.finished_at IS NOT NULL
+ AND full_scheduler_run.exit_code = 0
+JOIN (
+    SELECT scheduled_job_run_id, COUNT(*) AS linked_crawl_runs
+    FROM crawl_runs
+    WHERE scheduled_job_run_id IS NOT NULL
+    GROUP BY scheduled_job_run_id
+) AS full_scheduler_links
+  ON full_scheduler_links.scheduled_job_run_id = full_scheduler_run.id
+ AND full_scheduler_links.linked_crawl_runs = 1
+WHERE full_run.dataset_kind = 'full'
+  AND full_run.target_parts IS NULL
+  AND full_run.status = 'success'
+  AND full_run.finished_at IS NOT NULL
+  AND full_run.error_msg IS NULL
+),
+formal_current_parts AS (
 SELECT
     'full' AS dataset_scope,
-    CAST(NULL AS SIGNED) AS source_crawl_run_id,
+    p.crawl_run_id AS source_crawl_run_id,
     p.part_id, p.vehicle_id, p.model_id, p.vehicle_vid, p.brand, p.model,
     p.vehicle_name, p.vehicle_code, p.prod_period, p.production_from,
     p.production_to, p.engine, p.trim_name, p.part_name, p.part_number,
@@ -137,6 +323,35 @@ SELECT
     p.category_group, p.group_id, p.group_code, p.group_uid, p.part_range,
     p.part_from, p.part_to, p.source_url, p.note, p.quantity, p.code, p.snapshot_at
 FROM published_parts AS p
+JOIN qualified_full_runs ON qualified_full_runs.crawl_run_id = p.crawl_run_id
+),
+formal_previous_parts AS (
+SELECT
+    'full' AS dataset_scope,
+    previous.crawl_run_id AS source_crawl_run_id,
+    previous.part_id, previous.vehicle_id, previous.model_id, previous.vehicle_vid,
+    previous.brand, previous.model, previous.vehicle_name, previous.vehicle_code,
+    previous.prod_period, previous.production_from, previous.production_to,
+    previous.engine, previous.trim_name, previous.part_name, previous.part_number,
+    previous.part_number_normalized, previous.category_id, previous.category_cid,
+    previous.category_main, previous.category_group, previous.group_id,
+    previous.group_code, previous.group_uid, previous.part_range, previous.part_from,
+    previous.part_to, previous.source_url, previous.note, previous.quantity,
+    previous.code, previous.snapshot_at
+FROM published_parts_previous AS previous
+JOIN qualified_full_runs ON qualified_full_runs.crawl_run_id = previous.crawl_run_id
+),
+formal_full_parts AS (
+SELECT formal_current_parts.*
+FROM formal_current_parts
+UNION ALL
+SELECT formal_previous_parts.*
+FROM formal_previous_parts
+WHERE NOT EXISTS (SELECT 1 FROM formal_current_parts)
+)
+SELECT
+    formal_full_parts.*
+FROM formal_full_parts
 UNION ALL
 SELECT
     'bounded' AS dataset_scope,
@@ -154,11 +369,34 @@ JOIN crawl_runs AS current_run
  AND current_run.status = 'bounded_success'
  AND current_run.target_parts = 10000
  AND current_run.parts_ok = 10000
+ AND current_run.finished_at IS NOT NULL
+ AND current_run.error_msg IS NULL
+ AND current_run.evidence_status = 'verified'
+ AND current_run.evidence_manifest_sha256 REGEXP '^[0-9a-f]{64}$'
+ AND current_run.evidence_dataset_sha256 REGEXP '^[0-9a-f]{64}$'
+ AND current_run.evidence_artifact_count > 0
+ AND current_run.evidence_record_count = 10000
+ AND current_run.evidence_original_bytes > 0
+ AND current_run.evidence_stored_bytes > 0
+ AND current_run.evidence_verified_at IS NOT NULL
+JOIN verified_bounded_evidence AS verified_evidence
+  ON verified_evidence.crawl_run_id = current_run.id
+ AND verified_evidence.artifact_count = current_run.evidence_artifact_count
+ AND verified_evidence.live_artifact_count = verified_evidence.artifact_count
+ AND verified_evidence.page_type_count = 6
+ AND verified_evidence.accepted_record_count = current_run.evidence_record_count
+ AND verified_evidence.original_bytes = current_run.evidence_original_bytes
+ AND verified_evidence.stored_bytes = current_run.evidence_stored_bytes
+JOIN verified_bounded_records AS verified_records
+  ON verified_records.crawl_run_id = current_run.id
+ AND verified_records.accepted_record_count = current_run.evidence_record_count
+ AND verified_records.accepted_part_count = current_run.evidence_record_count
 JOIN scheduled_job_runs AS scheduler_run
   ON scheduler_run.id = current_run.scheduled_job_run_id
  AND scheduler_run.job_name = 'catalog'
  AND scheduler_run.trigger_mode = 'daemon'
  AND scheduler_run.status = 'completed'
+ AND scheduler_run.finished_at IS NOT NULL
  AND scheduler_run.exit_code = 0
 JOIN (
     SELECT scheduled_job_run_id, COUNT(*) AS linked_crawl_runs
@@ -177,7 +415,20 @@ JOIN (
   ON snapshot.row_count = 10000
  AND snapshot.min_crawl_run_id = current_run.id
  AND snapshot.max_crawl_run_id = current_run.id
-WHERE NOT EXISTS (SELECT 1 FROM published_parts);
+WHERE NOT EXISTS (SELECT 1 FROM formal_full_parts);
+
+-- Compatibility readers must obey the same provenance gate; direct access to
+-- published_parts would expose a scheduler-running or failed candidate.
+CREATE OR REPLACE VIEW v_parts AS
+SELECT
+    part_id, vehicle_id, model_id, vehicle_vid,
+    brand, model, vehicle_name, vehicle_code, prod_period,
+    production_from, production_to, engine, trim_name,
+    part_name, part_number,
+    category_id, category_cid, category_main, category_group,
+    group_id, group_code, group_uid,
+    part_range, part_from, part_to, source_url, note, quantity, code
+FROM v_current_catalog_parts;
 
 CREATE OR REPLACE VIEW v_vin_part_fitments AS
 SELECT mapped.*

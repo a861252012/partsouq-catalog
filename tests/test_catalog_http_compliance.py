@@ -129,13 +129,35 @@ def test_challenge_with_failed_refresh_retries_then_gives_up(
     assert manager.session.get.call_count == 4
 
 
+def test_refresh_backoff_emits_heartbeat_between_sleep_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = SessionManager(cookies=cookies())
+    slept: list[float] = []
+    monkeypatch.setattr("partsouq_catalog.http_client.session_backoff_remaining", lambda: 130.0)
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", slept.append)
+    caplog.set_level("WARNING", logger="http")
+
+    manager._sleep_with_backoff(0)
+
+    assert slept == [60.0, 60.0, 15.0]
+    assert [record.getMessage() for record in caplog.records] == [
+        "cookie refresh backoff; 135s remaining",
+        "cookie refresh backoff; 75s remaining",
+        "cookie refresh backoff; 15s remaining",
+    ]
+
+
 def test_challenge_after_fresh_browser_session_is_rejected_stops_without_relaunch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = SessionManager(cookies=cookies())
     manager.session.get = Mock(return_value=CHALLENGE_RESPONSE)
     refresh = Mock(return_value=cookies(cf="fresh-v1"))
+    reject = Mock()
     monkeypatch.setattr("partsouq_catalog.http_client.force_refresh_session", refresh)
+    monkeypatch.setattr("partsouq_catalog.http_client.reject_session", reject)
     monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
 
     with pytest.raises(ChallengeError, match="fresh browser session still challenged"):
@@ -143,6 +165,7 @@ def test_challenge_after_fresh_browser_session_is_rejected_stops_without_relaunc
 
     assert manager.session.get.call_count == 2
     refresh.assert_called_once()
+    reject.assert_called_once_with("fresh-v1")
 
 
 def test_404_raises_not_found_error() -> None:

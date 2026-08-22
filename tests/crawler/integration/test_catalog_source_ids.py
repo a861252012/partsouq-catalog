@@ -31,9 +31,11 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
         for table in (
             "admin_vehicle_mappings",
             "bounded_parts",
+            "published_parts_previous",
             "published_parts",
             "crawl_state",
             "crawl_runs",
+            "scheduled_job_runs",
             "brands",
         ):
             database._execute(f"DELETE FROM {table}")
@@ -47,9 +49,17 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
         brands = BrandRepository(database)
         vehicles = VehicleRepository(database)
         parts = PartRepository(database)
+        scheduled_job_run_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
         crawl = CrawlRepository(database, "source-id-fixture")
 
-        run_id = crawl.start_run("source-id-fixture", fresh=True)
+        run_id = crawl.start_run(
+            "source-id-fixture",
+            fresh=True,
+            scheduled_job_run_id=scheduled_job_run_id,
+        )
         brand_id = brands.upsert_brand("TOYOTA", None)
         model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-SSD", None)
         vehicle_id = vehicles.upsert_vehicle(
@@ -97,6 +107,12 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
         assert source_part is not None
         part_id = source_part["id"]
         assert crawl.publish_success_parts(run_id) == 1
+        crawl.finish_run(run_id, "success", {"parts": 1})
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'completed', exit_code = 0, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (scheduled_job_run_id,),
+        )
 
         artifact_cursor = database._execute(
             "INSERT INTO nhtsa_source_artifacts ("
@@ -204,6 +220,7 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
             "published_parts",
             "crawl_state",
             "crawl_runs",
+            "scheduled_job_runs",
             "brands",
         ):
             database._execute(f"DELETE FROM {table}")

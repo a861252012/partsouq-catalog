@@ -9,10 +9,14 @@ import fcntl
 import json
 import os
 import shlex
+import subprocess
 import sys
 import threading
 import time
 import types
+from contextlib import contextmanager
+from io import StringIO
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -32,6 +36,9 @@ NEW_COOKIES = [
 
 @pytest.fixture(autouse=True)
 def _reset_session_state(monkeypatch, tmp_path):
+    # 本檔所有 launch 測試都以 FakeProc/FakeBrowser 驗證，先移除真實
+    # Codex marker；專門的 preflight regression 會自行設回。
+    monkeypatch.delenv("CODEX_SANDBOX", raising=False)
     cloak._session_state.update(
         {
             "cookies": None,
@@ -44,7 +51,14 @@ def _reset_session_state(monkeypatch, tmp_path):
     )
     cloak._rejected_versions.clear()
     monkeypatch.setitem(cloak.CLOAK, "lock_file", tmp_path / "cloak.lock")
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", tmp_path / "cookies.json")
+    monkeypatch.setitem(cloak.CLOAK, "cookie_export_file", tmp_path / ".cloak-export.json")
+    monkeypatch.setitem(cloak.CLOAK, "error_log_file", tmp_path / "cloak-launch.err.log")
     yield
+    if cloak._browser_err_log is not None:
+        cloak._browser_err_log.close()
+    cloak._browser_err_log = None
+    cloak._browser_proc = None
     cloak._rejected_versions.clear()
     cloak._session_state.update(
         {
@@ -81,6 +95,26 @@ def test_refresh_stale_ttl_triggers_refresh_and_updates_state(monkeypatch) -> No
     assert cloak._session_state["cookies"] == NEW_COOKIES
     assert cloak._session_state["version"] == "v2"
     assert cloak._session_state["failures"] == 0
+
+
+def test_refresh_reloads_cookie_published_while_waiting_for_process_lock(
+    monkeypatch, tmp_path
+) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+
+    @contextmanager
+    def publish_before_lock_is_acquired():
+        cookie_file.write_text(json.dumps(NEW_COOKIES))
+        os.utime(cookie_file, (time.time() - 1, time.time() - 1))
+        yield True
+
+    impl = mock.Mock()
+    monkeypatch.setattr(cloak, "_process_refresh_lock", publish_before_lock_is_acquired)
+    monkeypatch.setattr(cloak, "_refresh_impl", impl)
+
+    assert cloak.refresh_session() == NEW_COOKIES
+    impl.assert_not_called()
 
 
 def test_singleflight_concurrent_calls_refresh_once(monkeypatch) -> None:
@@ -165,6 +199,29 @@ def test_force_refresh_with_same_version_clears_and_refreshes(monkeypatch) -> No
     assert cloak._session_state["version"] == "v2"
 
 
+def test_reject_session_deletes_only_matching_persisted_cookie(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES))
+    monkeypatch.setitem(cloak.CLOAK, "cookie_file", cookie_file)
+    cloak._session_state.update({"cookies": COOKIES, "ok_ts": 10.0, "version": "v1"})
+
+    cloak.reject_session("v1")
+
+    assert cloak._session_state["cookies"] is None
+    assert cloak._session_state["version"] is None
+    assert "v1" in cloak._rejected_versions
+    assert not cookie_file.exists()
+
+    cookie_file.write_text(json.dumps(NEW_COOKIES))
+    cloak._session_state.update({"cookies": NEW_COOKIES, "ok_ts": 20.0, "version": "v2"})
+
+    cloak.reject_session("v1")
+
+    assert cloak._session_state["cookies"] == NEW_COOKIES
+    assert cloak._session_state["version"] == "v2"
+    assert json.loads(cookie_file.read_text()) == NEW_COOKIES
+
+
 def test_force_refresh_failure_keeps_backoff_counters(monkeypatch) -> None:
     now_box = {"t": 1000.0}
     monkeypatch.setattr(cloak.time, "monotonic", lambda: now_box["t"])
@@ -194,11 +251,13 @@ def test_refresh_impl_restricts_and_unlinks_export_file(monkeypatch, tmp_path) -
         return True
 
     monkeypatch.setattr(cloak, "_launch_cloak", fake_launch)
-    monkeypatch.setattr(cloak, "_stop_owned_browser", lambda: None)
+    stop_owned_browser = mock.Mock()
+    monkeypatch.setattr(cloak, "_stop_owned_browser", stop_owned_browser)
 
     assert cloak.refresh_session() == COOKIES
     assert saved == [COOKIES]
     assert not export.exists()
+    assert stop_owned_browser.call_args_list == [mock.call(), mock.call(graceful=True)]
 
 
 def test_refresh_impl_stops_when_browser_exits_without_verified_export(
@@ -208,6 +267,7 @@ def test_refresh_impl_stops_when_browser_exits_without_verified_export(
     monkeypatch.setitem(cloak.CLOAK, "cookie_export_file", export)
 
     class FinishedProc:
+        pid = 99999
         returncode = 1
 
         def poll(self) -> int:
@@ -220,6 +280,7 @@ def test_refresh_impl_stops_when_browser_exits_without_verified_export(
     sleep = mock.Mock()
     monkeypatch.setattr(cloak, "_launch_cloak", fake_launch)
     monkeypatch.setattr(cloak.time, "sleep", sleep)
+    monkeypatch.setattr(cloak.os, "killpg", mock.Mock(side_effect=ProcessLookupError))
 
     assert cloak._refresh_impl() is None
     assert cloak._session_state["failures"] == 1
@@ -396,6 +457,7 @@ def test_force_refresh_rejected_version_is_not_reseeded_from_disk(monkeypatch, t
 
     assert cloak.force_refresh_session("v1") is None
     assert cloak._session_state["cookies"] is None
+    assert not cookie_file.exists()
 
     # 退避期結束後：同一份被拒的 v1 不得再從磁碟 seed 回來，
     # 必須真的走一次瀏覽器刷新。
@@ -423,11 +485,206 @@ def test_rejected_versions_are_forgotten_after_successful_refresh(monkeypatch) -
     assert cloak._rejected_versions == set()
 
 
+def test_cookie_export_timeout_covers_all_child_deadlines() -> None:
+    child_deadline = (
+        cloak.PAGE_LOAD_TIMEOUT_SECONDS
+        + cloak.CATALOG_VERIFY_TIMEOUT_SECONDS
+        + cloak.COOKIE_SETTLE_SECONDS
+    )
+
+    assert child_deadline < cloak.COOKIE_EXPORT_TIMEOUT
+
+
+def test_launch_cloak_refuses_macos_codex_sandbox_before_popen(monkeypatch) -> None:
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.sys, "platform", "darwin")
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
+
+
+def test_default_cloak_files_share_project_private_state_directory(tmp_path) -> None:
+    project_root = tmp_path / "checkout"
+    environment = os.environ.copy()
+    environment["PARTSOUQ_HOME"] = str(project_root)
+    for name in (
+        "PSQ_CLOAK_STATE_DIR",
+        "PSQ_COOKIE_EXPORT_FILE",
+        "PSQ_CLOAK_ERROR_LOG_FILE",
+    ):
+        environment.pop(name, None)
+    script = (
+        "import json\n"
+        "from partsouq_catalog.config import CLOAK\n"
+        "print(json.dumps({key: str(CLOAK[key]) for key in "
+        "('state_dir', 'cookie_file', 'cookie_export_file', 'lock_file', "
+        "'error_log_file')}))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    paths = {key: Path(value) for key, value in json.loads(result.stdout).items()}
+
+    assert paths["state_dir"] == project_root / "data"
+    assert all(
+        path.parent == paths["state_dir"] for key, path in paths.items() if key != "state_dir"
+    )
+    assert paths["cookie_export_file"] != Path("/tmp/psq_cloak_cookies.json")
+    assert paths["error_log_file"] != Path("/tmp/cloak_launch_err.log")
+
+
+def test_state_directory_setup_never_chmods_existing_override_parent(tmp_path) -> None:
+    shared_parent = tmp_path / "shared"
+    shared_parent.mkdir(mode=0o755)
+    shared_parent.chmod(0o755)
+
+    cloak._ensure_state_directory(shared_parent)
+
+    assert shared_parent.stat().st_mode & 0o777 == 0o755
+
+
+def test_stop_owned_browser_signals_group_even_after_wrapper_exits(monkeypatch) -> None:
+    class ExitedWrapper:
+        pid = 43210
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    killpg = mock.Mock(side_effect=(None, ProcessLookupError))
+    err_log = StringIO()
+    cloak._browser_proc = ExitedWrapper()
+    cloak._browser_err_log = err_log
+    monkeypatch.setattr(cloak.os, "killpg", killpg)
+
+    cloak._stop_owned_browser()
+
+    assert killpg.call_args_list == [
+        mock.call(43210, cloak.signal.SIGTERM),
+        mock.call(43210, 0),
+    ]
+    assert err_log.closed
+
+
+def test_stop_owned_browser_escalates_when_exited_wrapper_group_survives(monkeypatch) -> None:
+    class ExitedWrapper:
+        pid = 43211
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    signals: list[int] = []
+
+    def killpg(_pid: int, child_signal: int) -> None:
+        signals.append(child_signal)
+
+    cloak._browser_proc = ExitedWrapper()
+    monkeypatch.setattr(cloak, "BROWSER_STOP_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(cloak.os, "killpg", killpg)
+
+    cloak._stop_owned_browser()
+
+    assert signals == [cloak.signal.SIGTERM, cloak.signal.SIGKILL]
+
+
+def test_stop_owned_browser_allows_successful_process_group_to_exit_naturally(
+    monkeypatch,
+) -> None:
+    class GracefulProc:
+        pid = 43212
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            self.returncode = 0
+            return self.returncode
+
+    proc = GracefulProc()
+    signals: list[int] = []
+
+    def killpg(_pid: int, child_signal: int) -> None:
+        signals.append(child_signal)
+        if child_signal == 0 and proc.returncode is not None:
+            raise ProcessLookupError
+
+    err_log = StringIO()
+    cloak._browser_proc = proc
+    cloak._browser_err_log = err_log
+    monkeypatch.setattr(cloak.os, "killpg", killpg)
+
+    cloak._stop_owned_browser(graceful=True)
+
+    assert signals == [0]
+    assert err_log.closed
+
+
+def test_stop_owned_browser_forces_shutdown_after_graceful_timeout(monkeypatch) -> None:
+    class StuckProc:
+        pid = 43213
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float) -> int:
+            events.append(("wait", timeout))
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("cloakbrowser", timeout)
+            return self.returncode
+
+    proc = StuckProc()
+    now = {"value": 0.0}
+    events: list[tuple[str, float | int]] = []
+
+    def killpg(_pid: int, child_signal: int) -> None:
+        events.append(("signal", child_signal))
+        if child_signal == cloak.signal.SIGKILL:
+            proc.returncode = -cloak.signal.SIGKILL
+
+    def sleep(seconds: float) -> None:
+        events.append(("sleep", seconds))
+        now["value"] += seconds
+
+    cloak._browser_proc = proc
+    monkeypatch.setattr(cloak, "BROWSER_STOP_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(cloak.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(cloak.time, "sleep", sleep)
+    monkeypatch.setattr(cloak.os, "killpg", killpg)
+
+    cloak._stop_owned_browser(graceful=True)
+
+    terminating_signals = [
+        value
+        for event, value in events
+        if event == "signal" and value in {cloak.signal.SIGTERM, cloak.signal.SIGKILL}
+    ]
+    first_term = events.index(("signal", cloak.signal.SIGTERM))
+    assert any(event == "wait" for event, _value in events[:first_term])
+    assert ("signal", 0) in events[:first_term]
+    assert terminating_signals == [cloak.signal.SIGTERM, cloak.signal.SIGKILL]
+
+
 def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch, tmp_path) -> None:
     """P0 review: xvfb-run 的 --server-args 含空白時必須保持為單一 argv
     元素，否則 shlex 會把 `0` 拆成 xvfb-run 要執行的 command，CloakBrowser
     根本不會啟動。直接驗證最終 Popen argv。"""
     captured: list[str] = []
+    popen_options: dict[str, object] = {}
     export = tmp_path / "cookies.json"
     ready_file = export.with_name(f"{export.name}.ready")
 
@@ -447,9 +704,14 @@ def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch, tmp_path) ->
 
     def fake_popen(argv, **_kwargs):
         captured.extend(argv)
+        popen_options.update(_kwargs)
         ready_file.write_text("ready")
         return FakeProc()
 
+    monkeypatch.setenv("PARTSOUQ_DB_PASSWORD", "must-not-reach-browser")
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "must-not-reach-browser")
+    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(tmp_path / "cloak-cache"))
+    monkeypatch.setenv("CLOAKBROWSER_TOKEN", "must-not-reach-browser")
     monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(cloak, "_stop_owned_browser", lambda: None)
 
@@ -465,6 +727,13 @@ def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch, tmp_path) ->
         assert "cloakbrowser.launch_async" in captured[6]
         assert "stealth_args=False" not in captured[6]
         assert "--remote-debugging-port" not in captured[6]
+        child_environment = popen_options["env"]
+        assert isinstance(child_environment, dict)
+        assert "PARTSOUQ_DB_PASSWORD" not in child_environment
+        assert "PARTSOUQ_ADMIN_TOKEN" not in child_environment
+        assert child_environment["CLOAKBROWSER_CACHE_DIR"] == str(tmp_path / "cloak-cache")
+        assert "CLOAKBROWSER_TOKEN" not in child_environment
+        assert child_environment["CLOAKBROWSER_AUTO_UPDATE"] == "false"
     finally:
         cloak._browser_proc = None
 
@@ -535,9 +804,15 @@ def test_launch_cloak_only_exports_verified_catalog_page(monkeypatch, tmp_path) 
     try:
         assert cloak._launch_cloak() is True
         script = captured[-1]
+        assert f"timeout={int(cloak.PAGE_LOAD_TIMEOUT_SECONDS * 1000)}" in script
+        assert f"deadline = time.monotonic() + {cloak.CATALOG_VERIFY_TIMEOUT_SECONDS!r}" in script
+        assert f"await asyncio.sleep({cloak.COOKIE_SETTLE_SECONDS!r})" in script
+        assert script.index("await b.close()") < script.index("os.replace(tmp, OUT)")
         expired_script = script.replace(
-            "deadline = time.time() + 150", "deadline = time.time() - 1"
+            f"deadline = time.monotonic() + {cloak.CATALOG_VERIFY_TIMEOUT_SECONDS!r}",
+            "deadline = time.monotonic() - 1",
         )
+        assert expired_script != script
         with pytest.raises(RuntimeError, match="verified catalog page"):
             exec(compile(expired_script, "<cloak-test>", "exec"), {})
         assert not export.exists()
@@ -551,6 +826,61 @@ def test_launch_cloak_only_exports_verified_catalog_page(monkeypatch, tmp_path) 
         assert launch_options["headless"] is False
         assert "stealth_args" not in launch_options
         assert "args" not in launch_options
+    finally:
+        cloak._browser_proc = None
+
+
+def test_launch_cloak_closes_browser_when_navigation_raises(monkeypatch, tmp_path) -> None:
+    captured: list[str] = []
+    export = tmp_path / "cookies.json"
+
+    class FakeProc:
+        pid = 99999
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    class FakePage:
+        async def goto(self, *_args, **_kwargs) -> None:
+            raise RuntimeError("navigation failed")
+
+    class FakeContext:
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakeBrowser:
+        closed = False
+
+        async def new_context(self, **_kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    browser = FakeBrowser()
+
+    async def launch_async(**_kwargs) -> FakeBrowser:
+        return browser
+
+    def fake_popen(argv, **_kwargs):
+        captured.extend(argv)
+        export.with_name(f"{export.name}.ready").write_text("ready")
+        return FakeProc()
+
+    monkeypatch.setitem(cloak.CLOAK, "cookie_export_file", export)
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cloak, "_stop_owned_browser", lambda: None)
+    monkeypatch.setitem(
+        sys.modules, "cloakbrowser", types.SimpleNamespace(launch_async=launch_async)
+    )
+
+    try:
+        assert cloak._launch_cloak() is True
+        with pytest.raises(RuntimeError, match="navigation failed"):
+            exec(compile(captured[-1], "<cloak-test>", "exec"), {})
+        assert browser.closed is True
     finally:
         cloak._browser_proc = None
 
@@ -571,6 +901,7 @@ def test_launch_cloak_rejects_stale_ready_marker(monkeypatch, tmp_path) -> None:
     monkeypatch.setitem(cloak.CLOAK, "cookie_export_file", export)
     monkeypatch.setitem(cloak.CLOAK, "launcher", [])
     monkeypatch.setattr(cloak.subprocess, "Popen", lambda *_args, **_kwargs: FinishedProc())
+    monkeypatch.setattr(cloak.os, "killpg", mock.Mock(side_effect=ProcessLookupError))
 
     assert cloak._launch_cloak() is False
     assert not ready_file.exists()

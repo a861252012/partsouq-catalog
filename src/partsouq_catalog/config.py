@@ -25,10 +25,12 @@ class SiteConfig(TypedDict):
 
 
 class CloakConfig(TypedDict):
+    state_dir: Path
     venv_python: str
     cookie_export_file: Path
     cookie_file: Path
     lock_file: Path
+    error_log_file: Path
     launcher: list[str]
     user_agent: str
 
@@ -54,6 +56,9 @@ class CrawlConfig(TypedDict):
     bounded_parts: int
     bounded_run_key: str
     scheduled_job_run_id: int
+    evidence_max_body_bytes: int
+    evidence_max_run_bytes: int
+    evidence_max_artifacts: int
     row_count_shrink_ratio: float
     block_breather: int
 
@@ -64,21 +69,20 @@ BASE_DIR = (
     .expanduser()
     .resolve()
 )
-# Cookie 的持久化檔案與 CloakBrowser 設定檔目錄
-COOKIE_FILE = BASE_DIR / "data" / "cookies.json"
+# host runner 會把不同 checkout 指向同一個使用者私有 state dir，確保
+# cookie 與 refresh lock 跨 worktree 協調；未設定時維持專案內隔離。
+CLOAK_STATE_DIR = (
+    Path(os.environ.get("PSQ_CLOAK_STATE_DIR", BASE_DIR / "data")).expanduser().resolve()
+)
+COOKIE_FILE = CLOAK_STATE_DIR / "cookies.json"
 
-# MySQL 連線設定。PartSouq 型錄、NHTSA 與後台使用同一組 PARTSOUQ_DB_*。
-# PSQ_DB_* 僅保留為舊部署的相容 fallback。
+# MySQL 連線設定。PartSouq 型錄、NHTSA 與後台只使用同一組 PARTSOUQ_DB_*。
 DB_CONFIG = {
-    "host": os.environ.get("PARTSOUQ_DB_HOST", os.environ.get("PSQ_DB_HOST", "127.0.0.1")),
-    "port": int(os.environ.get("PARTSOUQ_DB_PORT", os.environ.get("PSQ_DB_PORT", "3308"))),
-    "user": os.environ.get("PARTSOUQ_DB_USER", os.environ.get("PSQ_DB_USER", "partsouq")),
-    "password": os.environ.get(
-        "PARTSOUQ_DB_PASSWORD", os.environ.get("PSQ_DB_PASS", "partsouq-local")
-    ),
-    "database": os.environ.get(
-        "PARTSOUQ_DB_NAME", os.environ.get("PSQ_DB_NAME", "partsouq_catalog")
-    ),
+    "host": os.environ.get("PARTSOUQ_DB_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("PARTSOUQ_DB_PORT", "3308")),
+    "user": os.environ.get("PARTSOUQ_DB_USER", "partsouq"),
+    "password": os.environ.get("PARTSOUQ_DB_PASSWORD", "partsouq-local"),
+    "database": os.environ.get("PARTSOUQ_DB_NAME", "partsouq_catalog"),
 }
 
 # PartSouq 的各層頁面網址模板
@@ -93,15 +97,22 @@ SITE: SiteConfig = {
 
 # CloakBrowser（隱匿瀏覽器）的整合設定
 CLOAK: CloakConfig = {
+    "state_dir": CLOAK_STATE_DIR,
     "venv_python": os.environ.get(
         "PSQ_CLOAK_PYTHON",
         str(Path(os.environ.get("CLOAK_VENV", "~/.venvs/partsouq-cloak/bin/python")).expanduser()),
     ),
     "cookie_export_file": Path(
-        os.environ.get("PSQ_COOKIE_EXPORT_FILE", "/tmp/psq_cloak_cookies.json")
-    ),
+        os.environ.get("PSQ_COOKIE_EXPORT_FILE", CLOAK_STATE_DIR / ".cloak-export.json")
+    ).expanduser(),
     "cookie_file": COOKIE_FILE,  # 持久化 session cookie（程序啟動時沿用，見 cloak.get_session）
     "lock_file": COOKIE_FILE.parent / ".cloak-refresh.lock",
+    "error_log_file": Path(
+        os.environ.get(
+            "PSQ_CLOAK_ERROR_LOG_FILE",
+            CLOAK_STATE_DIR / "cloak-launch.err.log",
+        )
+    ).expanduser(),
     # 啟動瀏覽器子程序時附加的前綴命令。headless=False 在無顯示環境
     # （如 Compose 的 Linux container）需要虛擬顯示，容器內設
     # PSQ_CLOAK_LAUNCHER="xvfb-run -a"；macOS host 留空即可。
@@ -162,6 +173,16 @@ CRAWL: CrawlConfig = {
     # 由 partsouq-scheduler 建立子程式時注入。直接 CLI 執行為 0，
     # 不得通過正式 bounded 發布 gate。
     "scheduled_job_run_id": int(os.environ.get("SCHEDULED_JOB_RUN_ID", "0")),
+    # Formal evidence stores only compressed, secret-sanitized parser input.
+    # These are hard fail-closed budgets, not targets; operators may lower them
+    # after the first verified 10k run establishes an observed distribution.
+    "evidence_max_body_bytes": int(
+        os.environ.get("PSQ_EVIDENCE_MAX_BODY_BYTES", str(8 * 1024 * 1024))
+    ),
+    "evidence_max_run_bytes": int(
+        os.environ.get("PSQ_EVIDENCE_MAX_RUN_BYTES", str(1024 * 1024 * 1024))
+    ),
+    "evidence_max_artifacts": int(os.environ.get("PSQ_EVIDENCE_MAX_ARTIFACTS", "50000")),
     # 零件數縮水門檻（SOL review P1）：本次解析到的零件數 < 前次
     # receipt 的 row_count × 此比例時視為「格式完整但內容縮水」
     # （反爬變體/版型異常），拒絕寫 terminal receipt。前次 < 3 筆的
@@ -215,7 +236,7 @@ def load_cookies(path: Path = COOKIE_FILE) -> Cookies | None:
 
 def save_cookies(cookies: Cookies) -> None:
     """以 owner-only 暫存檔原子更新 cookie，避免半份 JSON 或權限窗口。"""
-    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    COOKIE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(

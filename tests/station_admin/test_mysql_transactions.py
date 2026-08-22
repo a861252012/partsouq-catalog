@@ -12,7 +12,12 @@ from pymysql.cursors import DictCursor
 from partsouq_catalog.config import DB_CONFIG
 from partsouq_station_admin.db import AdminDatabase
 from partsouq_station_admin.query_trace import QueryTrace
-from partsouq_station_admin.repository import ENTITY_SPECS, AdminRepository
+from partsouq_station_admin.repository import (
+    ENTITY_SPECS,
+    AdminReadinessError,
+    AdminRepository,
+    RevisionConflictError,
+)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("UNIFIED_TEST_MYSQL") != "1",
@@ -34,6 +39,21 @@ def _connect() -> Connection[DictCursor]:
         autocommit=False,
         cursorclass=DictCursor,
     )
+
+
+def test_readiness_accepts_real_migration_019_contract() -> None:
+    connection = _connect()
+    trace = QueryTrace()
+    try:
+        AdminRepository(AdminDatabase(connection, trace)).check_readiness()
+        assert trace.tags[-2:] == (
+            "health.backoffice-schema",
+            "health.published-provenance",
+        )
+    except AdminReadinessError:
+        pytest.fail("test database does not satisfy migration 019 readiness contract")
+    finally:
+        connection.close()
 
 
 def test_legacy_json_null_part_overrides_fall_back_to_source_values() -> None:
@@ -109,16 +129,33 @@ def _seed_lock_fixture(
         )
         part_id = int(cursor.lastrowid)
         cursor.execute(
+            "INSERT INTO scheduled_job_runs("
+            "job_name, trigger_mode, status, started_at, finished_at, exit_code"
+            ") VALUES ('catalog', 'daemon', 'completed', UTC_TIMESTAMP(6), "
+            "UTC_TIMESTAMP(6), 0)"
+        )
+        scheduled_job_run_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO crawl_runs("
+            "run_key, started_at, finished_at, status, dataset_kind, target_parts, "
+            "scheduled_job_run_id, parts_ok, error_msg"
+            ") VALUES (%s, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 'success', 'full', NULL, "
+            "%s, 1, NULL)",
+            (f"lock-full-{suffix}", scheduled_job_run_id),
+        )
+        crawl_run_id = int(cursor.lastrowid)
+        cursor.execute(
             "INSERT INTO published_parts("
-            "part_id, vehicle_id, model_id, brand, model, vehicle_name, vehicle_code, "
+            "part_id, crawl_run_id, vehicle_id, model_id, brand, model, vehicle_name, vehicle_code, "
             "prod_period, production_from, production_to, engine, trim_name, part_name, "
             "part_number, part_number_normalized, category_main, group_id, "
             "group_code, part_range, snapshot_at"
-            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '2020-01', '2025-12', %s, %s, "
+            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '2020-01', '2025-12', %s, %s, "
             "%s, %s, %s, %s, %s, %s, '', "
             "UTC_TIMESTAMP())",
             (
                 part_id,
+                crawl_run_id,
                 vehicle_id,
                 model_id,
                 f"LOCK-{suffix}",
@@ -205,6 +242,8 @@ def _seed_lock_fixture(
             "mapping_id": mapping_id,
             "reconciliation_id": reconciliation_id,
             "taxonomy_group_id": group_id * 2 + 1,
+            "crawl_run_id": crawl_run_id,
+            "scheduled_job_run_id": scheduled_job_run_id,
         },
     )
 
@@ -225,6 +264,11 @@ def _cleanup_lock_fixture(connection: Connection[DictCursor], fixture: dict[str,
             "DELETE FROM admin_part_translations WHERE id = %s", (fixture["translation_id"],)
         )
         cursor.execute("DELETE FROM published_parts WHERE part_id = %s", (fixture["part_id"],))
+        cursor.execute("DELETE FROM crawl_runs WHERE id = %s", (fixture["crawl_run_id"],))
+        cursor.execute(
+            "DELETE FROM scheduled_job_runs WHERE id = %s",
+            (fixture["scheduled_job_run_id"],),
+        )
         cursor.execute("DELETE FROM brands WHERE id = %s", (fixture["brand_id"],))
     connection.commit()
 
@@ -264,3 +308,65 @@ def test_each_entity_locks_real_source_rows_and_blocks_crawler_update() -> None:
         else:
             locker.rollback()
         locker.close()
+
+
+def test_quarantine_resolve_uses_occurrence_key_and_is_single_use() -> None:
+    connection = _connect()
+    fixture: dict[str, object] = {}
+    quarantine_id = 0
+    try:
+        _, fixture = _seed_lock_fixture(connection)
+        group_id = (int(fixture["taxonomy_group_id"]) - 1) // 2
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO part_quarantine("
+                "group_id, part_number, range_str, reason, run_key"
+                ") VALUES (%s, %s, '', 'nameless', 'bounded-current')",
+                (group_id, f"Q-{uuid.uuid4().hex[:12]}"),
+            )
+            quarantine_id = int(cursor.lastrowid)
+        connection.commit()
+        repository = AdminRepository(AdminDatabase(connection, QueryTrace()))
+
+        with pytest.raises(RevisionConflictError, match="已更新"):
+            repository.resolve_quarantine(
+                quarantine_id,
+                "stale",
+                expected_run_key="bounded-old",
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT resolved_at, resolution FROM part_quarantine WHERE id = %s",
+                (quarantine_id,),
+            )
+            assert cursor.fetchone() == {"resolved_at": None, "resolution": None}
+
+        repository.resolve_quarantine(
+            quarantine_id,
+            "verified",
+            expected_run_key="bounded-current",
+        )
+        with pytest.raises(RevisionConflictError, match="已更新"):
+            repository.resolve_quarantine(
+                quarantine_id,
+                "duplicate",
+                expected_run_key="bounded-current",
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT resolved_at, resolution FROM part_quarantine WHERE id = %s",
+                (quarantine_id,),
+            )
+            resolved = cursor.fetchone()
+            assert resolved is not None
+            assert resolved["resolved_at"] is not None
+            assert resolved["resolution"] == "verified"
+    finally:
+        connection.rollback()
+        if quarantine_id:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM part_quarantine WHERE id = %s", (quarantine_id,))
+            connection.commit()
+        if fixture:
+            _cleanup_lock_fixture(connection, fixture)
+        connection.close()

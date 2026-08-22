@@ -158,12 +158,12 @@ CREATE TABLE IF NOT EXISTS part_quarantine (
     REFERENCES groups_t(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 最近一次完整 success 的不可變、反正規化 current snapshot。
--- normalized tables 可讓 failed/partial attempt 繼續 upsert；v_parts 只讀
--- 本表，因此不會在未完成 attempt 中途改變。成功收尾時以同一交易
--- upsert 本次列並刪除過期列；失敗 rollback 後仍保留上一版。
+-- 最新 full candidate 的反正規化 snapshot。父 scheduler 尚未記錄
+-- completed/exit 0 時，正式 view 會繼續讀 published_parts_previous；
+-- candidate 通過後才成為 authoritative current。
 CREATE TABLE IF NOT EXISTS published_parts (
   part_id        INT NOT NULL PRIMARY KEY,
+  crawl_run_id   INT NULL, -- migration 016：legacy snapshot 可為 NULL；新發布必須寫入
   vehicle_id     INT NOT NULL,
   model_id       INT NULL,
   vehicle_vid    VARCHAR(32) NULL,
@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS published_parts (
   quantity       VARCHAR(16) NULL,
   code           VARCHAR(64) NULL,
   snapshot_at    DATETIME NOT NULL,
+  KEY idx_published_crawl_run (crawl_run_id),
   KEY idx_published_part_number (part_number),
   KEY idx_published_part_number_normalized (part_number_normalized),
   KEY idx_published_brand_model (brand, model),
@@ -233,6 +234,11 @@ CREATE TABLE IF NOT EXISTS published_parts (
     part_from IS NULL OR part_to IS NULL OR part_from <= part_to
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 新 full run 會在 parent scheduler 記錄 completed/exit 0 前先 commit。
+-- 發布下一版前，把最後一份已確認成功的 full snapshot 保存於本表；
+-- scheduler 中斷或失敗時，正式 view 仍可讀上一版。
+CREATE TABLE IF NOT EXISTS published_parts_previous LIKE published_parts;
 
 -- 正式、有界、current-only 的 PartSouq dataset。它明確不代表全站；
 -- 只有 exact target 且通過來源/關聯品質關卡的 bounded run 會在
@@ -327,6 +333,21 @@ CREATE TABLE IF NOT EXISTS crawl_state (
   KEY idx_state_run (run_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Scheduler provenance 是 catalog run 與 HTTP evidence 的直接父層。
+-- admin.sql 也會以同一契約 CREATE IF NOT EXISTS；新 volume 先跑
+-- catalog.sql 時必須已有此表，才能立即建立不可偽造的 direct FK。
+CREATE TABLE IF NOT EXISTS scheduled_job_runs (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  job_name VARCHAR(32) NOT NULL,
+  trigger_mode VARCHAR(16) NOT NULL DEFAULT 'manual',
+  status VARCHAR(32) NOT NULL,
+  started_at DATETIME NOT NULL,
+  finished_at DATETIME NULL,
+  exit_code INT NULL,
+  output_text MEDIUMTEXT NULL,
+  KEY idx_scheduled_job_runs_name_started (job_name, started_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 爬蟲運行記錄
 CREATE TABLE IF NOT EXISTS crawl_runs (
   id           INT AUTO_INCREMENT PRIMARY KEY,
@@ -344,12 +365,189 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
   parts_ok     INT DEFAULT 0,
   parts_new    INT DEFAULT 0,
   error_msg    TEXT NULL,
+  evidence_status VARCHAR(16) NOT NULL DEFAULT 'missing',
+  evidence_manifest_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  evidence_dataset_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  evidence_artifact_count INT UNSIGNED NOT NULL DEFAULT 0,
+  evidence_record_count INT UNSIGNED NOT NULL DEFAULT 0,
+  evidence_original_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  evidence_stored_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  evidence_verified_at DATETIME(6) NULL,
   UNIQUE KEY uq_run_key (run_key),
   KEY idx_crawl_run_schedule (scheduled_job_run_id),
-  CONSTRAINT chk_crawl_run_target CHECK (target_parts IS NULL OR target_parts > 0)
+  KEY idx_crawl_run_evidence (evidence_status, id),
+  CONSTRAINT fk_crawl_run_schedule FOREIGN KEY (scheduled_job_run_id)
+    REFERENCES scheduled_job_runs(id),
+  CONSTRAINT chk_crawl_run_target CHECK (target_parts IS NULL OR target_parts > 0),
+  CONSTRAINT chk_crawl_run_evidence_status CHECK (
+    evidence_status IN ('missing', 'collecting', 'verified', 'rejected')
+  ),
+  CONSTRAINT chk_crawl_run_verified_evidence CHECK (
+    evidence_status <> 'verified' OR (
+      evidence_manifest_sha256 REGEXP '^[0-9a-f]{64}$'
+      AND evidence_dataset_sha256 REGEXP '^[0-9a-f]{64}$'
+      AND evidence_artifact_count > 0
+      AND evidence_record_count > 0
+      AND evidence_original_bytes > 0
+      AND evidence_stored_bytes > 0
+      AND evidence_verified_at IS NOT NULL
+    )
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 「現存」語意：只讀最近一次完整 success 交易建立的 snapshot。
+-- Content-addressed, zlib-compressed parser replay body.  Only the deterministic
+-- secret-sanitized HTML is stored; raw HTTP bytes, cookies and headers are never
+-- persisted.  Identical bodies across retries/runs share one CAS row.
+CREATE TABLE IF NOT EXISTS partsouq_response_bodies (
+  body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  compression VARCHAR(16) NOT NULL DEFAULT 'zlib',
+  body_blob LONGBLOB NOT NULL,
+  original_bytes BIGINT UNSIGNED NOT NULL,
+  stored_bytes BIGINT UNSIGNED NOT NULL,
+  sanitizer_version VARCHAR(64) NOT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (body_sha256),
+  CONSTRAINT chk_partsouq_body_sha256 CHECK (body_sha256 REGEXP '^[0-9a-f]{64}$'),
+  CONSTRAINT chk_partsouq_body_compression CHECK (compression = 'zlib'),
+  CONSTRAINT chk_partsouq_body_sizes CHECK (
+    original_bytes > 0 AND stored_bytes > 0
+    AND stored_bytes = OCTET_LENGTH(body_blob)
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- One live/fixture HTTP response and parser result.  public_source_url is the
+-- allowlisted URL with ssd/unknown query parameters removed.  raw_body_sha256
+-- proves which transient response was parsed without retaining its secrets.
+CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  crawl_run_id INT NOT NULL,
+  scheduled_job_run_id BIGINT UNSIGNED NOT NULL,
+  capture_kind VARCHAR(16) NOT NULL,
+  page_type VARCHAR(32) NOT NULL,
+  public_source_url VARCHAR(1024) NOT NULL,
+  source_url_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  raw_body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  http_status SMALLINT UNSIGNED NOT NULL,
+  content_type VARCHAR(128) NOT NULL,
+  challenge_detected TINYINT(1) NOT NULL DEFAULT 0,
+  fetched_at DATETIME(6) NOT NULL,
+  elapsed_ms INT UNSIGNED NOT NULL,
+  attempt SMALLINT UNSIGNED NOT NULL,
+  parser_name VARCHAR(128) NOT NULL,
+  parser_version VARCHAR(64) NOT NULL,
+  parser_context_json JSON NOT NULL,
+  parser_context_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  malformed_row_count INT UNSIGNED NOT NULL DEFAULT 0,
+  skipped_record_count INT UNSIGNED NOT NULL DEFAULT 0,
+  parsed_record_count INT UNSIGNED NOT NULL,
+  parsed_records_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  accepted_record_count INT UNSIGNED NOT NULL,
+  accepted_records_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  verification_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+  verified_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_partsouq_artifact_identity (
+    crawl_run_id, scheduled_job_run_id, source_url_sha256, raw_body_sha256, body_sha256,
+    parser_name, parser_version, parser_context_sha256
+  ),
+  UNIQUE KEY uq_partsouq_artifact_run (id, crawl_run_id),
+  KEY idx_partsouq_artifact_run_status (
+    crawl_run_id, verification_status, capture_kind
+  ),
+  KEY idx_partsouq_artifact_schedule (scheduled_job_run_id),
+  KEY idx_partsouq_artifact_body (body_sha256),
+  CONSTRAINT fk_partsouq_artifact_run FOREIGN KEY (crawl_run_id)
+    REFERENCES crawl_runs(id),
+  CONSTRAINT fk_partsouq_artifact_schedule FOREIGN KEY (scheduled_job_run_id)
+    REFERENCES scheduled_job_runs(id),
+  CONSTRAINT fk_partsouq_artifact_body FOREIGN KEY (body_sha256)
+    REFERENCES partsouq_response_bodies(body_sha256),
+  CONSTRAINT chk_partsouq_artifact_capture CHECK (
+    capture_kind IN ('live_http', 'fixture')
+  ),
+  CONSTRAINT chk_partsouq_artifact_page_type CHECK (
+    page_type IN ('genuine', 'locate', 'pick', 'vehicle', 'category', 'unit')
+  ),
+  CONSTRAINT chk_partsouq_artifact_public_url CHECK (
+    (
+      public_source_url = 'https://partsouq.com/en/catalog/genuine'
+      OR public_source_url LIKE 'https://partsouq.com/en/catalog/genuine/%'
+    )
+    AND LOWER(public_source_url) NOT REGEXP '(^|[?&])ssd='
+    AND public_source_url NOT LIKE '%#%'
+  ),
+  CONSTRAINT chk_partsouq_artifact_hashes CHECK (
+    source_url_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND raw_body_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND body_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND parser_context_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND parsed_records_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND accepted_records_sha256 REGEXP '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT chk_partsouq_artifact_context CHECK (
+    JSON_VALID(parser_context_json)
+    AND LOWER(CAST(parser_context_json AS CHAR)) NOT REGEXP
+      '("ssd"[[:space:]]*:|ssd=|cf_clearance|phpsessid|authorization|set-cookie)'
+  ),
+  CONSTRAINT chk_partsouq_artifact_http CHECK (
+    content_type <> '' AND elapsed_ms >= 0 AND attempt > 0
+  ),
+  CONSTRAINT chk_partsouq_artifact_counts CHECK (
+    parsed_record_count > 0
+    AND accepted_record_count <= parsed_record_count
+  ),
+  CONSTRAINT chk_partsouq_artifact_status CHECK (
+    verification_status IN ('pending', 'verified', 'superseded', 'rejected')
+    AND (verification_status <> 'verified' OR verified_at IS NOT NULL)
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Every parsed row is retained as a content hash.  Rows accepted into the
+-- bounded quota additionally point to the exact normalized part.  The final
+-- quota-truncated page therefore retains both the complete parser result and
+-- the accepted subset, without fabricating records that were not published.
+CREATE TABLE IF NOT EXISTS partsouq_artifact_records (
+  artifact_id BIGINT UNSIGNED NOT NULL,
+  crawl_run_id INT NOT NULL,
+  record_type VARCHAR(32) NOT NULL,
+  natural_key_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  parent_natural_key_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  record_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  accepted TINYINT(1) NOT NULL DEFAULT 0,
+  part_id INT NULL,
+  PRIMARY KEY (artifact_id, record_type, natural_key_sha256),
+  KEY idx_partsouq_record_run_accepted (crawl_run_id, accepted, part_id),
+  KEY idx_partsouq_record_part (part_id),
+  CONSTRAINT fk_partsouq_record_artifact FOREIGN KEY (artifact_id, crawl_run_id)
+    REFERENCES partsouq_http_artifacts(id, crawl_run_id) ON DELETE CASCADE,
+  CONSTRAINT fk_partsouq_record_part FOREIGN KEY (part_id) REFERENCES parts(id),
+  CONSTRAINT chk_partsouq_record_hashes CHECK (
+    natural_key_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND (
+      parent_natural_key_sha256 IS NULL
+      OR parent_natural_key_sha256 REGEXP '^[0-9a-f]{64}$'
+    )
+    AND record_sha256 REGEXP '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT chk_partsouq_record_chain CHECK (
+    record_type IN (
+      'brand', 'model', 'vehicle', 'category', 'group', 'part', 'quarantine_part'
+    )
+    AND (
+      (record_type = 'brand' AND parent_natural_key_sha256 IS NULL)
+      OR (record_type <> 'brand' AND parent_natural_key_sha256 IS NOT NULL)
+    )
+  ),
+  CONSTRAINT chk_partsouq_record_acceptance CHECK (
+    (accepted = 1 AND record_type = 'part' AND part_id IS NOT NULL)
+    OR (accepted = 0 AND part_id IS NULL)
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Catalog-only compatibility view。整合 admin schema 後會被重建為
+-- v_current_catalog_parts 的欄位投影，並套用 scheduler provenance gate。
 CREATE OR REPLACE VIEW v_parts AS
 SELECT
   part_id, vehicle_id, model_id, vehicle_vid,

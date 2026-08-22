@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import io
+import os
 import plistlib
+import shutil
+import stat
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -28,8 +32,12 @@ def test_compose_requires_explicit_scheduler_profile_and_checks_admin_health() -
     assert 'profiles: ["scheduler"]' in scheduler_anchor
     assert compose.count("<<: *scheduler-base") == 3
     assert "http://127.0.0.1:8000/api/health" in compose
+    assert "PARTSOUQ_ADMIN_BIND_HOST: 0.0.0.0" in compose
     assert "http://127.0.0.1:8086/health" in compose
     assert "json.load(response).get('status') == 'ok'" in compose
+    station_admin = compose.split("  station-admin:", 1)[1].split("\n  scheduler:", 1)[0]
+    assert 'PARTSOUQ_STATION_ADMIN_REQUIRE_AUTH: "1"' in station_admin
+    assert '"0.0.0.0:8086"' in station_admin
 
 
 def test_macos_catalog_scheduler_uses_host_browser_and_formal_bounded_mode() -> None:
@@ -39,7 +47,22 @@ def test_macos_catalog_scheduler_uses_host_browser_and_formal_bounded_mode() -> 
     assert launcher_path.stat().st_mode & 0o111
     assert 'export PSQ_CLOAK_LAUNCHER=""' in launcher
     assert "export PSQ_LIMIT_PARTS=0" in launcher
-    assert 'export PSQ_BOUNDED_PARTS="${PSQ_BOUNDED_PARTS:-10000}"' in launcher
+    assert "export PSQ_BOUNDED_PARTS=10000" in launcher
+    assert "PSQ_BOUNDED_PARTS:-" not in launcher
+    assert 'export PSQ_CLOAK_STATE_DIR="$HOST_STATE_DIR/cloak"' in launcher
+    assert 'export PSQ_SCHEDULER_STATE_DIR="$HOST_STATE_DIR/scheduler"' in launcher
+    assert '[[ "${PARTSOUQ_DB_NAME:-}" != "partsouq_catalog" ]]' in launcher
+    assert launcher.count('/usr/bin/env -i "${RUNTIME_ENV[@]}"') == 2
+    runtime_environment = launcher.split("RUNTIME_ENV=(", 1)[1].split("\n)", 1)[0]
+    for secret_name in (
+        "PARTSOUQ_MYSQL_ROOT_PASSWORD",
+        "PARTSOUQ_ADMIN_TOKEN",
+        "PARTSOUQ_STATION_ADMIN_SECRET_KEY",
+        "PARTSOUQ_STATION_ADMIN_USERNAME",
+        "PARTSOUQ_STATION_ADMIN_PASSWORD",
+    ):
+        assert secret_name not in runtime_environment
+    assert '"$PROJECT_ROOT/.venv/bin/partsouq-catalog-migrate" check' in launcher
     assert "--job catalog" in launcher
     assert "--daemon" in launcher
 
@@ -52,6 +75,209 @@ def test_macos_catalog_scheduler_uses_host_browser_and_formal_bounded_mode() -> 
     assert config["RunAtLoad"] is True
     assert config["KeepAlive"] is True
     assert config["ProgramArguments"] == [str(launcher_path)]
+    assert config["EnvironmentVariables"]["PARTSOUQ_LAUNCHD_JOB"] == "1"
+    assert config["EnvironmentVariables"]["LAUNCHD_JOB"] == "1"
+
+
+def test_macos_catalog_scheduler_rejects_non_production_database(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    shutil.copytree(PROJECT_ROOT / "deploy", project / "deploy")
+    (project / ".env").write_text(
+        "PARTSOUQ_DB_NAME=partsouq_catalog_test\n",
+        encoding="utf-8",
+    )
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "PATH": os.environ["PATH"],
+        "PARTSOUQ_LAUNCHD_JOB": "1",
+        "LAUNCHD_JOB": "1",
+    }
+
+    result = subprocess.run(
+        [project / "deploy/run-macos-catalog-scheduler.zsh"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "requires PARTSOUQ_DB_NAME=partsouq_catalog" in result.stderr
+
+
+def test_macos_catalog_scheduler_passes_only_crawler_runtime_environment(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    shutil.copytree(PROJECT_ROOT / "deploy", project / "deploy")
+    (project / ".venv/bin").mkdir(parents=True)
+    environment_log = tmp_path / "runtime-environment.log"
+    cloak_python = tmp_path / "cloak-python"
+    cloak_python.write_text(
+        "#!/bin/zsh\n"
+        "set -eu\n"
+        '[[ -z "${PARTSOUQ_DB_PASSWORD:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_MYSQL_ROOT_PASSWORD:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_ADMIN_TOKEN:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_STATION_ADMIN_SECRET_KEY:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_STATION_ADMIN_USERNAME:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_STATION_ADMIN_PASSWORD:-}" ]]\n'
+        f'print -r -- "cloak-clean" >> {str(environment_log)!r}\n',
+        encoding="utf-8",
+    )
+    cloak_python.chmod(0o700)
+    child_script = (
+        "#!/bin/zsh\n"
+        "set -eu\n"
+        '[[ "$PARTSOUQ_DB_PASSWORD" = "db-secret" ]]\n'
+        '[[ "$PARTSOUQ_DB_NAME" = "partsouq_catalog" ]]\n'
+        '[[ "$PSQ_BOUNDED_PARTS" = "10000" ]]\n'
+        '[[ "$PSQ_LIMIT_PARTS" = "0" ]]\n'
+        '[[ -z "${PARTSOUQ_MYSQL_ROOT_PASSWORD:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_ADMIN_TOKEN:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_STATION_ADMIN_SECRET_KEY:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_STATION_ADMIN_USERNAME:-}" ]]\n'
+        '[[ -z "${PARTSOUQ_STATION_ADMIN_PASSWORD:-}" ]]\n'
+        f'print -r -- "clean" >> {str(environment_log)!r}\n'
+    )
+    for name in ("partsouq-catalog-migrate", "partsouq-scheduler"):
+        executable = project / ".venv/bin" / name
+        executable.write_text(child_script, encoding="utf-8")
+        executable.chmod(0o700)
+    (project / ".env").write_text(
+        "PARTSOUQ_DB_HOST=127.0.0.1\n"
+        "PARTSOUQ_DB_PORT=3308\n"
+        "PARTSOUQ_DB_NAME=partsouq_catalog\n"
+        "PARTSOUQ_DB_USER=partsouq\n"
+        "export PARTSOUQ_DB_PASSWORD=db-secret\n"
+        "export PARTSOUQ_MYSQL_ROOT_PASSWORD=root-secret\n"
+        "export PARTSOUQ_ADMIN_TOKEN=admin-secret\n"
+        "export PARTSOUQ_STATION_ADMIN_SECRET_KEY=station-secret\n"
+        "export PARTSOUQ_STATION_ADMIN_USERNAME=station-user\n"
+        "export PARTSOUQ_STATION_ADMIN_PASSWORD=station-password\n"
+        f"PSQ_CLOAK_PYTHON={cloak_python}\n",
+        encoding="utf-8",
+    )
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "PATH": os.environ["PATH"],
+        "PARTSOUQ_LAUNCHD_JOB": "1",
+        "LAUNCHD_JOB": "1",
+    }
+
+    result = subprocess.run(
+        [project / "deploy/run-macos-catalog-scheduler.zsh"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert environment_log.read_text(encoding="utf-8").splitlines() == [
+        "cloak-clean",
+        "clean",
+        "clean",
+    ]
+
+
+def test_macos_catalog_launch_agent_install_disable_is_repeatable_and_preserves_state(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project & scheduler"
+    shutil.copytree(PROJECT_ROOT / "deploy", project / "deploy")
+    fake_launchctl = tmp_path / "launchctl"
+    launchctl_log = tmp_path / "launchctl.log"
+    launchctl_state = tmp_path / "launchctl.loaded"
+    fake_launchctl.write_text(
+        "#!/bin/zsh\n"
+        "set -eu\n"
+        'print -r -- "$*" >> "$PARTSOUQ_TEST_LAUNCHCTL_LOG"\n'
+        'case "$1" in\n'
+        '  print) [[ -f "$PARTSOUQ_TEST_LAUNCHCTL_STATE" ]] ;;\n'
+        '  bootstrap) : > "$PARTSOUQ_TEST_LAUNCHCTL_STATE" ;;\n'
+        '  bootout) /bin/rm -f "$PARTSOUQ_TEST_LAUNCHCTL_STATE" ;;\n'
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_launchctl.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "PARTSOUQ_LAUNCHCTL_BIN": str(fake_launchctl),
+            "PARTSOUQ_TEST_LAUNCHCTL_LOG": str(launchctl_log),
+            "PARTSOUQ_TEST_LAUNCHCTL_STATE": str(launchctl_state),
+        }
+    )
+    installer = project / "deploy/install-macos-catalog-scheduler.zsh"
+    disable = project / "deploy/disable-macos-catalog-scheduler.zsh"
+
+    subprocess.run(
+        [installer, "--no-start"],
+        cwd=project,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not launchctl_log.exists()
+
+    agent = home / "Library/LaunchAgents/com.partsouq.catalog-scheduler.plist"
+    first_render = agent.read_bytes()
+    assert b"__PROJECT_ROOT__" not in first_render
+    assert b"__STDOUT_PATH__" not in first_render
+    assert b"__STDERR_PATH__" not in first_render
+    config = plistlib.loads(first_render)
+    host_state = home / "Library/Application Support/partsouq-catalog"
+    log_dir = host_state / "logs"
+    reload_marker = host_state / "launch-agent-needs-reload"
+    assert reload_marker.exists()
+    assert config["ProgramArguments"] == [str(project / "deploy/run-macos-catalog-scheduler.zsh")]
+    assert config["WorkingDirectory"] == str(project)
+    assert config["StandardOutPath"] == str(log_dir / "catalog-scheduler.stdout.log")
+    assert config["StandardErrorPath"] == str(log_dir / "catalog-scheduler.stderr.log")
+    assert stat.S_IMODE(agent.stat().st_mode) == 0o600
+    for private_dir in (host_state, host_state / "cloak", host_state / "scheduler", log_dir):
+        assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+
+    for _ in range(2):
+        subprocess.run(
+            [installer],
+            cwd=project,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    assert agent.read_bytes() == first_render
+    launchctl_calls = launchctl_log.read_text(encoding="utf-8").splitlines()
+    assert sum(call.startswith("bootstrap ") for call in launchctl_calls) == 1
+    assert not any(call.startswith("bootout ") for call in launchctl_calls)
+    assert not reload_marker.exists()
+
+    cookie = host_state / "cloak/cookies.json"
+    scheduler_log = log_dir / "catalog-scheduler.stdout.log"
+    cookie.write_text("retained-cookie", encoding="utf-8")
+    scheduler_log.write_text("retained-log", encoding="utf-8")
+    subprocess.run(
+        [disable],
+        cwd=project,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert agent.exists()
+    assert cookie.read_text(encoding="utf-8") == "retained-cookie"
+    assert scheduler_log.read_text(encoding="utf-8") == "retained-log"
+    assert not launchctl_state.exists()
+    assert launchctl_log.read_text(encoding="utf-8").splitlines()[-1].startswith("bootout ")
 
 
 def test_catalog_challenge_stops_without_cookie_refresh() -> None:
@@ -90,6 +316,44 @@ def test_nhtsa_uses_shared_database_environment(monkeypatch: pytest.MonkeyPatch)
 
     assert config.mysql_database == "unified_database"
     assert config.mysql_user == "unified_user"
+
+
+def test_catalog_ignores_legacy_database_environment() -> None:
+    environment = os.environ.copy()
+    for name in (
+        "PARTSOUQ_DB_HOST",
+        "PARTSOUQ_DB_PORT",
+        "PARTSOUQ_DB_USER",
+        "PARTSOUQ_DB_PASSWORD",
+        "PARTSOUQ_DB_NAME",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "PSQ_DB_HOST": "legacy-host",
+            "PSQ_DB_PORT": "9999",
+            "PSQ_DB_USER": "legacy-user",
+            "PSQ_DB_PASS": "legacy-password",
+            "PSQ_DB_NAME": "legacy-database",
+        }
+    )
+    command = (
+        "from partsouq_catalog.config import DB_CONFIG; "
+        "assert DB_CONFIG == {'host': '127.0.0.1', 'port': 3308, "
+        "'user': 'partsouq', 'password': 'partsouq-local', "
+        "'database': 'partsouq_catalog'}"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_vin_mapping_rejects_full_vin() -> None:
@@ -239,15 +503,16 @@ def test_scheduler_redacts_vin_from_persisted_output(
         "_record_finish",
         lambda _run_id, _return_code, output, *_success: saved.append(output),
     )
-    process = Mock(returncode=0, stdout=io.StringIO('{"vin":"ZZZTEST00X0000001"}'))
-    process.wait.return_value = 0
-    process.poll.return_value = 0
-    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *_args, **_kwargs: process)
-
     assert (
         scheduler._run(
             "nhtsa-vin",
-            ["python", "-m", "partsouq_crawler", "nhtsa-decode-vin", " zzztest00x0000001 "],
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('{\"vin\":\"' + sys.argv[2].strip() + '\"}', end='')",
+                "nhtsa-decode-vin",
+                " zzztest00x0000001 ",
+            ],
         )
         == 0
     )

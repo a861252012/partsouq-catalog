@@ -39,6 +39,7 @@ def _parts_html(rows: list[tuple[str, str, str]]) -> str:
 @pytest.fixture
 def sample_crawler(monkeypatch):
     monkeypatch.setitem(CRAWL, "limit_parts", 1000)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=4)
     instance.run_id = 17
     instance.vehicles = mock.MagicMock()
@@ -163,6 +164,7 @@ def test_truncated_group_still_quarantines_nameless_rows(monkeypatch) -> None:
     頁面上的無名稱列仍要列進 quarantine —— 否則 bounded/sample run
     可以在無名稱料號被靜默丟棄之下照常發布 bounded_success。"""
     monkeypatch.setitem(CRAWL, "limit_parts", 1)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
     instance.run_id = 17
     instance.vehicles = mock.MagicMock()

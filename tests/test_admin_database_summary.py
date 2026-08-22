@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -7,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from partsouq_admin import app as admin_app
+from partsouq_admin.app import VinVehicleMappingUpdateInput
 
 
 def test_database_reads_redact_sensitive_source_url_query_values(
@@ -199,6 +201,153 @@ def test_part_pagination_validates_page_size_and_calculates_total_pages(
         assert client.get("/api/sample-parts?page=1&pageSize=15").status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("path", "expected_count_marker", "expected_order_marker"),
+    (
+        ("/api/parts", "v_current_catalog_parts", "current_part.snapshot_at DESC"),
+        ("/api/sample-parts", "status = 'sample'", "p.id ASC"),
+        ("/api/bounded-parts", "bounded_parts", "bp.part_id ASC"),
+    ),
+)
+def test_part_page_endpoints_clamp_out_of_range_page(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    expected_count_marker: str,
+    expected_order_marker: str,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict[str, object]:
+        assert expected_count_marker in sql
+        return {"total": 21}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict[str, object]]:
+        calls.append((sql, params))
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+
+    with TestClient(admin_app.app) as client:
+        response = client.get(path, params={"page": 99, "pageSize": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["page"] == 3
+    assert payload["totalPages"] == 3
+    assert expected_order_marker in calls[0][0]
+    assert calls[0][1][-2:] == (10, 20)
+
+
+@pytest.mark.parametrize("path", ("/api/parts", "/api/sample-parts", "/api/bounded-parts"))
+def test_empty_part_page_endpoints_use_page_one_and_zero_total_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: {"total": 0})
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
+
+    with TestClient(admin_app.app) as client:
+        response = client.get(path, params={"page": 99, "pageSize": 10})
+
+    assert response.status_code == 200
+    assert response.json()["page"] == 1
+    assert response.json()["totalPages"] == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    (
+        (
+            "/api/vehicle-mappings",
+            {"vin_prefix": 123, "make_name": "A", "model_name": "B"},
+        ),
+        (
+            "/api/vin-vehicle-mappings",
+            {"vin": 123, "partsouq_vehicle_id": 1},
+        ),
+        (
+            "/api/part-fitments",
+            {
+                "part_number": "P1",
+                "vin_prefix": 123,
+                "make_name": "A",
+                "model_name": "B",
+            },
+        ),
+    ),
+)
+def test_malformed_admin_json_types_return_422_without_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+    connect = MagicMock(side_effect=AssertionError("validation must happen before DB access"))
+    monkeypatch.setattr(admin_app, "_connect", connect)
+
+    with TestClient(admin_app.app) as client:
+        response = client.post(path, json=payload, headers={"X-Admin-Token": "test-token"})
+
+    assert response.status_code == 422
+    connect.assert_not_called()
+
+
+def test_invalid_json_syntax_returns_422() -> None:
+    with TestClient(admin_app.app) as client:
+        response = client.post(
+            "/api/vehicle-mappings",
+            content="{",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 422
+
+
+def test_data_admin_rejects_untrusted_host_before_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetch = MagicMock(side_effect=AssertionError("untrusted host must not reach DB"))
+    monkeypatch.setattr(admin_app, "_fetch_one", fetch)
+
+    with TestClient(admin_app.app) as client:
+        response = client.get("/api/health", headers={"Host": "evil.example"})
+
+    assert response.status_code == 400
+    fetch.assert_not_called()
+
+
+def test_data_admin_cli_binds_loopback_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = MagicMock()
+    monkeypatch.delenv("PARTSOUQ_ADMIN_BIND_HOST", raising=False)
+    monkeypatch.setattr(admin_app.uvicorn, "run", run)
+
+    admin_app.main()
+
+    run.assert_called_once_with(
+        "partsouq_admin.app:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=False,
+    )
+
+
+@pytest.mark.parametrize("configured_host", ("", "   "))
+def test_data_admin_cli_empty_bind_host_still_binds_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_host: str,
+) -> None:
+    run = MagicMock()
+    monkeypatch.setenv("PARTSOUQ_ADMIN_BIND_HOST", configured_host)
+    monkeypatch.setattr(admin_app.uvicorn, "run", run)
+
+    admin_app.main()
+
+    assert run.call_args.kwargs["host"] == "127.0.0.1"
+
+
 def test_categories_mark_small_category_source_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -237,6 +386,7 @@ def test_data_quality_queries_require_partsouq_part_code(
     assert "TRIM(pp.code)" in published_quality_sql
     assert "TRIM(p.code)" in sample_quality_sql
     assert "TRIM(bp.vehicle_code)" in queries[0]
+    assert "DATABASE() <> 'partsouq_catalog'" in queries[0]
     assert "bp.part_number_normalized <>" in queries[0]
     assert "v_current_catalog_parts AS current_year" in mapping_status_sql
     assert "current_year.production_from IS NOT NULL" in mapping_status_sql
@@ -259,6 +409,129 @@ def test_mapping_list_requires_current_catalog_vehicle_year_range(
     assert "current_year.production_from IS NOT NULL" in queries[0]
     assert "current_year.production_to IS NOT NULL" in queries[0]
     assert "d.model_year >=" in queries[0]
+
+
+def test_vin_mapping_update_requires_matching_updated_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.rowcount = 1
+    current = {
+        "id": 7,
+        "vin": "1HGCM82633A004352",
+        "updated_at": datetime(2026, 8, 22, 12, 0, 0),
+    }
+    monkeypatch.setattr(admin_app, "_row_or_404", lambda *_args: current)
+    monkeypatch.setattr(admin_app, "_validated_vin_vehicle_mapping", lambda *_args: (1,) * 10)
+    monkeypatch.setattr(admin_app, "_connect", lambda: connection)
+    expected_updated_at = datetime(2026, 8, 22, 12, 0, 0)
+
+    result = admin_app.update_vin_vehicle_mapping(
+        7,
+        VinVehicleMappingUpdateInput(
+            vin="1HGCM82633A004352",
+            partsouq_vehicle_id=1,
+            expected_updated_at=expected_updated_at,
+        ),
+    )
+
+    assert result == current
+    sql, params = cursor.execute.call_args.args
+    assert "WHERE id=%s AND updated_at=%s" in sql
+    assert "updated_at + INTERVAL 1 SECOND" in sql
+    assert params[-2:] == (7, expected_updated_at)
+    connection.commit.assert_called_once_with()
+    connection.rollback.assert_not_called()
+
+
+def test_get_vin_mapping_reads_exact_mapping_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queries: list[tuple[str, tuple[object, ...]]] = []
+
+    def fetch_one(sql: str, params: tuple[object, ...] = ()) -> dict[str, object]:
+        queries.append((sql, params))
+        return {"id": 101, "vin": "1HGCM82633A004352", "updated_at": "2026-08-22 12:00:00"}
+
+    monkeypatch.setattr(admin_app, "_fetch_one", fetch_one)
+
+    row = admin_app.get_vin_vehicle_mapping(101)
+
+    assert row["id"] == 101
+    assert "id = %s AND vin IS NOT NULL" in queries[0][0]
+    assert queries[0][1] == (101,)
+
+
+def test_vin_mapping_update_rejects_stale_updated_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.rowcount = 0
+    monkeypatch.setattr(
+        admin_app,
+        "_row_or_404",
+        lambda *_args: {"id": 7, "vin": "1HGCM82633A004352"},
+    )
+    monkeypatch.setattr(admin_app, "_validated_vin_vehicle_mapping", lambda *_args: (1,) * 10)
+    monkeypatch.setattr(admin_app, "_connect", lambda: connection)
+
+    with pytest.raises(HTTPException) as exc_info:
+        admin_app.update_vin_vehicle_mapping(
+            7,
+            VinVehicleMappingUpdateInput(
+                vin="1HGCM82633A004352",
+                partsouq_vehicle_id=1,
+                expected_updated_at=datetime(2026, 8, 22, 11, 0, 0),
+            ),
+        )
+
+    assert exc_info.value.status_code == 409
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
+
+
+def test_vin_mapping_update_http_requires_expected_updated_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+    connect = MagicMock(side_effect=AssertionError("validation must happen before DB access"))
+    monkeypatch.setattr(admin_app, "_connect", connect)
+
+    with TestClient(admin_app.app) as client:
+        response = client.put(
+            "/api/vin-vehicle-mappings/7",
+            json={"vin": "1HGCM82633A004352", "partsouq_vehicle_id": 1},
+            headers={"X-Admin-Token": "test-token"},
+        )
+
+    assert response.status_code == 422
+    connect.assert_not_called()
+
+
+def test_vin_mapping_update_rejects_timezone_version_before_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+    connect = MagicMock(side_effect=AssertionError("validation must happen before DB access"))
+    monkeypatch.setattr(admin_app, "_connect", connect)
+
+    with TestClient(admin_app.app) as client:
+        response = client.put(
+            "/api/vin-vehicle-mappings/7",
+            json={
+                "vin": "1HGCM82633A004352",
+                "partsouq_vehicle_id": 1,
+                "expected_updated_at": "2026-08-22T04:00:00Z",
+            },
+            headers={"X-Admin-Token": "test-token"},
+        )
+
+    assert response.status_code == 422
+    connect.assert_not_called()
 
 
 def test_sample_part_range_is_informational_when_vehicle_years_are_complete(
@@ -397,6 +670,18 @@ def _bounded_summary(
         "bounded_unique_part_numbers": 9234,
         "bounded_unique_vehicles": 318,
         "bounded_official_source_url_rows": 10000,
+        "bounded_evidence_status": "verified",
+        "bounded_evidence_manifest_sha256": "a" * 64,
+        "bounded_evidence_dataset_sha256": "b" * 64,
+        "bounded_evidence_artifact_count": 250,
+        "bounded_active_artifact_count": 250,
+        "bounded_live_artifact_count": 250,
+        "bounded_evidence_page_type_count": 6,
+        "bounded_evidence_record_count": 10000,
+        "bounded_accepted_evidence_records": 10000,
+        "bounded_evidence_original_bytes": 1000000,
+        "bounded_evidence_stored_bytes": 250000,
+        "bounded_evidence_verified_at": datetime(2026, 8, 22, 12, 0, 0),
         "bounded_part_range_missing_rows": 10000,
         "current_catalog_scope": "bounded",
         "current_catalog_crawl_run_id": 42,
@@ -444,9 +729,16 @@ def test_bounded_summary_requires_exact_scheduled_10000_rows(
     assert summary["bounded"]["source_provenance"] == {
         "official_source_url_rows": 10000,
         "invalid_source_url_rows": 0,
-        "evidence_level": "linked_scheduler_run_and_source_url",
-        "raw_http_artifact_status": "not_persisted_by_catalog_crawler",
-        "live_http_evidence": False,
+        "evidence_level": "verified_live_http_replay_mapping_chain",
+        "raw_http_artifact_status": "raw_hash_and_sanitized_parser_body_persisted",
+        "live_http_evidence": True,
+        "evidence_status": "verified",
+        "manifest_sha256": "a" * 64,
+        "dataset_sha256": "b" * 64,
+        "artifact_count": 250,
+        "record_count": 10000,
+        "required_page_types": ["genuine", "locate", "pick", "vehicle", "category", "unit"],
+        "verified_page_type_count": 6,
         "non_live_data_marker": False,
     }
     assert summary["bounded"]["part_range_source"] == {
@@ -473,6 +765,33 @@ def test_bounded_summary_requires_exact_scheduled_10000_rows(
     assert summary["production_ready"] is False
     assert "full_catalog_not_published" in summary["production_pending_reasons"]
     assert "partsouq_english_name_language_not_verified" in summary["production_pending_reasons"]
+    assert (
+        "partsouq_live_mapping_evidence_not_verified" not in summary["production_pending_reasons"]
+    )
+
+
+def test_bounded_summary_does_not_claim_source_evidence_for_zero_source_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _bounded_summary(
+        monkeypatch,
+        bounded_fitment_rows=0,
+        bounded_official_source_url_rows=0,
+    )
+
+    assert summary["bounded"]["source_provenance"]["evidence_level"] == "not_verified"
+
+
+def test_bounded_summary_requires_source_evidence_for_every_bounded_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _bounded_summary(
+        monkeypatch,
+        bounded_fitment_rows=10_000,
+        bounded_official_source_url_rows=9_999,
+    )
+
+    assert summary["bounded"]["source_provenance"]["evidence_level"] == "not_verified"
 
 
 @pytest.mark.parametrize(
@@ -497,6 +816,26 @@ def test_bounded_summary_requires_exact_scheduled_10000_rows(
         ({"bounded_invalid_source_url_rows": 1}, "bounded_source_url_invalid"),
         ({"bounded_active_override_rows": 1}, "bounded_active_overrides_present"),
         ({"bounded_non_live_data_marker": 1}, "bounded_non_live_data_marker"),
+        (
+            {"bounded_evidence_status": "missing"},
+            "bounded_live_mapping_evidence_not_verified",
+        ),
+        (
+            {"bounded_evidence_page_type_count": 5},
+            "bounded_live_mapping_evidence_not_verified",
+        ),
+        (
+            {"bounded_live_artifact_count": 249},
+            "bounded_live_mapping_evidence_not_verified",
+        ),
+        (
+            {"bounded_evidence_record_count": 9999},
+            "bounded_live_mapping_evidence_not_verified",
+        ),
+        (
+            {"bounded_evidence_manifest_sha256": None},
+            "bounded_live_mapping_evidence_not_verified",
+        ),
     ),
 )
 def test_bounded_summary_fails_closed(
@@ -531,6 +870,11 @@ def test_admin_page_loads_summary_published_and_sample_parts() -> None:
         assert f">{label}</button>" in html
     assert 'id="parts-page-number"' in html
     assert "event.key === 'Enter'" in html
+    assert "const current = await call(`/api/vin-vehicle-mappings/${mappingId}`)" in html
+    assert "if (!body.expected_updated_at)" in html
+    assert "vinMappingId.addEventListener('input', () => { vinMappingVersion.value = ''; })" in html
+    assert "const current = await call(`${endpoint}/${body.mapping_id}`)" not in html
+    assert "method === 'PUT' ? '已更新資料。' : '已建立資料。'" in html
     assert 'id="parts-range-label"' in html
     assert "共用 DB 資料總覽" in html
     assert "NHTSA 基礎資料" in html

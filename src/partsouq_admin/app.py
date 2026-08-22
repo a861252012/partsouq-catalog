@@ -4,8 +4,9 @@ import hmac
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import pymysql
 import uvicorn
@@ -13,7 +14,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pymysql.connections import Connection
 from pymysql.cursors import DictCursor
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from partsouq_catalog.config import DB_CONFIG
 from partsouq_crawler.nhtsa.api import normalize_vin
@@ -24,8 +27,24 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 VIN_PREFIX_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{3,11}$")
 ALLOWED_PAGE_SIZES = {10, 25, 30, 50, 100, 200}
 BOUNDED_ACCEPTANCE_TARGET = 10_000
+DEFAULT_TRUSTED_HOSTS = ("127.0.0.1", "localhost", "testserver", "partsouq.localhost")
+TRUSTED_HOSTS = tuple(
+    dict.fromkeys(
+        (
+            *DEFAULT_TRUSTED_HOSTS,
+            *(
+                host.strip()
+                for host in os.getenv("PARTSOUQ_ADMIN_TRUSTED_HOSTS", "").split(",")
+                if host.strip()
+            ),
+        )
+    )
+)
+
+type Row = dict[str, Any]
 
 app = FastAPI(title="PartSouq Catalog Backoffice", version="0.1.0")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(TRUSTED_HOSTS))
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -45,7 +64,9 @@ class VehicleMappingInput(InputModel):
 
     @field_validator("vin_prefix", mode="before")
     @classmethod
-    def validate_vin_prefix(cls, value: str) -> str:
+    def validate_vin_prefix(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("VIN 前綴必須是字串")
         value = value.upper()
         if not VIN_PREFIX_RE.fullmatch(value):
             raise ValueError("VIN 僅接受 3 至 11 碼 WMI/VDS 前綴，不接受完整 17 碼 VIN")
@@ -57,7 +78,9 @@ class VinInput(InputModel):
 
     @field_validator("vin", mode="before")
     @classmethod
-    def validate_vin(cls, value: str) -> str:
+    def validate_vin(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("VIN 必須是字串")
         return normalize_vin(value)
 
 
@@ -74,6 +97,17 @@ class VinVehicleMappingInput(VinInput):
         if self.source_name == "manual-name-override" and not self.allow_name_override:
             raise ValueError("人工 override 來源名稱只允許由人工確認流程設定")
         return self
+
+
+class VinVehicleMappingUpdateInput(VinVehicleMappingInput):
+    expected_updated_at: datetime
+
+    @field_validator("expected_updated_at")
+    @classmethod
+    def validate_naive_updated_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise ValueError("mapping 版本時間不得包含時區")
+        return value
 
 
 class PartTranslationInput(InputModel):
@@ -106,9 +140,11 @@ class PartFitmentInput(InputModel):
 
     @field_validator("vin_prefix", mode="before")
     @classmethod
-    def validate_optional_vin_prefix(cls, value: str | None) -> str | None:
+    def validate_optional_vin_prefix(cls, value: object) -> str | None:
         if value is None:
             return None
+        if not isinstance(value, str):
+            raise ValueError("VIN 前綴必須是字串")
         value = value.upper()
         if not VIN_PREFIX_RE.fullmatch(value):
             raise ValueError("VIN 僅接受 3 至 11 碼 WMI/VDS 前綴，不接受完整 17 碼 VIN")
@@ -137,8 +173,8 @@ class CategoryLabelInput(InputModel):
 class ReconciliationInput(InputModel):
     channel: Literal["part", "vehicle", "category", "translation"]
     subject_key: str = Field(min_length=1, max_length=512)
-    left_value: dict | list | str | int | float | bool | None = None
-    right_value: dict | list | str | int | float | bool | None = None
+    left_value: Row | list[object] | str | int | float | bool | None = None
+    right_value: Row | list[object] | str | int | float | bool | None = None
     resolution_note: str | None = None
 
 
@@ -153,29 +189,40 @@ class CrawlRequestInput(InputModel):
 
 
 class QuarantineResolveInput(InputModel):
+    expected_run_key: str = Field(min_length=1, max_length=128)
     resolution: str = Field(default="", max_length=255)
 
 
-def _connect() -> pymysql.connections.Connection:
-    return pymysql.connect(**DB_CONFIG, cursorclass=DictCursor, autocommit=True)
+def _connect() -> Connection[DictCursor]:
+    return pymysql.connect(
+        host=str(DB_CONFIG["host"]),
+        port=int(str(DB_CONFIG["port"])),
+        user=str(DB_CONFIG["user"]),
+        password=str(DB_CONFIG["password"]),
+        database=str(DB_CONFIG["database"]),
+        cursorclass=DictCursor,
+        autocommit=True,
+    )
 
 
-def _fetch_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+def _fetch_all(sql: str, params: tuple[object, ...] = ()) -> list[Row]:
     connection = _connect()
     try:
         with connection.cursor() as cursor:
             cursor.execute(sql, params)
-            rows = list(cursor.fetchall())
-            for row in rows:
+            rows: list[Row] = []
+            for fetched in cursor.fetchall():
+                row = dict(fetched)
                 source_url = row.get("source_url")
                 if isinstance(source_url, str):
                     row["source_url"] = redact_sensitive_url(source_url)
+                rows.append(row)
             return rows
     finally:
         connection.close()
 
 
-def _fetch_one(sql: str, params: tuple[object, ...] = ()) -> dict | None:
+def _fetch_one(sql: str, params: tuple[object, ...] = ()) -> Row | None:
     rows = _fetch_all(sql, params)
     return rows[0] if rows else None
 
@@ -201,7 +248,7 @@ def require_admin_token(x_admin_token: Annotated[str | None, Header()] = None) -
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="後台 token 無效")
 
 
-def _row_or_404(table: str, row_id: int) -> dict:
+def _row_or_404(table: str, row_id: int) -> Row:
     row = _fetch_one(f"SELECT * FROM {table} WHERE id = %s", (row_id,))
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到資料")
@@ -228,6 +275,12 @@ def _validate_page_size(page_size: int) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="pageSize 僅允許 " + "、".join(str(size) for size in sorted(ALLOWED_PAGE_SIZES)),
         )
+
+
+def _pagination(total: int, page: int, page_size: int) -> tuple[int, int, int]:
+    total_pages = (total + page_size - 1) // page_size
+    current_page = min(page, total_pages) if total_pages else 1
+    return current_page, total_pages, (current_page - 1) * page_size
 
 
 @app.get("/", include_in_schema=False)
@@ -264,8 +317,10 @@ def health() -> dict[str, str]:
             "models",
             "vehicles",
             "categories",
+            "groups_t",
             "parts",
             "published_parts",
+            "published_parts_previous",
             "bounded_parts",
             "crawl_runs",
             "nhtsa_sync_runs",
@@ -279,6 +334,7 @@ def health() -> dict[str, str]:
             "admin_reconciliation_items",
             "admin_crawl_requests",
             "scheduled_job_runs",
+            "part_quarantine",
             "v_current_catalog_parts",
             "v_vin_part_fitments",
             "admin_override_heads",
@@ -286,11 +342,109 @@ def health() -> dict[str, str]:
         )
     )
     _fetch_one(f"SELECT 1 AS ready FROM {readiness_tables} LIMIT 0")
+    provenance_contract = _fetch_one(
+        "SELECT "
+        "EXISTS (SELECT 1 FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts' "
+        "AND COLUMN_NAME = 'crawl_run_id' AND COLUMN_TYPE = 'int' "
+        "AND IS_NULLABLE = 'YES') AS current_column_ready, "
+        "EXISTS (SELECT 1 FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts_previous' "
+        "AND COLUMN_NAME = 'crawl_run_id' AND COLUMN_TYPE = 'int' "
+        "AND IS_NULLABLE = 'YES') AS previous_column_ready, "
+        "(SELECT IF(COUNT(*) = 1 AND MIN(NON_UNIQUE) = 1 "
+        "AND MIN(COLUMN_NAME) = 'crawl_run_id' AND MIN(SEQ_IN_INDEX) = 1 "
+        "AND COALESCE(SUM(EXPRESSION IS NOT NULL), 0) = 0 "
+        "AND COALESCE(SUM(SUB_PART IS NOT NULL), 0) = 0 "
+        "AND MIN(COLLATION) = 'A' AND MAX(COLLATION) = 'A' "
+        "AND MIN(INDEX_TYPE) = 'BTREE' AND MAX(INDEX_TYPE) = 'BTREE' "
+        "AND MIN(IS_VISIBLE) = 'YES' AND MAX(IS_VISIBLE) = 'YES', 1, 0) "
+        "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'published_parts' "
+        "AND INDEX_NAME = 'idx_published_crawl_run') AS current_index_ready, "
+        "(SELECT IF(COUNT(*) = 1 AND MIN(NON_UNIQUE) = 1 "
+        "AND MIN(COLUMN_NAME) = 'crawl_run_id' AND MIN(SEQ_IN_INDEX) = 1 "
+        "AND COALESCE(SUM(EXPRESSION IS NOT NULL), 0) = 0 "
+        "AND COALESCE(SUM(SUB_PART IS NOT NULL), 0) = 0 "
+        "AND MIN(COLLATION) = 'A' AND MAX(COLLATION) = 'A' "
+        "AND MIN(INDEX_TYPE) = 'BTREE' AND MAX(INDEX_TYPE) = 'BTREE' "
+        "AND MIN(IS_VISIBLE) = 'YES' AND MAX(IS_VISIBLE) = 'YES', 1, 0) "
+        "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'published_parts_previous' "
+        "AND INDEX_NAME = 'idx_published_crawl_run') AS previous_index_ready, "
+        "EXISTS (SELECT 1 FROM information_schema.KEY_COLUMN_USAGE AS key_columns "
+        "JOIN information_schema.REFERENTIAL_CONSTRAINTS AS constraints "
+        "ON constraints.CONSTRAINT_SCHEMA = key_columns.CONSTRAINT_SCHEMA "
+        "AND constraints.TABLE_NAME = key_columns.TABLE_NAME "
+        "AND constraints.CONSTRAINT_NAME = key_columns.CONSTRAINT_NAME "
+        "WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE() "
+        "AND key_columns.TABLE_NAME = 'published_parts' "
+        "AND key_columns.CONSTRAINT_NAME = 'fk_published_crawl_run' "
+        "AND key_columns.COLUMN_NAME = 'crawl_run_id' "
+        "AND key_columns.REFERENCED_TABLE_SCHEMA = DATABASE() "
+        "AND key_columns.REFERENCED_TABLE_NAME = 'crawl_runs' "
+        "AND key_columns.REFERENCED_COLUMN_NAME = 'id' "
+        "AND constraints.UPDATE_RULE = 'NO ACTION' "
+        "AND constraints.DELETE_RULE = 'NO ACTION') AS current_foreign_key_ready, "
+        "EXISTS (SELECT 1 FROM information_schema.KEY_COLUMN_USAGE AS key_columns "
+        "JOIN information_schema.REFERENTIAL_CONSTRAINTS AS constraints "
+        "ON constraints.CONSTRAINT_SCHEMA = key_columns.CONSTRAINT_SCHEMA "
+        "AND constraints.TABLE_NAME = key_columns.TABLE_NAME "
+        "AND constraints.CONSTRAINT_NAME = key_columns.CONSTRAINT_NAME "
+        "WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE() "
+        "AND key_columns.TABLE_NAME = 'published_parts_previous' "
+        "AND key_columns.CONSTRAINT_NAME = 'fk_published_previous_crawl_run' "
+        "AND key_columns.COLUMN_NAME = 'crawl_run_id' "
+        "AND key_columns.REFERENCED_TABLE_SCHEMA = DATABASE() "
+        "AND key_columns.REFERENCED_TABLE_NAME = 'crawl_runs' "
+        "AND key_columns.REFERENCED_COLUMN_NAME = 'id' "
+        "AND constraints.UPDATE_RULE = 'NO ACTION' "
+        "AND constraints.DELETE_RULE = 'NO ACTION') AS previous_foreign_key_ready, "
+        "EXISTS (SELECT 1 FROM information_schema.VIEWS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'v_current_catalog_parts' "
+        "AND LOCATE('qualified_full_runs', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('formal_current_parts', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('formal_previous_parts', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('published_parts_previous', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('full_scheduler_run', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('linked_crawl_runs', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('bounded_parts', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('verified_bounded_evidence', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('verified_bounded_records', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('partsouq_http_artifacts', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('partsouq_artifact_records', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('evidence_status', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('live_http', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('trigger_mode', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('daemon', LOWER(VIEW_DEFINITION)) > 0) AS formal_view_ready, "
+        "(SELECT IF(COUNT(*) = 2, 1, 0) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'v_current_catalog_parts' "
+        "AND COLUMN_NAME IN ('dataset_scope', 'source_crawl_run_id')) "
+        "AS formal_view_columns_ready"
+    )
+    if provenance_contract is None or any(
+        int(provenance_contract.get(key) or 0) != 1
+        for key in (
+            "current_column_ready",
+            "previous_column_ready",
+            "current_index_ready",
+            "previous_index_ready",
+            "current_foreign_key_ready",
+            "previous_foreign_key_ready",
+            "formal_view_ready",
+            "formal_view_columns_ready",
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="bounded evidence provenance schema 尚未完成 migration 019",
+        )
     return {"status": "ok"}
 
 
 @app.get("/api/database-summary")
-def database_summary() -> dict:
+def database_summary() -> Row:
     counts = (
         _fetch_one(
             "SELECT "
@@ -342,6 +496,18 @@ def database_summary() -> dict:
             "MAX(r.started_at) AS bounded_started_at, "
             "MAX(r.finished_at) AS bounded_finished_at, "
             "MAX(r.error_msg) AS bounded_error_msg, "
+            "MAX(r.evidence_status) AS bounded_evidence_status, "
+            "MAX(r.evidence_manifest_sha256) AS bounded_evidence_manifest_sha256, "
+            "MAX(r.evidence_dataset_sha256) AS bounded_evidence_dataset_sha256, "
+            "MAX(r.evidence_artifact_count) AS bounded_evidence_artifact_count, "
+            "MAX(r.evidence_record_count) AS bounded_evidence_record_count, "
+            "MAX(r.evidence_original_bytes) AS bounded_evidence_original_bytes, "
+            "MAX(r.evidence_stored_bytes) AS bounded_evidence_stored_bytes, "
+            "MAX(r.evidence_verified_at) AS bounded_evidence_verified_at, "
+            "MAX(evidence.active_artifact_count) AS bounded_active_artifact_count, "
+            "MAX(evidence.live_artifact_count) AS bounded_live_artifact_count, "
+            "MAX(evidence.page_type_count) AS bounded_evidence_page_type_count, "
+            "MAX(evidence.accepted_record_count) AS bounded_accepted_evidence_records, "
             "MAX(r.scheduled_job_run_id) AS bounded_scheduled_job_run_id, "
             "MAX(sj.job_name) AS bounded_scheduler_job_name, "
             "MAX(sj.trigger_mode) AS bounded_scheduler_trigger_mode, "
@@ -351,7 +517,7 @@ def database_summary() -> dict:
             "MAX(sj.finished_at) AS bounded_scheduler_finished_at, "
             "MAX(scheduler_links.crawl_run_count) "
             "AS bounded_scheduler_linked_crawl_runs, "
-            "MAX(CASE WHEN RIGHT(DATABASE(), 5) = '_test' "
+            "MAX(CASE WHEN DATABASE() <> 'partsouq_catalog' "
             "OR LOWER(COALESCE(r.run_key, '')) LIKE 'sample-%%' "
             "OR LOWER(COALESCE(r.error_msg, '')) "
             "REGEXP 'browser-assisted|fixture|synthetic|fake' "
@@ -430,9 +596,18 @@ def database_summary() -> dict:
             "AS bounded_source_value_mismatch_rows "
             "FROM (SELECT 1 AS singleton) AS anchor "
             "LEFT JOIN (SELECT id, run_key, dataset_kind, status, target_parts, parts_ok, "
-            "started_at, finished_at, error_msg, scheduled_job_run_id FROM crawl_runs "
+            "started_at, finished_at, error_msg, scheduled_job_run_id, "
+            "evidence_status, evidence_manifest_sha256, evidence_dataset_sha256, "
+            "evidence_artifact_count, evidence_record_count, evidence_original_bytes, "
+            "evidence_stored_bytes, evidence_verified_at FROM crawl_runs "
             "WHERE dataset_kind = 'bounded' ORDER BY started_at DESC, id DESC LIMIT 1) AS r "
             "ON TRUE "
+            "LEFT JOIN (SELECT crawl_run_id, COUNT(*) AS active_artifact_count, "
+            "SUM(capture_kind = 'live_http') AS live_artifact_count, "
+            "COUNT(DISTINCT page_type) AS page_type_count, "
+            "SUM(accepted_record_count) AS accepted_record_count "
+            "FROM partsouq_http_artifacts WHERE verification_status = 'verified' "
+            "GROUP BY crawl_run_id) AS evidence ON evidence.crawl_run_id = r.id "
             "LEFT JOIN scheduled_job_runs AS sj ON sj.id = r.scheduled_job_run_id "
             "LEFT JOIN (SELECT scheduled_job_run_id, COUNT(*) AS crawl_run_count "
             "FROM crawl_runs WHERE scheduled_job_run_id IS NOT NULL "
@@ -663,6 +838,40 @@ def database_summary() -> dict:
         ),
         "non_live_data_marker": int(counts.get("bounded_non_live_data_marker") or 0),
     }
+    evidence_artifact_count = int(counts.get("bounded_evidence_artifact_count") or 0)
+    active_artifact_count = int(counts.get("bounded_active_artifact_count") or 0)
+    live_artifact_count = int(counts.get("bounded_live_artifact_count") or 0)
+    evidence_record_count = int(counts.get("bounded_evidence_record_count") or 0)
+    accepted_evidence_records = int(counts.get("bounded_accepted_evidence_records") or 0)
+    evidence_page_type_count = int(counts.get("bounded_evidence_page_type_count") or 0)
+    evidence_hashes_valid = all(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+        for value in (
+            counts.get("bounded_evidence_manifest_sha256"),
+            counts.get("bounded_evidence_dataset_sha256"),
+        )
+    )
+    live_mapping_evidence = (
+        counts.get("bounded_evidence_status") == "verified"
+        and counts.get("bounded_evidence_verified_at") is not None
+        and evidence_hashes_valid
+        and evidence_artifact_count > 0
+        and active_artifact_count == evidence_artifact_count
+        and live_artifact_count == evidence_artifact_count
+        and evidence_page_type_count == 6
+        and evidence_record_count == BOUNDED_ACCEPTANCE_TARGET
+        and accepted_evidence_records == BOUNDED_ACCEPTANCE_TARGET
+        and bounded_target == BOUNDED_ACCEPTANCE_TARGET
+        and bounded_run_parts == BOUNDED_ACCEPTANCE_TARGET
+        and bounded_rows == BOUNDED_ACCEPTANCE_TARGET
+        and int(counts.get("bounded_official_source_url_rows") or 0) == bounded_rows
+        and not bounded_quality["invalid_source_url_rows"]
+        and not bounded_quality["non_live_data_marker"]
+        and int(counts.get("bounded_evidence_original_bytes") or 0) > 0
+        and int(counts.get("bounded_evidence_stored_bytes") or 0) > 0
+    )
     bounded_blocking_reasons = []
     bounded_crawl_run_id = counts.get("bounded_crawl_run_id")
     if bounded_crawl_run_id is None:
@@ -690,6 +899,8 @@ def database_summary() -> dict:
             bounded_blocking_reasons.append("bounded_scheduler_link_not_unique")
         if bounded_quality["non_live_data_marker"]:
             bounded_blocking_reasons.append("bounded_non_live_data_marker")
+        if not live_mapping_evidence:
+            bounded_blocking_reasons.append("bounded_live_mapping_evidence_not_verified")
 
     bounded_quality_reasons = {
         "required_field_missing_rows": "bounded_required_fields_missing",
@@ -739,6 +950,8 @@ def database_summary() -> dict:
         production_pending_reasons.append("nhtsa_required_fields_missing")
     if int(mappings.get("stale", 0)) or int(mappings["unconfirmed_vin_decodes"]):
         production_pending_reasons.append("stale_or_unconfirmed_vin_mapping")
+    if not live_mapping_evidence:
+        production_pending_reasons.append("partsouq_live_mapping_evidence_not_verified")
     production_pending_reasons.append("partsouq_small_category_source_unavailable")
     production_pending_reasons.append("partsouq_english_name_language_not_verified")
 
@@ -809,12 +1022,30 @@ def database_summary() -> dict:
                 ),
                 "invalid_source_url_rows": bounded_quality["invalid_source_url_rows"],
                 "evidence_level": (
-                    "linked_scheduler_run_and_source_url"
-                    if counts.get("bounded_scheduled_job_run_id") is not None
+                    "verified_live_http_replay_mapping_chain"
+                    if live_mapping_evidence
                     else "not_verified"
                 ),
-                "raw_http_artifact_status": "not_persisted_by_catalog_crawler",
-                "live_http_evidence": False,
+                "raw_http_artifact_status": (
+                    "raw_hash_and_sanitized_parser_body_persisted"
+                    if live_mapping_evidence
+                    else "not_verified"
+                ),
+                "live_http_evidence": live_mapping_evidence,
+                "evidence_status": counts.get("bounded_evidence_status"),
+                "manifest_sha256": counts.get("bounded_evidence_manifest_sha256"),
+                "dataset_sha256": counts.get("bounded_evidence_dataset_sha256"),
+                "artifact_count": evidence_artifact_count,
+                "record_count": evidence_record_count,
+                "required_page_types": [
+                    "genuine",
+                    "locate",
+                    "pick",
+                    "vehicle",
+                    "category",
+                    "unit",
+                ],
+                "verified_page_type_count": evidence_page_type_count,
                 "non_live_data_marker": bool(bounded_quality["non_live_data_marker"]),
             },
             "part_range_source": {
@@ -967,7 +1198,7 @@ def list_parts(
         params,
     )
     total = int((count_row or {}).get("total", 0))
-    offset = (page - 1) * page_size
+    current_page, total_pages, offset = _pagination(total, page, page_size)
     items = _fetch_all(
         "SELECT CASE WHEN current_part.dataset_scope = 'bounded' "
         "THEN 'scheduled_bounded_not_full_published' ELSE 'published' END AS dataset_status, "
@@ -994,10 +1225,10 @@ def list_parts(
         "items": items,
         "datasetScope": (count_row or {}).get("dataset_scope"),
         "crawlRunId": (count_row or {}).get("source_crawl_run_id"),
-        "page": page,
+        "page": current_page,
         "pageSize": page_size,
         "total": total,
-        "totalPages": (total + page_size - 1) // page_size,
+        "totalPages": total_pages,
     }
 
 
@@ -1022,7 +1253,7 @@ def list_sample_parts(
     )
     count_row = _fetch_one("SELECT COUNT(*) AS total" + sample_from)
     total = int((count_row or {}).get("total", 0))
-    offset = (page - 1) * page_size
+    current_page, total_pages, offset = _pagination(total, page, page_size)
     items = _fetch_all(
         "SELECT 'sample_not_published' AS dataset_status, p.id AS part_id, m.id AS model_id, "
         "v.id AS vehicle_id, v.vid AS vehicle_vid, c.id AS category_id, c.cid AS category_cid, "
@@ -1041,10 +1272,10 @@ def list_sample_parts(
     )
     return {
         "items": items,
-        "page": page,
+        "page": current_page,
         "pageSize": page_size,
         "total": total,
-        "totalPages": (total + page_size - 1) // page_size,
+        "totalPages": total_pages,
     }
 
 
@@ -1095,7 +1326,7 @@ def list_bounded_parts(
         params,
     )
     total = int((count_row or {}).get("total", 0))
-    offset = (page - 1) * page_size
+    current_page, total_pages, offset = _pagination(total, page, page_size)
     items = _fetch_all(
         "SELECT 'scheduled_bounded_not_full_published' AS dataset_status, "
         "bp.crawl_run_id, bp.part_id, bp.model_id, bp.vehicle_id, bp.vehicle_vid, "
@@ -1114,15 +1345,15 @@ def list_bounded_parts(
     return {
         "items": items,
         "crawlRunId": (count_row or {}).get("crawl_run_id"),
-        "page": page,
+        "page": current_page,
         "pageSize": page_size,
         "total": total,
-        "totalPages": (total + page_size - 1) // page_size,
+        "totalPages": total_pages,
     }
 
 
 @app.get("/api/parts/{part_number}/fitments")
-def part_fitments(part_number: str) -> dict[str, list[dict]]:
+def part_fitments(part_number: str) -> dict[str, list[Row]]:
     normalized = normalize_catalog_part_number(part_number)
     if not normalized:
         raise HTTPException(
@@ -1175,7 +1406,7 @@ def part_fitments(part_number: str) -> dict[str, list[dict]]:
 def list_vehicle_mappings(
     vin_prefix: str | None = None,
     limit: int = Query(default=100, ge=1, le=200),
-) -> list[dict]:
+) -> list[Row]:
     if vin_prefix:
         return _fetch_all(
             "SELECT * FROM admin_vehicle_mappings WHERE vin_prefix LIKE %s ORDER BY vin_prefix LIMIT %s",
@@ -1191,7 +1422,7 @@ def list_vehicle_mappings(
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_vehicle_mapping(payload: VehicleMappingInput) -> dict:
+def create_vehicle_mapping(payload: VehicleMappingInput) -> Row:
     row_id = _insert_or_conflict(
         "INSERT INTO admin_vehicle_mappings "
         "(vin_prefix, make_name, model_name, model_year, engine, trim_name, source_name, source_reference) "
@@ -1202,7 +1433,7 @@ def create_vehicle_mapping(payload: VehicleMappingInput) -> dict:
 
 
 @app.put("/api/vehicle-mappings/{row_id}", dependencies=[Depends(require_admin_token)])
-def update_vehicle_mapping(row_id: int, payload: VehicleMappingInput) -> dict:
+def update_vehicle_mapping(row_id: int, payload: VehicleMappingInput) -> Row:
     current = _row_or_404("admin_vehicle_mappings", row_id)
     if current.get("vin"):
         raise HTTPException(
@@ -1224,7 +1455,7 @@ def update_vehicle_mapping(row_id: int, payload: VehicleMappingInput) -> dict:
 def list_vin_vehicle_mappings(
     vin: str | None = None,
     limit: int = Query(default=100, ge=1, le=200),
-) -> list[dict]:
+) -> list[Row]:
     params: list[object] = []
     clause = "WHERE a.vin IS NOT NULL"
     if vin:
@@ -1295,7 +1526,7 @@ def list_vin_vehicle_mappings(
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> dict:
+def create_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> Row:
     values = _validated_vin_vehicle_mapping(payload)
     row_id = _insert_or_conflict(
         "INSERT INTO admin_vehicle_mappings "
@@ -1307,11 +1538,25 @@ def create_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> dict:
     return _row_or_404("admin_vehicle_mappings", row_id)
 
 
+@app.get(
+    "/api/vin-vehicle-mappings/{row_id}",
+    dependencies=[Depends(require_admin_token)],
+)
+def get_vin_vehicle_mapping(row_id: int) -> Row:
+    row = _fetch_one(
+        "SELECT * FROM admin_vehicle_mappings WHERE id = %s AND vin IS NOT NULL",
+        (row_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到資料")
+    return row
+
+
 @app.put(
     "/api/vin-vehicle-mappings/{row_id}",
     dependencies=[Depends(require_admin_token)],
 )
-def update_vin_vehicle_mapping(row_id: int, payload: VinVehicleMappingInput) -> dict:
+def update_vin_vehicle_mapping(row_id: int, payload: VinVehicleMappingUpdateInput) -> Row:
     current = _row_or_404("admin_vehicle_mappings", row_id)
     if not current.get("vin"):
         raise HTTPException(
@@ -1319,12 +1564,33 @@ def update_vin_vehicle_mapping(row_id: int, payload: VinVehicleMappingInput) -> 
             detail="這筆資料不是完整 VIN 車款對應",
         )
     values = _validated_vin_vehicle_mapping(payload)
-    _update_or_conflict(
-        "UPDATE admin_vehicle_mappings SET vin_prefix=%s, vin=%s, partsouq_vehicle_id=%s, "
-        "make_name=%s, model_name=%s, model_year=%s, engine=%s, trim_name=%s, "
-        "source_name=%s, source_reference=%s WHERE id=%s",
-        (*values, row_id),
-    )
+    connection = _connect()
+    try:
+        connection.begin()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE admin_vehicle_mappings SET vin_prefix=%s, vin=%s, "
+                "partsouq_vehicle_id=%s, make_name=%s, model_name=%s, model_year=%s, "
+                "engine=%s, trim_name=%s, source_name=%s, source_reference=%s, "
+                "updated_at=IF(updated_at >= CURRENT_TIMESTAMP, "
+                "updated_at + INTERVAL 1 SECOND, CURRENT_TIMESTAMP) "
+                "WHERE id=%s AND updated_at=%s",
+                (*values, row_id, payload.expected_updated_at),
+            )
+            if cursor.rowcount != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="車款對應已由其他使用者更新，請重新整理後再修改",
+                )
+        connection.commit()
+    except pymysql.err.IntegrityError as error:
+        connection.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="資料已存在") from error
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
     return _row_or_404("admin_vehicle_mappings", row_id)
 
 
@@ -1334,7 +1600,7 @@ def list_quarantine(
     run_key: str | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, alias="pageSize", ge=1, le=200),
-) -> dict:
+) -> Row:
     """列出 part_quarantine（無名稱料號列的紀錄，使用者決定的
     「忽略 + 紀錄」政策）。state=unresolved 只回未處置列。"""
     _validate_page_size(page_size)
@@ -1369,9 +1635,9 @@ def list_quarantine(
         )
     else:
         from_clause = "FROM part_quarantine JOIN groups_t ON groups_t.id = part_quarantine.group_id"
-    total = _fetch_one(f"SELECT COUNT(*) AS n FROM part_quarantine {clause}", tuple(params))["n"]
-    total_pages = max(1, (int(total) + page_size - 1) // page_size)
-    current_page = min(page, total_pages)
+    total_row = _fetch_one(f"SELECT COUNT(*) AS n FROM part_quarantine {clause}", tuple(params))
+    total = int((total_row or {}).get("n", 0))
+    current_page, total_pages, offset = _pagination(total, page, page_size)
     rows = _fetch_all(
         f"SELECT part_quarantine.id, part_quarantine.part_number, "
         f"part_quarantine.range_str, part_quarantine.reason, part_quarantine.code, "
@@ -1381,13 +1647,13 @@ def list_quarantine(
         f"{from_clause} {clause} "
         f"{order_by} "
         f"LIMIT %s OFFSET %s",
-        (*params, page_size, (current_page - 1) * page_size),
+        (*params, page_size, offset),
     )
     return {
         "items": rows,
         "page": current_page,
         "pageSize": page_size,
-        "total": int(total),
+        "total": total,
         "totalPages": total_pages,
     }
 
@@ -1396,7 +1662,7 @@ def list_quarantine(
     "/api/quarantine/{row_id}/resolve",
     dependencies=[Depends(require_admin_token)],
 )
-def resolve_quarantine(row_id: int, payload: QuarantineResolveInput) -> dict:
+def resolve_quarantine(row_id: int, payload: QuarantineResolveInput) -> Row:
     """把 quarantine 列標記為已處置（resolved_at = now）。
 
     同一料號在後續 run 再次出現時，爬蟲會重開處置狀態
@@ -1410,16 +1676,38 @@ def resolve_quarantine(row_id: int, payload: QuarantineResolveInput) -> dict:
                 "SELECT * FROM part_quarantine WHERE id = %s FOR UPDATE",
                 (row_id,),
             )
-            if cursor.fetchone() is None:
+            current = cursor.fetchone()
+            if current is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到資料")
+            if (
+                current.get("run_key") != payload.expected_run_key
+                or current.get("resolved_at") is not None
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="資料已由其他排程或使用者更新，請重新整理後再處置",
+                )
             cursor.execute(
                 "UPDATE part_quarantine "
                 "SET resolved_at = NOW(), resolution = %s, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = %s",
-                (payload.resolution, row_id),
+                "WHERE id = %s AND run_key = %s AND resolved_at IS NULL",
+                (payload.resolution, row_id, payload.expected_run_key),
             )
-            cursor.execute("SELECT * FROM part_quarantine WHERE id = %s", (row_id,))
+            if cursor.rowcount != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="資料已由其他排程或使用者更新，請重新整理後再處置",
+                )
+            cursor.execute(
+                "SELECT * FROM part_quarantine WHERE id = %s AND run_key = %s",
+                (row_id, payload.expected_run_key),
+            )
             updated = cursor.fetchone()
+            if updated is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="處置結果無法讀回，請重新整理後確認",
+                )
         connection.commit()
         return dict(updated)
     except BaseException:
@@ -1501,7 +1789,7 @@ def _validated_vin_vehicle_mapping(payload: VinVehicleMappingInput) -> tuple[obj
     "/api/vins/{vin}/vehicle-candidates",
     dependencies=[Depends(require_admin_token)],
 )
-def list_vin_vehicle_candidates(vin: str) -> list[dict]:
+def list_vin_vehicle_candidates(vin: str) -> list[Row]:
     try:
         normalized = normalize_vin(vin)
     except ValueError as error:
@@ -1549,7 +1837,7 @@ def list_vin_vehicle_candidates(vin: str) -> list[dict]:
     "/api/vins/{vin}/parts",
     dependencies=[Depends(require_admin_token)],
 )
-def list_vin_parts(vin: str) -> list[dict]:
+def list_vin_parts(vin: str) -> list[Row]:
     try:
         normalized = normalize_vin(vin)
     except ValueError as error:
@@ -1584,7 +1872,7 @@ def list_vin_parts(vin: str) -> list[dict]:
 def list_part_translations(
     query: str | None = None,
     limit: int = Query(default=100, ge=1, le=200),
-) -> list[dict]:
+) -> list[Row]:
     if query:
         like = f"%{query}%"
         return _fetch_all(
@@ -1603,7 +1891,7 @@ def list_part_translations(
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_part_translation(payload: PartTranslationInput) -> dict:
+def create_part_translation(payload: PartTranslationInput) -> Row:
     row_id = _insert_or_conflict(
         "INSERT INTO admin_part_translations "
         "(english_name, chinese_name, common_chinese_name, source_name, source_reference) "
@@ -1614,7 +1902,7 @@ def create_part_translation(payload: PartTranslationInput) -> dict:
 
 
 @app.put("/api/part-translations/{row_id}", dependencies=[Depends(require_admin_token)])
-def update_part_translation(row_id: int, payload: PartTranslationInput) -> dict:
+def update_part_translation(row_id: int, payload: PartTranslationInput) -> Row:
     _row_or_404("admin_part_translations", row_id)
     _update_or_conflict(
         "UPDATE admin_part_translations SET english_name=%s, chinese_name=%s, common_chinese_name=%s, "
@@ -1629,7 +1917,7 @@ def update_part_translation(row_id: int, payload: PartTranslationInput) -> dict:
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_part_fitment(payload: PartFitmentInput) -> dict:
+def create_part_fitment(payload: PartFitmentInput) -> Row:
     row_id = _insert_or_conflict(
         "INSERT INTO admin_part_fitments "
         "(part_number, vin_prefix, make_name, model_name, model_year_from, model_year_to, engine, trim_name, "
@@ -1640,7 +1928,7 @@ def create_part_fitment(payload: PartFitmentInput) -> dict:
 
 
 @app.put("/api/part-fitments/{row_id}", dependencies=[Depends(require_admin_token)])
-def update_part_fitment(row_id: int, payload: PartFitmentInput) -> dict:
+def update_part_fitment(row_id: int, payload: PartFitmentInput) -> Row:
     _row_or_404("admin_part_fitments", row_id)
     _update_or_conflict(
         "UPDATE admin_part_fitments SET part_number=%s, vin_prefix=%s, make_name=%s, model_name=%s, "
@@ -1652,7 +1940,7 @@ def update_part_fitment(row_id: int, payload: PartFitmentInput) -> dict:
 
 
 @app.get("/api/categories")
-def list_categories(limit: int = Query(default=200, ge=1, le=500)) -> list[dict]:
+def list_categories(limit: int = Query(default=200, ge=1, le=500)) -> list[Row]:
     return _fetch_all(
         "SELECT c.dataset_status, c.category_main, c.category_group, c.category_small, "
         "CASE WHEN c.category_small IS NULL THEN 'unavailable_in_current_partsouq_hierarchy' "
@@ -1688,7 +1976,7 @@ def list_categories(limit: int = Query(default=200, ge=1, le=500)) -> list[dict]
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_category_label(payload: CategoryLabelInput) -> dict:
+def create_category_label(payload: CategoryLabelInput) -> Row:
     row_id = _insert_or_conflict(
         "INSERT INTO admin_category_labels "
         "(category_main, category_group, category_small, chinese_label, common_chinese_label, source_name) "
@@ -1699,7 +1987,7 @@ def create_category_label(payload: CategoryLabelInput) -> dict:
 
 
 @app.put("/api/categories/{row_id}", dependencies=[Depends(require_admin_token)])
-def update_category_label(row_id: int, payload: CategoryLabelInput) -> dict:
+def update_category_label(row_id: int, payload: CategoryLabelInput) -> Row:
     _row_or_404("admin_category_labels", row_id)
     _update_or_conflict(
         "UPDATE admin_category_labels SET category_main=%s, category_group=%s, category_small=%s, "
@@ -1713,7 +2001,7 @@ def update_category_label(row_id: int, payload: CategoryLabelInput) -> dict:
 def list_reconciliation_items(
     item_status: Literal["open", "matched", "rejected"] | None = None,
     limit: int = Query(default=100, ge=1, le=200),
-) -> list[dict]:
+) -> list[Row]:
     if item_status:
         rows = _fetch_all(
             "SELECT * FROM admin_reconciliation_items WHERE status=%s ORDER BY updated_at DESC LIMIT %s",
@@ -1735,7 +2023,7 @@ def list_reconciliation_items(
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_reconciliation_item(payload: ReconciliationInput) -> dict:
+def create_reconciliation_item(payload: ReconciliationInput) -> Row:
     row_id = _execute(
         "INSERT INTO admin_reconciliation_items "
         "(channel, subject_key, left_value, right_value, resolution_note) VALUES (%s, %s, %s, %s, %s)",
@@ -1751,7 +2039,7 @@ def create_reconciliation_item(payload: ReconciliationInput) -> dict:
 
 
 @app.put("/api/reconciliation-items/{row_id}", dependencies=[Depends(require_admin_token)])
-def update_reconciliation_item(row_id: int, payload: ReconciliationUpdate) -> dict:
+def update_reconciliation_item(row_id: int, payload: ReconciliationUpdate) -> Row:
     _row_or_404("admin_reconciliation_items", row_id)
     _execute(
         "UPDATE admin_reconciliation_items SET status=%s, resolution_note=%s, "
@@ -1762,7 +2050,7 @@ def update_reconciliation_item(row_id: int, payload: ReconciliationUpdate) -> di
 
 
 @app.get("/api/crawl-requests", dependencies=[Depends(require_admin_token)])
-def list_crawl_requests(limit: int = Query(default=100, ge=1, le=200)) -> list[dict]:
+def list_crawl_requests(limit: int = Query(default=100, ge=1, le=200)) -> list[Row]:
     return _fetch_all(
         "SELECT * FROM admin_crawl_requests ORDER BY requested_at DESC LIMIT %s", (limit,)
     )
@@ -1773,7 +2061,7 @@ def list_crawl_requests(limit: int = Query(default=100, ge=1, le=200)) -> list[d
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin_token)],
 )
-def create_crawl_request(payload: CrawlRequestInput) -> dict:
+def create_crawl_request(payload: CrawlRequestInput) -> Row:
     requested_scope = payload.requested_scope
     if payload.job_name == "nhtsa-vin":
         try:
@@ -1791,7 +2079,7 @@ def create_crawl_request(payload: CrawlRequestInput) -> dict:
 
 
 @app.get("/api/job-runs", dependencies=[Depends(require_admin_token)])
-def list_job_runs(limit: int = Query(default=100, ge=1, le=200)) -> list[dict]:
+def list_job_runs(limit: int = Query(default=100, ge=1, le=200)) -> list[Row]:
     return _fetch_all(
         "SELECT id, job_name, status, started_at, finished_at, exit_code, "
         "LEFT(output_text, 1000) AS output_text FROM scheduled_job_runs "
@@ -1805,7 +2093,7 @@ def list_nhtsa_vehicles(
     make_name: str | None = None,
     model_name: str | None = None,
     limit: int = Query(default=100, ge=1, le=200),
-) -> list[dict]:
+) -> list[Row]:
     clauses = ["1 = 1"]
     params: list[object] = []
     if make_name:
@@ -1825,7 +2113,13 @@ def list_nhtsa_vehicles(
 
 
 def main() -> None:
-    uvicorn.run("partsouq_admin.app:app", host="0.0.0.0", port=8000, reload=False)
+    bind_host = os.getenv("PARTSOUQ_ADMIN_BIND_HOST", "").strip() or "127.0.0.1"
+    uvicorn.run(
+        "partsouq_admin.app:app",
+        host=bind_host,
+        port=8000,
+        reload=False,
+    )
 
 
 if __name__ == "__main__":

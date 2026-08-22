@@ -25,15 +25,37 @@ import logging
 import threading
 import time
 import urllib.parse
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from functools import partial
+from typing import Any, cast
 
 import pymysql
 
+from .admission import catalog_writer_admission
 from .config import CRAWL, SITE
-from .db import ConnectionLost
+from .db import ConnectionLost, Database
+from .evidence import (
+    PARSER_CONTRACT_VERSION,
+    CatalogHttpResponse,
+    RecordEvidence,
+    brand_record_evidence,
+    category_record_evidence,
+    category_record_natural_key,
+    group_natural_key,
+    group_record_evidence,
+    model_record_evidence,
+    part_record_evidence,
+    public_source_url,
+    replay_catalog_records,
+    sanitize_parser_html,
+    vehicle_record_evidence,
+    vehicle_record_natural_key,
+)
 from .governor import RequestGovernor
 from .http_client import NotFoundError, SessionManager
 from .parsers import (
+    ParsedRecord,
     _soup,
     parse_brand_index,
     parse_category_links,
@@ -52,6 +74,10 @@ from .repositories import (
 
 log = logging.getLogger("crawler")
 
+type ReceiptKey = tuple[str, str, str]
+type ReceiptMap = dict[ReceiptKey, int]
+type CategoryIdMap = dict[str, int]
+
 # 品牌之間切換時的休息秒數：模擬人類換任務的行為，降低被偵測的機率。
 BRAND_PAUSE_SECONDS = 120
 
@@ -62,7 +88,7 @@ class SampleLimitReached(Exception):
 
 def _group_closure_mismatches(
     known_codes: dict[str, set[str]],
-    parsed_groups: list[dict],
+    parsed_groups: list[ParsedRecord],
     default_cid: str,
 ) -> tuple[list[str], list[str], list[str]]:
     """比對 DB 已知的 group 身分與本次解析結果，回傳三份差異。
@@ -123,8 +149,13 @@ class Crawler:
     """
 
     def __init__(
-        self, http: SessionManager, db, workers: int = 8, governor=None, fresh: bool = False
-    ):
+        self,
+        http: SessionManager,
+        db: Database,
+        workers: int = 8,
+        governor: RequestGovernor | None = None,
+        fresh: bool = False,
+    ) -> None:
         self.http = http
         self.db = db
         # Repository 層：SQL 全部封裝在這些物件裡
@@ -151,11 +182,19 @@ class Crawler:
             )
         ):
             raise ValueError("PSQ_BOUNDED_PARTS cannot be combined with another scope limit")
+        for setting, value in (
+            ("evidence_max_body_bytes", CRAWL["evidence_max_body_bytes"]),
+            ("evidence_max_run_bytes", CRAWL["evidence_max_run_bytes"]),
+            ("evidence_max_artifacts", CRAWL["evidence_max_artifacts"]),
+        ):
+            if int(value) <= 0:
+                raise ValueError(f"{setting} must be a positive integer")
         scheduled_job_run_id = int(CRAWL["scheduled_job_run_id"])
         if scheduled_job_run_id < 0:
             raise ValueError("SCHEDULED_JOB_RUN_ID must be zero or a positive integer")
         self.sample_mode = bool(sample_limit)
         self.bounded_mode = bool(bounded_limit)
+        self.evidence_mode = bounded_limit == 10_000
         self.part_limit = bounded_limit or sample_limit
         self.scheduled_job_run_id = scheduled_job_run_id or None
         if self.part_limit and workers != 1:
@@ -179,8 +218,8 @@ class Crawler:
         # 本 run 實際處理過的品牌（閉合檢查用，F1b）：_brands() 縮水時
         # 未被回傳的品牌不在這集合裡，光查歷史 done 會被上個月的
         # 完成狀態誤導成 success。
-        self._visited_brands = set()
-        self.counts = {
+        self._visited_brands: set[str] = set()
+        self.counts: dict[str, int] = {
             "brands": 0,
             "models": 0,
             "vehicles": 0,
@@ -198,7 +237,7 @@ class Crawler:
             thread_name_prefix="psq",
         )
 
-    def close(self):
+    def close(self) -> None:
         """關閉 worker 池並釋放 thread-local 資源（結束前一定要呼叫）。"""
         self._pool.shutdown(wait=True)
         try:
@@ -224,7 +263,7 @@ class Crawler:
             self._local.session = s
         return s
 
-    def _get(self, url: str) -> str:
+    def _get_response(self, url: str) -> CatalogHttpResponse:
         """發 GET 請求：先確保 cookie 新鮮、再取回 HTML。
 
         全域限速在 SessionManager.get() 內、每次 wire request 前由
@@ -234,14 +273,90 @@ class Crawler:
         session = self._session()
         session.ensure_fresh()
         session.sleep()
-        return session.get(url)
+        return session.get_response(url)
 
-    def _bump(self, key: str, n: int = 1):
+    def _get(self, url: str) -> str:
+        """相容既有呼叫端，只回傳 parser 使用的 HTML 文字。"""
+
+        return self._get_response(url).text
+
+    def _fetch(self, url: str) -> tuple[str, CatalogHttpResponse | None]:
+        """正式 10k 保留 response metadata，其餘模式維持既有文字介面。"""
+
+        if self.evidence_mode:
+            response = self._get_response(url)
+            return response.text, response
+        return self._get(url), None
+
+    def _capture_http_evidence(
+        self,
+        response: CatalogHttpResponse,
+        *,
+        page_type: str,
+        parser_name: str,
+        parser_context: Mapping[str, object],
+        live_records: Sequence[RecordEvidence],
+        accepted_records: Sequence[tuple[int, RecordEvidence]] = (),
+        malformed_rows: int = 0,
+        skipped_record_count: int = 0,
+    ) -> int | None:
+        """保存 bounded run 的 secret-safe parser replay 證據。
+
+        一般 full/sample run 不寫 evidence。正式 bounded run 會先把 HTML
+        做 deterministic sanitize，再用相同 parser 重跑；diagnostics 或
+        record hash 有任何差異時，repository 會拒絕寫入與後續發布。
+        """
+
+        if not self.evidence_mode:
+            return None
+        if self.run_id is None or self.scheduled_job_run_id is None:
+            raise RuntimeError("formal evidence requires crawl and scheduler run ids")
+        sanitized = sanitize_parser_html(response.text)
+        if sanitized.original_bytes > int(CRAWL["evidence_max_body_bytes"]):
+            raise RuntimeError(
+                f"{page_type} evidence body exceeds configured limit: "
+                f"{sanitized.original_bytes}>{CRAWL['evidence_max_body_bytes']}"
+            )
+        replay_records, replay_malformed, replay_skipped = replay_catalog_records(
+            sanitized.body,
+            parser_name=parser_name,
+            parser_version=PARSER_CONTRACT_VERSION,
+            context=parser_context,
+        )
+        if (replay_malformed, replay_skipped) != (malformed_rows, skipped_record_count):
+            raise RuntimeError(
+                f"{page_type} evidence diagnostics changed after sanitization: "
+                f"live=({malformed_rows},{skipped_record_count}) "
+                f"replay=({replay_malformed},{replay_skipped})"
+            )
+        return self.crawl.record_http_evidence(
+            self.run_id,
+            self.scheduled_job_run_id,
+            page_type=page_type,
+            public_url=public_source_url(response.final_url),
+            raw_body_sha256=response.raw_body_sha256,
+            status_code=response.status_code,
+            content_type=response.content_type,
+            fetched_at=response.fetched_at,
+            elapsed_ms=response.elapsed_ms,
+            attempt=response.attempt,
+            sanitized_body=sanitized,
+            parser_name=parser_name,
+            parser_version=PARSER_CONTRACT_VERSION,
+            parser_context=parser_context,
+            parsed_records=live_records,
+            replayed_records=replay_records,
+            accepted_records=accepted_records,
+            malformed_rows=malformed_rows,
+            skipped_record_count=skipped_record_count,
+        )
+
+    def _bump(self, key: str, n: int = 1) -> None:
         """統計計數累加（鎖保護，避免並行 worker 的 race condition）。"""
         with self.lock:
             self.counts[key] += n
 
-    def _guard_parse(self, html: str, items, what: str, ctx: str):
+    def _guard_parse(self, html: str, items: object, what: str, ctx: str) -> None:
         """0 解析結果一律視為異常（不再依賴 5,000 bytes 門檻）。
 
         修復前的問題：只有 HTML 超過 5,000 bytes 才檢查空結果，短版
@@ -282,9 +397,14 @@ class Crawler:
             f"[{ctx}] parsed 0 {what} from {len(html)}-byte page (site layout changed?)"
         )
 
-    def _brands(self):
+    def _brands(self) -> list[ParsedRecord]:
         """從首頁取得 18 個品牌的清單。"""
-        html = self.http.get(SITE["genuine"])
+        # 首頁是唯一直接使用主 SessionManager 的請求；其餘頁面都走
+        # _get_response。lazy cookie bootstrap 後，這裡也必須先檢查
+        # freshness，且此時 Crawler.run 已提交 running marker。
+        self.http.ensure_fresh()
+        response = self.http.get_response(SITE["genuine"])
+        html = response.text
         from .parsers import parse_brands
 
         brands, malformed = parse_brands(html, diagnostics=True)
@@ -293,9 +413,19 @@ class Crawler:
                 f"brand index contains {malformed} malformed canonical link(s); "
                 "refusing partial catalog"
             )
+        self._guard_parse(html, brands, "brands", "genuine index")
+
+        self._capture_http_evidence(
+            response,
+            page_type="genuine",
+            parser_name="parse_brands",
+            parser_context={},
+            live_records=brand_record_evidence(brands),
+            malformed_rows=malformed,
+        )
         return brands
 
-    def _check_capacity(self, run_key: str):
+    def _check_capacity(self, run_key: str) -> None:
         """在網路請求前記錄已知工作的最低容量需求。
 
         每個尚未 receipted 的既有 group 至少需要一次 unit request；階層頁、
@@ -330,13 +460,23 @@ class Crawler:
         這趟是否真的全站成功。
         """
         locate_url = SITE["locate"].format(brand=urllib.parse.quote(brand))
-        html = self._get(locate_url)
+        html, response = self._fetch(locate_url)
         models, malformed = parse_brand_index(html, brand, diagnostics=True)
         if malformed:
             raise RuntimeError(
                 f"[{brand}] {malformed} malformed canonical model link(s); refusing partial catalog"
             )
         self._guard_parse(html, models, "models", brand)
+
+        if response is not None:
+            self._capture_http_evidence(
+                response,
+                page_type="locate",
+                parser_name="parse_brand_index",
+                parser_context={"brand": brand},
+                live_records=model_record_evidence(brand, models),
+                malformed_rows=malformed,
+            )
         log.info("[%s] %d models", brand, len(models))
 
         brand_id = self.brands.upsert_brand(brand, locate_url)
@@ -424,7 +564,7 @@ class Crawler:
             log.info("[%s] brand done, nothing to crawl (all models done)", brand)
         return failures
 
-    def _vehicle_key(self, model_id: int, vehicle: dict) -> str:
+    def _vehicle_key(self, model_id: int, vehicle: ParsedRecord) -> str:
         """產生與 vehicles.identity_hash 完全一致的版本化 resume key。"""
         return f"v5:{vehicle_identity_hash(model_id, vehicle)}"
 
@@ -460,7 +600,7 @@ class Crawler:
                 )
         return problems
 
-    def crawl_model(self, brand: str, brand_id: int, model: dict) -> tuple[int, bool]:
+    def crawl_model(self, brand: str, brand_id: int, model: ParsedRecord) -> tuple[int, bool]:
         """爬取單一型號：取得車型清單 → 派發給 worker 池並行爬取。
 
         回傳 (failed, worked)：failed 是失敗的車型數（0 = 全部成功），
@@ -478,7 +618,7 @@ class Crawler:
             model=urllib.parse.quote(model["name"]),
             ssd=urllib.parse.quote(model["ssd"] or ""),
         )
-        html = self._get(pick_url)
+        html, response = self._fetch(pick_url)
         vehicles, malformed = parse_vehicles(html, brand, diagnostics=True)
         if malformed:
             raise RuntimeError(
@@ -487,6 +627,16 @@ class Crawler:
             )
         log.info("  [%s] %d vehicles", model["name"], len(vehicles))
         self._guard_parse(html, vehicles, "vehicles", model["name"])
+
+        if response is not None:
+            self._capture_http_evidence(
+                response,
+                page_type="pick",
+                parser_name="parse_vehicles",
+                parser_context={"brand": brand, "model": str(model["name"])},
+                live_records=vehicle_record_evidence(brand, str(model["name"]), vehicles),
+                malformed_rows=malformed,
+            )
 
         limit = CRAWL["limit_vehicles"]
         truncated = 0
@@ -498,7 +648,7 @@ class Crawler:
                 truncated = len(vehicles) - limit
             vehicles = vehicles[:limit]
 
-        pending = []
+        pending: list[ParsedRecord] = []
         for vehicle in vehicles:
             key = self._vehicle_key(model_id, vehicle)
             # F1b：見即記錄（見 crawl_brand 的說明）—— 車型層縮水
@@ -516,24 +666,29 @@ class Crawler:
 
         failed = 0
 
-        def _settle(f, v):
+        def _settle(future: Future[None], *, vehicle: ParsedRecord) -> None:
             """backoff 後殘留 futures 的收尾（P2 修復）：已開始執行的
             future 無法取消，完成時由 callback 統一標 done/error，不讓
             它們「寫了資料卻沒有狀態」—— 否則續爬會把已完成的車重抓
             一遍（浪費 rate budget）。被取消的 future 保持無狀態，由
             續爬重試。"""
-            key = self._vehicle_key(model_id, v)
-            if f.cancelled():
+            key = self._vehicle_key(model_id, vehicle)
+            if future.cancelled():
                 # 被取消的 future 保持無狀態（不標 done/error），由續爬
                 # 機制重試；標 error 會讓這台車的失敗被重複計算。
                 return
             try:
-                f.result()
+                future.result()
                 self.crawl.mark_done("vehicle", key)
             except SampleLimitReached:
                 return
             except Exception as e:
-                log.error("    [%s/%s] vehicle (late) failed: %s", model["name"], v.get("name"), e)
+                log.error(
+                    "    [%s/%s] vehicle (late) failed: %s",
+                    model["name"],
+                    vehicle.get("name"),
+                    e,
+                )
                 self.crawl.mark_error("vehicle", key, str(e))
             try:
                 self.db.commit()
@@ -545,7 +700,7 @@ class Crawler:
         # 數量」補工，否則多個同時完成時 in-flight 會從 workers*2 掉
         # 到 1、退化成近乎單工；失敗門檻觸發後（gave_up）不再補工。
         max_inflight = max(2, self.workers * 2)
-        futures = {}
+        futures: dict[Future[None], ParsedRecord] = {}
         pending_iter = iter(pending)
         gave_up = False
 
@@ -554,7 +709,13 @@ class Crawler:
                 vehicle = next(pending_iter)
             except StopIteration:
                 return False
-            fut = self._pool.submit(self.crawl_vehicle, brand, model_id, vehicle)
+            fut = self._pool.submit(
+                self.crawl_vehicle,
+                brand,
+                model_id,
+                vehicle,
+                str(model["name"]),
+            )
             futures[fut] = vehicle
             return True
 
@@ -576,7 +737,7 @@ class Crawler:
                     # 筆數達上限是預期停止；目前車不得標 done/error。
                     for f, v in list(futures.items()):
                         f.cancel()
-                        f.add_done_callback(lambda fut, vv=v: _settle(fut, vv))
+                        f.add_done_callback(partial(_settle, vehicle=v))
                     futures.clear()
                     gave_up = True
                     raise
@@ -606,7 +767,7 @@ class Crawler:
                         # 保持無狀態，由續爬重試。
                         for f, v in list(futures.items()):
                             f.cancel()
-                            f.add_done_callback(lambda fut, vv=v: _settle(fut, vv))
+                            f.add_done_callback(partial(_settle, vehicle=v))
                         futures.clear()
                         gave_up = True
                         break
@@ -622,7 +783,13 @@ class Crawler:
 
     # ------------------------------------------------------------ vehicles
 
-    def crawl_vehicle(self, brand: str, model_id: int, vehicle: dict):
+    def crawl_vehicle(
+        self,
+        brand: str,
+        model_id: int,
+        vehicle: ParsedRecord,
+        model_name: str | None = None,
+    ) -> None:
         """爬取單一車型：寫入車型、取得分類清單、逐分類爬取零件組。
 
         效能：vehicle 頁面的 HTML 只交給 lxml 解析一次，分類連結與
@@ -638,6 +805,9 @@ class Crawler:
                 f"[{brand} model_id={model_id}] missing ssd token for "
                 f"{vehicle.get('name', '?')}/{vehicle.get('model_code', '?')}; cannot fetch"
             )
+        if self.evidence_mode and not model_name:
+            raise RuntimeError("formal vehicle evidence requires the source model name")
+        evidence_vehicle_key = vehicle_record_natural_key(brand, model_name or "", vehicle)
 
         # SOL review P2：group 身分快取以「一台車」為生命週期。只移除
         # **本車**各 category 的快取（並行 worker 爬其他車時，它們的
@@ -649,14 +819,15 @@ class Crawler:
         log.info("    [%s %s] groups...", vehicle.get("name"), vehicle.get("model_code"))
         with self.lock:
             for category in self.vehicles.list_categories(vehicle_id):
-                self._group_identities.pop(category["id"], None)
+                self._group_identities.pop(cast(int, category["id"]), None)
 
         # SOL review P1（分類縮水對帳）：記錄本車「DB 已知分類」
         # （前月遺留；此時尚未寫入任何本 run 的分類），爬完後與
         # 本次解析到的分類集合比對 —— vehicle 頁只回傳部分分類連結
         # 時，沒被爬到的分類其零件組永遠不會補抓，但車仍會被標 done。
-        known_categories = {
-            (c["cid"] or c["name"]): c["name"] for c in self.vehicles.list_categories(vehicle_id)
+        known_categories: dict[str, str] = {
+            (cast(str | None, c["cid"]) or cast(str, c["name"])): cast(str, c["name"])
+            for c in self.vehicles.list_categories(vehicle_id)
         }
 
         base_vid = str(vehicle.get("vid") or "0")
@@ -666,7 +837,7 @@ class Crawler:
             ssd=urllib.parse.quote(ssd),
             vid=urllib.parse.quote(base_vid),
         )
-        html = self._get(vehicle_url)
+        html, response = self._fetch(vehicle_url)
         soup = _soup(html)
         category_links, malformed_categories, skipped_category_links = parse_category_links(
             html,
@@ -689,7 +860,7 @@ class Crawler:
                 skipped_category_links,
             )
         # 分類清單 = 引擎/燃油/工具（預設第一分類）+ 頁面上的其他分類連結
-        categories = [
+        categories: list[ParsedRecord] = [
             {
                 "category_name": "ENGINE/FUEL/TOOL",
                 "cid": "1",
@@ -702,6 +873,22 @@ class Crawler:
             if link["cid"] not in {c["cid"] for c in categories}:
                 categories.append(link)
 
+        if response is not None:
+            self._capture_http_evidence(
+                response,
+                page_type="vehicle",
+                parser_name="parse_category_links",
+                parser_context={
+                    "brand": brand,
+                    "vehicle_key": evidence_vehicle_key,
+                    "expected_vid": base_vid,
+                    "source_url": public_source_url(response.final_url),
+                },
+                live_records=category_record_evidence(evidence_vehicle_key, categories),
+                malformed_rows=malformed_categories,
+                skipped_record_count=skipped_category_links,
+            )
+
         # 預設分類（ENGINE/FUEL/TOOL）的截斷數必須一起收（P0：舊碼
         # 忽略此回傳值，僅預設分類的車被 limit_groups 截斷時仍會標
         # done，缺的零件組永久跳過）。
@@ -711,7 +898,7 @@ class Crawler:
         # SOL review P1：上一 run 的 row_count map —— 本次解析到的
         # 零件數相較前次大幅縮水（格式完整但內容縮水）時拒絕 receipt。
         prev_rows = self.crawl.previous_row_count_map(vehicle_id, self.crawl.run_key or "")
-        category_ids = {}
+        category_ids: CategoryIdMap = {}
         try:
             truncated = self.crawl_groups(
                 brand,
@@ -725,6 +912,9 @@ class Crawler:
                 category_ids=category_ids,
                 expected_ssd=ssd,
                 expected_vid=base_vid,
+                evidence_response=response,
+                evidence_vehicle_key=evidence_vehicle_key,
+                evidence_page_type="vehicle",
             )
 
             remaining_categories = categories[1:]
@@ -732,16 +922,16 @@ class Crawler:
                 if self._sample_limit_reached.is_set():
                     truncated += len(remaining_categories) - index
                     break
-                category_url = category["url"]
+                category_url = cast(str, category["url"])
                 if not category_url.startswith("http"):
                     category_url = SITE["base"] + category_url
-                category_html = self._get(category_url)
+                category_html, category_response = self._fetch(category_url)
                 category_soup = _soup(category_html)
                 truncated += self.crawl_groups(
                     brand,
                     vehicle_id,
                     category_html,
-                    default_cid=category["cid"],
+                    default_cid=cast(str, category["cid"]),
                     soup=category_soup,
                     skip=True,
                     fetched=fetched,
@@ -749,6 +939,9 @@ class Crawler:
                     category_ids=category_ids,
                     expected_ssd=str(category.get("ssd") or ssd),
                     expected_vid=str(category.get("vid") or base_vid),
+                    evidence_response=category_response,
+                    evidence_vehicle_key=evidence_vehicle_key,
+                    evidence_page_type="category",
                 )
 
             # SOL review P1：分類縮水對帳 —— DB 已知但本次完全沒解析到的
@@ -789,13 +982,16 @@ class Crawler:
         vehicle_id: int,
         html: str,
         default_cid: str,
-        soup=None,
-        skip=False,
-        fetched=None,
-        prev_rows=None,
-        category_ids=None,
-        expected_ssd=None,
-        expected_vid=None,
+        soup: Any = None,
+        skip: bool = False,
+        fetched: ReceiptMap | None = None,
+        prev_rows: ReceiptMap | None = None,
+        category_ids: CategoryIdMap | None = None,
+        expected_ssd: str | None = None,
+        expected_vid: str | None = None,
+        evidence_response: CatalogHttpResponse | None = None,
+        evidence_vehicle_key: Mapping[str, object] | None = None,
+        evidence_page_type: str = "vehicle",
     ) -> int:
         """解析一頁 HTML 內的所有零件組並逐一爬取。回傳被 limit_groups
         或 limit_parts 截斷而未完整爬取的零件組數。
@@ -880,6 +1076,23 @@ class Crawler:
                     len(downgraded),
                     ", ".join(downgraded[:5]),
                 )
+        if self.evidence_mode:
+            if evidence_response is None or evidence_vehicle_key is None:
+                raise RuntimeError("formal group evidence requires its HTTP and vehicle context")
+            self._capture_http_evidence(
+                evidence_response,
+                page_type=evidence_page_type,
+                parser_name="parse_groups",
+                parser_context={
+                    "brand": brand,
+                    "vehicle_key": evidence_vehicle_key,
+                    "default_cid": default_cid,
+                    "expected_vid": str(expected_vid or ""),
+                },
+                live_records=group_record_evidence(evidence_vehicle_key, groups),
+                malformed_rows=malformed,
+                skipped_record_count=skipped_groups + image_only,
+            )
         truncated = 0
         limit = CRAWL["limit_groups"]
         for i, group in enumerate(groups):
@@ -903,6 +1116,7 @@ class Crawler:
                 fetched=fetched,
                 prev_rows=prev_rows,
                 category_ids=category_ids,
+                evidence_vehicle_key=evidence_vehicle_key,
             )
             if part_truncated:
                 truncated = len(groups) - i
@@ -913,11 +1127,12 @@ class Crawler:
         self,
         brand: str,
         vehicle_id: int,
-        group: dict,
+        group: ParsedRecord,
         skip_if_fetched: bool = False,
-        fetched=None,
-        prev_rows=None,
-        category_ids=None,
+        fetched: ReceiptMap | None = None,
+        prev_rows: ReceiptMap | None = None,
+        category_ids: CategoryIdMap | None = None,
+        evidence_vehicle_key: Mapping[str, object] | None = None,
     ) -> bool:
         """爬取單一零件組：寫入分類/零件組 → 爬取零件明細。
 
@@ -1014,11 +1229,22 @@ class Crawler:
         self.db.commit()
         self._bump("groups")
 
+        source_group_key: Mapping[str, object] | None = None
+        if self.evidence_mode:
+            if evidence_vehicle_key is None:
+                raise RuntimeError("formal part evidence requires its vehicle context")
+            source_category_key = category_record_natural_key(evidence_vehicle_key, group)
+            source_group_key = group_natural_key(
+                source_category_key,
+                group.get("group_code"),
+                group.get("uid"),
+            )
+
         unit_url = group["url"]
         if not unit_url.startswith("http"):
             unit_url = SITE["base"] + unit_url
         try:
-            html = self._get(unit_url)
+            html, unit_response = self._fetch(unit_url)
         except NotFoundError:
             # 404 = 此 group 在網站端沒有資料（合法狀態）：視為完成，
             # 不讓整台車失敗（實際發生：部分車型的某些 group 頁 404）。
@@ -1037,6 +1263,7 @@ class Crawler:
                 fetched[map_key] = 0
             return False
         parts, malformed, skipped_nameless, skipped_rows = parse_parts(html, diagnostics=True)
+        parsed_source_parts = list(parts)
         # 站方合法存在、但完全沒有可驗證文字名稱的純料號列：不落庫
         # （發布資料必須能把料號對到產品名稱），但也不是版型異常 ——
         # 只警告、不失敗整台車（實測多個車型的 unit 頁固定含有此類列，
@@ -1066,6 +1293,18 @@ class Crawler:
                 f"[{brand} group={group.get('group_code')}] "
                 f"{malformed} malformed part row(s) (layout changed?)"
             )
+        source_part_records: list[RecordEvidence] = []
+        if self.evidence_mode:
+            if unit_response is None or source_group_key is None:
+                raise RuntimeError("formal part evidence is missing its HTTP or group context")
+            source_part_records = [
+                *part_record_evidence(source_group_key, parsed_source_parts),
+                *part_record_evidence(
+                    source_group_key,
+                    skipped_rows,
+                    record_type="quarantine_part",
+                ),
+            ]
         # SOL review P1：相較前次 receipt 的 row_count 大幅縮水 = 頁面
         # 只回傳「少數但格式完整」的資料（反爬變體/內容縮水）——
         # malformed 抓不到這種頁面，guard 也會放行，必須拒絕 receipt，
@@ -1114,6 +1353,16 @@ class Crawler:
             )
             self.parts.quarantine_parts(group_id, run_key, skipped_rows)
             self.crawl.mark_group_fetched(group_id, run_key, status="done", row_count=0)
+            if unit_response is not None and source_group_key is not None:
+                self._capture_http_evidence(
+                    unit_response,
+                    page_type="unit",
+                    parser_name="parse_parts",
+                    parser_context={"group_key": source_group_key},
+                    live_records=source_part_records,
+                    malformed_rows=malformed,
+                    skipped_record_count=skipped_nameless,
+                )
             self.db.commit()
             if fetched is not None:
                 fetched[map_key] = 0
@@ -1129,7 +1378,7 @@ class Crawler:
             context = self.parts.bounded_group_context(group_id)
             production_from = context.get("production_from") if context else None
             production_to = context.get("production_to") if context else None
-            eligible = []
+            eligible: list[ParsedRecord] = []
             for part in parts:
                 required = all(
                     str(part.get(field) or "").strip() for field in ("part_number", "name", "code")
@@ -1219,6 +1468,27 @@ class Crawler:
                     self.run_id,
                     complete_group=complete_group,
                 )
+                if unit_response is not None and source_group_key is not None:
+                    if source_group_key is None:
+                        raise RuntimeError("formal part evidence is missing its group key")
+                    accepted_records = [
+                        (part_id, part_record_evidence(source_group_key, [part])[0])
+                        for part_id, part in self.parts.part_ids_for_evidence(group_id, parts)
+                    ]
+                    if len(accepted_records) != len(parts):
+                        raise RuntimeError(
+                            "formal part evidence could not resolve every accepted part id"
+                        )
+                    self._capture_http_evidence(
+                        unit_response,
+                        page_type="unit",
+                        parser_name="parse_parts",
+                        parser_context={"group_key": source_group_key},
+                        live_records=source_part_records,
+                        accepted_records=accepted_records,
+                        malformed_rows=malformed,
+                        skipped_record_count=skipped_nameless,
+                    )
                 if complete_group:
                     # 同一組同時含有「合法零件」與「無名稱純料號列」時，
                     # 零件照常 receipt，無名稱列列進 quarantine 記錄
@@ -1271,7 +1541,7 @@ class Crawler:
 
     # ------------------------------------------------------------- entry
 
-    def run(self) -> dict:
+    def run(self) -> dict[str, int]:
         """執行整趟爬取（進入點）。回傳統計計數；self.last_status 記錄
         最終狀態，供 CLI 決定 exit code（P2 修復：
         不完整 run 不該以 exit 0 結束）。"""
@@ -1286,24 +1556,6 @@ class Crawler:
 
         sample_mode = self.sample_mode
         bounded_mode = self.bounded_mode
-        if bounded_mode:
-            run_key = (
-                CRAWL["bounded_run_key"]
-                or self.crawl.resumable_bounded_run_key(
-                    self.part_limit,
-                    scheduled_job_run_id=self.scheduled_job_run_id,
-                )
-                or f"bounded-{self.part_limit}-"
-                f"{'s' if self.scheduled_job_run_id else 'd'}"
-                f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
-            )
-            if len(run_key) > 32:
-                raise ValueError("PSQ_BOUNDED_RUN_KEY must be at most 32 characters")
-        elif sample_mode:
-            run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f")
-        else:
-            run_key = datetime.now().strftime("%Y-%m")
-        self.crawl.run_key = run_key
         partial = any(
             bool(CRAWL.get(k))
             for k in (
@@ -1316,49 +1568,103 @@ class Crawler:
                 "bounded_parts",
             )
         )
-        dataset_kind = "bounded" if bounded_mode else "sample" if sample_mode else "full"
-        run_id = self.crawl.start_run(
-            run_key,
-            fresh=self.fresh,
-            dataset_kind=dataset_kind,
-            target_parts=self.part_limit or None,
-            scheduled_job_run_id=self.scheduled_job_run_id,
-        )
-        self.run_id = run_id
-        # --fresh 的 run 邊界、state、receipt 與 membership reset 必須在
-        # 同一交易。若程序在初始化後崩潰，DB 會保留 running，下一次
-        # 普通啟動可繼續，而不會因舊 success 被靜默跳過。
-        if self.fresh:
-            self.crawl.reset_run_state(run_key)
-            self.crawl.reset_group_receipts(run_key)
-            self.crawl.reset_part_markers(run_id)
-        # 交易邊界由服務層決定（db.py 分層契約）。
-        self.db.commit()
-        if bounded_mode:
-            # 排程重試沿用穩定 run_key。配額必須從持久化 membership
-            # 恢復，不能從 0 重算，否則中斷後會再爬 target 筆。
-            self.counts["parts"] = self.crawl.count_run_parts(run_id)
-            if not self.fresh and self.crawl.run_status(run_id) == "bounded_success":
-                self.last_status = "bounded_success"
-                log.info("bounded run %s already published; skipping duplicate crawl", run_key)
-                return self.counts
-            discarded = self.crawl.discard_invalid_bounded_membership(run_id)
-            if discarded:
-                self.db.commit()
-                self.counts["parts"] = self.crawl.count_run_parts(run_id)
-                log.warning(
-                    "discarded %d invalid bounded membership row(s); continuing from %d/%d",
-                    discarded,
-                    self.counts["parts"],
-                    self.part_limit,
+        # Direct CLI 沒有 scheduler marker；先取得與 migration 相同的短鎖，
+        # 並在 running crawl marker 與 fresh reset 一起 commit 後立即釋放。
+        # 取得前不能查任何業務表，避免 metadata lock 反向等待。
+        with catalog_writer_admission(self.db._thread_conn()):
+            if bounded_mode:
+                run_key = (
+                    CRAWL["bounded_run_key"]
+                    or self.crawl.resumable_bounded_run_key(
+                        self.part_limit,
+                        scheduled_job_run_id=self.scheduled_job_run_id,
+                    )
+                    or f"bounded-{self.part_limit}-"
+                    f"{'s' if self.scheduled_job_run_id else 'd'}"
+                    f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
                 )
-        # 同月完整 run 已成功時，普通重啟不應再次 publish 舊 logical
-        # window；--fresh 已在 start_run 重設邊界，局部 run 則仍允許執行
-        # 修補 normalized 資料（但不會發布 current snapshot）。
-        if not self.fresh and not partial and self.crawl.run_status(run_id) == "success":
+                if len(run_key) > 32:
+                    raise ValueError("PSQ_BOUNDED_RUN_KEY must be at most 32 characters")
+            elif sample_mode:
+                run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f")
+            elif partial:
+                # 局部修補不得沿用已成功的月 run。start_run 會刻意保留
+                # success，因此沿用 YYYY-MM 會在 admission 釋放後沒有
+                # running marker，migration 可能與後續 normalized writes
+                # 交錯。排程重試沿用 scheduler id；直接 CLI 每次使用
+                # 獨立、32 字元內的 logical run。
+                run_key = (
+                    f"partial-s{self.scheduled_job_run_id}"
+                    if self.scheduled_job_run_id
+                    else datetime.now().strftime("partial-%y%m%dT%H%M%S%f")
+                )
+            else:
+                run_key = datetime.now().strftime("%Y-%m")
+            self.crawl.run_key = run_key
+            dataset_kind = "bounded" if bounded_mode else "sample" if sample_mode else "full"
+            try:
+                run_id = self.crawl.start_run(
+                    run_key,
+                    fresh=self.fresh,
+                    dataset_kind=dataset_kind,
+                    target_parts=self.part_limit or None,
+                    scheduled_job_run_id=self.scheduled_job_run_id,
+                )
+                self.run_id = run_id
+                # start_run 會保留既有 terminal row；在 admission 交易內
+                # 先讀回狀態，才能區分「新 running marker」與「既有已發布
+                # run」。讀取失敗會連同新 marker rollback，不會留下半套。
+                started_status = self.crawl.run_status(run_id)
+                # --fresh 的 run 邊界、state、receipt 與 membership reset 必須在
+                # 同一交易。若程序在初始化後崩潰，DB 會保留 running，下一次
+                # 普通啟動可繼續，而不會因舊 success 被靜默跳過。
+                if self.fresh:
+                    self.crawl.reset_run_state(run_key)
+                    self.crawl.reset_group_receipts(run_key)
+                    self.crawl.reset_part_markers(run_id)
+                # running marker durable 後立即釋放 admission；整趟爬取仍由
+                # scheduler／crawler flock 保護，不把 DB mutex 當 job lease。
+                self.db.commit()
+            except Exception:
+                # 先回滾初始化交易再釋放 schema admission，避免 migration
+                # 拿到 mutex 後仍被本連線尚未提交的 DML/metadata lock 卡住。
+                self.db.rollback()
+                raise
+        if not self.fresh and bounded_mode and started_status == "bounded_success":
+            self.last_status = "bounded_success"
+            log.info("bounded run %s already published; skipping duplicate crawl", run_key)
+            return self.counts
+        if not self.fresh and not partial and started_status == "success":
             self.last_status = "success"
             log.info("run %s already completed; skipping duplicate full crawl", run_key)
             return self.counts
+        try:
+            if bounded_mode:
+                # 排程重試沿用穩定 run_key。配額必須從持久化 membership
+                # 恢復，不能從 0 重算，否則中斷後會再爬 target 筆。
+                self.counts["parts"] = self.crawl.count_run_parts(run_id)
+                discarded = self.crawl.discard_invalid_bounded_membership(run_id)
+                if discarded:
+                    self.db.commit()
+                    self.counts["parts"] = self.crawl.count_run_parts(run_id)
+                    log.warning(
+                        "discarded %d invalid bounded membership row(s); continuing from %d/%d",
+                        discarded,
+                        self.counts["parts"],
+                        self.part_limit,
+                    )
+        except Exception as e:
+            # running marker 已提交；任何 resume/readback 初始化錯誤都必須
+            # 立即關閉本 run，否則 direct CLI 沒有 scheduler recovery 可用，
+            # 永久 running 會讓後續 migration 全部 fail closed。
+            self.last_status = "error"
+            self.db.rollback()
+            try:
+                self.crawl.finish_run(run_id, "error", self.counts, str(e))
+                self.db.commit()
+            except Exception:
+                log.exception("failed to persist crawl initialization error status")
+            raise
         # P1 修復：舊版 resume key（只有 model_code）的行永不關閉且被
         # count_errors 永久計入 —— 開啟本次 run 前先清掉，讓這些車以
         # v5 新格式重新爬取（一次性相容）。
@@ -1393,6 +1699,7 @@ class Crawler:
                         )
                     else:
                         log.info("publishing bounded snapshot with 0 quarantined row(s)")
+                    self.crawl.verify_run_evidence(run_id)
                     self.crawl.publish_bounded_parts(run_id, self.part_limit)
                     self.crawl.finish_run(run_id, "bounded_success", self.counts)
                     self.db.commit()
@@ -1506,6 +1813,7 @@ class Crawler:
                 else:
                     log.info("publishing bounded snapshot with 0 quarantined row(s)")
                 finalizing = True
+                self.crawl.verify_run_evidence(run_id)
                 self.crawl.publish_bounded_parts(run_id, self.part_limit)
                 self.crawl.finish_run(run_id, "bounded_success", self.counts)
                 self.db.commit()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from flask import Flask
+from flask import Flask, request
 
 from partsouq_station_admin.config import AdminConfig
 from partsouq_station_admin.db import AdminDatabase, RequestDatabase
@@ -30,9 +30,15 @@ def create_app(
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=resolved.secure_cookie,
         MAX_CONTENT_LENGTH=1_000_000,
+        TRUSTED_HOSTS=list(resolved.allowed_hosts),
     )
     app.extensions["partsouq_admin_config"] = resolved
     app.extensions["partsouq_admin_database_factory"] = database_factory
+
+    @app.before_request
+    def enforce_trusted_host() -> None:
+        _ = request.host
+
     app.register_blueprint(bp)
     return app
 

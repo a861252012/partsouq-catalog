@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -11,18 +12,25 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
+from unittest import mock
 
 import pymysql
 import pytest
 from fastapi.testclient import TestClient
+from playwright._impl import _transport as playwright_transport
 from playwright.sync_api import Browser, Error, Playwright, expect, sync_playwright
-from pymysql.constants import CLIENT
 from pymysql.cursors import DictCursor
 from werkzeug.serving import make_server
 
 from partsouq_admin import app as data_admin_app
+from partsouq_crawler.crawl.browser_fetcher import (
+    browser_driver_environment,
+    browser_process_environment,
+)
 from partsouq_station_admin.app import create_app
 from partsouq_station_admin.config import AdminConfig
+from tests.e2e.test_bounded_admin_performance import LOCAL_DATABASE_HOSTS, _mysql_statements
 
 pytestmark = pytest.mark.skipif(
     os.getenv("STATION_ADMIN_E2E") != "1",
@@ -49,6 +57,7 @@ OVERRIDE_PART_NUMBER_NORMALIZED = "E2EOVERRIDE000200"
 UPDATED_SOURCE_CODE = "C0200-UPDATED"
 VIN = "ZZZTEST00X0000003"
 ACTOR = "station-admin-e2e"
+ADMIN_PASSWORD = "station-admin-e2e-password"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +90,9 @@ class E2EDatabase:
             bind_host="127.0.0.1",
             bind_port=0,
             secret_key="station-admin-e2e-secret",
+            username=ACTOR,
+            password=ADMIN_PASSWORD,
+            require_auth=True,
             default_actor=ACTOR,
             page_size=30,
         )
@@ -89,6 +101,8 @@ class E2EDatabase:
 @pytest.fixture
 def e2e_database() -> Iterator[E2EDatabase]:
     host = os.environ["PARTSOUQ_DB_HOST"]
+    if host not in LOCAL_DATABASE_HOSTS:
+        raise ValueError("station admin E2E database host must be local loopback")
     port = int(os.environ["PARTSOUQ_DB_PORT"])
     root_password = os.environ["PARTSOUQ_MYSQL_ROOT_PASSWORD"]
     database_name = f"partsouq_station_admin_{uuid.uuid4().hex[:12]}_test"
@@ -124,6 +138,20 @@ def _validate_test_database_name(database_name: str) -> None:
         raise ValueError("E2E database name must be a safe identifier ending in _test")
 
 
+def test_e2e_database_rejects_remote_host_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARTSOUQ_DB_HOST", "mysql.example.test")
+    connect = mock.MagicMock()
+    monkeypatch.setattr(pymysql, "connect", connect)
+    fixture = e2e_database.__wrapped__()
+
+    with pytest.raises(ValueError, match="must be local loopback"):
+        next(fixture)
+
+    connect.assert_not_called()
+
+
 def _apply_schemas(database: E2EDatabase) -> None:
     connection = pymysql.connect(
         host=database.host,
@@ -134,14 +162,12 @@ def _apply_schemas(database: E2EDatabase) -> None:
         charset="utf8mb4",
         autocommit=False,
         cursorclass=DictCursor,
-        client_flag=CLIENT.MULTI_STATEMENTS,
     )
     try:
         with connection.cursor() as cursor:
             for schema_path in SCHEMA_PATHS:
-                cursor.execute(schema_path.read_text(encoding="utf-8"))
-                while cursor.nextset():
-                    pass
+                for statement in _mysql_statements(schema_path.read_text(encoding="utf-8")):
+                    cursor.execute(statement)
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -239,14 +265,30 @@ def _seed_parts(database: E2EDatabase) -> None:
                 rows,
             )
             cursor.execute(
+                "INSERT INTO scheduled_job_runs("
+                "job_name, trigger_mode, status, started_at, finished_at, exit_code"
+                ") VALUES ('catalog', 'daemon', 'completed', UTC_TIMESTAMP(6), "
+                "UTC_TIMESTAMP(6), 0)"
+            )
+            scheduled_job_run_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO crawl_runs("
+                "run_key, started_at, finished_at, status, dataset_kind, target_parts, "
+                "scheduled_job_run_id, parts_ok, error_msg"
+                ") VALUES ('e2e-formal-full', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), "
+                "'success', 'full', NULL, %s, 1, NULL)",
+                (scheduled_job_run_id,),
+            )
+            formal_crawl_run_id = cursor.lastrowid
+            cursor.execute(
                 "INSERT INTO published_parts("
-                "part_id, vehicle_id, model_id, vehicle_vid, brand, model, vehicle_name, "
+                "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, brand, model, vehicle_name, "
                 "vehicle_code, prod_period, production_from, production_to, engine, trim_name, "
                 "part_name, part_number, part_number_normalized, category_id, category_cid, "
                 "category_main, "
                 "category_group, group_id, group_code, group_uid, part_range, part_from, "
                 "part_to, source_url, note, quantity, code, snapshot_at"
-                ") SELECT p.id, v.id, m.id, v.vid, b.name, m.name, v.name, v.model_code, "
+                ") SELECT p.id, %s, v.id, m.id, v.vid, b.name, m.name, v.name, v.model_code, "
                 "v.prod_period, v.production_from, v.production_to, v.engine, v.grade, "
                 "p.name, p.part_number, "
                 "UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')), "
@@ -258,7 +300,7 @@ def _seed_parts(database: E2EDatabase) -> None:
                 "JOIN vehicles AS v ON v.id = c.vehicle_id "
                 "JOIN models AS m ON m.id = v.model_id "
                 "JOIN brands AS b ON b.id = m.brand_id WHERE p.id = %s",
-                (TARGET_PART_ID,),
+                (formal_crawl_run_id, TARGET_PART_ID),
             )
             cursor.execute(
                 "UPDATE parts SET part_number = %s, name = %s WHERE id = %s",
@@ -295,6 +337,29 @@ def _seed_parts(database: E2EDatabase) -> None:
     except BaseException:
         connection.rollback()
         raise
+    finally:
+        connection.close()
+
+
+def test_station_admin_e2e_fixture_requires_auth_and_formal_provenance(
+    e2e_database: E2EDatabase,
+) -> None:
+    config = e2e_database.admin_config()
+    assert config.require_auth is True
+    assert config.auth_required is True
+
+    connection = e2e_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT dataset_scope, source_crawl_run_id "
+                "FROM v_current_catalog_parts WHERE part_id = %s",
+                (TARGET_PART_ID,),
+            )
+            published = cursor.fetchone()
+        assert published is not None
+        assert published["dataset_scope"] == "full"
+        assert int(published["source_crawl_run_id"]) > 0
     finally:
         connection.close()
 
@@ -346,11 +411,17 @@ def _running_admin_server(database: E2EDatabase) -> Iterator[str]:
 
 
 def _launch_chromium(playwright: Playwright) -> Browser:
+    _assert_browser_launch_environment()
     channel = os.getenv("STATION_ADMIN_E2E_BROWSER_CHANNEL", "").strip()
+    browser_environment = browser_process_environment()
     try:
         if channel:
-            return playwright.chromium.launch(headless=True, channel=channel)
-        return playwright.chromium.launch(headless=True)
+            return playwright.chromium.launch(
+                headless=True,
+                channel=channel,
+                env=browser_environment,
+            )
+        return playwright.chromium.launch(headless=True, env=browser_environment)
     except Error as error:
         pytest.fail(
             "STATION_ADMIN_E2E=1 requires a launchable Chromium browser; "
@@ -359,6 +430,156 @@ def _launch_chromium(playwright: Playwright) -> Browser:
             pytrace=False,
         )
         raise AssertionError from error
+
+
+def _assert_browser_launch_environment() -> None:
+    if sys.platform == "darwin" and os.getenv("CODEX_SANDBOX"):
+        raise RuntimeError(
+            "refusing to launch macOS Chromium inside the Codex sandbox; "
+            "run this E2E command from a normal Aqua terminal or an explicitly "
+            "approved unsandboxed runner"
+        )
+
+
+@contextmanager
+def _playwright_runtime() -> Iterator[Playwright]:
+    # async/sync Playwright 會先啟動 node driver；preflight 必須在進入
+    # sync_playwright context 前執行，否則 Chromium launch guard 已太晚。
+    _assert_browser_launch_environment()
+    manager = sync_playwright()
+    try:
+        with browser_driver_environment():
+            playwright = manager.start()
+    except BaseException as error:
+        try:
+            manager.__exit__(*sys.exc_info())
+        except BaseException as cleanup_error:
+            error.add_note(
+                "Playwright cleanup failed after driver startup error: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
+    try:
+        yield playwright
+    finally:
+        playwright.stop()
+
+
+def test_browser_launch_preflight_rejects_macos_codex_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeChromium:
+        def __init__(self) -> None:
+            self.launch_called = False
+
+        def launch(self, **_kwargs: object) -> None:
+            self.launch_called = True
+
+    class FakePlaywright:
+        def __init__(self) -> None:
+            self.chromium = FakeChromium()
+
+    playwright = FakePlaywright()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+
+    with pytest.raises(RuntimeError, match="refusing to launch macOS Chromium"):
+        _launch_chromium(cast(Playwright, playwright))
+    assert playwright.chromium.launch_called is False
+
+
+def test_playwright_node_is_not_started_inside_macos_codex_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_start = mock.Mock()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    monkeypatch.setattr(sys.modules[__name__], "sync_playwright", sync_start)
+
+    with (
+        pytest.raises(RuntimeError, match="refusing to launch macOS Chromium"),
+        _playwright_runtime(),
+    ):
+        pytest.fail("Playwright context must not be entered")
+    sync_start.assert_not_called()
+
+
+def test_playwright_node_starts_without_application_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node_environment: dict[str, str] = {}
+    stopped = False
+
+    class FakePlaywright:
+        def stop(self) -> None:
+            nonlocal stopped
+            stopped = True
+
+    class FakeManager:
+        def start(self) -> FakePlaywright:
+            node_environment.update(cast(dict[str, str], playwright_transport.get_driver_env()))
+            return FakePlaywright()
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("PARTSOUQ_DB_PASSWORD", "database-secret")
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "admin-secret")
+    monkeypatch.setattr(sys.modules[__name__], "sync_playwright", FakeManager)
+
+    with _playwright_runtime():
+        assert os.environ["PARTSOUQ_DB_PASSWORD"] == "database-secret"
+        assert os.environ["PARTSOUQ_ADMIN_TOKEN"] == "admin-secret"
+
+    assert "PARTSOUQ_DB_PASSWORD" not in node_environment
+    assert "PARTSOUQ_ADMIN_TOKEN" not in node_environment
+    assert stopped is True
+
+
+def test_playwright_manager_stops_when_driver_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stopped = False
+
+    class FakeManager:
+        def start(self) -> None:
+            raise RuntimeError("driver start failed")
+
+        def __exit__(self, *_args: object) -> None:
+            nonlocal stopped
+            stopped = True
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys.modules[__name__], "sync_playwright", FakeManager)
+
+    with pytest.raises(RuntimeError, match="driver start failed"), _playwright_runtime():
+        pytest.fail("Playwright runtime must not yield after a start failure")
+
+    assert stopped is True
+
+
+def test_browser_launch_does_not_receive_application_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launch_options: dict[str, object] = {}
+
+    class FakeChromium:
+        def launch(self, **kwargs: object) -> object:
+            launch_options.update(kwargs)
+            return object()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("STATION_ADMIN_E2E_BROWSER_CHANNEL", raising=False)
+    monkeypatch.setenv("PARTSOUQ_DB_PASSWORD", "database-secret")
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "admin-secret")
+
+    _launch_chromium(cast(Playwright, FakePlaywright()))
+
+    browser_environment = launch_options["env"]
+    assert isinstance(browser_environment, dict)
+    assert "PARTSOUQ_DB_PASSWORD" not in browser_environment
+    assert "PARTSOUQ_ADMIN_TOKEN" not in browser_environment
 
 
 def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
@@ -400,7 +621,7 @@ def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
         connection.close()
     with (
         _running_admin_server(e2e_database) as admin_url,
-        sync_playwright() as playwright,
+        _playwright_runtime() as playwright,
     ):
         browser = _launch_chromium(playwright)
         try:
@@ -574,11 +795,25 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
         with (
             _running_server(e2e_database) as base_url,
             TestClient(data_admin_app.app) as data_client,
-            sync_playwright() as playwright,
+            _playwright_runtime() as playwright,
         ):
             browser = _launch_chromium(playwright)
             try:
                 page = browser.new_page()
+                page.goto(f"{base_url}/entities/part_numbers")
+                expect(page).to_have_url(re.compile(r"/login\?next="))
+                expect(page.get_by_role("heading", name="站方後台登入")).to_be_visible()
+
+                page.get_by_label("帳號").fill(ACTOR)
+                page.get_by_label("密碼").fill("wrong-password")
+                page.get_by_role("button", name="登入").click()
+                expect(page.get_by_text("帳號或密碼錯誤。", exact=True)).to_be_visible()
+
+                page.get_by_label("帳號").fill(ACTOR)
+                page.get_by_label("密碼").fill(ADMIN_PASSWORD)
+                page.get_by_role("button", name="登入").click()
+                expect(page).to_have_url(re.compile(r"/entities/part_numbers$"))
+
                 page.goto(base_url)
                 current_card = page.locator(".summary-grid > div").filter(has_text="目前正式資料列")
                 normalized_history_card = page.locator(".summary-grid > div").filter(
@@ -622,7 +857,8 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
                 page.locator('input[name="field__number_raw"]').fill(OVERRIDE_PART_NUMBER)
                 page.locator('input[name="field__name_en_raw"]').fill(OVERRIDE_PART_NAME)
                 page.locator('select[name="field__is_assembly_inferred"]').select_option("1")
-                page.get_by_label("操作者").fill(ACTOR)
+                expect(page.get_by_label("操作者")).to_have_value(ACTOR)
+                expect(page.get_by_label("操作者")).to_have_attribute("readonly", "")
                 page.get_by_label("修改原因").fill("E2E update")
                 page.get_by_role("button", name="儲存新版本").click()
                 expect(
@@ -636,14 +872,12 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
 
                 page.get_by_role("link", name="編輯覆寫").click()
                 page.locator('select[name="field__is_assembly_inferred"]').select_option("")
-                page.get_by_label("操作者").fill(ACTOR)
                 page.get_by_label("修改原因").fill("E2E clear boolean override")
                 page.get_by_role("button", name="儲存新版本").click()
                 expect(page.locator(".page-title p")).to_contain_text("覆寫版本 2")
 
                 page.get_by_role("link", name="編輯覆寫").click()
                 _update_source_code(e2e_database)
-                page.get_by_label("操作者").fill(ACTOR)
                 page.get_by_label("修改原因").fill("E2E stale source")
                 page.get_by_role("button", name="儲存新版本").click()
                 expect(
@@ -655,12 +889,10 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
 
                 page.goto(f"{base_url}/entities/part_numbers/source:{TARGET_PART_ID}")
                 page.get_by_role("link", name="編輯覆寫").click()
-                page.get_by_label("操作者").fill(ACTOR)
                 page.get_by_label("修改原因").fill("E2E rebase after source refresh")
                 page.get_by_role("button", name="儲存新版本").click()
                 expect(page.locator(".page-title p")).to_contain_text("覆寫版本 3")
 
-                page.get_by_label("操作者").fill(ACTOR)
                 page.get_by_label("原因").fill("E2E retire")
                 page.get_by_role("button", name="停用").click()
                 expect(page.locator(".page-title p")).to_contain_text("狀態 retired")
@@ -668,13 +900,23 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
                 retired = _read_effective_api_evidence(data_client, headers)
                 assert retired == {"published": [], "sample": [], "fitments": [], "vin": []}
 
-                page.get_by_label("操作者").fill(ACTOR)
                 page.get_by_label("原因").fill("E2E restore")
                 page.get_by_role("button", name="恢復").click()
                 expect(page.locator(".page-title p")).to_contain_text("狀態 active")
                 expect(page.locator(".page-title p")).to_contain_text("覆寫版本 5")
                 restored = _read_effective_api_evidence(data_client, headers)
                 _assert_effective_part_visible(restored)
+
+                rejected_logout = page.request.post(
+                    f"{base_url}/logout",
+                    form={},
+                    fail_on_status_code=False,
+                )
+                assert rejected_logout.status == 400
+                page.get_by_role("button", name="登出").click()
+                expect(page.get_by_role("heading", name="站方後台登入")).to_be_visible()
+                page.goto(f"{base_url}/entities/part_numbers")
+                expect(page).to_have_url(re.compile(r"/login\?next="))
             finally:
                 browser.close()
 

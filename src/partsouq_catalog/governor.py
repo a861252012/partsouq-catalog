@@ -49,7 +49,7 @@ class RequestGovernor:
         self._last = now
         return rate
 
-    def acquire(self):
+    def acquire(self) -> None:
         """取得一個請求時槽（必要時阻塞等待；等待時釋放鎖）。"""
         with self._cond:
             while True:
@@ -63,7 +63,7 @@ class RequestGovernor:
                     return
                 self._cond.wait(timeout=(1.0 - self._tokens) / rate)
 
-    def throttle(self, seconds: float):
+    def throttle(self, seconds: float) -> None:
         """暫停所有 workers 至少 seconds 秒（429 / 反爬偵測）。"""
         if seconds <= 0:
             return
@@ -76,7 +76,7 @@ class RequestGovernor:
             self._last = self._block_until
             self._cond.notify_all()
 
-    def slow(self, seconds: float = SLOW_DEFAULT_SECONDS):
+    def slow(self, seconds: float = SLOW_DEFAULT_SECONDS) -> None:
         """偵測到反爬後降速（速率砍半），持續 seconds 秒後自動恢復。"""
         if seconds <= 0:
             return

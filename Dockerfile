@@ -1,8 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+
+ARG UV_VERSION=0.9.18
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PARTSOUQ_HOME=/app
+    PARTSOUQ_HOME=/app \
+    PSQ_CLOAK_PYTHON=/usr/local/bin/python \
+    UV_LINK_MODE=copy
 
 # CloakBrowser 0.4.0 提供 Linux x64 / arm64 的指紋修補版 Chromium：
 # 需要標準 Chromium 系統依賴，且 headless=False 需要虛擬顯示（Xvfb）
@@ -18,13 +22,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 固定與 macOS host 驗證過相同的版本；binary 在建置時預先下載進
 # image（/app/.cloakbrowser），runtime 不再需要外網下載。
 ENV CLOAKBROWSER_CACHE_DIR=/app/.cloakbrowser
-RUN pip install --no-cache-dir "cloakbrowser==0.4.0" \
-    && python -m cloakbrowser install
+COPY deploy/requirements-cloakbrowser.txt /tmp/requirements-cloakbrowser.txt
+RUN pip install --no-cache-dir --require-hashes \
+        -r /tmp/requirements-cloakbrowser.txt \
+    && python -m cloakbrowser install \
+    && pip install --no-cache-dir "uv==${UV_VERSION}"
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev
+ENV PATH="/app/.venv/bin:${PATH}"
 COPY db ./db
+COPY migrations ./migrations
+COPY deploy/checked-entrypoint.sh /usr/local/bin/partsouq-checked-entrypoint
+RUN chmod 0755 /usr/local/bin/partsouq-checked-entrypoint
 
 CMD ["partsouq-admin"]

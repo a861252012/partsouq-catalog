@@ -4,14 +4,13 @@ import json
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from typing import Any
 
 import pymysql
 from pymysql.connections import Connection
-from pymysql.constants import CLIENT
 from pymysql.cursors import DictCursor
 
+from partsouq_catalog.admission import catalog_writer_admission
 from partsouq_crawler.nhtsa.api import normalize_vin
 from partsouq_crawler.nhtsa.config import NhtsaConfig
 from partsouq_crawler.nhtsa.models import (
@@ -40,13 +39,10 @@ class NhtsaMySQLRepository:
             charset="utf8mb4",
             autocommit=False,
             cursorclass=DictCursor,
-            client_flag=CLIENT.MULTI_STATEMENTS,
             read_timeout=600,
             write_timeout=600,
         )
-        repository = cls(connection)
-        repository.apply_schema()
-        return repository
+        return cls(connection)
 
     def close(self) -> None:
         self.connection.close()
@@ -63,54 +59,12 @@ class NhtsaMySQLRepository:
         else:
             self.connection.commit()
 
-    def apply_schema(self) -> None:
-        schema_path = Path(__file__).with_name("mysql_schema.sql")
-        schema = schema_path.read_text(encoding="utf-8")
-        with self.transaction() as connection, connection.cursor() as cursor:
-            cursor.execute(schema)
-            while cursor.nextset():
-                pass
-        self._apply_artifact_lineage_migration()
-
-    def _apply_artifact_lineage_migration(self) -> None:
-        with self.connection.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM nhtsa_schema_migrations WHERE version = 2")
-            if cursor.fetchone():
-                return
-            cursor.execute(
-                """
-                SELECT COLUMN_NAME
-                FROM information_schema.STATISTICS
-                WHERE TABLE_SCHEMA = DATABASE()
-                  AND TABLE_NAME = 'nhtsa_artifact_records'
-                  AND INDEX_NAME = 'PRIMARY'
-                ORDER BY SEQ_IN_INDEX
-                """
-            )
-            primary_columns = tuple(str(row["COLUMN_NAME"]) for row in cursor)
-
-        with self.transaction() as connection, connection.cursor() as cursor:
-            if primary_columns != ("artifact_id", "member_name", "source_line"):
-                cursor.execute(
-                    """
-                    ALTER TABLE nhtsa_artifact_records
-                        DROP PRIMARY KEY,
-                        DROP INDEX uq_nhtsa_artifact_line,
-                        ADD PRIMARY KEY (artifact_id, member_name, source_line),
-                        ADD INDEX idx_nhtsa_artifact_natural_key (
-                            artifact_id, dataset_name, natural_key_sha256, record_sha256
-                        )
-                    """
-                )
-            cursor.execute(
-                """
-                INSERT INTO nhtsa_schema_migrations(version, applied_at)
-                VALUES (2, UTC_TIMESTAMP(6))
-                """
-            )
-
     def start_run(self, run_key: str, scope_name: str, source_keys: Sequence[str]) -> int:
-        with self.transaction() as connection, connection.cursor() as cursor:
+        with (
+            catalog_writer_admission(self.connection),
+            self.transaction() as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 INSERT INTO nhtsa_sync_runs(

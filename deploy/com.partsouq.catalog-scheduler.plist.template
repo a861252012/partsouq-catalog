@@ -10,6 +10,13 @@
   </array>
   <key>WorkingDirectory</key>
   <string>__PROJECT_ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PARTSOUQ_LAUNCHD_JOB</key>
+    <string>1</string>
+    <key>LAUNCHD_JOB</key>
+    <string>1</string>
+  </dict>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>RunAtLoad</key>
@@ -19,8 +26,8 @@
   <key>ThrottleInterval</key>
   <integer>60</integer>
   <key>StandardOutPath</key>
-  <string>/tmp/partsouq-catalog-scheduler.stdout.log</string>
+  <string>__STDOUT_PATH__</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/partsouq-catalog-scheduler.stderr.log</string>
+  <string>__STDERR_PATH__</string>
 </dict>
 </plist>

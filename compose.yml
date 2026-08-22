@@ -1,25 +1,38 @@
+x-app-db-environment: &app-db-environment
+  PARTSOUQ_DB_HOST: mysql
+  PARTSOUQ_DB_PORT: 3306
+  PARTSOUQ_DB_NAME: ${PARTSOUQ_DB_NAME:-partsouq_catalog}
+  PARTSOUQ_DB_USER: ${PARTSOUQ_DB_USER:-partsouq}
+  PARTSOUQ_DB_PASSWORD: ${PARTSOUQ_DB_PASSWORD:?set PARTSOUQ_DB_PASSWORD in .env}
+
+x-scheduler-environment: &scheduler-environment
+  <<: *app-db-environment
+  PARTSOUQ_HOME: /app
+  PSQ_LIMIT_PARTS: "0"
+  PSQ_BOUNDED_PARTS: "10000"
+  PSQ_EVIDENCE_MAX_BODY_BYTES: "8388608"
+  PSQ_EVIDENCE_MAX_RUN_BYTES: "1073741824"
+  PSQ_EVIDENCE_MAX_ARTIFACTS: "50000"
+  PSQ_SCHEDULER_STATE_DIR: /app/logs
+
 x-scheduler-base: &scheduler-base
   build: .
   profiles: ["scheduler"]
   restart: unless-stopped
   stop_grace_period: 30s
-  env_file: .env
   environment:
-    PARTSOUQ_HOME: /app
-    PARTSOUQ_DB_HOST: mysql
-    PARTSOUQ_DB_PORT: 3306
-    PSQ_LIMIT_PARTS: "0"
-    PSQ_BOUNDED_PARTS: ${PSQ_BOUNDED_PARTS:-10000}
+    <<: *scheduler-environment
   depends_on:
     mysql:
       condition: service_healthy
+  entrypoint: ["partsouq-checked-entrypoint"]
   volumes:
     - ./output:/app/output
     - ./logs:/app/logs
 
 services:
   mysql:
-    image: mysql:8.4
+    image: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
     environment:
       MYSQL_DATABASE: ${PARTSOUQ_DB_NAME:-partsouq_catalog}
       MYSQL_USER: ${PARTSOUQ_DB_USER:-partsouq}
@@ -41,16 +54,19 @@ services:
 
   admin:
     build: .
-    env_file: .env
     environment:
+      <<: *app-db-environment
       PARTSOUQ_HOME: /app
-      PARTSOUQ_DB_HOST: mysql
-      PARTSOUQ_DB_PORT: 3306
+      PARTSOUQ_ADMIN_BIND_HOST: 0.0.0.0
+      PARTSOUQ_ADMIN_TOKEN: ${PARTSOUQ_ADMIN_TOKEN:?set PARTSOUQ_ADMIN_TOKEN in .env}
+      PARTSOUQ_ADMIN_TRUSTED_HOSTS: ${PARTSOUQ_ADMIN_TRUSTED_HOSTS:-127.0.0.1,localhost,admin.partsouq.localhost}
+      PSQ_LIMIT_PARTS: "0"
     depends_on:
       mysql:
         condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
+    entrypoint: ["partsouq-checked-entrypoint"]
     command: ["partsouq-admin"]
     healthcheck:
       test:
@@ -67,16 +83,20 @@ services:
 
   station-admin:
     build: .
-    env_file: .env
     environment:
+      <<: *app-db-environment
       PARTSOUQ_HOME: /app
-      PARTSOUQ_DB_HOST: mysql
-      PARTSOUQ_DB_PORT: 3306
+      PARTSOUQ_STATION_ADMIN_SECRET_KEY: ${PARTSOUQ_STATION_ADMIN_SECRET_KEY:?set PARTSOUQ_STATION_ADMIN_SECRET_KEY in .env}
+      PARTSOUQ_STATION_ADMIN_USERNAME: ${PARTSOUQ_STATION_ADMIN_USERNAME:?set PARTSOUQ_STATION_ADMIN_USERNAME in .env}
+      PARTSOUQ_STATION_ADMIN_PASSWORD: ${PARTSOUQ_STATION_ADMIN_PASSWORD:?set PARTSOUQ_STATION_ADMIN_PASSWORD in .env}
+      PARTSOUQ_STATION_ADMIN_REQUIRE_AUTH: "1"
+      PARTSOUQ_STATION_ADMIN_ALLOWED_HOSTS: ${PARTSOUQ_STATION_ADMIN_ALLOWED_HOSTS:-localhost,127.0.0.1,admin.partsouq.localhost}
     depends_on:
       mysql:
         condition: service_healthy
     ports:
       - "127.0.0.1:8086:8086"
+    entrypoint: ["partsouq-checked-entrypoint"]
     command:
       [
         "gunicorn",
@@ -99,14 +119,23 @@ services:
       retries: 12
       start_period: 5s
 
+  schema-migrate:
+    build: .
+    profiles: ["migration"]
+    restart: "no"
+    environment:
+      <<: *app-db-environment
+      PARTSOUQ_HOME: /app
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["partsouq-catalog-migrate", "apply"]
+
   scheduler:
     <<: *scheduler-base
     environment:
-      PARTSOUQ_HOME: /app
-      PARTSOUQ_DB_HOST: mysql
-      PARTSOUQ_DB_PORT: 3306
-      PSQ_LIMIT_PARTS: "0"
-      PSQ_BOUNDED_PARTS: ${PSQ_BOUNDED_PARTS:-10000}
+      <<: *scheduler-environment
+      PSQ_CLOAK_STATE_DIR: /app/data
       # CloakBrowser transport（Linux arm64/x64 版本）：用本 image 內建的
       # python 與 Chromium binary；headless=False 需要 Xvfb 虛擬顯示。
       # server-args 含空白必須保持為單一參數（xvfb-run 才會正確解析），

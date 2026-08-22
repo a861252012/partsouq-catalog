@@ -12,15 +12,92 @@
 """
 
 import hashlib
+import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import cast
 
-from .db import Database
+from .config import CRAWL
+from .db import Database, Row
+from .evidence import (
+    RecordEvidence,
+    SanitizedBody,
+    assert_no_secret_material,
+    brand_natural_key,
+    canonical_parser_context,
+    canonical_sha256,
+    category_natural_key,
+    dataset_sha256,
+    group_natural_key,
+    model_natural_key,
+    part_natural_key,
+    public_source_url,
+    replay_catalog_records,
+    restore_sanitized_body,
+    vehicle_natural_key,
+)
 
 log = logging.getLogger("repos")
 
 # 零件的搜尋頁網址模板（PartSouq 的零件查詢入口）
 PART_URL_TEMPLATE = "https://partsouq.com/en/search/all?q={part_number}"
+
+type IntCompatible = str | bytes | bytearray | int | float
+
+_SHA256_LENGTH = 64
+_EVIDENCE_PARENT_TYPE = {
+    "model": "brand",
+    "vehicle": "model",
+    "category": "vehicle",
+    "group": "category",
+    "part": "group",
+    "quarantine_part": "group",
+}
+_EVIDENCE_PAGE_PARSERS = {
+    ("genuine", "parse_brands"),
+    ("locate", "parse_brand_index"),
+    ("pick", "parse_vehicles"),
+    ("vehicle", "parse_category_links"),
+    ("vehicle", "parse_groups"),
+    ("category", "parse_groups"),
+    ("unit", "parse_parts"),
+}
+
+
+def _db_int(value: object) -> int:
+    """將已知為數值欄位的 DB 值轉成 int，保留原有 int() 語意。"""
+    return int(cast(IntCompatible, value))
+
+
+def _evidence_record_set_sha256(records: Sequence[RecordEvidence]) -> str:
+    """Hash a deterministic record set, including every parent-chain edge."""
+    return dataset_sha256(records)
+
+
+def _evidence_record_key(record: RecordEvidence) -> tuple[str, str, str | None, str]:
+    return (
+        record.record_type,
+        record.natural_key_sha256,
+        record.parent_natural_key_sha256,
+        record.record_sha256,
+    )
+
+
+def _require_sha256(value: str, field_name: str) -> None:
+    if len(value) != _SHA256_LENGTH or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
+class _RunEvidenceSummary:
+    manifest_sha256: str
+    dataset_sha256: str
+    artifact_count: int
+    accepted_record_count: int
+    original_bytes: int
+    stored_bytes: int
 
 
 @dataclass
@@ -43,7 +120,7 @@ class GroupIdentity:
     image_by_uid: dict[str, int] = field(default_factory=dict)
 
 
-def vehicle_identity_hash(model_id: int, vehicle: dict) -> str:
+def vehicle_identity_hash(model_id: int, vehicle: Mapping[str, object]) -> str:
     """回傳與 vehicles 唯一鍵一致的穩定 SHA256 identity。
 
     ssd / vid / url 都是請求用 token 或參數，不屬於車型身分；它們輪替
@@ -84,13 +161,13 @@ class BrandRepository:
     def list_brands(self) -> list[str]:
         """列出資料庫中已知的所有品牌名稱（判定全站完成用）。"""
         cur = self.db._execute("SELECT name FROM brands ORDER BY name")
-        return [r["name"] for r in cur.fetchall()]
+        return [cast(str, r["name"]) for r in cur.fetchall()]
 
     def _brand_id(self, name: str) -> int:
         """依品牌名稱查詢 id（upsert 回傳值為 0 時的備援查詢）。"""
         cur = self.db._execute("SELECT id FROM brands WHERE name = %s", (name,))
         row = cur.fetchone()
-        return row["id"] if row else 0
+        return cast(int, row["id"]) if row else 0
 
     def upsert_model(self, brand_id: int, name: str, ssd: str | None, url: str | None) -> int:
         """新增或更新型號（以品牌 + 名稱唯一）。回傳型號 id。
@@ -103,9 +180,9 @@ class BrandRepository:
             "url = new.url, fetched_at = NOW(), id = LAST_INSERT_ID(id)",
             (brand_id, name, ssd, url),
         )
-        return cur.lastrowid
+        return cast(int, cur.lastrowid)
 
-    def list_models(self, brand_id: int) -> list[dict]:
+    def list_models(self, brand_id: int) -> Sequence[Row]:
         """列出某品牌下的所有型號（依 id 排序）。"""
         cur = self.db._execute(
             "SELECT id, name, ssd, url FROM models WHERE brand_id = %s ORDER BY id",
@@ -120,7 +197,7 @@ class BrandRepository:
             "JOIN brands b ON b.id = m.brand_id WHERE b.name = %s ORDER BY m.name",
             (brand,),
         )
-        return [r["name"] for r in cur.fetchall()]
+        return [cast(str, r["name"]) for r in cur.fetchall()]
 
 
 class VehicleRepository:
@@ -129,7 +206,7 @@ class VehicleRepository:
     def __init__(self, db: Database):
         self.db = db
 
-    def upsert_vehicle(self, model_id: int, vehicle: dict) -> int:
+    def upsert_vehicle(self, model_id: int, vehicle: Mapping[str, object]) -> int:
         """新增或更新車型（以 model_id + identity_hash 唯一）。回傳 id。"""
         identity_hash = vehicle_identity_hash(model_id, vehicle)
         cur = self.db._execute(
@@ -166,9 +243,9 @@ class VehicleRepository:
                 vehicle.get("url"),
             ),
         )
-        return cur.lastrowid
+        return cast(int, cur.lastrowid)
 
-    def list_vehicles(self, model_id: int) -> list[dict]:
+    def list_vehicles(self, model_id: int) -> Sequence[Row]:
         """列出某型號下的所有車型（依 id 排序）。"""
         cur = self.db._execute(
             "SELECT id, name, model_code, ssd, vid, url FROM vehicles "
@@ -205,7 +282,7 @@ class VehicleRepository:
                 "id = LAST_INSERT_ID(id)",
                 (vehicle_id, name, cid),
             )
-            return cur.lastrowid
+            return cast(int, cur.lastrowid)
 
         # cid 為 NULL 時 uq_cat_cid 不會判定重複，只能維持以名稱查找的
         # 相容路徑；不能假裝成安全的單句 upsert。
@@ -222,16 +299,16 @@ class VehicleRepository:
                 "UPDATE categories SET name = %s, cid = %s, fetched_at = NOW() WHERE id = %s",
                 (name, cid, row["id"]),
             )
-            return row["id"]
+            return cast(int, row["id"])
         cur = self.db._execute(
             "INSERT INTO categories (vehicle_id, name, cid) VALUES (%s, %s, %s) AS new "
             "ON DUPLICATE KEY UPDATE name = new.name, cid = new.cid, fetched_at = NOW(), "
             "id = LAST_INSERT_ID(id)",
             (vehicle_id, name, cid),
         )
-        return cur.lastrowid
+        return cast(int, cur.lastrowid)
 
-    def list_categories(self, vehicle_id: int) -> list[dict]:
+    def list_categories(self, vehicle_id: int) -> Sequence[Row]:
         """列出某車型下的所有分類（依 id 排序）。"""
         cur = self.db._execute(
             "SELECT id, name, cid FROM categories WHERE vehicle_id = %s ORDER BY id",
@@ -251,14 +328,14 @@ class VehicleRepository:
         )
         identity = GroupIdentity({}, {})
         for row in cur.fetchall():
-            code = row["code"] or ""
-            uid = row["uid"] or ""
+            code = cast(str, row["code"] or "")
+            uid = cast(str, row["uid"] or "")
             if uid == "":
                 # legacy NULL 回推列沒有站方身分可依，不參與 by-uid 對帳
                 continue
-            identity.by_key[(code, uid)] = row["id"]
+            identity.by_key[(code, uid)] = cast(int, row["id"])
             if code == "":
-                identity.image_by_uid[uid] = row["id"]
+                identity.image_by_uid[uid] = cast(int, row["id"])
         return identity
 
     def upsert_group(
@@ -331,7 +408,7 @@ class VehicleRepository:
                         "fetched_at = NOW() WHERE id = %s",
                         (code, name, url, image_row["id"]),
                     )
-                    return image_row["id"]
+                    return cast(int, image_row["id"])
         cur = self.db._execute(
             "INSERT INTO groups_t (category_id, code, name, uid, url) "
             "VALUES (%s, %s, %s, %s, %s) AS new "
@@ -339,7 +416,7 @@ class VehicleRepository:
             "fetched_at = NOW(), id = LAST_INSERT_ID(id)",
             (category_id, code, name, uid, url),
         )
-        row_id = cur.lastrowid
+        row_id = cast(int, cur.lastrowid)
         if identity is not None:
             # 同步快取：無論是全新插入或 ON DUPLICATE 更新既有列，
             # LAST_INSERT_ID(id) 都已回傳該身分真正的 id。
@@ -369,7 +446,7 @@ class VehicleRepository:
         )
         identities: dict[str, set[str]] = {}
         for row in cur.fetchall():
-            identities.setdefault(row["uid"], set()).add(row["code"] or "")
+            identities.setdefault(cast(str, row["uid"]), set()).add(cast(str, row["code"] or ""))
         return identities
 
 
@@ -382,7 +459,7 @@ class PartRepository:
     def upsert_parts(
         self,
         group_id: int,
-        parts: list[dict],
+        parts: Sequence[Mapping[str, object]],
         run_id: int | None = None,
         *,
         complete_group: bool = True,
@@ -449,7 +526,7 @@ class PartRepository:
                 new_count += 1
         return new_count
 
-    def clear_group_membership(self, group_id: int):
+    def clear_group_membership(self, group_id: int) -> None:
         """清除單一 group 的舊 run membership；與後續 upsert 同交易。"""
         self.db._execute("UPDATE parts SET seen_run_id = NULL WHERE group_id = %s", (group_id,))
 
@@ -457,7 +534,7 @@ class PartRepository:
         self,
         group_id: int,
         run_key: str,
-        rows: list[dict],
+        rows: Sequence[Mapping[str, object]],
         reason: str = "nameless",
     ) -> int:
         """記錄站方合法存在但無法發布的零件列（SOL review P1 起）。
@@ -506,7 +583,7 @@ class PartRepository:
         )
         return len(rows)
 
-    def _clear_stale_group_membership(self, group_id: int, run_id: int):
+    def _clear_stale_group_membership(self, group_id: int, run_id: int) -> None:
         """只清除本次 payload 已不存在的 membership。"""
         self.db._execute(
             "UPDATE parts SET seen_run_id = NULL WHERE group_id = %s AND seen_run_id <> %s",
@@ -516,9 +593,10 @@ class PartRepository:
     def count_parts_in_group(self, group_id: int) -> int:
         """統計某零件組下的零件數量（供驗證與監督使用）。"""
         cur = self.db._execute("SELECT COUNT(*) AS n FROM parts WHERE group_id = %s", (group_id,))
-        return cur.fetchone()["n"]
+        row = cast(Row, cur.fetchone())
+        return cast(int, row["n"])
 
-    def bounded_group_context(self, group_id: int) -> dict | None:
+    def bounded_group_context(self, group_id: int) -> Row | None:
         """讀取正式 bounded 配額所需的 group／車款來源欄位。"""
         return self.db._execute(
             "SELECT v.production_from, v.production_to, "
@@ -549,7 +627,47 @@ class PartRepository:
             "SELECT part_number, range_str FROM parts WHERE group_id = %s AND seen_run_id = %s",
             (group_id, run_id),
         ).fetchall()
-        return {(row["part_number"], row["range_str"]) for row in rows}
+        return {(cast(str, row["part_number"]), cast(str, row["range_str"])) for row in rows}
+
+    def part_ids_for_evidence(
+        self,
+        group_id: int,
+        parts: Sequence[Mapping[str, object]],
+    ) -> list[tuple[int, Mapping[str, object]]]:
+        """依 parts 唯一鍵找回 evidence 要綁定的 DB id。
+
+        只查一次整個 group，並保留輸入順序。重複 natural key
+        會使「解析列數」與「可發布零件數」語意不明，因此
+        fail closed；找不到列也不允許用舊 id 或推測值補齊。
+        本方法不 commit，必須與 upsert_parts、artifact、receipt 在同一
+        group transaction 內呼叫。
+        """
+        if not parts:
+            return []
+        rows = self.db._execute(
+            "SELECT id, part_number, range_str FROM parts WHERE group_id = %s",
+            (group_id,),
+        ).fetchall()
+        ids = {
+            (cast(str, row["part_number"]), cast(str, row["range_str"])): cast(int, row["id"])
+            for row in rows
+        }
+        result: list[tuple[int, Mapping[str, object]]] = []
+        seen: set[tuple[str, str]] = set()
+        for part in parts:
+            key = (str(part.get("part_number") or ""), str(part.get("range_str") or ""))
+            if not key[0]:
+                raise ValueError("part evidence requires a non-empty part_number")
+            if key in seen:
+                raise ValueError(f"duplicate part evidence natural key: {key!r}")
+            seen.add(key)
+            part_id = ids.get(key)
+            if part_id is None:
+                raise RuntimeError(
+                    f"part evidence row was not upserted: group_id={group_id}, key={key!r}"
+                )
+            result.append((part_id, part))
+        return result
 
     def clear_seen_keys(
         self,
@@ -592,7 +710,8 @@ class CrawlRepository:
             )
         else:
             cur = self.db._execute("SELECT COUNT(*) AS n FROM groups_t")
-        return cur.fetchone()["n"]
+        row = cast(Row, cur.fetchone())
+        return cast(int, row["n"])
 
     def count_quarantined(self, run_key: str = "") -> int:
         """回傳指定 run 列進 part_quarantine 的料號列數（供運維查詢）。
@@ -607,9 +726,10 @@ class CrawlRepository:
             "SELECT COUNT(*) AS n FROM part_quarantine WHERE run_key = %s AND resolved_at IS NULL",
             (run_key,),
         )
-        return cur.fetchone()["n"]
+        row = cast(Row, cur.fetchone())
+        return cast(int, row["n"])
 
-    def mark_done(self, scope: str, key: str):
+    def mark_done(self, scope: str, key: str) -> None:
         """把某範圍的某個鍵標記為「完成」。
 
         scope 例：'model'（型號）、'vehicle'（車型）；
@@ -623,7 +743,7 @@ class CrawlRepository:
             (self.run_key, scope, key),
         )
 
-    def mark_error(self, scope: str, key: str, msg: str):
+    def mark_error(self, scope: str, key: str, msg: str) -> None:
         """把某範圍的某個鍵標記為「失敗」，並記錄錯誤訊息（截斷 500 字）。"""
         self.db._execute(
             "INSERT INTO crawl_state (run_key, scope, scope_key, status, error_msg) "
@@ -657,7 +777,8 @@ class CrawlRepository:
             "WHERE run_key = %s AND status IN ('error', 'pending')",
             (run_key,),
         )
-        return cur.fetchone()["n"]
+        row = cast(Row, cur.fetchone())
+        return cast(int, row["n"])
 
     def count_failures(self, run_key: str = "") -> int:
         """只統計真正失敗的項目；sample 預期留下的 pending 不算失敗。"""
@@ -665,7 +786,8 @@ class CrawlRepository:
             "SELECT COUNT(*) AS n FROM crawl_state WHERE run_key = %s AND status = 'error'",
             (run_key,),
         )
-        return cur.fetchone()["n"]
+        row = cast(Row, cur.fetchone())
+        return cast(int, row["n"])
 
     def is_group_fetched(
         self,
@@ -696,7 +818,9 @@ class CrawlRepository:
         )
         return cur.fetchone() is not None
 
-    def fetched_group_map(self, vehicle_id: int, run_key: str = "") -> dict:
+    def fetched_group_map(
+        self, vehicle_id: int, run_key: str = ""
+    ) -> dict[tuple[str, str, str], int]:
         """一次載入某車「本 run 已抓完」的所有零件組（F5 優化）。
 
         回傳 {(cid, code, uid): row_count, ...}（存在即代表已抓過）。
@@ -716,11 +840,17 @@ class CrawlRepository:
             (vehicle_id, run_key),
         )
         return {
-            (str(r["cid"] or ""), r["code"], r["uid"]): r["fetched_row_count"] or 0
+            (
+                str(r["cid"] or ""),
+                cast(str, r["code"]),
+                cast(str, r["uid"]),
+            ): _db_int(r["fetched_row_count"] or 0)
             for r in cur.fetchall()
         }
 
-    def previous_row_count_map(self, vehicle_id: int, run_key: str = "") -> dict:
+    def previous_row_count_map(
+        self, vehicle_id: int, run_key: str = ""
+    ) -> dict[tuple[str, str, str], int]:
         """一次載入某車每個組已驗證的歷史最高 row_count。
 
         回傳 {(cid, code, uid): verified_row_count}。
@@ -738,7 +868,12 @@ class CrawlRepository:
             (vehicle_id,),
         )
         return {
-            (str(r["cid"] or ""), r["code"], r["uid"]): r["row_count"] or 0 for r in cur.fetchall()
+            (
+                str(r["cid"] or ""),
+                cast(str, r["code"]),
+                cast(str, r["uid"]),
+            ): _db_int(r["row_count"] or 0)
+            for r in cur.fetchall()
         }
 
     def previous_row_count(self, group_id: int) -> int:
@@ -750,11 +885,12 @@ class CrawlRepository:
         cur = self.db._execute(
             "SELECT verified_row_count AS n FROM groups_t WHERE id = %s", (group_id,)
         )
-        return cur.fetchone()["n"] or 0
+        row = cast(Row, cur.fetchone())
+        return cast(int, row["n"] or 0)
 
     def mark_group_fetched(
         self, group_id: int, run_key: str = "", status: str = "done", row_count: int = 0
-    ):
+    ) -> None:
         """標記某零件組已在本次 run 抓取完成（durable receipt，F1b/F5）。
 
         status 區分完成種類：'done'（有零件）、'not_found'（404，網站
@@ -787,7 +923,7 @@ class CrawlRepository:
                 (run_key, status, row_count, group_id),
             )
 
-    def seen(self, scope: str, key: str):
+    def seen(self, scope: str, key: str) -> None:
         """記錄「本 run 遇見」某項目（不改變既有狀態）。
 
         F1b 修復：閉合對帳需要知道「本 run 從清單層見到過哪些項目」。
@@ -820,9 +956,9 @@ class CrawlRepository:
                 "SELECT scope_key FROM crawl_state WHERE run_key = %s AND scope = %s",
                 (run_key, scope),
             )
-        return {r["scope_key"] for r in cur.fetchall()}
+        return {cast(str, r["scope_key"]) for r in cur.fetchall()}
 
-    def reset_scope(self, scope: str, run_key: str = ""):
+    def reset_scope(self, scope: str, run_key: str = "") -> None:
         """清除某範圍的所有進度紀錄（--fresh 模式用）。
 
         run_key 為空字串時清除「相容（run_key=''）」與全部；指定時只清該 run。
@@ -835,11 +971,11 @@ class CrawlRepository:
         else:
             self.db._execute("DELETE FROM crawl_state WHERE scope = %s", (scope,))
 
-    def reset_run_state(self, run_key: str):
+    def reset_run_state(self, run_key: str) -> None:
         """清除指定 run 的所有 scope，包含舊版或未來新增的 scope。"""
         self.db._execute("DELETE FROM crawl_state WHERE run_key = %s", (run_key,))
 
-    def reset_group_receipts(self, run_key: str | None = None):
+    def reset_group_receipts(self, run_key: str | None = None) -> None:
         """清除所有零件組的抓取收據（--fresh 模式用）。
 
         同月既有 fetched_run_key 會讓 group 在 HTTP 與 upsert 前直接
@@ -854,7 +990,7 @@ class CrawlRepository:
         else:
             self.db._execute("UPDATE groups_t SET fetched_run_key = NULL, fetched_status = NULL")
 
-    def reset_part_markers(self, run_id: int):
+    def reset_part_markers(self, run_id: int) -> None:
         """清除同月 fresh run 的舊 membership，不影響已發布 snapshot。"""
         self.db._execute("UPDATE parts SET seen_run_id = NULL WHERE seen_run_id = %s", (run_id,))
 
@@ -909,6 +1045,10 @@ class CrawlRepository:
                 "ON DUPLICATE KEY UPDATE started_at = NOW(), finished_at = NULL, "
                 "status = 'running', brands_ok = 0, models_ok = 0, vehicles_ok = 0, "
                 "groups_ok = 0, parts_ok = 0, parts_new = 0, error_msg = NULL, "
+                "evidence_status = 'missing', evidence_manifest_sha256 = NULL, "
+                "evidence_dataset_sha256 = NULL, evidence_artifact_count = 0, "
+                "evidence_record_count = 0, evidence_original_bytes = 0, "
+                "evidence_stored_bytes = 0, evidence_verified_at = NULL, "
                 "dataset_kind = VALUES(dataset_kind), target_parts = VALUES(target_parts), "
                 "scheduled_job_run_id = VALUES(scheduled_job_run_id), "
                 "id = LAST_INSERT_ID(id)",
@@ -931,13 +1071,21 @@ class CrawlRepository:
                 "id = LAST_INSERT_ID(id)",
                 (run_key, dataset_kind, target_parts, scheduled_job_run_id),
             )
-        return cur.lastrowid
+        run_id = cast(int, cur.lastrowid)
+        if fresh:
+            # --fresh 會重用同一 logical run id；舊 artifact 不能和新 HTTP
+            # body 混成一份 manifest。CAS body 保留供其他 run 去重。
+            self.db._execute(
+                "DELETE FROM partsouq_http_artifacts WHERE crawl_run_id = %s",
+                (run_id,),
+            )
+        return run_id
 
     def run_status(self, run_id: int) -> str | None:
         """讀取指定 run 的目前狀態（commit 結果不明時用來對帳）。"""
         cur = self.db._execute("SELECT status FROM crawl_runs WHERE id = %s", (run_id,))
         row = cur.fetchone()
-        return row["status"] if row else None
+        return cast(str, row["status"]) if row else None
 
     def count_run_parts(self, run_id: int) -> int:
         """以 DB membership 作為筆數受限 run 的續爬配額基線。"""
@@ -945,7 +1093,7 @@ class CrawlRepository:
             "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
             (run_id,),
         ).fetchone()
-        return int((row or {}).get("row_count", 0))
+        return _db_int((row or {}).get("row_count", 0))
 
     def discard_invalid_bounded_membership(self, run_id: int) -> int:
         """解除不符合正式 bounded 欄位／年份門檻的配額 membership。"""
@@ -988,11 +1136,15 @@ class CrawlRepository:
         *,
         scheduled_job_run_id: int | None,
     ) -> str | None:
-        """取得同 target、同 daemon/direct provenance 的最新未完成 run。"""
+        """取得同 target、同 daemon/direct provenance 的最新未完成 run。
+
+        新 daemon attempt 只能接手已明確失敗且有結束碼的舊 attempt；
+        artifact 保留原 scheduler id，最終 evidence 會逐 attempt 驗證時間窗。
+        """
         if scheduled_job_run_id is None:
             row = self.db._execute(
                 "SELECT run_key FROM crawl_runs WHERE dataset_kind = 'bounded' "
-                "AND target_parts = %s AND status IN ('running', 'error') "
+                "AND target_parts = %s AND status IN ('running', 'error', 'interrupted') "
                 "AND scheduled_job_run_id IS NULL "
                 "ORDER BY started_at DESC, id DESC LIMIT 1",
                 (target_parts,),
@@ -1001,19 +1153,874 @@ class CrawlRepository:
             row = self.db._execute(
                 "SELECT cr.run_key FROM scheduled_job_runs AS current_job "
                 "JOIN crawl_runs AS cr ON cr.dataset_kind = 'bounded' "
-                "AND cr.target_parts = %s AND cr.status IN ('running', 'error') "
+                "AND cr.target_parts = %s "
+                "AND cr.status IN ('running', 'error', 'interrupted') "
                 "JOIN scheduled_job_runs AS previous_job "
                 "ON previous_job.id = cr.scheduled_job_run_id "
                 "AND previous_job.job_name = 'catalog' "
                 "AND previous_job.trigger_mode = 'daemon' "
                 "WHERE current_job.id = %s AND current_job.job_name = 'catalog' "
                 "AND current_job.trigger_mode = 'daemon' AND current_job.status = 'running' "
+                "AND (previous_job.id = current_job.id OR ("
+                "previous_job.status = 'failed' AND previous_job.finished_at IS NOT NULL "
+                "AND previous_job.exit_code IS NOT NULL AND previous_job.exit_code <> 0)) "
                 "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1",
                 (target_parts, scheduled_job_run_id),
             ).fetchone()
         return str(row["run_key"]) if row and row.get("run_key") else None
 
-    def finish_run(self, run_id: int, status: str, counts: dict, error: str | None = None):
+    def record_http_evidence(
+        self,
+        run_id: int,
+        scheduled_job_run_id: int,
+        *,
+        page_type: str,
+        public_url: str,
+        raw_body_sha256: str,
+        status_code: int,
+        content_type: str,
+        fetched_at: datetime,
+        elapsed_ms: int,
+        attempt: int,
+        sanitized_body: SanitizedBody,
+        parser_name: str,
+        parser_version: str,
+        parser_context: Mapping[str, object],
+        parsed_records: Sequence[RecordEvidence],
+        replayed_records: Sequence[RecordEvidence],
+        accepted_records: Sequence[tuple[int, RecordEvidence]],
+        malformed_rows: int = 0,
+        skipped_record_count: int = 0,
+    ) -> int:
+        """Persist one secret-safe HTTP response and its replayed parser result.
+
+        ``parsed_records`` is the complete live-parser result, including
+        ``quarantine_part`` diagnostics. ``accepted_records`` is only the quota
+        subset written to ``parts``; this keeps the final truncated unit page
+        reproducible without pretending every parsed row was published.
+
+        The caller must invoke this after the normalized upsert and before the
+        group receipt commit. No commit occurs here, so body/artifact/records,
+        normalized rows and receipt share one transaction boundary.
+        """
+        if page_type not in {"genuine", "locate", "pick", "vehicle", "category", "unit"}:
+            raise ValueError("unsupported PartSouq evidence page_type")
+        canonical_url = public_source_url(public_url)
+        if canonical_url != public_url:
+            raise ValueError("public_url must already be canonical and secret-free")
+        _require_sha256(raw_body_sha256, "raw_body_sha256")
+        _require_sha256(sanitized_body.body_sha256, "sanitized body_sha256")
+        if status_code != 200 or not content_type.lower().startswith("text/html"):
+            raise ValueError("verified PartSouq evidence requires an HTTP 200 HTML response")
+        if elapsed_ms < 0 or attempt <= 0:
+            raise ValueError("invalid PartSouq evidence timing metadata")
+        if not parser_name.strip() or not parser_version.strip():
+            raise ValueError("PartSouq evidence parser identity is required")
+        if (page_type, parser_name) not in _EVIDENCE_PAGE_PARSERS:
+            raise ValueError("PartSouq evidence page/parser contract mismatch")
+        if malformed_rows != 0:
+            raise ValueError("malformed parser rows cannot become verified evidence")
+        if not parsed_records:
+            raise ValueError("PartSouq evidence cannot contain an empty parser result")
+        quarantine_record_count = sum(
+            record.record_type == "quarantine_part" for record in parsed_records
+        )
+        if (page_type == "unit" and skipped_record_count != quarantine_record_count) or (
+            page_type != "unit" and quarantine_record_count
+        ):
+            raise ValueError("skipped_record_count does not match quarantine evidence rows")
+
+        parser_context_json = canonical_parser_context(parser_name, parser_context)
+        parser_context_sha256 = hashlib.sha256(parser_context_json).hexdigest()
+        independently_replayed, replay_malformed, replay_skipped = replay_catalog_records(
+            sanitized_body.body,
+            parser_name=parser_name,
+            parser_version=parser_version,
+            context=parser_context,
+        )
+        if (replay_malformed, replay_skipped) != (malformed_rows, skipped_record_count):
+            raise RuntimeError("sanitized HTML replay diagnostics do not match the live parser")
+
+        parsed_keys = [_evidence_record_key(record) for record in parsed_records]
+        replayed_keys = [_evidence_record_key(record) for record in replayed_records]
+        independent_keys = [_evidence_record_key(record) for record in independently_replayed]
+        if len(set((key[0], key[1]) for key in parsed_keys)) != len(parsed_keys):
+            raise ValueError("duplicate parser evidence natural key")
+        if sorted(parsed_keys) != sorted(replayed_keys) or sorted(parsed_keys) != sorted(
+            independent_keys
+        ):
+            raise RuntimeError("sanitized HTML replay does not match the live parser result")
+
+        parsed_by_key = {
+            (record.record_type, record.natural_key_sha256): record for record in parsed_records
+        }
+        accepted_by_key: dict[tuple[str, str], int] = {}
+        accepted_part_ids: set[int] = set()
+        accepted_evidence: list[RecordEvidence] = []
+        for part_id, record in accepted_records:
+            key = (record.record_type, record.natural_key_sha256)
+            if part_id <= 0 or record.record_type != "part":
+                raise ValueError("accepted evidence must identify a persisted part row")
+            if parsed_by_key.get(key) != record:
+                raise ValueError("accepted evidence is not an exact parsed-record subset")
+            if key in accepted_by_key or part_id in accepted_part_ids:
+                raise ValueError("duplicate accepted PartSouq evidence row")
+            accepted_by_key[key] = part_id
+            accepted_part_ids.add(part_id)
+            accepted_evidence.append(record)
+
+        max_body_bytes = int(CRAWL["evidence_max_body_bytes"])
+        if (
+            sanitized_body.original_bytes <= 0
+            or sanitized_body.original_bytes > max_body_bytes
+            or sanitized_body.original_bytes != len(sanitized_body.body)
+            or sanitized_body.stored_bytes != len(sanitized_body.compressed)
+        ):
+            raise ValueError(
+                "sanitized PartSouq evidence body exceeds or violates its size contract"
+            )
+        restored = restore_sanitized_body(
+            "zlib",
+            sanitized_body.compressed,
+            expected_size=sanitized_body.original_bytes,
+            max_bytes=max_body_bytes,
+        )
+        if restored != sanitized_body.body:
+            raise ValueError("sanitized PartSouq evidence zlib round trip mismatch")
+        if hashlib.sha256(restored).hexdigest() != sanitized_body.body_sha256:
+            raise ValueError("sanitized PartSouq evidence body hash mismatch")
+        assert_no_secret_material(restored)
+
+        run = self.db._execute(
+            "SELECT cr.started_at, cr.status, cr.dataset_kind, cr.target_parts, "
+            "cr.scheduled_job_run_id, sj.job_name AS scheduled_job_name, "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status "
+            "FROM crawl_runs AS cr "
+            "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
+            "WHERE cr.id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if not run or run.get("status") != "running":
+            raise RuntimeError(f"evidence crawl run {run_id} is not running")
+        if _db_int(run.get("scheduled_job_run_id") or 0) != scheduled_job_run_id:
+            raise RuntimeError("evidence scheduler id does not match its crawl run")
+        if (
+            run.get("scheduled_job_name") != "catalog"
+            or run.get("scheduled_trigger_mode") != "daemon"
+            or run.get("scheduled_job_status") != "running"
+        ):
+            raise RuntimeError("evidence crawl run has invalid scheduler provenance")
+        started_at = cast(datetime, run["started_at"])
+        latest_allowed = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5)
+        if fetched_at < started_at or fetched_at > latest_allowed:
+            raise RuntimeError("evidence fetched_at is outside the active crawl window")
+
+        self.db._execute(
+            "INSERT INTO partsouq_response_bodies ("
+            "body_sha256, compression, body_blob, original_bytes, stored_bytes, "
+            "sanitizer_version) VALUES (%s, 'zlib', %s, %s, %s, %s) AS new "
+            "ON DUPLICATE KEY UPDATE body_sha256 = new.body_sha256",
+            (
+                sanitized_body.body_sha256,
+                sanitized_body.compressed,
+                sanitized_body.original_bytes,
+                sanitized_body.stored_bytes,
+                sanitized_body.sanitizer_version,
+            ),
+        )
+        source_url_sha256 = hashlib.sha256(public_url.encode("utf-8")).hexdigest()
+        parsed_records_sha256 = _evidence_record_set_sha256(parsed_records)
+        accepted_records_sha256 = _evidence_record_set_sha256(accepted_evidence)
+        artifact_cursor = self.db._execute(
+            "INSERT INTO partsouq_http_artifacts ("
+            "crawl_run_id, scheduled_job_run_id, capture_kind, page_type, "
+            "public_source_url, source_url_sha256, raw_body_sha256, body_sha256, "
+            "http_status, content_type, challenge_detected, fetched_at, elapsed_ms, attempt, "
+            "parser_name, parser_version, parser_context_json, parser_context_sha256, "
+            "malformed_row_count, skipped_record_count, "
+            "parsed_record_count, parsed_records_sha256, accepted_record_count, "
+            "accepted_records_sha256, verification_status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, "
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending') AS new "
+            "ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), "
+            "capture_kind = new.capture_kind, page_type = new.page_type, "
+            "public_source_url = new.public_source_url, http_status = new.http_status, "
+            "content_type = new.content_type, challenge_detected = new.challenge_detected, "
+            "fetched_at = new.fetched_at, elapsed_ms = new.elapsed_ms, attempt = new.attempt, "
+            "malformed_row_count = new.malformed_row_count, "
+            "skipped_record_count = new.skipped_record_count, "
+            "parsed_record_count = new.parsed_record_count, "
+            "parsed_records_sha256 = new.parsed_records_sha256, "
+            "accepted_record_count = new.accepted_record_count, "
+            "accepted_records_sha256 = new.accepted_records_sha256, "
+            "verification_status = 'pending', verified_at = NULL",
+            (
+                run_id,
+                scheduled_job_run_id,
+                "live_http",
+                page_type,
+                public_url,
+                source_url_sha256,
+                raw_body_sha256,
+                sanitized_body.body_sha256,
+                status_code,
+                content_type[:128],
+                fetched_at,
+                elapsed_ms,
+                attempt,
+                parser_name[:128],
+                parser_version[:64],
+                parser_context_json.decode("utf-8"),
+                parser_context_sha256,
+                malformed_rows,
+                skipped_record_count,
+                len(parsed_records),
+                parsed_records_sha256,
+                len(accepted_evidence),
+                accepted_records_sha256,
+            ),
+        )
+        artifact_id = cast(int, artifact_cursor.lastrowid)
+        self.db._execute(
+            "DELETE FROM partsouq_artifact_records WHERE artifact_id = %s",
+            (artifact_id,),
+        )
+        self.db._executemany(
+            "INSERT INTO partsouq_artifact_records ("
+            "artifact_id, crawl_run_id, record_type, natural_key_sha256, "
+            "parent_natural_key_sha256, record_sha256, accepted, part_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            [
+                (
+                    artifact_id,
+                    run_id,
+                    record.record_type,
+                    record.natural_key_sha256,
+                    record.parent_natural_key_sha256,
+                    record.record_sha256,
+                    1 if (record.record_type, record.natural_key_sha256) in accepted_by_key else 0,
+                    accepted_by_key.get((record.record_type, record.natural_key_sha256)),
+                )
+                for record in parsed_records
+            ],
+        )
+        self.db._execute(
+            "UPDATE partsouq_http_artifacts SET verification_status = 'superseded' "
+            "WHERE crawl_run_id = %s AND source_url_sha256 = %s AND page_type = %s "
+            "AND parser_name = %s AND parser_context_sha256 = %s "
+            "AND verification_status = 'verified' AND id <> %s",
+            (
+                run_id,
+                source_url_sha256,
+                page_type,
+                parser_name,
+                parser_context_sha256,
+                artifact_id,
+            ),
+        )
+        self.db._execute(
+            "UPDATE partsouq_http_artifacts SET verification_status = 'verified', "
+            "verified_at = UTC_TIMESTAMP(6) WHERE id = %s",
+            (artifact_id,),
+        )
+        budget = self.db._execute(
+            "SELECT COUNT(*) AS artifact_count, "
+            "COALESCE(SUM(body.original_bytes), 0) AS original_bytes "
+            "FROM partsouq_http_artifacts AS artifact "
+            "JOIN partsouq_response_bodies AS body ON body.body_sha256 = artifact.body_sha256 "
+            "WHERE artifact.crawl_run_id = %s AND artifact.verification_status = 'verified'",
+            (run_id,),
+        ).fetchone()
+        if _db_int((budget or {}).get("artifact_count", 0)) > int(
+            CRAWL["evidence_max_artifacts"]
+        ) or _db_int((budget or {}).get("original_bytes", 0)) > int(
+            CRAWL["evidence_max_run_bytes"]
+        ):
+            raise RuntimeError("PartSouq evidence run exceeded its fail-closed storage budget")
+        self.db._execute(
+            "UPDATE crawl_runs SET evidence_status = 'collecting', "
+            "evidence_manifest_sha256 = NULL, evidence_dataset_sha256 = NULL, "
+            "evidence_artifact_count = 0, evidence_record_count = 0, "
+            "evidence_original_bytes = 0, evidence_stored_bytes = 0, "
+            "evidence_verified_at = NULL WHERE id = %s",
+            (run_id,),
+        )
+        return artifact_id
+
+    def verify_run_evidence(self, run_id: int) -> tuple[str, str]:
+        """Replay-check and seal a complete formal bounded evidence manifest."""
+        run = self.db._execute(
+            "SELECT cr.started_at, cr.status, cr.dataset_kind, cr.target_parts, "
+            "cr.scheduled_job_run_id, sj.job_name AS scheduled_job_name, "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status, "
+            "(SELECT COUNT(*) FROM crawl_runs AS linked "
+            "WHERE linked.scheduled_job_run_id = cr.scheduled_job_run_id) AS scheduled_crawl_count "
+            "FROM crawl_runs AS cr "
+            "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
+            "WHERE cr.id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if not run or (
+            run.get("status") != "running"
+            or run.get("dataset_kind") != "bounded"
+            or _db_int(run.get("target_parts") or 0) != 10_000
+        ):
+            raise RuntimeError(f"run {run_id} is not an active formal bounded crawl")
+        scheduled_job_run_id = _db_int(run.get("scheduled_job_run_id") or 0)
+        if scheduled_job_run_id <= 0 or (
+            run.get("scheduled_job_name") != "catalog"
+            or run.get("scheduled_trigger_mode") != "daemon"
+            or run.get("scheduled_job_status") != "running"
+            or _db_int(run.get("scheduled_crawl_count") or 0) != 1
+        ):
+            raise RuntimeError(f"run {run_id} has invalid evidence scheduler provenance")
+        summary = self._calculate_run_evidence(
+            run_id,
+            scheduled_job_run_id,
+            cast(datetime, run["started_at"]),
+            10_000,
+        )
+        self.db._execute(
+            "UPDATE crawl_runs SET evidence_status = 'verified', "
+            "evidence_manifest_sha256 = %s, evidence_dataset_sha256 = %s, "
+            "evidence_artifact_count = %s, evidence_record_count = %s, "
+            "evidence_original_bytes = %s, evidence_stored_bytes = %s, "
+            "evidence_verified_at = UTC_TIMESTAMP(6) WHERE id = %s",
+            (
+                summary.manifest_sha256,
+                summary.dataset_sha256,
+                summary.artifact_count,
+                summary.accepted_record_count,
+                summary.original_bytes,
+                summary.stored_bytes,
+                run_id,
+            ),
+        )
+        return summary.manifest_sha256, summary.dataset_sha256
+
+    def audit_run_evidence(
+        self,
+        run_id: int,
+        expected_parts: int = 10_000,
+        *,
+        allow_running_scheduler: bool = False,
+        allow_failed_scheduler: bool = False,
+    ) -> dict[str, object]:
+        """Read back and independently replay a completed formal evidence run."""
+
+        if expected_parts != 10_000:
+            raise ValueError("formal evidence expected_parts must be exactly 10000")
+        run = self.db._execute(
+            "SELECT cr.started_at, cr.finished_at, cr.status, cr.dataset_kind, "
+            "cr.target_parts, cr.scheduled_job_run_id, cr.evidence_status, "
+            "cr.evidence_manifest_sha256, cr.evidence_dataset_sha256, "
+            "cr.evidence_artifact_count, cr.evidence_record_count, "
+            "cr.evidence_original_bytes, cr.evidence_stored_bytes, "
+            "cr.evidence_verified_at, sj.job_name AS scheduled_job_name, "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status, "
+            "sj.exit_code AS scheduled_job_exit_code, "
+            "sj.finished_at AS scheduled_job_finished_at, "
+            "(SELECT COUNT(*) FROM crawl_runs AS linked "
+            "WHERE linked.scheduled_job_run_id = cr.scheduled_job_run_id) "
+            "AS scheduled_crawl_count FROM crawl_runs AS cr "
+            "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
+            "WHERE cr.id = %s",
+            (run_id,),
+        ).fetchone()
+        if not run or (
+            run.get("status") != "bounded_success"
+            or run.get("finished_at") is None
+            or run.get("dataset_kind") != "bounded"
+            or _db_int(run.get("target_parts") or 0) != expected_parts
+        ):
+            raise RuntimeError(f"run {run_id} is not a completed formal bounded crawl")
+        scheduled_job_status = run.get("scheduled_job_status")
+        scheduled_job_exit_code = run.get("scheduled_job_exit_code")
+        scheduler_provenance_valid = (
+            scheduled_job_status == "completed"
+            and scheduled_job_exit_code is not None
+            and _db_int(scheduled_job_exit_code) == 0
+        ) or (allow_running_scheduler and scheduled_job_status == "running")
+        if allow_failed_scheduler and scheduled_job_status == "failed":
+            scheduler_provenance_valid = (
+                scheduled_job_exit_code is not None
+                and _db_int(scheduled_job_exit_code) != 0
+                and run.get("scheduled_job_finished_at") is not None
+            )
+        if (
+            run.get("scheduled_job_name") != "catalog"
+            or run.get("scheduled_trigger_mode") != "daemon"
+            or not scheduler_provenance_valid
+            or _db_int(run.get("scheduled_crawl_count") or 0) != 1
+        ):
+            raise RuntimeError(f"run {run_id} has no completed scheduler provenance")
+        self._assert_verified_run_evidence(
+            run_id,
+            run,
+            expected_parts,
+            allow_failed_current_scheduler=allow_failed_scheduler,
+        )
+        return {
+            "run_id": run_id,
+            "expected_parts": expected_parts,
+            "artifact_count": _db_int(run.get("evidence_artifact_count") or 0),
+            "record_count": _db_int(run.get("evidence_record_count") or 0),
+            "manifest_sha256": run["evidence_manifest_sha256"],
+            "dataset_sha256": run["evidence_dataset_sha256"],
+            "verified": True,
+        }
+
+    def _calculate_run_evidence(
+        self,
+        run_id: int,
+        current_scheduled_job_run_id: int,
+        run_started_at: datetime,
+        target_parts: int,
+        *,
+        allow_failed_current_scheduler: bool = False,
+    ) -> _RunEvidenceSummary:
+        """Recompute the manifest, hierarchy chain and exact accepted dataset."""
+        incomplete = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts "
+            "WHERE crawl_run_id = %s "
+            "AND verification_status NOT IN ('verified', 'superseded')",
+            (run_id,),
+        ).fetchone()
+        if _db_int((incomplete or {}).get("row_count", 0)):
+            raise RuntimeError(f"run {run_id} contains incomplete HTTP evidence artifacts")
+
+        artifacts = list(
+            self.db._execute(
+                "SELECT artifact.id, artifact.scheduled_job_run_id, artifact.capture_kind, "
+                "artifact.page_type, artifact.public_source_url, artifact.source_url_sha256, "
+                "artifact.raw_body_sha256, artifact.body_sha256, artifact.http_status, "
+                "artifact.content_type, artifact.challenge_detected, artifact.fetched_at, "
+                "artifact.elapsed_ms, artifact.attempt, artifact.parser_name, "
+                "artifact.parser_version, artifact.parser_context_json, "
+                "artifact.parser_context_sha256, artifact.malformed_row_count, "
+                "artifact.skipped_record_count, artifact.parsed_record_count, "
+                "artifact.parsed_records_sha256, artifact.accepted_record_count, "
+                "artifact.accepted_records_sha256, artifact.verified_at, "
+                "evidence_job.job_name AS evidence_job_name, "
+                "evidence_job.trigger_mode AS evidence_trigger_mode, "
+                "evidence_job.status AS evidence_job_status, "
+                "evidence_job.exit_code AS evidence_job_exit_code, "
+                "evidence_job.started_at AS evidence_job_started_at, "
+                "evidence_job.finished_at AS evidence_job_finished_at "
+                "FROM partsouq_http_artifacts AS artifact "
+                "JOIN scheduled_job_runs AS evidence_job "
+                "ON evidence_job.id = artifact.scheduled_job_run_id "
+                "WHERE artifact.crawl_run_id = %s "
+                "AND artifact.verification_status = 'verified' "
+                "ORDER BY artifact.source_url_sha256, artifact.page_type, artifact.id",
+                (run_id,),
+            ).fetchall()
+        )
+        if not artifacts:
+            raise RuntimeError(f"run {run_id} has no verified HTTP evidence")
+        if len(artifacts) > int(CRAWL["evidence_max_artifacts"]):
+            raise RuntimeError(f"run {run_id} exceeds the HTTP evidence artifact budget")
+
+        body_rows = self.db._execute(
+            "SELECT body.body_sha256, body.compression, body.body_blob, "
+            "body.original_bytes, body.stored_bytes, body.sanitizer_version "
+            "FROM partsouq_response_bodies AS body JOIN ("
+            "SELECT DISTINCT body_sha256 FROM partsouq_http_artifacts "
+            "WHERE crawl_run_id = %s AND verification_status = 'verified'"
+            ") AS referenced ON referenced.body_sha256 = body.body_sha256",
+            (run_id,),
+        ).fetchall()
+        bodies = {cast(str, row["body_sha256"]): row for row in body_rows}
+
+        record_rows = self.db._execute(
+            "SELECT records.artifact_id, records.record_type, "
+            "records.natural_key_sha256, records.parent_natural_key_sha256, "
+            "records.record_sha256, records.accepted, records.part_id "
+            "FROM partsouq_artifact_records AS records "
+            "JOIN partsouq_http_artifacts AS artifact ON artifact.id = records.artifact_id "
+            "AND artifact.crawl_run_id = records.crawl_run_id "
+            "WHERE records.crawl_run_id = %s AND artifact.verification_status = 'verified' "
+            "ORDER BY records.artifact_id, records.record_type, records.natural_key_sha256",
+            (run_id,),
+        ).fetchall()
+        records_by_artifact: dict[int, list[tuple[RecordEvidence, bool, int | None]]] = {}
+        active_records: dict[tuple[str, str], RecordEvidence] = {}
+        accepted_records: list[RecordEvidence] = []
+        accepted_part_ids: set[int] = set()
+        for row in record_rows:
+            artifact_id = _db_int(row["artifact_id"])
+            record = RecordEvidence(
+                record_type=cast(str, row["record_type"]),
+                natural_key_sha256=cast(str, row["natural_key_sha256"]),
+                record_sha256=cast(str, row["record_sha256"]),
+                parent_natural_key_sha256=cast(str | None, row["parent_natural_key_sha256"]),
+            )
+            key = (record.record_type, record.natural_key_sha256)
+            if key in active_records:
+                raise RuntimeError(f"run {run_id} contains duplicate active evidence key {key!r}")
+            active_records[key] = record
+            accepted = bool(_db_int(row.get("accepted") or 0))
+            part_id = _db_int(row["part_id"]) if row.get("part_id") is not None else None
+            if accepted:
+                if record.record_type != "part" or part_id is None or part_id in accepted_part_ids:
+                    raise RuntimeError(f"run {run_id} contains invalid accepted part evidence")
+                accepted_part_ids.add(part_id)
+                accepted_records.append(record)
+            elif part_id is not None:
+                raise RuntimeError(f"run {run_id} contains an unaccepted evidence part id")
+            records_by_artifact.setdefault(artifact_id, []).append((record, accepted, part_id))
+
+        for record in active_records.values():
+            if record.record_type == "brand":
+                if record.parent_natural_key_sha256 is not None:
+                    raise RuntimeError(f"run {run_id} contains a parented brand evidence row")
+                continue
+            parent_type = _EVIDENCE_PARENT_TYPE.get(record.record_type)
+            if parent_type is None or record.parent_natural_key_sha256 is None:
+                raise RuntimeError(f"run {run_id} contains an unsupported evidence chain row")
+            if (parent_type, record.parent_natural_key_sha256) not in active_records:
+                raise RuntimeError(
+                    f"run {run_id} has a broken {record.record_type}->{parent_type} evidence chain"
+                )
+
+        source_part_rows = self.db._execute(
+            "SELECT p.id, p.part_number, p.name, p.code, p.note, p.quantity, "
+            "p.range_str, p.part_from, p.part_to, g.code AS group_code, g.uid, "
+            "c.cid, c.name AS category_name, v.name AS vehicle_name, v.model_code, "
+            "v.prod_period, v.production_from, v.production_to, v.engine, "
+            "v.grade AS trim_name, v.vid, m.name AS model_name, b.name AS brand_name "
+            "FROM parts AS p "
+            "JOIN groups_t AS g ON g.id = p.group_id "
+            "JOIN categories AS c ON c.id = g.category_id "
+            "JOIN vehicles AS v ON v.id = c.vehicle_id "
+            "JOIN models AS m ON m.id = v.model_id "
+            "JOIN brands AS b ON b.id = m.brand_id "
+            "WHERE p.seen_run_id = %s ORDER BY p.id",
+            (run_id,),
+        ).fetchall()
+        source_part_ids = {_db_int(row["id"]) for row in source_part_rows}
+        if (
+            len(source_part_ids) != target_parts
+            or len(accepted_part_ids) != target_parts
+            or accepted_part_ids != source_part_ids
+        ):
+            raise RuntimeError(
+                f"run {run_id} HTTP evidence coverage mismatch: "
+                f"source={len(source_part_ids)}, accepted={len(accepted_part_ids)}, "
+                f"target={target_parts}"
+            )
+        accepted_by_part_id = {
+            part_id: record
+            for values in records_by_artifact.values()
+            for record, is_accepted, part_id in values
+            if is_accepted and part_id is not None
+        }
+        for row in source_part_rows:
+            part_id = _db_int(row["id"])
+            brand_key = brand_natural_key(row["brand_name"])
+            model_key = model_natural_key(row["brand_name"], row["model_name"])
+            vehicle_key = vehicle_natural_key(
+                row["brand_name"],
+                row["model_name"],
+                name=row["vehicle_name"],
+                model_code=row["model_code"],
+                prod_period=row["prod_period"],
+                production_from=row["production_from"],
+                production_to=row["production_to"],
+                engine=row["engine"],
+                trim_name=row["trim_name"],
+                vid=row["vid"],
+            )
+            category_key = category_natural_key(
+                vehicle_key,
+                row["cid"],
+                row["category_name"],
+            )
+            group_key = group_natural_key(
+                category_key,
+                row["group_code"],
+                row["uid"],
+            )
+            part_key = part_natural_key(
+                group_key,
+                row["part_number"],
+                row["range_str"],
+            )
+            required_chain = (
+                ("brand", canonical_sha256(brand_key)),
+                ("model", canonical_sha256(model_key)),
+                ("vehicle", canonical_sha256(vehicle_key)),
+                ("category", canonical_sha256(category_key)),
+                ("group", canonical_sha256(group_key)),
+            )
+            missing_chain = [
+                record_type
+                for record_type, natural_key_sha256 in required_chain
+                if (record_type, natural_key_sha256) not in active_records
+            ]
+            if missing_chain:
+                raise RuntimeError(
+                    f"run {run_id} part {part_id} lacks live hierarchy evidence: "
+                    f"{','.join(missing_chain)}"
+                )
+            accepted_record = accepted_by_part_id[part_id]
+            expected_hash = canonical_sha256(
+                {
+                    "group": group_key,
+                    "part_number": row["part_number"],
+                    "name": row["name"],
+                    "code": row["code"],
+                    "note": row["note"],
+                    "quantity": row["quantity"],
+                    "range_str": row["range_str"],
+                    "part_from": row["part_from"],
+                    "part_to": row["part_to"],
+                }
+            )
+            if (
+                accepted_record.natural_key_sha256 != canonical_sha256(part_key)
+                or accepted_record.parent_natural_key_sha256 != canonical_sha256(group_key)
+                or accepted_record.record_sha256 != expected_hash
+            ):
+                raise RuntimeError(f"run {run_id} part {part_id} evidence payload hash mismatch")
+
+        manifest_items: list[dict[str, object]] = []
+        original_bytes = 0
+        stored_bytes = 0
+        latest_allowed = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5)
+        for artifact in artifacts:
+            artifact_id = _db_int(artifact["id"])
+            artifact_scheduler_id = _db_int(artifact.get("scheduled_job_run_id") or 0)
+            evidence_job_status = artifact.get("evidence_job_status")
+            evidence_job_exit_code = artifact.get("evidence_job_exit_code")
+            current_attempt = artifact_scheduler_id == current_scheduled_job_run_id
+            scheduler_provenance_valid = (
+                current_attempt
+                and (
+                    evidence_job_status == "running"
+                    or (
+                        evidence_job_status == "completed"
+                        and evidence_job_exit_code is not None
+                        and _db_int(evidence_job_exit_code) == 0
+                    )
+                    or (
+                        allow_failed_current_scheduler
+                        and evidence_job_status == "failed"
+                        and evidence_job_exit_code is not None
+                        and _db_int(evidence_job_exit_code) != 0
+                        and artifact.get("evidence_job_finished_at") is not None
+                    )
+                )
+            ) or (
+                not current_attempt
+                and evidence_job_status == "failed"
+                and evidence_job_exit_code is not None
+                and _db_int(evidence_job_exit_code) != 0
+            )
+            if (
+                artifact.get("capture_kind") != "live_http"
+                or artifact.get("evidence_job_name") != "catalog"
+                or artifact.get("evidence_trigger_mode") != "daemon"
+                or not scheduler_provenance_valid
+                or _db_int(artifact.get("http_status") or 0) != 200
+                or not str(artifact.get("content_type") or "").lower().startswith("text/html")
+                or bool(_db_int(artifact.get("challenge_detected") or 0))
+                or _db_int(artifact.get("malformed_row_count") or 0) != 0
+                or artifact.get("verified_at") is None
+                or (artifact.get("page_type"), artifact.get("parser_name"))
+                not in _EVIDENCE_PAGE_PARSERS
+            ):
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} is not verified live HTTP")
+            fetched_at = cast(datetime, artifact["fetched_at"])
+            evidence_job_started_at = cast(datetime, artifact["evidence_job_started_at"])
+            evidence_job_finished_at = cast(datetime | None, artifact["evidence_job_finished_at"])
+            artifact_latest_allowed = (
+                evidence_job_finished_at + timedelta(minutes=5)
+                if evidence_job_finished_at is not None
+                else latest_allowed
+            )
+            if (
+                fetched_at < run_started_at
+                or fetched_at < evidence_job_started_at
+                or fetched_at > artifact_latest_allowed
+                or (evidence_job_status != "running" and evidence_job_finished_at is None)
+            ):
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} is outside the run window")
+            url = cast(str, artifact["public_source_url"])
+            if public_source_url(url) != url:
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} retained a secret URL")
+            if hashlib.sha256(url.encode()).hexdigest() != artifact.get("source_url_sha256"):
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} source URL hash mismatch")
+            _require_sha256(cast(str, artifact["raw_body_sha256"]), "raw_body_sha256")
+
+            body_sha256 = cast(str, artifact["body_sha256"])
+            body = bodies.get(body_sha256)
+            if body is None:
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} has no CAS body")
+            body_original_bytes = _db_int(body["original_bytes"])
+            body_stored_bytes = _db_int(body["stored_bytes"])
+            compressed = cast(bytes, body["body_blob"])
+            if (
+                body_original_bytes <= 0
+                or body_original_bytes > int(CRAWL["evidence_max_body_bytes"])
+                or body_stored_bytes != len(compressed)
+            ):
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} violates the body budget")
+            restored = restore_sanitized_body(
+                cast(str, body["compression"]),
+                compressed,
+                expected_size=body_original_bytes,
+                max_bytes=int(CRAWL["evidence_max_body_bytes"]),
+            )
+            if (
+                len(restored) != body_original_bytes
+                or hashlib.sha256(restored).hexdigest() != body_sha256
+            ):
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} CAS body mismatch")
+            assert_no_secret_material(restored)
+
+            artifact_records = records_by_artifact.get(artifact_id, [])
+            parsed = [record for record, _accepted, _part_id in artifact_records]
+            artifact_accepted_records = [
+                record for record, is_accepted, _part_id in artifact_records if is_accepted
+            ]
+            quarantine_record_count = sum(
+                record.record_type == "quarantine_part" for record in parsed
+            )
+            raw_context = artifact.get("parser_context_json")
+            if isinstance(raw_context, Mapping):
+                parser_context = dict(raw_context)
+            else:
+                if isinstance(raw_context, (bytes, bytearray)):
+                    raw_context = bytes(raw_context).decode("utf-8")
+                try:
+                    parser_context = json.loads(cast(str, raw_context))
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise RuntimeError(
+                        f"run {run_id} artifact {artifact_id} parser context is invalid"
+                    ) from error
+            if not isinstance(parser_context, dict):
+                raise RuntimeError(
+                    f"run {run_id} artifact {artifact_id} parser context is not an object"
+                )
+            try:
+                canonical_context = canonical_parser_context(
+                    cast(str, artifact["parser_name"]), parser_context
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"run {run_id} artifact {artifact_id} parser context is invalid"
+                ) from error
+            if hashlib.sha256(canonical_context).hexdigest() != artifact.get(
+                "parser_context_sha256"
+            ):
+                raise RuntimeError(
+                    f"run {run_id} artifact {artifact_id} parser context hash mismatch"
+                )
+            try:
+                replayed, replay_malformed, replay_skipped = replay_catalog_records(
+                    restored,
+                    parser_name=cast(str, artifact["parser_name"]),
+                    parser_version=cast(str, artifact["parser_version"]),
+                    context=parser_context,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"run {run_id} artifact {artifact_id} parser replay is invalid"
+                ) from error
+            if (
+                len(parsed) != _db_int(artifact["parsed_record_count"])
+                or len(artifact_accepted_records) != _db_int(artifact["accepted_record_count"])
+                or (
+                    artifact.get("page_type") == "unit"
+                    and quarantine_record_count != _db_int(artifact["skipped_record_count"])
+                )
+                or (artifact.get("page_type") != "unit" and quarantine_record_count != 0)
+                or replay_malformed != _db_int(artifact["malformed_row_count"])
+                or replay_skipped != _db_int(artifact["skipped_record_count"])
+                or sorted(map(_evidence_record_key, replayed))
+                != sorted(map(_evidence_record_key, parsed))
+                or _evidence_record_set_sha256(parsed) != artifact.get("parsed_records_sha256")
+                or _evidence_record_set_sha256(artifact_accepted_records)
+                != artifact.get("accepted_records_sha256")
+            ):
+                raise RuntimeError(f"run {run_id} artifact {artifact_id} parser evidence mismatch")
+            original_bytes += body_original_bytes
+            stored_bytes += body_stored_bytes
+            manifest_items.append(
+                {
+                    "capture_kind": artifact["capture_kind"],
+                    "scheduled_job_run_id": artifact["scheduled_job_run_id"],
+                    "page_type": artifact["page_type"],
+                    "source_url_sha256": artifact["source_url_sha256"],
+                    "raw_body_sha256": artifact["raw_body_sha256"],
+                    "body_sha256": body_sha256,
+                    "sanitizer_version": body["sanitizer_version"],
+                    "http_status": artifact["http_status"],
+                    "content_type": artifact["content_type"],
+                    "fetched_at": fetched_at.isoformat(timespec="microseconds"),
+                    "elapsed_ms": artifact["elapsed_ms"],
+                    "attempt": artifact["attempt"],
+                    "parser_name": artifact["parser_name"],
+                    "parser_version": artifact["parser_version"],
+                    "parser_context_sha256": artifact["parser_context_sha256"],
+                    "parsed_record_count": len(parsed),
+                    "parsed_records_sha256": artifact["parsed_records_sha256"],
+                    "accepted_record_count": len(artifact_accepted_records),
+                    "accepted_records_sha256": artifact["accepted_records_sha256"],
+                }
+            )
+
+        if original_bytes > int(CRAWL["evidence_max_run_bytes"]):
+            raise RuntimeError(f"run {run_id} exceeds the HTTP evidence byte budget")
+        return _RunEvidenceSummary(
+            manifest_sha256=canonical_sha256(manifest_items),
+            dataset_sha256=_evidence_record_set_sha256(accepted_records),
+            artifact_count=len(artifacts),
+            accepted_record_count=len(accepted_records),
+            original_bytes=original_bytes,
+            stored_bytes=stored_bytes,
+        )
+
+    def _assert_verified_run_evidence(
+        self,
+        run_id: int,
+        run: Mapping[str, object],
+        target_parts: int,
+        *,
+        allow_failed_current_scheduler: bool = False,
+    ) -> None:
+        if (
+            run.get("evidence_status") != "verified"
+            or run.get("evidence_verified_at") is None
+            or not run.get("evidence_manifest_sha256")
+            or not run.get("evidence_dataset_sha256")
+        ):
+            raise RuntimeError(f"bounded run {run_id} has no verified live HTTP evidence")
+        summary = self._calculate_run_evidence(
+            run_id,
+            _db_int(run.get("scheduled_job_run_id") or 0),
+            cast(datetime, run["started_at"]),
+            target_parts,
+            allow_failed_current_scheduler=allow_failed_current_scheduler,
+        )
+        if (
+            summary.manifest_sha256 != run.get("evidence_manifest_sha256")
+            or summary.dataset_sha256 != run.get("evidence_dataset_sha256")
+            or summary.artifact_count != _db_int(run.get("evidence_artifact_count") or 0)
+            or summary.accepted_record_count != _db_int(run.get("evidence_record_count") or 0)
+            or summary.original_bytes != _db_int(run.get("evidence_original_bytes") or 0)
+            or summary.stored_bytes != _db_int(run.get("evidence_stored_bytes") or 0)
+        ):
+            raise RuntimeError(f"bounded run {run_id} HTTP evidence manifest/dataset mismatch")
+
+    def finish_run(
+        self,
+        run_id: int,
+        status: str,
+        counts: Mapping[str, int],
+        error: str | None = None,
+    ) -> None:
         """收尾一筆爬取紀錄：寫入完成時間、狀態、各層計數與錯誤訊息。
 
         若該 run 已是 success 或 bounded_success，本次收尾不降級
@@ -1045,17 +2052,22 @@ class CrawlRepository:
         )
 
     def publish_success_parts(self, run_id: int) -> int:
-        """在同一交易內更新不可變的 current snapshot。
+        """在同一交易內更新 full candidate 並保留上一份正式 snapshot。
 
         normalized tables 可被後續 failed/partial attempt 原地 upsert；因此
-        current view 不直接 join 它們。先 upsert 本次 logical run 明確
-        標記的資料，再刪除不屬於本次 run 的舊列。與 finish_run(success)
-        同次 commit；任一步失敗 rollback 後，舊 snapshot 仍完整可讀。
+        current view 不直接 join 它們。若現有 candidate 已有正式 scheduler
+        provenance，先複製到 published_parts_previous；再以本次 logical run
+        取代 candidate。與 finish_run(success) 同次 commit；任一步失敗會
+        rollback。此時父 scheduler 必須仍為 running；正式 view 會等它
+        completed 且 exit_code=0，期間繼續提供上一份合格 full snapshot。
         """
         run = self.db._execute(
             "SELECT cr.run_key, cr.dataset_kind, cr.target_parts, cr.status, "
             "cr.scheduled_job_run_id, sj.job_name AS scheduled_job_name, "
-            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status, "
+            "(SELECT COUNT(*) FROM crawl_runs AS linked "
+            "WHERE linked.scheduled_job_run_id = cr.scheduled_job_run_id) "
+            "AS scheduled_crawl_count "
             "FROM crawl_runs AS cr "
             "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
             "WHERE cr.id = %s FOR UPDATE",
@@ -1069,29 +2081,40 @@ class CrawlRepository:
             or run.get("status") != "running"
         ):
             raise RuntimeError(f"run {run_id} is not a matching running full crawl")
-        scheduled_job_run_id = run.get("scheduled_job_run_id")
-        if scheduled_job_run_id is not None and (
+        if run.get("scheduled_job_run_id") is None or (
             run.get("scheduled_job_name") != "catalog"
-            or run.get("scheduled_trigger_mode") not in {"daemon", "manual"}
+            or run.get("scheduled_trigger_mode") != "daemon"
             or run.get("scheduled_job_status") != "running"
+            or _db_int(run.get("scheduled_crawl_count") or 0) != 1
         ):
             raise RuntimeError(f"full run {run_id} has invalid scheduler provenance")
 
         run_key = str(run.get("run_key") or "")
         if not run_key:
             raise RuntimeError(f"full run {run_id} has no run key")
-        failure_rows = self.db._execute(
-            "SELECT id FROM crawl_state WHERE run_key = %s AND status = 'error' FOR UPDATE",
+        failure_row = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM crawl_state WHERE run_key = %s AND status = 'error'",
             (run_key,),
-        ).fetchall()
-        if failure_rows:
-            raise RuntimeError(f"full run {run_id} has crawl failures: count={len(failure_rows)}")
+        ).fetchone()
+        failure_count = _db_int((failure_row or {}).get("row_count", 0))
+        if failure_count:
+            raise RuntimeError(f"full run {run_id} has crawl failures: count={failure_count}")
+        pending_row = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM crawl_state "
+            "WHERE run_key = %s AND status = 'pending'",
+            (run_key,),
+        ).fetchone()
+        pending_count = _db_int((pending_row or {}).get("row_count", 0))
+        if pending_count:
+            raise RuntimeError(
+                f"full run {run_id} has incomplete crawl state: count={pending_count}"
+            )
 
         source_row = self.db._execute(
             "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
             (run_id,),
         ).fetchone()
-        source_count = int((source_row or {}).get("row_count", 0))
+        source_count = _db_int((source_row or {}).get("row_count", 0))
         if source_count <= 0:
             raise RuntimeError(f"run {run_id} produced an empty published snapshot")
 
@@ -1116,24 +2139,71 @@ class CrawlRepository:
             "OR NULLIF(TRIM(g.url), '') IS NULL OR g.url NOT LIKE "
             "'https://partsouq.com/en/catalog/genuine/unit?%%' "
             "OR (v.production_from IS NULL AND v.production_to IS NULL "
-            "AND p.part_from IS NULL AND p.part_to IS NULL))",
+            "AND p.part_from IS NULL AND p.part_to IS NULL) "
+            "OR (p.part_to IS NOT NULL AND v.production_from IS NOT NULL "
+            "AND p.part_to < v.production_from) "
+            "OR (v.production_to IS NOT NULL AND p.part_from IS NOT NULL "
+            "AND v.production_to < p.part_from))",
             (run_id,),
         ).fetchone()
-        invalid_rows = int((quality or {}).get("invalid_rows", 0))
+        invalid_rows = _db_int((quality or {}).get("invalid_rows", 0))
         if invalid_rows:
             raise RuntimeError(
                 f"full run {run_id} failed source/field quality gate: invalid_rows={invalid_rows}"
             )
 
+        # The child crawler commits before its parent scheduler can record
+        # completed/exit 0. Preserve the last qualified full snapshot before
+        # staging this run, so a parent crash never removes the current catalog.
+        current_snapshot = self.db._execute(
+            "SELECT COUNT(*) AS row_count, COUNT(crawl_run_id) AS provenance_count, "
+            "COUNT(DISTINCT crawl_run_id) AS run_count, "
+            "MIN(crawl_run_id) AS min_run_id, MAX(crawl_run_id) AS max_run_id "
+            "FROM published_parts"
+        ).fetchone()
+        current_count = _db_int((current_snapshot or {}).get("row_count", 0))
+        current_run_id = _db_int((current_snapshot or {}).get("min_run_id") or 0)
+        current_is_single_snapshot = (
+            current_count > 0
+            and _db_int((current_snapshot or {}).get("provenance_count", 0)) == current_count
+            and _db_int((current_snapshot or {}).get("run_count", 0)) == 1
+            and current_run_id == _db_int((current_snapshot or {}).get("max_run_id") or 0)
+        )
+        if current_is_single_snapshot:
+            qualified = self.db._execute(
+                "SELECT cr.id FROM crawl_runs AS cr "
+                "JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
+                "WHERE cr.id = %s AND cr.dataset_kind = 'full' "
+                "AND cr.target_parts IS NULL AND cr.status = 'success' "
+                "AND cr.finished_at IS NOT NULL AND cr.error_msg IS NULL "
+                "AND sj.job_name = 'catalog' AND sj.trigger_mode = 'daemon' "
+                "AND sj.status = 'completed' AND sj.finished_at IS NOT NULL "
+                "AND sj.exit_code = 0 "
+                "AND (SELECT COUNT(*) FROM crawl_runs AS linked "
+                "WHERE linked.scheduled_job_run_id = sj.id) = 1",
+                (current_run_id,),
+            ).fetchone()
+            if qualified:
+                self.db._execute("DELETE FROM published_parts_previous")
+                copied = self.db._execute(
+                    "INSERT INTO published_parts_previous SELECT * FROM published_parts"
+                ).rowcount
+                if copied != current_count:
+                    raise RuntimeError(
+                        f"full snapshot fallback copy mismatch: "
+                        f"source={current_count}, copied={copied}"
+                    )
+
         self.db._execute(
             "INSERT INTO published_parts ("
-            "part_id, vehicle_id, model_id, vehicle_vid, "
+            "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, "
             "brand, model, vehicle_name, vehicle_code, prod_period, "
             "production_from, production_to, engine, trim_name, "
             "part_name, part_number, part_number_normalized, category_id, category_cid, "
             "category_main, category_group, group_id, group_code, group_uid, "
             "part_range, part_from, part_to, source_url, note, quantity, code, snapshot_at) "
-            "SELECT source.part_id, source.vehicle_id, source.model_id, source.vehicle_vid, "
+            "SELECT source.part_id, source.crawl_run_id, source.vehicle_id, "
+            "source.model_id, source.vehicle_vid, "
             "source.brand, source.model, "
             "source.vehicle_name, source.vehicle_code, source.prod_period, "
             "source.production_from, source.production_to, source.engine, source.trim_name, "
@@ -1144,7 +2214,8 @@ class CrawlRepository:
             "source.group_code, source.group_uid, "
             "source.part_range, source.part_from, source.part_to, "
             "source.source_url, source.note, source.quantity, source.code, source.snapshot_at FROM ("
-            "SELECT p.id AS part_id, v.id AS vehicle_id, m.id AS model_id, "
+            "SELECT p.id AS part_id, %s AS crawl_run_id, v.id AS vehicle_id, "
+            "m.id AS model_id, "
             "v.vid AS vehicle_vid, b.name AS brand, m.name AS model, "
             "v.name AS vehicle_name, v.model_code AS vehicle_code, "
             "v.prod_period AS prod_period, v.production_from AS production_from, "
@@ -1166,7 +2237,8 @@ class CrawlRepository:
             "JOIN brands b ON b.id = m.brand_id "
             "WHERE p.seen_run_id = %s) AS source "
             "ON DUPLICATE KEY UPDATE "
-            "vehicle_id = source.vehicle_id, model_id = source.model_id, "
+            "crawl_run_id = source.crawl_run_id, vehicle_id = source.vehicle_id, "
+            "model_id = source.model_id, "
             "vehicle_vid = source.vehicle_vid, brand = source.brand, model = source.model, "
             "vehicle_name = source.vehicle_name, vehicle_code = source.vehicle_code, "
             "prod_period = source.prod_period, production_from = source.production_from, "
@@ -1182,7 +2254,7 @@ class CrawlRepository:
             "part_to = source.part_to, source_url = source.source_url, note = source.note, "
             "quantity = source.quantity, code = source.code, "
             "snapshot_at = source.snapshot_at",
-            (run_id,),
+            (run_id, run_id),
         )
         self.db._execute(
             "DELETE pp FROM published_parts pp "
@@ -1191,12 +2263,21 @@ class CrawlRepository:
             (run_id,),
         )
         published_row = self.db._execute(
-            "SELECT COUNT(*) AS row_count FROM published_parts"
+            "SELECT COUNT(*) AS row_count, COUNT(crawl_run_id) AS provenance_count, "
+            "COUNT(DISTINCT crawl_run_id) AS run_count, "
+            "MIN(crawl_run_id) AS min_run_id, MAX(crawl_run_id) AS max_run_id "
+            "FROM published_parts"
         ).fetchone()
-        published_count = int((published_row or {}).get("row_count", 0))
-        if published_count != source_count:
+        published_count = _db_int((published_row or {}).get("row_count", 0))
+        if (
+            published_count != source_count
+            or _db_int((published_row or {}).get("provenance_count", 0)) != published_count
+            or _db_int((published_row or {}).get("run_count", 0)) != 1
+            or _db_int((published_row or {}).get("min_run_id") or 0) != run_id
+            or _db_int((published_row or {}).get("max_run_id") or 0) != run_id
+        ):
             raise RuntimeError(
-                f"run {run_id} snapshot row count mismatch: "
+                f"run {run_id} snapshot identity/count mismatch: "
                 f"source={source_count}, published={published_count}"
             )
         return published_count
@@ -1208,13 +2289,20 @@ class CrawlRepository:
         run metadata、筆數、來源 ID 關聯與必填欄位全部通過時
         更換 current bounded snapshot；交易失敗會保留上一版。
         """
-        if target_parts <= 0:
-            raise ValueError("bounded target_parts must be positive")
+        if target_parts != 10_000:
+            raise ValueError("formal bounded target_parts must be exactly 10000")
 
         run = self.db._execute(
-            "SELECT cr.run_key, cr.dataset_kind, cr.target_parts, cr.status, "
+            "SELECT cr.run_key, cr.started_at, cr.dataset_kind, cr.target_parts, cr.status, "
+            "cr.evidence_status, cr.evidence_manifest_sha256, "
+            "cr.evidence_dataset_sha256, cr.evidence_artifact_count, "
+            "cr.evidence_record_count, cr.evidence_original_bytes, "
+            "cr.evidence_stored_bytes, cr.evidence_verified_at, "
             "cr.scheduled_job_run_id, sj.job_name AS scheduled_job_name, "
-            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status, "
+            "(SELECT COUNT(*) FROM crawl_runs AS linked "
+            "WHERE linked.scheduled_job_run_id = cr.scheduled_job_run_id) "
+            "AS scheduled_crawl_count "
             "FROM crawl_runs AS cr "
             "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
             "WHERE cr.id = %s FOR UPDATE",
@@ -1224,7 +2312,7 @@ class CrawlRepository:
             raise RuntimeError(f"bounded run {run_id} does not exist")
         if (
             run.get("dataset_kind") != "bounded"
-            or int(run.get("target_parts") or 0) != target_parts
+            or _db_int(run.get("target_parts") or 0) != target_parts
             or run.get("status") != "running"
         ):
             raise RuntimeError(f"run {run_id} is not a matching running bounded crawl")
@@ -1232,6 +2320,7 @@ class CrawlRepository:
             run.get("scheduled_job_name") != "catalog"
             or run.get("scheduled_trigger_mode") != "daemon"
             or run.get("scheduled_job_status") != "running"
+            or _db_int(run.get("scheduled_crawl_count") or 0) != 1
         ):
             raise RuntimeError(f"bounded run {run_id} has invalid scheduler provenance")
 
@@ -1251,12 +2340,18 @@ class CrawlRepository:
             "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
             (run_id,),
         ).fetchone()
-        source_count = int((source_row or {}).get("row_count", 0))
+        source_count = _db_int((source_row or {}).get("row_count", 0))
         if source_count != target_parts:
             raise RuntimeError(
                 f"bounded run {run_id} source count mismatch: "
                 f"source={source_count}, target={target_parts}"
             )
+
+        # 正式 snapshot 的第一個 mutation 是下方 DELETE。必須先在同一個
+        # locked run transaction 內重算並比對完整 live HTTP evidence，
+        # 否則任何缺頁、fixture、跨排程或 9,999/10,000 覆蓋都 fail closed，
+        # 並保留上一版 bounded_parts。
+        self._assert_verified_run_evidence(run_id, run, target_parts)
 
         # current-only snapshot：DELETE + INSERT 都在 crawler 收尾交易內。
         # 讀者在 commit 前仍看到上一版，失敗時則整筆 rollback。
@@ -1292,10 +2387,10 @@ class CrawlRepository:
             "FROM bounded_parts"
         ).fetchone()
         if (
-            int((snapshot or {}).get("row_count", 0)) != target_parts
-            or int((snapshot or {}).get("run_count", 0)) != 1
-            or int((snapshot or {}).get("min_run_id") or 0) != run_id
-            or int((snapshot or {}).get("max_run_id") or 0) != run_id
+            _db_int((snapshot or {}).get("row_count", 0)) != target_parts
+            or _db_int((snapshot or {}).get("run_count", 0)) != 1
+            or _db_int((snapshot or {}).get("min_run_id") or 0) != run_id
+            or _db_int((snapshot or {}).get("max_run_id") or 0) != run_id
         ):
             raise RuntimeError(f"bounded run {run_id} snapshot identity/count mismatch")
 
@@ -1335,7 +2430,7 @@ class CrawlRepository:
             "'https://partsouq.com/en/catalog/genuine/unit?%%')",
             (run_id,),
         ).fetchone()
-        invalid_rows = int((quality or {}).get("invalid_rows", 0))
+        invalid_rows = _db_int((quality or {}).get("invalid_rows", 0))
         if invalid_rows:
             raise RuntimeError(
                 f"bounded run {run_id} failed source/field quality gate: "

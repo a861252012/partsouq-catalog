@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.28,<1",
+    "httpx2>=2,<3",
     "mypy>=1.15,<2",
     "pytest>=8.3,<9",
     "pytest-cov>=6,<8",
@@ -44,6 +44,8 @@ partsouq-admin = "partsouq_admin.app:main"
 partsouq-station-admin = "partsouq_station_admin.app:main"
 partsouq-catalog-crawl = "partsouq_catalog.run_crawl:main"
 partsouq-catalog-supervisor = "partsouq_catalog.supervisor:main"
+partsouq-catalog-migrate = "partsouq_catalog.migrations:main"
+partsouq-evidence = "partsouq_catalog.evidence:main"
 partsouq-crawler = "partsouq_crawler.cli:main"
 partsouq-scheduler = "partsouq_catalog.scheduler:main"
 
@@ -77,6 +79,7 @@ ignore = ["E501", "SIM105", "SIM115"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+mypy_path = "src"
 packages = [
     "partsouq_admin",
     "partsouq_catalog",

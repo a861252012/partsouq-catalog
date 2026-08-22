@@ -11,6 +11,7 @@ unit 頁面    → 零件明細（料號/名稱/代碼/備註/數量/範圍表�
 import logging
 import re
 from html import unescape
+from typing import Any, Literal, overload
 from urllib.parse import parse_qs, unquote, urlparse
 
 from bs4 import BeautifulSoup
@@ -18,6 +19,8 @@ from bs4 import BeautifulSoup
 from partsouq_crawler.parsers.common import parse_unambiguous_range
 
 log = logging.getLogger("parse")
+
+type ParsedRecord = dict[str, Any]
 
 # 使用 lxml 解析器：比 html5lib 快 3~4 倍，且已驗證四層解析輸出完全一致
 PARSER = "lxml"
@@ -49,7 +52,7 @@ def _abs(href: str) -> str:
     return unescape(href) if href else ""
 
 
-def _qs(url: str, key: str):
+def _qs(url: str, key: str) -> str | None:
     """從網址的 query string 取出指定參數（沒有則回傳 None）。"""
     q = parse_qs(urlparse(url).query)
     vals = q.get(key, [])
@@ -77,7 +80,7 @@ def _candidate_identity(
     url: str,
     *keys: str,
     required: tuple[str, ...] = (),
-) -> tuple:
+) -> tuple[str | None, ...]:
     """以 request context 對 canonical link 去重；缺欄時保留原網址。"""
     params = {key: _qs(url, key) for key in keys}
     values = tuple(params[key] for key in keys)
@@ -105,12 +108,31 @@ def _context_mismatch(
 # ---------------------------------------------------------------- locate
 
 
+@overload
 def parse_brand_index(
     html: str,
     brand: str,
-    soup=None,
+    soup: Any = None,
+    diagnostics: Literal[False] = False,
+) -> list[ParsedRecord]: ...
+
+
+@overload
+def parse_brand_index(
+    html: str,
+    brand: str,
+    soup: Any = None,
+    *,
+    diagnostics: Literal[True],
+) -> tuple[list[ParsedRecord], int]: ...
+
+
+def parse_brand_index(
+    html: str,
+    brand: str,
+    soup: Any = None,
     diagnostics: bool = False,
-) -> list[dict] | tuple[list[dict], int]:
+) -> list[ParsedRecord] | tuple[list[ParsedRecord], int]:
     """解析 locate 頁面 → 型號清單（含 pick 網址）。
 
     每個型號是手風琴 <h4> 標題，內含連結到
@@ -146,11 +168,28 @@ def parse_brand_index(
     return models
 
 
+@overload
 def parse_brands(
     html: str,
-    soup=None,
+    soup: Any = None,
+    diagnostics: Literal[False] = False,
+) -> list[ParsedRecord]: ...
+
+
+@overload
+def parse_brands(
+    html: str,
+    soup: Any = None,
+    *,
+    diagnostics: Literal[True],
+) -> tuple[list[ParsedRecord], int]: ...
+
+
+def parse_brands(
+    html: str,
+    soup: Any = None,
     diagnostics: bool = False,
-) -> list[dict] | tuple[list[dict], int]:
+) -> list[ParsedRecord] | tuple[list[ParsedRecord], int]:
     """解析原廠目錄首頁 → 品牌清單（含代碼）。
 
     品牌位於側邊欄：<a href="/en/catalog/genuine/locate?c=NAME">
@@ -185,7 +224,7 @@ def parse_brands(
 # ----------------------------------------------------------------- pick
 
 
-def _vehicle_fields(th_classes, th_text):
+def _vehicle_fields(th_classes: Any, th_text: str) -> str | None:
     """把 pick 頁面的欄位標題對應到車型欄位名稱。
 
     各品牌的欄位配置不盡相同（Toyota: Name|Description|Model|Options|Prod
@@ -229,12 +268,31 @@ def _vehicle_fields(th_classes, th_text):
     return None
 
 
+@overload
 def parse_vehicles(
     html: str,
     brand: str,
-    soup=None,
+    soup: Any = None,
+    diagnostics: Literal[False] = False,
+) -> list[ParsedRecord]: ...
+
+
+@overload
+def parse_vehicles(
+    html: str,
+    brand: str,
+    soup: Any = None,
+    *,
+    diagnostics: Literal[True],
+) -> tuple[list[ParsedRecord], int]: ...
+
+
+def parse_vehicles(
+    html: str,
+    brand: str,
+    soup: Any = None,
     diagnostics: bool = False,
-) -> list[dict] | tuple[list[dict], int]:
+) -> list[ParsedRecord] | tuple[list[ParsedRecord], int]:
     """解析 pick 頁面的規格表 → 車型清單。
 
     欄位隨品牌與表格而異（部分品牌多了 Engine / Body Style / Grade /
@@ -246,7 +304,7 @@ def parse_vehicles(
     malformed = 0
     candidates = set()
     valid_candidates = set()
-    candidate_specs = {}
+    candidate_specs: dict[tuple[str | None, ...], tuple[str, ...]] = {}
     for a in soup.select("a[href]"):
         href = _abs(a.get("href", ""))
         # 只把本品牌車型的連結視為 candidate；其他品牌的交叉導覽
@@ -289,7 +347,7 @@ def parse_vehicles(
             if not matching_links:
                 continue
             url = _abs(matching_links[0].get("href"))
-            rec = {
+            rec: ParsedRecord = {
                 "name": "",
                 "description": "",
                 "model_code": "",
@@ -344,8 +402,8 @@ def parse_vehicles(
             vehicles.append((rec, key))
     # ssd / vid / url 是請求用 token，不是車型身分。若依 ssd 去重，
     # 同 token 的不同規格會靜默消失；改以 parser 已辨識的穩定規格去重。
-    seen = set()
-    out = []
+    seen: set[tuple[str, ...]] = set()
+    out: list[ParsedRecord] = []
     for vehicle, key in vehicles:
         if key in seen:
             continue
@@ -360,14 +418,37 @@ def parse_vehicles(
 # -------------------------------------------------------------- vehicle
 
 
+@overload
 def parse_category_links(
     html: str,
     brand: str,
-    soup=None,
+    soup: Any = None,
+    diagnostics: Literal[False] = False,
+    expected_ssd: str | None = None,
+    expected_vid: str | None = None,
+) -> list[ParsedRecord]: ...
+
+
+@overload
+def parse_category_links(
+    html: str,
+    brand: str,
+    soup: Any = None,
+    *,
+    diagnostics: Literal[True],
+    expected_ssd: str | None = None,
+    expected_vid: str | None = None,
+) -> tuple[list[ParsedRecord], int, int]: ...
+
+
+def parse_category_links(
+    html: str,
+    brand: str,
+    soup: Any = None,
     diagnostics: bool = False,
     expected_ssd: str | None = None,
     expected_vid: str | None = None,
-) -> list[dict] | tuple[list[dict], int] | tuple[list[dict], int, int]:
+) -> list[ParsedRecord] | tuple[list[ParsedRecord], int, int]:
     """解析 vehicle 頁面 → 分類導覽連結。
 
     每個主要分類（Engine、Power Train、Body、Electrical）都是一個
@@ -381,7 +462,7 @@ def parse_category_links(
     skipped_context = 0
     candidates = set()
     valid_candidates = set()
-    seen = {}
+    seen: dict[str, str] = {}
     for a in soup.select("a[href]"):
         href = _abs(a.get("href", ""))
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/vehicle"):
@@ -441,21 +522,43 @@ def parse_category_links(
     return cats
 
 
+@overload
 def parse_groups(
     html: str,
     brand: str,
     default_cid: str = "1",
-    soup=None,
+    soup: Any = None,
+    diagnostics: Literal[False] = False,
+    expected_ssd: str | None = None,
+    expected_vid: str | None = None,
+    expected_cid: str | None = None,
+) -> list[ParsedRecord]: ...
+
+
+@overload
+def parse_groups(
+    html: str,
+    brand: str,
+    default_cid: str = "1",
+    soup: Any = None,
+    *,
+    diagnostics: Literal[True],
+    expected_ssd: str | None = None,
+    expected_vid: str | None = None,
+    expected_cid: str | None = None,
+) -> tuple[list[ParsedRecord], int, int, int]: ...
+
+
+def parse_groups(
+    html: str,
+    brand: str,
+    default_cid: str = "1",
+    soup: Any = None,
     diagnostics: bool = False,
     expected_ssd: str | None = None,
     expected_vid: str | None = None,
     expected_cid: str | None = None,
-) -> (
-    list[dict]
-    | tuple[list[dict], int]
-    | tuple[list[dict], int, int]
-    | tuple[list[dict], int, int, int]
-):
+) -> list[ParsedRecord] | tuple[list[ParsedRecord], int, int, int]:
     """解析 vehicle 頁面 → 零件組連結（NNNN: NAME → /unit?...）。
 
     零件組位於目前啟用的分類區塊；每個都連結到
@@ -471,11 +574,11 @@ def parse_groups(
     malformed = 0
     skipped_context = 0
     image_only = 0
-    seen = {}
-    seen_uids = set()
+    seen: dict[tuple[str, str, str], str] = {}
+    seen_uids: set[tuple[str, str]] = set()
     candidates = set()
     valid_candidates = set()
-    candidate_specs = {}
+    candidate_specs: dict[tuple[str | None, ...], tuple[str, str]] = {}
     for a in soup.select("a[href]"):
         href = _abs(a.get("href", ""))
         # 只接受真正的 unit endpoint。redirect?next=/unit?... 或其他
@@ -591,7 +694,28 @@ def parse_groups(
 # ----------------------------------------------------------------- unit
 
 
-def parse_parts(html: str, soup=None, diagnostics: bool = False):
+@overload
+def parse_parts(
+    html: str,
+    soup: Any = None,
+    diagnostics: Literal[False] = False,
+) -> tuple[list[ParsedRecord], int]: ...
+
+
+@overload
+def parse_parts(
+    html: str,
+    soup: Any = None,
+    *,
+    diagnostics: Literal[True],
+) -> tuple[list[ParsedRecord], int, int, list[ParsedRecord]]: ...
+
+
+def parse_parts(
+    html: str,
+    soup: Any = None,
+    diagnostics: bool = False,
+) -> tuple[list[ParsedRecord], int] | tuple[list[ParsedRecord], int, int, list[ParsedRecord]]:
     """解析 unit 頁面的零件表。
 
     unit 頁面有兩張表：先是車型資訊的標題表，再來才是零件表
@@ -626,10 +750,10 @@ def parse_parts(html: str, soup=None, diagnostics: bool = False):
       呼叫端把它們寫入 quarantine 表，避免「整組標 done、料號永久漏掉」。
     """
     soup = soup if soup is not None else _soup(html)
-    parts_by_key = {}
+    parts_by_key: dict[tuple[str, str], ParsedRecord] = {}
     malformed = 0
     skipped_nameless = 0
-    skipped_rows = []
+    skipped_rows: list[ParsedRecord] = []
     for table in soup.find_all("table"):
         # 巢狀 table（包在另一個 table 的 td 裡）不是零件表本身，
         # 必須排除 —— 否則其內層列會被當成獨立的零件列（P2 修復，

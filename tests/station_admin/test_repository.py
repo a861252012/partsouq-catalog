@@ -11,6 +11,7 @@ from partsouq_station_admin.repository import (
     FIELD_LABELS,
     PAGE_SIZES,
     AdminDataError,
+    AdminReadinessError,
     AdminRepository,
     RecordNotFoundError,
     RevisionConflictError,
@@ -177,6 +178,7 @@ def test_dashboard_counts_nhtsa_rows_from_current_artifact_metadata() -> None:
     assert summary["bounded_scheduled_job_run_id"] == 77
     assert summary["bounded_scheduler_trigger_mode"] == "daemon"
     assert "MAX(jobs.trigger_mode)" in call.sql
+    assert "DATABASE() <> 'partsouq_catalog'" in call.sql
     assert summary["bounded_scheduler_linked_crawl_runs"] == 1
     assert summary["bounded_non_live_data_marker"] == 0
     assert summary["bounded_active_override_rows"] == 0
@@ -325,6 +327,7 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
         "health.quarantine-list",
         "health.quarantine-run-key",
         "health.backoffice-schema",
+        "health.published-provenance",
     ]
     assert "FORCE INDEX (idx_quarantine_list)" in database.calls[0].sql
     assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in database.calls[1].sql
@@ -351,9 +354,55 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
         "scheduled_job_runs",
         "nhtsa_current_artifacts",
         "nhtsa_source_artifacts",
+        "brands",
+        "models",
+        "vehicles",
+        "categories",
+        "groups_t",
+        "parts",
+        "published_parts",
+        "published_parts_previous",
+        "bounded_parts",
+        "crawl_runs",
+        "v_current_catalog_parts",
+        "part_quarantine",
+        "admin_vehicle_mappings",
+        "admin_part_translations",
+        "admin_reconciliation_items",
+        "nhtsa_vin_decodes",
     ):
         assert table in readiness_sql
     assert "LIMIT 0" in readiness_sql
+    contract_sql = database.calls[3].sql
+    for marker in (
+        "idx_published_crawl_run",
+        "fk_published_crawl_run",
+        "fk_published_previous_crawl_run",
+        "qualified_full_runs",
+        "formal_current_parts",
+        "formal_previous_parts",
+        "published_parts_previous",
+        "formal_full_parts",
+        "full_scheduler_run",
+        "linked_crawl_runs",
+        "bounded_parts",
+        "verified_bounded_evidence",
+        "verified_bounded_records",
+        "partsouq_http_artifacts",
+        "partsouq_artifact_records",
+        "evidence_status",
+        "live_http",
+        "dataset_scope",
+        "source_crawl_run_id",
+    ):
+        assert marker in contract_sql
+
+
+def test_readiness_rejects_incomplete_published_provenance_contract() -> None:
+    database = ScriptedDatabase(QueryTrace(), readiness_contract_ready=False)
+
+    with pytest.raises(AdminReadinessError, match="migration 019"):
+        AdminRepository(database).check_readiness()
 
 
 def test_quarantine_list_all_state_has_no_resolved_filter() -> None:
@@ -390,13 +439,18 @@ def test_quarantine_resolve_updates_row_in_transaction() -> None:
     trace = QueryTrace()
     database = ScriptedDatabase(trace)
 
-    AdminRepository(database).resolve_quarantine(7, "verified removed from site")
+    AdminRepository(database).resolve_quarantine(
+        7,
+        "verified removed from site",
+        expected_run_key="bounded-1",
+    )
 
     tags = [call.tag for call in database.calls]
     assert tags == ["quarantine.lock-row", "quarantine.resolve"]
     resolve_call = database.calls[-1]
     assert "SET resolved_at = NOW(), resolution = %s" in resolve_call.sql
-    assert resolve_call.params == ("verified removed from site", 7)
+    assert "WHERE id = %s AND run_key = %s AND resolved_at IS NULL" in resolve_call.sql
+    assert resolve_call.params == ("verified removed from site", 7, "bounded-1")
 
 
 def test_quarantine_resolve_unknown_row_raises_record_not_found() -> None:
@@ -408,4 +462,88 @@ def test_quarantine_resolve_unknown_row_raises_record_not_found() -> None:
 
     database.fetch_one = deny_lock  # type: ignore[method-assign]
     with pytest.raises(RecordNotFoundError):
-        AdminRepository(database).resolve_quarantine(999, "checked")
+        AdminRepository(database).resolve_quarantine(
+            999,
+            "checked",
+            expected_run_key="bounded-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("entity_type", "payload"),
+    (
+        ("vin_vehicle_mappings", {"vin": "INVALID"}),
+        ("vin_vehicle_mappings", {"vin": 123}),
+        ("vehicle_configurations", {"production_from": "2020-1"}),
+        ("vehicle_configurations", {"production_to": "2101-01"}),
+        ("vehicle_configurations", {"production_precision": "quarter"}),
+        ("part_term_mappings", {"mapping_status": "maybe"}),
+        ("vin_vehicle_mappings", {"decode_status": "pending"}),
+        ("reconciliation_cases", {"severity": "critical"}),
+        ("reconciliation_cases", {"status": "resolved"}),
+        ("vin_vehicle_mappings", {"engine_cylinders": "4"}),
+        ("vehicle_configurations", {"catalog_brand": 123}),
+    ),
+)
+def test_clean_payload_rejects_invalid_vin_date_enum_and_types(
+    entity_type: str,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(AdminDataError):
+        AdminRepository._clean_payload(ENTITY_SPECS[entity_type], payload)
+
+
+def test_clean_payload_normalizes_vin_and_text() -> None:
+    cleaned = AdminRepository._clean_payload(
+        ENTITY_SPECS["vin_vehicle_mappings"],
+        {
+            "vin": " test0000000000000 ",
+            "make_name": " Toyota ",
+            "model_year": 2020,
+            "engine_cylinders": 4,
+            "decode_status": "decoded",
+        },
+    )
+
+    assert cleaned == {
+        "vin": "TEST0000000000000",
+        "make_name": "Toyota",
+        "model_year": 2020,
+        "engine_cylinders": 4,
+        "decode_status": "decoded",
+    }
+
+
+def test_clean_payload_rejects_reversed_month_range() -> None:
+    with pytest.raises(AdminDataError, match="不可晚於"):
+        AdminRepository._clean_payload(
+            ENTITY_SPECS["vehicle_configurations"],
+            {"production_from": "2021-01", "production_to": "2020-12"},
+        )
+
+
+def test_quarantine_resolve_rejects_stale_or_already_resolved_occurrence() -> None:
+    stale_database = ScriptedDatabase(QueryTrace())
+    with pytest.raises(RevisionConflictError, match="已更新"):
+        AdminRepository(stale_database).resolve_quarantine(
+            7,
+            "checked",
+            expected_run_key="bounded-old",
+        )
+    assert [call.tag for call in stale_database.calls] == ["quarantine.lock-row"]
+
+    resolved_database = ScriptedDatabase(QueryTrace())
+    original_fetch_one = resolved_database.fetch_one
+
+    def resolved_lock(tag: str, sql: str, params: object = None) -> dict | None:
+        if tag == "quarantine.lock-row":
+            return {"id": 7, "run_key": "bounded-1", "resolved_at": "2026-08-22"}
+        return original_fetch_one(tag, sql, params)  # type: ignore[arg-type]
+
+    resolved_database.fetch_one = resolved_lock  # type: ignore[method-assign]
+    with pytest.raises(RevisionConflictError, match="已更新"):
+        AdminRepository(resolved_database).resolve_quarantine(
+            7,
+            "checked again",
+            expected_run_key="bounded-1",
+        )

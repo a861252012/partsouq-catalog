@@ -17,9 +17,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TextIO, TypedDict
 
 from .config import CLOAK, CRAWL, SITE, Cookies, load_cookies, save_cookies
@@ -27,7 +29,15 @@ from .config import CLOAK, CRAWL, SITE, Cookies, load_cookies, save_cookies
 log = logging.getLogger("cloak")
 
 BROWSER_START_TIMEOUT = 60.0
-COOKIE_EXPORT_TIMEOUT = 180.0
+BROWSER_STOP_GRACE_SECONDS = 5.0
+PAGE_LOAD_TIMEOUT_SECONDS = 60.0
+CATALOG_VERIFY_TIMEOUT_SECONDS = 150.0
+COOKIE_SETTLE_SECONDS = 2.0
+# ready marker 在 page.goto 之前發布；父程序等待時間必須完整涵蓋子程序
+# 的 navigation、型錄驗證與 cookie settle，再留 30 秒寫檔/排程餘裕。
+COOKIE_EXPORT_TIMEOUT = (
+    PAGE_LOAD_TIMEOUT_SECONDS + CATALOG_VERIFY_TIMEOUT_SECONDS + COOKIE_SETTLE_SECONDS + 30.0
+)
 
 # 只管理本程序親自啟動的 CloakBrowser process group。不得用 pkill 掃描
 # 共用機器上的命令列，否則會誤殺其他專案的 CloakBrowser。
@@ -82,6 +92,12 @@ def _cf_value(cookies: Cookies | None) -> str:
     return ""
 
 
+def _ensure_state_directory(path: Path) -> None:
+    # mode 只套用在新建目錄；不得 chmod 既有任意 parent（例如使用者把
+    # override 指向 /tmp/file 時，絕不能把 /tmp 改成 0700）。
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
 @contextlib.contextmanager
 def _process_refresh_lock() -> Iterator[bool]:
     """跨程序 refresh 互斥鎖（single-flight 只管得到同程序內執行緒）。
@@ -91,7 +107,7 @@ def _process_refresh_lock() -> Iterator[bool]:
     呼叫端拿到 acquired=False。
     """
     lock_path = CLOAK["lock_file"]
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_state_directory(lock_path.parent)
     lock_file = open(lock_path, "a+")
     acquired = False
     deadline = time.monotonic() + COOKIE_EXPORT_TIMEOUT + 120
@@ -115,7 +131,7 @@ def _process_refresh_lock() -> Iterator[bool]:
         lock_file.close()
 
 
-def _stop_owned_browser() -> None:
+def _stop_owned_browser(*, graceful: bool = False) -> None:
     """冪等停止本程序啟動的 CloakBrowser process group。"""
     global _browser_err_log, _browser_proc
 
@@ -128,20 +144,54 @@ def _stop_owned_browser() -> None:
     try:
         if proc is None:
             return
-        running = proc.poll() is None
-        if running:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                running = False
-            except PermissionError:
+        if graceful:
+            deadline = time.monotonic() + BROWSER_STOP_GRACE_SECONDS
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                try:
+                    proc.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(proc.pid, 0)
+                except ProcessLookupError:
+                    return
+                except PermissionError:
+                    break
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        wrapper_running = proc.poll() is None
+        group_signaled = False
+        try:
+            # wrapper 可能已先退出，但 start_new_session 建立的 child process
+            # group 仍存活；無論 wrapper 狀態都必須對 owned PGID 送訊號。
+            os.killpg(proc.pid, signal.SIGTERM)
+            group_signaled = True
+        except ProcessLookupError:
+            wrapper_running = False
+        except PermissionError:
+            if wrapper_running:
                 try:
                     proc.terminate()
                 except ProcessLookupError:
-                    running = False
-        if running:
+                    wrapper_running = False
+        if group_signaled:
+            deadline = time.monotonic() + BROWSER_STOP_GRACE_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(proc.pid, 0)
+                except ProcessLookupError:
+                    break
+                except PermissionError:
+                    break
+                time.sleep(0.1)
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (PermissionError, ProcessLookupError):
+                    pass
+        if wrapper_running:
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=BROWSER_STOP_GRACE_SECONDS + 1)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -153,7 +203,7 @@ def _stop_owned_browser() -> None:
                     except ProcessLookupError:
                         pass
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=BROWSER_STOP_GRACE_SECONDS + 1)
                 except subprocess.TimeoutExpired:
                     log.error("owned CloakBrowser process group did not exit after SIGKILL")
     finally:
@@ -176,8 +226,19 @@ def _launch_cloak() -> bool:
     """
     global _browser_err_log, _browser_proc
 
+    # Codex 的 macOS seatbelt 無法安全啟動 headed Chromium；強行啟動時
+    # Chromium 會被系統終止並跳出「未預期的結束」視窗。正式 Aqua
+    # LaunchAgent 不會帶這個環境變數，因此正常 host 排程不受影響。
+    if sys.platform == "darwin" and os.environ.get("CODEX_SANDBOX"):
+        log.error(
+            "refusing to launch headed CloakBrowser inside the macOS Codex sandbox; "
+            "use the Aqua LaunchAgent"
+        )
+        return False
+
     ready_file = CLOAK["cookie_export_file"].with_name(f"{CLOAK['cookie_export_file'].name}.ready")
     ready_tmp = ready_file.with_name(f"{ready_file.name}.tmp")
+    _ensure_state_directory(ready_file.parent)
     ready_file.unlink(missing_ok=True)
     ready_tmp.unlink(missing_ok=True)
     script = (
@@ -186,74 +247,122 @@ def _launch_cloak() -> bool:
         "READY = %r\n"
         "SITE = %r\n"
         "async def main():\n"
-        "    b = await cloakbrowser.launch_async(\n"
-        "        headless=False)\n"
-        "    ready_tmp = READY + '.tmp'\n"
-        "    fd = os.open(ready_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
-        "    with os.fdopen(fd, 'w') as f:\n"
-        "        f.write(str(os.getpid()))\n"
-        "    os.replace(ready_tmp, READY)\n"
-        "    ctx = await b.new_context(viewport={'width': 1366, 'height': 900})\n"
-        "    page = await ctx.new_page()\n"
-        "    await page.goto(SITE, wait_until='domcontentloaded', timeout=60000)\n"
-        "    verified = False\n"
-        "    title = ''\n"
-        "    brand_links = 0\n"
-        "    page_url = ''\n"
-        "    deadline = time.time() + 150\n"
-        "    while time.time() < deadline:\n"
-        "        try:\n"
-        "            title = await page.title()\n"
-        "            page_url = page.url\n"
-        "            brand_links = await page.locator(\n"
-        "                'li a[href*=\"/en/catalog/genuine/locate?c=\"]'\n"
-        "            ).count()\n"
-        "            catalog_url = page_url.split('#', 1)[0].split('?', 1)[0].rstrip('/')\n"
-        "            if catalog_url == SITE.rstrip('/') and brand_links >= %d:\n"
-        "                verified = True\n"
-        "                break\n"
-        "        except Exception:\n"
-        "            pass\n"
-        "        await asyncio.sleep(3)\n"
-        "    if not verified:\n"
+        "    b = None\n"
+        "    try:\n"
+        "        b = await cloakbrowser.launch_async(\n"
+        "            headless=False)\n"
+        "        ready_tmp = READY + '.tmp'\n"
+        "        fd = os.open(ready_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
+        "        with os.fdopen(fd, 'w') as f:\n"
+        "            f.write(str(os.getpid()))\n"
+        "        os.replace(ready_tmp, READY)\n"
+        "        ctx = await b.new_context(viewport={'width': 1366, 'height': 900})\n"
+        "        page = await ctx.new_page()\n"
+        "        await page.goto(SITE, wait_until='domcontentloaded', timeout=%d)\n"
+        "        verified = False\n"
+        "        title = ''\n"
+        "        brand_links = 0\n"
+        "        page_url = ''\n"
+        "        deadline = time.monotonic() + %r\n"
+        "        while time.monotonic() < deadline:\n"
+        "            try:\n"
+        "                title = await page.title()\n"
+        "                page_url = page.url\n"
+        "                brand_links = await page.locator(\n"
+        "                    'li a[href*=\"/en/catalog/genuine/locate?c=\"]'\n"
+        "                ).count()\n"
+        "                catalog_url = page_url.split('#', 1)[0].split('?', 1)[0].rstrip('/')\n"
+        "                if catalog_url == SITE.rstrip('/') and brand_links >= %d:\n"
+        "                    verified = True\n"
+        "                    break\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "            await asyncio.sleep(3)\n"
+        "        if not verified:\n"
+        "            raise RuntimeError(\n"
+        "                f'verified catalog page not reached: url={page_url[:120]!r} '\n"
+        "                f'title={title[:80]!r} brand_links={brand_links}'\n"
+        "            )\n"
+        "        await asyncio.sleep(%r)\n"
+        "        cookies = await ctx.cookies()\n"
+        "        data = [{'name': c['name'], 'value': c['value'],\n"
+        "                 'domain': c.get('domain', ''), 'path': c.get('path', '/')}\n"
+        "                for c in cookies]\n"
+        # OUT 是父程序的 completion marker。必須先讓 Chromium 正常關閉，
+        # 再發布檔案；否則父程序一看到 OUT 就會在 finally 對仍在關閉中
+        # 的 browser process group 送 TERM/KILL，macOS 便顯示未預期結束。
         "        await b.close()\n"
-        "        raise RuntimeError(\n"
-        "            f'verified catalog page not reached: url={page_url[:120]!r} '\n"
-        "            f'title={title[:80]!r} brand_links={brand_links}'\n"
-        "        )\n"
-        "    await asyncio.sleep(2)\n"
-        "    cookies = await ctx.cookies()\n"
-        "    data = [{'name': c['name'], 'value': c['value'],\n"
-        "             'domain': c.get('domain', ''), 'path': c.get('path', '/')}\n"
-        "            for c in cookies]\n"
-        "    tmp = OUT + '.tmp'\n"
-        "    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
-        "    with os.fdopen(fd, 'w') as f:\n"
-        "        json.dump(data, f)\n"
-        "    os.replace(tmp, OUT)\n"
-        "    print('COOKIES_EXPORTED', len(data), flush=True)\n"
-        "    await b.close()\n"
+        "        b = None\n"
+        "        tmp = OUT + '.tmp'\n"
+        "        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
+        "        with os.fdopen(fd, 'w') as f:\n"
+        "            json.dump(data, f)\n"
+        "        os.replace(tmp, OUT)\n"
+        "        print('COOKIES_EXPORTED', len(data), flush=True)\n"
+        "    finally:\n"
+        "        if b is not None:\n"
+        "            await b.close()\n"
         "asyncio.run(main())\n"
     ) % (
         str(CLOAK["cookie_export_file"]),
         str(ready_file),
         SITE["genuine"],
+        int(PAGE_LOAD_TIMEOUT_SECONDS * 1000),
+        CATALOG_VERIFY_TIMEOUT_SECONDS,
         CRAWL["min_brands"],
+        COOKIE_SETTLE_SECONDS,
     )  # noqa: UP031
     err_log = None
     try:
         # 只保留最後一次的 stderr，並在寫入前設為 owner-only。
+        error_log_file = CLOAK["error_log_file"]
+        _ensure_state_directory(error_log_file.parent)
         err_fd = os.open(
-            "/tmp/cloak_launch_err.log",
+            error_log_file,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
             0o600,
         )
         os.fchmod(err_fd, 0o600)
         err_log = os.fdopen(err_fd, "w")
+        browser_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            in {
+                "ALL_PROXY",
+                "CLOAKBROWSER_CACHE_DIR",
+                "DISPLAY",
+                "HOME",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "LANG",
+                "LC_ALL",
+                "LOGNAME",
+                "NO_PROXY",
+                "PATH",
+                "PLAYWRIGHT_NODEJS_PATH",
+                "SHELL",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "USER",
+                "XAUTHORITY",
+                "all_proxy",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+            }
+        }
+        # Browser binary 與 HTTP UA 必須維持同一個已驗證版本；也避免
+        # runtime 背景下載。DB 密碼、後台 token 等非必要環境不會傳入。
+        browser_environment["CLOAKBROWSER_AUTO_UPDATE"] = "false"
         proc = subprocess.Popen(
             [*CLOAK["launcher"], CLOAK["venv_python"], "-u", "-c", script],
             stdout=subprocess.DEVNULL,
             stderr=err_log,
+            env=browser_environment,
             start_new_session=True,
         )
     except OSError as e:
@@ -265,12 +374,13 @@ def _launch_cloak() -> bool:
         _browser_proc = proc
         _browser_err_log = err_log
     log.info("CloakBrowser launching (pid=%s), waiting for browser readiness...", proc.pid)
-    deadline = time.time() + BROWSER_START_TIMEOUT
-    while time.time() < deadline:
+    deadline = time.monotonic() + BROWSER_START_TIMEOUT
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             log.error(
-                "CloakBrowser exited before becoming ready (rc=%s); see /tmp/cloak_launch_err.log",
+                "CloakBrowser exited before becoming ready (rc=%s); see %s",
                 proc.returncode,
+                CLOAK["error_log_file"],
             )
             _stop_owned_browser()
             return False
@@ -279,8 +389,9 @@ def _launch_cloak() -> bool:
             return True
         time.sleep(2)
     log.error(
-        "CloakBrowser did not become ready within %.0fs; see /tmp/cloak_launch_err.log",
+        "CloakBrowser did not become ready within %.0fs; see %s",
         BROWSER_START_TIMEOUT,
+        CLOAK["error_log_file"],
     )
     _stop_owned_browser()
     return False
@@ -299,6 +410,9 @@ def refresh_session() -> Cookies | None:
         if not lock_acquired:
             log.error("refresh lock held by another process; refresh skipped")
             return None
+        # 等待跨程序鎖時，另一個 crawler 可能已完成刷新並發布 cookie。
+        # 取得鎖後重新讀磁碟，避免本程序立刻再開一個瀏覽器。
+        _seed_from_disk(replace_stale=True)
         with _SESSION_COND:
             while _session_state["busy"]:
                 _SESSION_COND.wait()
@@ -345,6 +459,31 @@ def session_backoff_remaining() -> float:
     return max(0.0, remaining)
 
 
+def reject_session(rejected_version: str | None = None) -> None:
+    """淘汰被站方拒絕的 session，且只刪除磁碟上的同一版本。"""
+    with _SESSION_COND:
+        rejected = rejected_version or _session_state.get("version")
+        if not rejected:
+            return
+        _rejected_versions.add(rejected)
+        if _session_state.get("version") == rejected:
+            _session_state["cookies"] = None
+            _session_state["ok_ts"] = 0.0
+            _session_state["version"] = None
+
+    with _process_refresh_lock() as lock_acquired:
+        if not lock_acquired:
+            log.warning("could not lock persisted session while rejecting version")
+            return
+        cookie_file = CLOAK["cookie_file"]
+        try:
+            persisted = load_cookies(cookie_file)
+            if _cf_value(persisted) == rejected:
+                cookie_file.unlink(missing_ok=True)
+        except OSError as error:
+            log.warning("failed to remove rejected persisted session: %s", error)
+
+
 def force_refresh_session(rejected_version: str | None = None) -> Cookies | None:
     """強制刷新 cookie：無視 TTL，即使快取仍新鮮也重新解決驗證。
 
@@ -379,11 +518,7 @@ def force_refresh_session(rejected_version: str | None = None) -> Cookies | None
             # 不再清掉重刷
             return _session_state["cookies"]
         rejected = rejected_version or _session_state.get("version")
-        if rejected:
-            _rejected_versions.add(rejected)
-        _session_state["cookies"] = None
-        _session_state["ok_ts"] = 0.0
-        _session_state["version"] = None
+    reject_session(rejected)
     return refresh_session()
 
 
@@ -391,6 +526,7 @@ def _refresh_impl() -> Cookies | None:
     """實際刷新；離開時一律回收本次擁有的 browser process group。"""
     export_file = CLOAK["cookie_export_file"]
     export_temp_file = export_file.with_name(f"{export_file.name}.tmp")
+    _ensure_state_directory(export_file.parent)
     for path in (export_file, export_temp_file):
         try:
             path.unlink(missing_ok=True)
@@ -398,18 +534,22 @@ def _refresh_impl() -> Cookies | None:
             pass
 
     _stop_owned_browser()
+    exported = False
     try:
         if not _launch_cloak():
             _mark_refresh_failed()
             return None
 
         # 等待瀏覽器內部腳本驗證實際型錄頁後匯出 cookie。
-        deadline = time.time() + COOKIE_EXPORT_TIMEOUT
+        deadline = time.monotonic() + COOKIE_EXPORT_TIMEOUT
         last_progress_log = 0.0
-        while time.time() < deadline:
-            if time.time() - last_progress_log >= 30:
-                last_progress_log = time.time()
-                log.info("waiting for cookie export... %ds elapsed", int(deadline - time.time()))
+        while time.monotonic() < deadline:
+            if time.monotonic() - last_progress_log >= 30:
+                last_progress_log = time.monotonic()
+                log.info(
+                    "waiting for cookie export... %ds remaining",
+                    int(deadline - time.monotonic()),
+                )
             if export_file.exists():
                 # 子程序以預設 umask 寫出，先限縮成 owner-only 再讀，
                 # 避免 cf_clearance 短暫暴露給本機其他使用者。
@@ -433,6 +573,7 @@ def _refresh_impl() -> Cookies | None:
                         sorted(names),
                         "cf_clearance" in names,
                     )
+                    exported = True
                     return cookies
                 log.warning("cookie export is empty or invalid")
             with _BROWSER_LOCK:
@@ -449,7 +590,7 @@ def _refresh_impl() -> Cookies | None:
         _mark_refresh_failed()
         return None
     finally:
-        _stop_owned_browser()
+        _stop_owned_browser(graceful=exported)
         # 無論成功與否都清掉暫存匯出檔（cookie 已在 save_cookies 落地）。
         for path in (export_file, export_temp_file):
             try:
@@ -473,7 +614,7 @@ def _mark_refresh_failed() -> None:
         log.warning("refresh failed (%d consecutive); backing off %.0fs", n, delay)
 
 
-def _seed_from_disk() -> None:
+def _seed_from_disk(*, replace_stale: bool = False) -> None:
     """程序啟動時把上次持久化的 cookie 載入記憶體（只做一次）。
 
     每個新程序（daemon 每趟 run 都是新 process）不該為了「不知道
@@ -484,8 +625,9 @@ def _seed_from_disk() -> None:
     版本已在本程序被伺服器拒絕過的（_rejected_versions）跳過不載入，
     否則 force_refresh 白清快取、403 迴圈重演。
     """
-    if _session_state["cookies"] is not None:
-        return
+    with _SESSION_COND:
+        if _session_state["cookies"] is not None and not replace_stale:
+            return
     try:
         if not CLOAK["cookie_file"].exists():
             return
@@ -503,7 +645,10 @@ def _seed_from_disk() -> None:
         log.info("skipping persisted session cookies previously rejected by server")
         return
     with _SESSION_COND:
-        if _session_state["cookies"] is not None:
+        if (
+            _session_state["cookies"] is not None
+            and time.monotonic() - _session_state["ok_ts"] < COOKIE_TTL
+        ):
             return
         _session_state["cookies"] = cookies
         _session_state["ok_ts"] = time.monotonic() - age

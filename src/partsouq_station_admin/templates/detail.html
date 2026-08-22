@@ -20,7 +20,7 @@
     <form method="post" action="{{ url_for('admin.entity_restore' if detail.record.status == 'retired' else 'admin.entity_retire', entity_type=spec.key, identity_key=detail.record.identity_key) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ detail.record.revision }}">
-      <label>操作者<input name="actor" value="{{ actor }}" required></label>
+      <label>操作者<input name="actor" value="{{ actor }}" required {% if actor_locked %}readonly{% endif %}></label>
       <label>原因<input name="reason" required></label>
       <button type="submit" class="{{ 'button' if detail.record.status == 'retired' else 'danger' }}">{{ '恢復' if detail.record.status == 'retired' else '停用' }}</button>
     </form>

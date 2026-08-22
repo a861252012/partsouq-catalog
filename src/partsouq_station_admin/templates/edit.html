@@ -28,7 +28,7 @@
       {% endfor %}
     </div>
     <div class="two-columns">
-      <label>操作者<input name="actor" value="{{ actor }}" required maxlength="191"></label>
+      <label>操作者<input name="actor" value="{{ actor }}" required maxlength="191" {% if actor_locked %}readonly{% endif %}></label>
       <label>修改原因<input name="reason" required></label>
     </div>
     <button type="submit">儲存新版本</button>

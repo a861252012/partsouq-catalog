@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.9.18"
+
+jobs:
+  quality:
+    name: Quality / Python 3.12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Verify lock file
+        run: uv lock --check
+      - name: Run formatting and static-analysis gates
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+          uv run --locked mypy
+          git diff --check
+
+  unit:
+    name: Unit / Python 3.12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Run unit suite
+        run: |
+          mkdir -p artifacts
+          uv run --locked pytest --override-ini addopts="" -W error -q -ra \
+            --strict-config --strict-markers \
+            --junitxml=artifacts/unit.xml
+      - name: Reject undocumented skips
+        run: |
+          uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/unit.xml \
+            --allow-message "set NHTSA_TEST_MYSQL=1 to run MySQL integration tests" \
+            --allow-message "set STATION_ADMIN_E2E=1 to run the station-admin browser E2E gate" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL catalog tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL full snapshot tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL mapping tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL quarantine plan tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL sample tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run station-admin MySQL tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run the isolated MySQL gate"
+      - name: Upload unit report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unit-junit
+          path: artifacts/unit.xml
+          if-no-files-found: error
+
+  mysql-browser-e2e:
+    name: MySQL + Chromium E2E / Python 3.12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      mysql:
+        image: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        env:
+          MYSQL_DATABASE: partsouq_catalog_test
+          MYSQL_USER: partsouq
+          MYSQL_PASSWORD: ci-app-password
+          MYSQL_ROOT_PASSWORD: ci-root-password
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3308:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -uroot -pci-root-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      PARTSOUQ_DB_HOST: 127.0.0.1
+      PARTSOUQ_DB_PORT: "3308"
+      PARTSOUQ_DB_NAME: partsouq_catalog_test
+      PARTSOUQ_DB_USER: partsouq
+      PARTSOUQ_DB_PASSWORD: ci-app-password
+      PARTSOUQ_MYSQL_ROOT_PASSWORD: ci-root-password
+      PARTSOUQ_ADMIN_TOKEN: ci-admin-token
+      NHTSA_TEST_MYSQL: "1"
+      UNIFIED_TEST_MYSQL: "1"
+      STATION_ADMIN_E2E: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Initialize shared test schema
+        env:
+          MYSQL_CONTAINER_ID: ${{ job.services.mysql.id }}
+          MYSQL_ROOT_PASSWORD: ci-root-password
+        run: |
+          for schema in db/catalog.sql db/nhtsa.sql db/admin.sql db/station_admin.sql; do
+            docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER_ID" \
+              mysql -uroot partsouq_catalog_test < "$schema"
+          done
+      - name: Install Playwright Chromium
+        run: uv run --locked playwright install --with-deps chromium
+      - name: Run MySQL and browser E2E suite
+        run: |
+          mkdir -p artifacts
+          uv run --locked pytest --override-ini addopts="" -W error -q -ra \
+            --strict-config --strict-markers \
+            --junitxml=artifacts/mysql-browser-e2e.xml
+      - name: Require zero skipped tests
+        run: uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/mysql-browser-e2e.xml
+      - name: Upload E2E JUnit report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: mysql-browser-e2e-junit
+          path: artifacts/mysql-browser-e2e.xml
+          if-no-files-found: error

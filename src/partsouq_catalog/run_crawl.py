@@ -14,8 +14,9 @@ import logging
 import logging.handlers
 import os
 import sys
+from pathlib import Path
 
-from .cloak import get_session
+from .admission import AdmissionLockBusy
 from .config import CRAWL, LOG_DIR, load_cookies
 from .crawler import Crawler
 from .db import Database
@@ -23,7 +24,7 @@ from .governor import RequestGovernor
 from .http_client import SessionManager
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="PartSouq 全站爬蟲")
     parser.add_argument("--brand", default=None, help="只爬這個品牌（例如 Toyota）")
     parser.add_argument("--fresh", action="store_true", help="執行前先清除爬取進度（從頭開始）")
@@ -41,7 +42,7 @@ def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     # 由 launchd 啟動時 stdout 會寫入無上限的 launchd.out.log：
     # 此時只寫輪替檔，不重複寫 stdout。
-    handlers = [
+    handlers: list[logging.Handler] = [
         # 20 MB x 5 輪替：跑好幾天的爬蟲不能讓日誌無限長大
         logging.handlers.RotatingFileHandler(
             LOG_DIR / "crawl.log",
@@ -64,7 +65,14 @@ def main():
     # supervisor 的 flock 只能防兩個 supervisor；直接 CLI（尤其
     # --fresh）也必須共用 crawler lock，否則兩趟 run 會同時重設 state
     # 與發布 snapshot。
-    lock_fd = open(LOG_DIR / "crawler.lock", "a")
+    configured_state_dir = os.getenv("PSQ_SCHEDULER_STATE_DIR", "").strip()
+    lock_dir = (
+        Path(configured_state_dir).expanduser().resolve() if configured_state_dir else LOG_DIR
+    )
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = lock_dir / "crawler.lock"
+    lock_fd = open(lock_path, "a")
+    os.chmod(lock_path, 0o600)
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -75,8 +83,13 @@ def main():
         # 組合根：組裝各層元件。--fresh 的 reset 已移到 Crawler.run，
         # 與 start_run 在同一交易，不會在 cookie 初始化失敗時先毀進度。
         db = Database().connect()
-        crawler = None
-        cookies = load_cookies() if args.no_browser else get_session()
+        crawler: Crawler | None = None
+        # 只讀既有 cookie；此處不得呼叫 get_session()。第一次真正的 HTTP
+        # 請求才由 SessionManager.ensure_fresh() 視需要啟動瀏覽器，確保
+        # Crawler.run 已先取得 migration admission lock 並提交 running
+        # marker。schema migration 進行中時，CLI 因此能在零瀏覽器啟動下
+        # 以 exit 75 延後。
+        cookies = load_cookies()
         if cookies is None:
             log.warning(
                 "no cookies available%s",
@@ -91,7 +104,11 @@ def main():
         governor = RequestGovernor(CRAWL["request_rate"], CRAWL["request_burst"])
         http = SessionManager(cookies, no_browser=args.no_browser, gov=governor)
         crawler = Crawler(http, db, workers=args.workers, governor=governor, fresh=args.fresh)
-        counts = crawler.run()
+        try:
+            counts = crawler.run()
+        except AdmissionLockBusy:
+            log.warning("schema migration in progress; crawler deferred before writing")
+            return 75
         log.info("crawl complete: %s (status=%s)", counts, crawler.last_status)
         # 全站與正式 bounded dataset 成功均是 exit 0；sample 是
         # 未發布的預期停止，仍保留獨立 exit 3。
@@ -106,6 +123,10 @@ def main():
         if "db" in locals():
             db.close()
         lock_fd.close()
+        root_logger = logging.getLogger()
+        for handler in handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
 
 
 if __name__ == "__main__":

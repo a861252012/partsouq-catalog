@@ -1,4 +1,7 @@
+import fcntl
 import os
+from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from unittest import mock
 
 import pytest
@@ -45,6 +48,7 @@ def _parts_html(count: int) -> str:
 @pytest.fixture
 def sample_crawler(monkeypatch):
     monkeypatch.setitem(CRAWL, "limit_parts", 1000)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=4)
     instance.run_id = 17
     instance.vehicles = mock.MagicMock()
@@ -125,7 +129,9 @@ def test_partial_group_preserves_existing_membership():
 
 
 def test_sample_run_is_not_published_or_marked_success(monkeypatch):
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     monkeypatch.setitem(CRAWL, "limit_parts", 1000)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     monkeypatch.setitem(CRAWL, "min_brands", 1)
     for key in ("start_brand", "limit_brands", "limit_models", "limit_vehicles", "limit_groups"):
         monkeypatch.setitem(CRAWL, key, "" if key == "start_brand" else 0)
@@ -161,8 +167,112 @@ def test_sample_run_is_not_published_or_marked_success(monkeypatch):
     instance.crawl.publish_success_parts.assert_not_called()
 
 
+def test_partial_run_uses_independent_running_marker(monkeypatch):
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
+    monkeypatch.setitem(CRAWL, "start_brand", "TOYOTA")
+    monkeypatch.setitem(CRAWL, "limit_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 0)
+    for key in ("limit_brands", "limit_models", "limit_vehicles", "limit_groups"):
+        monkeypatch.setitem(CRAWL, key, 0)
+
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.crawl = mock.MagicMock()
+    instance.crawl.start_run.return_value = 17
+    instance.crawl.purge_legacy_vehicle_state.return_value = 0
+    instance.crawl.remaining_group_count.return_value = 0
+    instance.crawl.count_errors.return_value = 0
+    instance._brands = mock.MagicMock(return_value=[{"name": "TOYOTA"}])
+    instance.crawl_brand = mock.MagicMock(return_value=0)
+    try:
+        instance.run()
+    finally:
+        instance.close()
+
+    run_key = instance.crawl.start_run.call_args.args[0]
+    assert run_key.startswith("partial-")
+    assert len(run_key) <= 32
+    assert run_key != datetime.now().strftime("%Y-%m")
+    instance.crawl.finish_run.assert_called_once_with(
+        17,
+        "error",
+        instance.counts,
+        "partial run (start/limit set: TOYOTA)",
+    )
+
+
+def test_crawler_rolls_back_initial_marker_before_releasing_admission(monkeypatch):
+    events: list[str] = []
+
+    @contextmanager
+    def admission(_connection):
+        events.append("acquired")
+        try:
+            yield
+        finally:
+            events.append("released")
+
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", admission)
+    monkeypatch.setitem(CRAWL, "start_brand", "")
+    monkeypatch.setitem(CRAWL, "limit_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 0)
+    for key in ("limit_brands", "limit_models", "limit_vehicles", "limit_groups"):
+        monkeypatch.setitem(CRAWL, key, 0)
+
+    database = mock.MagicMock()
+    database.rollback.side_effect = lambda: events.append("rollback")
+    instance = Crawler(mock.MagicMock(), database, workers=1)
+    instance.crawl = mock.MagicMock()
+    instance.crawl.start_run.side_effect = RuntimeError("marker failed")
+    try:
+        with pytest.raises(RuntimeError, match="marker failed"):
+            instance.run()
+    finally:
+        instance.close()
+
+    assert events == ["acquired", "rollback", "released"]
+
+
+def test_brand_request_refreshes_cookie_after_running_marker_commit(monkeypatch):
+    events: list[str] = []
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
+    monkeypatch.setitem(CRAWL, "start_brand", "")
+    monkeypatch.setitem(CRAWL, "limit_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 0)
+    monkeypatch.setitem(CRAWL, "min_brands", 1)
+    for key in ("limit_brands", "limit_models", "limit_vehicles", "limit_groups"):
+        monkeypatch.setitem(CRAWL, key, 0)
+
+    http = mock.MagicMock()
+    http.ensure_fresh.side_effect = lambda: events.append("ensure_fresh")
+    http.get_response.side_effect = lambda _url: (
+        events.append("request")
+        or mock.MagicMock(text='<li><a href="/en/catalog/genuine/locate?c=TOYOTA">TOYOTA</a></li>')
+    )
+    database = mock.MagicMock()
+    database.commit.side_effect = lambda: events.append("commit")
+    instance = Crawler(http, database, workers=1)
+    instance.crawl = mock.MagicMock()
+    instance.crawl.start_run.return_value = 17
+    instance.crawl.run_status.return_value = "running"
+    instance.crawl.purge_legacy_vehicle_state.return_value = 0
+    instance.crawl.remaining_group_count.return_value = 0
+    instance.crawl.count_errors.return_value = 1
+    instance.crawl_brand = mock.MagicMock(return_value=0)
+    try:
+        instance.run()
+    finally:
+        instance.close()
+
+    assert events.index("commit") < events.index("ensure_fresh") < events.index("request")
+    http.ensure_fresh.assert_called_once_with()
+
+
 def test_negative_limit_is_rejected(monkeypatch):
     monkeypatch.setitem(CRAWL, "limit_parts", -1)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
 
     with pytest.raises(ValueError, match="PSQ_LIMIT_PARTS"):
         Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
@@ -177,6 +287,7 @@ def test_mysql_partial_sample_readback(monkeypatch):
         raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
 
     monkeypatch.setitem(CRAWL, "limit_parts", 1000)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     database = Database().connect()
     try:
         for table in (
@@ -304,9 +415,54 @@ def test_cli_has_distinct_exit_codes(monkeypatch, tmp_path, status, expected):
     monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path)
     monkeypatch.setattr(run_crawl, "Database", mock.MagicMock(return_value=database))
     database.connect.return_value = database
+    load_cookies = mock.MagicMock(return_value={})
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
     monkeypatch.setattr(run_crawl, "SessionManager", mock.MagicMock())
     monkeypatch.setattr(run_crawl, "RequestGovernor", mock.MagicMock())
     monkeypatch.setattr(run_crawl, "Crawler", mock.MagicMock(return_value=crawler))
     monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
 
     assert run_crawl.main() == expected
+    load_cookies.assert_called_once_with()
+
+
+def test_cli_uses_shared_scheduler_state_lock_across_worktrees(monkeypatch, tmp_path):
+    shared_state = tmp_path / "shared-state"
+    shared_state.mkdir()
+    held_lock = open(shared_state / "crawler.lock", "a")
+    fcntl.flock(held_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    load_cookies = mock.MagicMock()
+
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(shared_state))
+    monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path / "other-worktree" / "logs")
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    try:
+        assert run_crawl.main() == 2
+        load_cookies.assert_not_called()
+    finally:
+        fcntl.flock(held_lock, fcntl.LOCK_UN)
+        held_lock.close()
+
+
+def test_direct_cli_defers_when_schema_migration_has_admission_lock(monkeypatch, tmp_path):
+    database = mock.MagicMock()
+    crawler = mock.MagicMock()
+    crawler.run.side_effect = run_crawl.AdmissionLockBusy("migration")
+
+    monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(run_crawl, "Database", mock.MagicMock(return_value=database))
+    database.connect.return_value = database
+    load_cookies = mock.MagicMock(return_value={})
+    browser_session = mock.MagicMock()
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr("partsouq_catalog.http_client.get_session", browser_session)
+    monkeypatch.setattr(run_crawl, "SessionManager", mock.MagicMock())
+    monkeypatch.setattr(run_crawl, "RequestGovernor", mock.MagicMock())
+    monkeypatch.setattr(run_crawl, "Crawler", mock.MagicMock(return_value=crawler))
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    assert run_crawl.main() == 75
+    load_cookies.assert_called_once_with()
+    browser_session.assert_not_called()

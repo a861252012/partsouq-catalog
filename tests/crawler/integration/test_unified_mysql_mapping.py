@@ -64,6 +64,7 @@ def _clear_shared_database(repository: NhtsaMySQLRepository) -> None:
             "admin_reconciliation_items",
             "admin_crawl_requests",
             "bounded_parts",
+            "published_parts_previous",
             "published_parts",
             "crawl_state",
             "crawl_runs",
@@ -84,7 +85,7 @@ def _vehicle_html() -> str:
       </tr>
       <tr>
         <td><a href="/en/catalog/genuine/vehicle?c=TOYOTA&amp;ssd=S1&amp;vid=1">CAMRY</a></td>
-        <td>AXVA70</td><td>- 12.2020</td><td>A25A-FKS</td><td>LE</td>
+        <td>AXVA70</td><td>- 12.2022</td><td>A25A-FKS</td><td>LE</td>
       </tr>
     </table>
     """
@@ -189,15 +190,23 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
         parts, malformed = parse_parts(_parts_html())
         assert malformed == 0
         assert vehicles[0]["production_from"] is None
-        assert vehicles[0]["production_to"] == "2020-12"
+        assert vehicles[0]["production_to"] == "2022-12"
         assert parts[0]["part_from"] == "2018-01"
         assert parts[0]["part_to"] == "2019-12"
 
         brands = BrandRepository(database)
         vehicle_repository = VehicleRepository(database)
         part_repository = PartRepository(database)
+        scheduled_job_run_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
         crawl_repository = CrawlRepository(database, "mapping-fixture")
-        run_id = crawl_repository.start_run("mapping-fixture", fresh=True)
+        run_id = crawl_repository.start_run(
+            "mapping-fixture",
+            fresh=True,
+            scheduled_job_run_id=scheduled_job_run_id,
+        )
         brand_id = brands.upsert_brand("TOYOTA", "https://partsouq.com/en/catalog/genuine")
         model_id = brands.upsert_model(brand_id, "CAMRY", "S1", None)
         vehicle_id = vehicle_repository.upsert_vehicle(model_id, vehicles[0])
@@ -244,6 +253,11 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
             "success",
             {"brands": 1, "models": 1, "vehicles": 2, "groups": 2, "parts": 4},
         )
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'completed', exit_code = 0, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (scheduled_job_run_id,),
+        )
         database.commit()
 
         with pytest.raises(pymysql.MySQLError):
@@ -274,7 +288,7 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                 == "normalized_make_model_year_engine_trim_in_current_range"
             )
             assert candidates_by_id[vehicle_id]["catalog_dataset_scope"] == "full"
-            assert candidates_by_id[vehicle_id]["catalog_crawl_run_id"] is None
+            assert candidates_by_id[vehicle_id]["catalog_crawl_run_id"] == run_id
 
             first_manual_mapping = client.post(
                 "/api/vehicle-mappings",
@@ -334,6 +348,7 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                     "partsouq_vehicle_id": alternate_vehicle_id,
                     "source_name": "manual-corrected",
                     "source_reference": "fixture re-confirmation",
+                    "expected_updated_at": mapping.json()["updated_at"],
                 },
             )
             assert corrected_mapping.status_code == 409
@@ -347,11 +362,26 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                     "partsouq_vehicle_id": alternate_vehicle_id,
                     "allow_name_override": True,
                     "source_reference": "fixture engine and trim override evidence",
+                    "expected_updated_at": mapping.json()["updated_at"],
                 },
             )
             assert override_mapping.status_code == 200
             assert override_mapping.json()["partsouq_vehicle_id"] == alternate_vehicle_id
             assert override_mapping.json()["source_name"] == "manual-name-override"
+
+            stale_mapping = client.put(
+                f"/api/vin-vehicle-mappings/{mapping.json()['id']}",
+                headers=headers,
+                json={
+                    "vin": VIN,
+                    "partsouq_vehicle_id": alternate_vehicle_id,
+                    "allow_name_override": True,
+                    "source_reference": "stale fixture edit",
+                    "expected_updated_at": mapping.json()["updated_at"],
+                },
+            )
+            assert stale_mapping.status_code == 409
+            assert "其他使用者更新" in stale_mapping.json()["detail"]
 
             duplicate = client.post(
                 "/api/vin-vehicle-mappings",
@@ -443,6 +473,7 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                     "partsouq_vehicle_id": alternate_vehicle_id,
                     "allow_name_override": True,
                     "source_reference": "fixture changed decode review",
+                    "expected_updated_at": override_mapping.json()["updated_at"],
                 },
             )
             assert reconfirmed_mapping.status_code == 200
@@ -531,7 +562,34 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
                 run_id=bounded_run_id,
             )
             assert bounded_crawl.count_run_parts(bounded_run_id) == 10_000
-            assert bounded_crawl.publish_bounded_parts(bounded_run_id, 10_000) == 10_000
+            # 這段只驗證 full/bounded mapping 的讀取優先序；synthetic fixture
+            # 不得偽造 live HTTP evidence 或呼叫正式發布入口。
+            database._execute("DELETE FROM bounded_parts")
+            database._execute(
+                "INSERT INTO bounded_parts ("
+                "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, "
+                "brand, model, vehicle_name, vehicle_code, prod_period, "
+                "production_from, production_to, engine, trim_name, part_name, "
+                "part_number, part_number_normalized, category_id, category_cid, "
+                "category_main, category_group, group_id, group_code, group_uid, "
+                "part_range, part_from, part_to, source_url, note, quantity, code, snapshot_at) "
+                "SELECT parts.id, %s, vehicles.id, models.id, vehicles.vid, brands.name, "
+                "models.name, vehicles.name, vehicles.model_code, vehicles.prod_period, "
+                "vehicles.production_from, vehicles.production_to, vehicles.engine, "
+                "vehicles.grade, parts.name, parts.part_number, "
+                "UPPER(REGEXP_REPLACE(parts.part_number, '[[:space:]-]+', '')), "
+                "categories.id, categories.cid, categories.name, groups_t.name, "
+                "groups_t.id, groups_t.code, groups_t.uid, parts.range_str, "
+                "parts.part_from, parts.part_to, groups_t.url, parts.note, "
+                "parts.quantity, parts.code, UTC_TIMESTAMP() FROM parts "
+                "JOIN groups_t ON groups_t.id = parts.group_id "
+                "JOIN categories ON categories.id = groups_t.category_id "
+                "JOIN vehicles ON vehicles.id = categories.vehicle_id "
+                "JOIN models ON models.id = vehicles.model_id "
+                "JOIN brands ON brands.id = models.brand_id "
+                "WHERE parts.seen_run_id = %s",
+                (bounded_run_id, bounded_run_id),
+            )
             bounded_crawl.finish_run(
                 bounded_run_id,
                 "bounded_success",
@@ -557,38 +615,38 @@ def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(
             )
             assert bounded_candidates.status_code == 200
             bounded_by_id = {row["partsouq_vehicle_id"]: row for row in bounded_candidates.json()}
-            assert set(bounded_by_id) == {vehicle_id}
-            assert bounded_by_id[vehicle_id]["catalog_dataset_scope"] == "bounded"
-            assert bounded_by_id[vehicle_id]["catalog_crawl_run_id"] == bounded_run_id
+            assert bounded_by_id == {}
 
             bounded_mapping = client.post(
                 "/api/vin-vehicle-mappings",
                 headers=headers,
                 json={"vin": VIN, "partsouq_vehicle_id": vehicle_id},
             )
-            assert bounded_mapping.status_code == 201
+            assert bounded_mapping.status_code == 409
+            assert (
+                "不是品牌、型號、年份、引擎與 Trim 相符的候選" in (bounded_mapping.json()["detail"])
+            )
 
             bounded_active_mapping = client.get(
                 f"/api/vin-vehicle-mappings?vin={VIN}",
                 headers=headers,
             )
             assert bounded_active_mapping.status_code == 200
-            assert bounded_active_mapping.json()[0]["vehicle_mapping_status"] == "confirmed"
+            assert bounded_active_mapping.json() == []
 
             bounded_summary = client.get("/api/database-summary")
             assert bounded_summary.status_code == 200
             assert bounded_summary.json()["bounded_ready"] is False
             assert bounded_summary.json()["bounded"]["blocking_reasons"] == [
-                "bounded_non_live_data_marker"
+                "bounded_non_live_data_marker",
+                "bounded_live_mapping_evidence_not_verified",
             ]
-            assert bounded_summary.json()["mappings"]["confirmed"] == 1
+            assert bounded_summary.json()["mappings"]["confirmed"] == 0
             assert bounded_summary.json()["mappings"]["stale"] == 0
 
             bounded_parts = client.get(f"/api/vins/{VIN}/parts", headers=headers)
             assert bounded_parts.status_code == 200
-            assert {row["part_number"] for row in bounded_parts.json()} == {"TEST-PART-001"}
-            assert {row["catalog_dataset_scope"] for row in bounded_parts.json()} == {"bounded"}
-            assert {row["catalog_crawl_run_id"] for row in bounded_parts.json()} == {bounded_run_id}
+            assert bounded_parts.json() == []
     finally:
         database.close()
         _clear_shared_database(repository)

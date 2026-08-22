@@ -27,6 +27,7 @@ browser UA 送出（為了維持 cf_clearance session）；因此 robots 規則�
    取得全域時槽（SOL P1）。
 """
 
+import hashlib
 import logging
 import random
 import time
@@ -45,15 +46,18 @@ from .cloak import (
     REFRESH_RETRY_BACKOFF,
     force_refresh_session,
     get_session,
+    reject_session,
     session_backoff_remaining,
 )
 from .config import CLOAK, CRAWL, Cookies
+from .evidence import CatalogHttpResponse
 
 log = logging.getLogger("http")
 
 CATALOG_USER_AGENT = "partsouq-catalog-crawler/0.1 (+https://github.com/a861252012)"
 CATALOG_PRODUCT_TOKEN = "partsouq-catalog-crawler"
 CATALOG_HOSTS = frozenset({"partsouq.com", "www.partsouq.com"})
+BACKOFF_HEARTBEAT_SECONDS = 60.0
 
 
 class RequestGovernor(Protocol):
@@ -258,7 +262,12 @@ class SessionManager:
             self._apply_cookies()
 
     def get(self, url: str) -> str:
-        """GET 請求：含重試 + 驗證自動刷新。回傳 HTML 文字。
+        """GET 請求：含重試 + 驗證自動刷新。回傳 HTML 文字。"""
+
+        return self.get_response(url).text
+
+    def get_response(self, url: str) -> CatalogHttpResponse:
+        """GET 請求並回傳不含 cookie／任意 headers 的 evidence envelope。
 
         404 有特殊語意：代表該資源在網站端不存在（例如某車型的某個
         group 頁）。以 NotFoundError 拋出、由呼叫端決定如何處理
@@ -295,6 +304,8 @@ class SessionManager:
                 if self.gov is not None:
                     self.gov.acquire()
                 r = self.session.get(url, timeout=CRAWL["http_timeout"], allow_redirects=False)
+                encoding = r.encoding or r.apparent_encoding or "utf-8"
+                r.encoding = encoding
                 text = r.text or ""
                 # 驗證偵測優先（F4）：403 或任何帶驗證特徵的回應
                 # （含 429 + cf-mitigated: challenge）一律進驗證分支。
@@ -328,7 +339,25 @@ class SessionManager:
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
                     raise requests.RequestException(f"http {r.status_code} at {url[:100]}")
-                return text
+                final_url = r.url if isinstance(r.url, str) else url
+                raw_content = r.content
+                raw_body = raw_content if isinstance(raw_content, bytes) else text.encode("utf-8")
+                elapsed_seconds = r.elapsed.total_seconds()
+                elapsed_ms = (
+                    max(0, int(elapsed_seconds * 1000))
+                    if isinstance(elapsed_seconds, (int, float))
+                    else 0
+                )
+                return CatalogHttpResponse(
+                    final_url=final_url,
+                    status_code=r.status_code,
+                    content_type=r.headers.get("content-type", "").split(";", 1)[0].strip().lower(),
+                    raw_body_sha256=hashlib.sha256(raw_body).hexdigest(),
+                    text=text,
+                    fetched_at=datetime.now(UTC).replace(tzinfo=None),
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                )
             except ChallengeError as e:
                 last_err = e
                 if self.no_browser:
@@ -336,6 +365,7 @@ class SessionManager:
                     log.error("challenge while no-browser mode; giving up on %s", url[:100])
                     break
                 if refresh_successes:
+                    reject_session(_cf_value(self.cookies))
                     last_err = ChallengeError(
                         f"fresh browser session still challenged at {url[:100]}"
                     )
@@ -532,10 +562,14 @@ class SessionManager:
         下限（避免伺服器冷卻期間狂打）。
         """
         remaining = session_backoff_remaining()
-        if remaining > 0:
-            time.sleep(remaining + 5)
-            return
-        time.sleep(max(REFRESH_RETRY_BACKOFF + 5, 15 * (attempt + 1)))
+        wait_seconds = (
+            remaining + 5 if remaining > 0 else max(REFRESH_RETRY_BACKOFF + 5, 15 * (attempt + 1))
+        )
+        while wait_seconds > 0:
+            chunk_seconds = min(BACKOFF_HEARTBEAT_SECONDS, wait_seconds)
+            log.warning("cookie refresh backoff; %.0fs remaining", wait_seconds)
+            time.sleep(chunk_seconds)
+            wait_seconds -= chunk_seconds
 
     def sleep(self) -> None:
         """依設定延遲隨機休息（2~5 秒），模擬人類瀏覽節奏。"""

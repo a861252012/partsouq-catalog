@@ -4,6 +4,13 @@ import os
 import secrets
 from dataclasses import dataclass
 
+DEFAULT_ALLOWED_HOSTS = (
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "admin.partsouq.localhost",
+)
+
 
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
@@ -13,6 +20,13 @@ def _env_int(name: str, default: int) -> int:
 def _env_page_size(name: str, default: int) -> int:
     value = _env_int(name, default)
     return value if value in {10, 25, 30, 50, 100, 200} else default
+
+
+def _env_allowed_hosts(name: str) -> tuple[str, ...]:
+    value = os.getenv(name)
+    if value is None:
+        return DEFAULT_ALLOWED_HOSTS
+    return tuple(host.strip().lower() for host in value.split(",") if host.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,9 +41,11 @@ class AdminConfig:
     secret_key: str = ""
     username: str = ""
     password: str = ""
+    require_auth: bool = False
     secure_cookie: bool = False
     default_actor: str = "local-admin"
     page_size: int = 30
+    allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
 
     @classmethod
     def from_env(cls) -> AdminConfig:
@@ -44,15 +60,14 @@ class AdminConfig:
             mysql_database=os.getenv("PARTSOUQ_DB_NAME", "partsouq_catalog"),
             bind_host=os.getenv("PARTSOUQ_STATION_ADMIN_HOST", "127.0.0.1"),
             bind_port=_env_int("PARTSOUQ_STATION_ADMIN_PORT", 8086),
-            secret_key=os.getenv(
-                "PARTSOUQ_STATION_ADMIN_SECRET_KEY",
-                os.getenv("PARTSOUQ_ADMIN_TOKEN", ""),
-            ),
+            secret_key=os.getenv("PARTSOUQ_STATION_ADMIN_SECRET_KEY", ""),
             username=os.getenv("PARTSOUQ_STATION_ADMIN_USERNAME", ""),
             password=os.getenv("PARTSOUQ_STATION_ADMIN_PASSWORD", ""),
+            require_auth=os.getenv("PARTSOUQ_STATION_ADMIN_REQUIRE_AUTH", "0") == "1",
             secure_cookie=os.getenv("PARTSOUQ_STATION_ADMIN_SECURE_COOKIE", "0") == "1",
             default_actor=os.getenv("PARTSOUQ_STATION_ADMIN_ACTOR", "local-admin"),
             page_size=_env_page_size("PARTSOUQ_STATION_ADMIN_PAGE_SIZE", 30),
+            allowed_hosts=_env_allowed_hosts("PARTSOUQ_STATION_ADMIN_ALLOWED_HOSTS"),
         )
 
     def resolved_secret_key(self) -> str:
@@ -63,6 +78,8 @@ class AdminConfig:
         return bool(self.username and self.password)
 
     def validate_server_mode(self) -> None:
+        if not self.allowed_hosts:
+            raise ValueError("PARTSOUQ_STATION_ADMIN_ALLOWED_HOSTS must not be empty")
         if bool(self.username) != bool(self.password):
             raise ValueError(
                 "PARTSOUQ_STATION_ADMIN_USERNAME and "
@@ -70,6 +87,11 @@ class AdminConfig:
             )
         if self.auth_required and not self.secret_key:
             raise ValueError("authenticated admin requires PARTSOUQ_STATION_ADMIN_SECRET_KEY")
+        if self.require_auth and not self.auth_required:
+            raise ValueError(
+                "station admin deployment requires "
+                "PARTSOUQ_STATION_ADMIN_USERNAME/PARTSOUQ_STATION_ADMIN_PASSWORD"
+            )
         if self.bind_host in {"127.0.0.1", "localhost", "::1"}:
             return
         if not self.auth_required:

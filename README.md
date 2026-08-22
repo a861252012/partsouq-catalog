@@ -66,11 +66,22 @@ PartSouq 成功發布後，後台的 VIN mapping 列表會把已不在 current s
 ```bash
 cp .env.example .env
 chmod 600 .env
-# 先把 .env 中的 password 與 PARTSOUQ_ADMIN_TOKEN 改成非預設值
-docker compose up -d --build mysql admin station-admin
+# 先把 .env 中所有 password、token 與 session secret 改成非預設值
+docker compose up -d mysql
+docker compose --profile migration run --rm --build schema-migrate
+docker compose up -d --build admin station-admin
 ```
 
-MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、`db/admin.sql` 與 `db/station_admin.sql`。現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，先確認無需保留資料後再使用 `docker compose down -v`。
+MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、
+`db/admin.sql` 與 `db/station_admin.sql`。接著必須執行一次明確的
+`schema-migrate`，建立 migration ledger、驗證固定 checksum，並安全重播可重複
+執行的 migration。後台與三個 scheduler 每次啟動前只會執行 read-only 的
+migration ledger／checksum gate；
+不會自行套 DDL。現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，
+先確認無需保留資料後再使用 `docker compose down -v`。
+Compose 只把各服務需要的變數傳入 container：root 密碼只給 MySQL，8000 token
+只給 admin，8086 的 session／登入密碼只給 station-admin。三個 scheduler、兩套後台、
+NHTSA 與 PartSouq 仍共用同一個 `partsouq_catalog`。
 
 既有 MySQL volume 不要先啟動後台；先只啟動資料庫，再完成下列升級與 health
 check：
@@ -79,9 +90,19 @@ check：
 docker compose up -d mysql
 ```
 
-以下流程適用至少已完成 catalog migration 001–006 的既有 volume。更舊的
-schema 必須先逐檔閱讀並執行 001–006；不可直接略過，且 migration 005
-可能要求備份後顯式授權重建 normalized vehicle tree。
+runner 會以固定 manifest 從 001 開始檢查並重播尚未記錄的 active migration
+（001–012、015–019），不靠人工猜測既有 volume 的版本。013／014 已被 015
+取代，不會在新升級執行。
+migration 019 會讓正式 bounded view fail closed：除了精確 10,000 筆與成功的
+daemon provenance，還必須有已 seal 的 live HTTP evidence、六種頁面類型與逐筆
+accepted part coverage；resume 的每個 scheduler attempt 也必須符合各自的 daemon
+狀態與擷取時間窗。沒有 evidence 或只有 fixture evidence 的資料仍可供原始
+診斷查詢，但不會出現在正式後台 view 或 VIN mapping。
+這個 evidence gate 目前只涵蓋 bounded 10,000；既有 full snapshot 分支仍只有
+scheduler provenance，尚未保存同級 live HTTP evidence，不在本次 10,000 筆正式
+驗收範圍，也不能據此宣稱 full crawl 已完成 live evidence 驗證。
+migration 005 若判定舊 vehicle tree 必須重建，仍會在刪除前 fail closed，且只接受
+備份後由操作者明確授權。
 
 升級前先記錄目前 running services，停止後台、排程與 crawler：
 
@@ -112,51 +133,53 @@ docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -e
 最後的 `preflight_status` 必須是 `OK` 才可繼續。若為
 `BLOCK_REBUILD_REQUIRED`，先停止升級並另排維護時段重建該表。不可先執行
 013／014，否則表面索引可能已修正，但 hidden FTS artifacts 仍會留下。
-若現有 volume 只完成到
-006，使用同一個 fail-fast subshell 依序執行：
+preflight 通過後執行唯一的 migration 入口：
 
 ```bash
-(
-set -e
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/007_unified_vin_mapping.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/008_admin_source_ids.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/009_bounded_production_dataset.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/010_group_uid_identity.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/011_part_quarantine.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/012_part_quarantine_resolution.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/015_quarantine_index_contract_cleanup.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
-)
+docker compose --profile migration run --rm --build schema-migrate
 ```
 
-若 volume 停在 007–011，從下一個尚未執行的檔案補到 012，再接 015；不可
-略過 007–012 的資料／schema migration。若已確認完成 012（包含已完成
-013／014），或只是重跑最新版，則不要重播 012–014；它們會重新建立已淘汰
-索引，增加不必要的 I/O 與 metadata lock。只執行：
+runner 會先在記憶體讀完所有 SQL、驗證固定 raw-byte SHA-256 與 statement
+邊界，接著取得 database-specific advisory lock。未知 ledger 版本、檔案缺漏、
+checksum 漂移或前一次 `applying`／`failed` 都會在下一個 migration DDL 前停止。
+新版 scheduler、直接 PartSouq／NHTSA 入口與 legacy supervisor 在建立或修復
+`running` marker 前，會短暫取得同一把 admission lock；marker commit 後立即釋放，
+不會把整趟爬蟲序列化。第一次升級仍必須先停止所有舊版 writer，因為舊 binary
+不認得這把鎖。
+MySQL DDL 會 implicit commit，因此失敗後不可手動把 ledger 改成成功；先修正根因，
+再精確指定 dirty 版本，從該檔第一句完整重播：
+
+若舊 `crawl_runs` 仍是 `running`，但它連結的 catalog scheduler 已明確是
+`failed`，且有 `finished_at`、非零 `exit_code`，並且該 scheduler 只連到一筆
+catalog run，runner 才會在 ledger preflight 通過後以 CAS 自動改成
+`interrupted`，保留原錯誤並附加修復原因。缺關聯、重複關聯、scheduler
+仍在執行、已完成卻留下 running crawl，或其他不一致狀態都會 fail closed，不會
+自動改資料。
 
 ```bash
-(
-set -e
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < migrations/catalog/015_quarantine_index_contract_cleanup.sql
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < db/station_admin.sql
-)
+docker compose --profile migration run --rm --build schema-migrate \
+  partsouq-catalog-migrate apply --retry 15
 ```
 
-本專案目前沒有 migration ledger。若沒有可信的部署紀錄可判定停在哪一版，
-不可憑印象略過；應在備份與維護時段內，以前述 fail-fast 方式從 007 依序重跑
-到 012，再執行 015。這會增加 I/O，但可避免漏套資料 migration。
+若 migration 005 明確要求重建，完成備份與維護確認後才可執行：
 
-上述 migration 都可重複執行；013／014 是已由 015 取代的歷史索引
-migration，新升級不必重播。從 006 升級時依序執行 007–012，再執行 015；
-015 可單獨重跑並收斂成目前 schema。涉及舊 snapshot 關聯回填
-時，只回填能唯一證明的 `vehicle_id` 與來源 ID；無法唯一確認的列會保留
-但不進 VIN mapping，須等下一次完整成功的 PartSouq publish 更新。
-若 migration-owned 索引被改成 FULLTEXT，或已存在 orphaned hidden FTS
-metadata，015 也會拒絕自動修復，避免在 online migration 偷做 table
-rebuild。
+```bash
+docker compose --profile migration run --rm --build schema-migrate \
+  partsouq-catalog-migrate apply --retry 5 --allow-v5-rebuild
+```
 
-`db/station_admin.sql` 可重複執行，用來建立 8086 後台的 compatibility
-views、overlay heads 與 append-only audit events。升級完成後，只恢復升級
+`db/station_admin.sql` 有獨立 checksum state。只有 manifest 內已知的舊 checksum
+可以升級；未知 checksum 一律視為 drift。檔案更新時 runner 會在 catalog migration
+全部完成後重套；若中斷，同樣必須明確重試：
+
+```bash
+docker compose --profile migration run --rm --build schema-migrate \
+  partsouq-catalog-migrate apply --retry-station-asset
+docker compose --profile migration run --rm --build schema-migrate \
+  partsouq-catalog-migrate check
+```
+
+升級完成後，只恢復升級
 前原本 running 的服務；不要因本段文件而啟動原先未執行的 scheduler。
 若升級前兩套後台都有執行，可使用
 `docker compose up -d --build admin station-admin`。恢復後要核對原 running
@@ -167,6 +190,10 @@ docker compose ps --services --filter status=running
 curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://partsouq.localhost:8000/api/health
 curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://admin.partsouq.localhost:8086/health
 ```
+
+啟動前的 gate 驗證 immutable migration 檔、ledger 與 station schema asset checksum，
+不宣稱能偵測任意人工 schema drift。兩套後台的必要 table／view／index readiness 由
+各自 `/health` 驗證；隔離 MySQL migration gate則負責實際重播與資料保留。
 
 8086 首頁會分開顯示 PartSouq normalized sample、published snapshot、NHTSA current reference records 與逐 VIN decode。Sample 筆數不等於已發布筆數；NHTSA reference records 已同步也不代表已有使用者提供的 VIN decode。
 
@@ -198,28 +225,51 @@ macOS host 則取得 18 個品牌連結，且 cookie 交給 HTTP client 後可�
 `scheduler` 只保留給未來已通過相同 smoke 的 Linux 環境，不得只以 browser ready
 或 cookie 檔存在就啟動 10,000 筆驗收。
 
-host 入口是 `deploy/run-macos-catalog-scheduler.zsh`，會讀取 `.env`、強制
-`PSQ_LIMIT_PARTS=0`、預設 `PSQ_BOUNDED_PARTS=10000`，並使用 host
-CloakBrowser Python。`deploy/com.partsouq.catalog-scheduler.plist.template` 是
-launchd 範本；將 `__PROJECT_ROOT__` 換成此 repository 的絕對路徑後，再安裝成
-使用者 LaunchAgent。範本的 `RunAtLoad` 會在 bootstrap 後立即開始正式 10,000
-筆排程，因此只有在準備執行正式驗收時才能 bootstrap。
+host 入口是 `deploy/run-macos-catalog-scheduler.zsh`，會讀取 `.env`，但只把 DB、
+爬蟲與 Aqua 執行所需的 allowlist 變數傳給子程序；MySQL root、8000 token 與
+8086 認證資訊不會進入 crawler。正式排程硬性要求既有 `partsouq_catalog`，並
+覆寫為 `PSQ_LIMIT_PARTS=0` 與 `PSQ_BOUNDED_PARTS=10000`，不能被舊的 sample
+設定或 `_test` DB 降級。CloakBrowser cookie／refresh lock 與 scheduler lock
+固定共用 owner-private 的
+`~/Library/Application Support/partsouq-catalog/`，避免不同 checkout 同時啟動
+瀏覽器或互相覆寫 cookie。
 
-headed Chromium 必須從 macOS Aqua session 啟動；範本已用
-`LimitLoadToSessionType=Aqua` 限制執行環境。不要從 SSH、LaunchDaemon 或其他
-無 GUI session 的 runner 直接執行 host scheduler，否則 AppKit 可能在啟動時
-以 `SIGABRT` 結束 Chromium。
+headed Chromium 必須從 macOS Aqua session 啟動；LaunchAgent 除了
+`LimitLoadToSessionType=Aqua`，也會傳入 host runner marker。runner 會拒絕未帶
+marker、SSH、CI 與 Codex sandbox 直接執行，避免 AppKit 以 `SIGABRT` 結束
+Chromium 並跳出「未預期的結束」提示。
 
 ```bash
-project_root="$PWD"
-agent="$HOME/Library/LaunchAgents/com.partsouq.catalog-scheduler.plist"
-mkdir -p "$HOME/Library/LaunchAgents"
-sed "s|__PROJECT_ROOT__|$project_root|g" \
-  deploy/com.partsouq.catalog-scheduler.plist.template > "$agent"
-plutil -lint "$agent"
-# 下一行會立即開始正式 10,000 筆排程：
-launchctl bootstrap "gui/$(id -u)" "$agent"
+# 第一次安裝 host CloakBrowser；requirements 內含全部 transitive hash：
+uv venv --python 3.14.5 "$HOME/.venvs/partsouq-cloak"
+uv pip install --python "$HOME/.venvs/partsouq-cloak/bin/python" \
+  --require-hashes -r deploy/requirements-cloakbrowser.txt
+"$HOME/.venvs/partsouq-cloak/bin/python" -m cloakbrowser install
+
+# 驗證 host runtime，不啟動 Chromium：
+"$HOME/.venvs/partsouq-cloak/bin/python" -c \
+  'import cloakbrowser; print(cloakbrowser.__version__)'
+
+# 只 render、lint 與安裝 plist，不啟動爬蟲：
+deploy/install-macos-catalog-scheduler.zsh --no-start
+
+# 安裝並立即開始正式 10,000 筆排程：
+deploy/install-macos-catalog-scheduler.zsh
+
+# 查看目前 LaunchAgent 狀態：
+launchctl print "gui/$(id -u)/com.partsouq.catalog-scheduler"
+
+# 停用排程；保留 plist、cookie、state 與 logs，之後可再執行 installer 啟用：
+deploy/disable-macos-catalog-scheduler.zsh
 ```
+
+installer 以 `plutil` 安全填入 repository 與 log 絕對路徑，render 後會檢查
+placeholder、plist 格式與權限。重複執行時，已載入且內容未變的 LaunchAgent 不會
+被重啟；若 plist 有變更，會先精確 bootout 同一 label 再 bootstrap。變更安裝設定
+會中斷當下工作，因此正式 10,000 筆執行期間不要重裝。stdout／stderr 位於
+`~/Library/Application Support/partsouq-catalog/logs/`，不是共用 `/tmp` 檔案。
+`.env` 的 `PSQ_CLOAK_PYTHON` 留空時會使用上述預設 venv；若改用其他路徑，必須
+填入可執行且已安裝相同 hash-locked 套件的 Python 絕對路徑。
 
 預設排程如下；都可用同名環境變數調整，不需要人工逐次觸發：
 
@@ -233,15 +283,19 @@ pending 並自動重試；無效 VIN 等一般非零結果會結束為 failed，
 
 `SCHEDULER_CATALOG_INTERVAL_SECONDS`、`SCHEDULER_NHTSA_INTERVAL_SECONDS`、
 `SCHEDULER_PENDING_INTERVAL_SECONDS` 控制頻率；失敗會從 60 秒開始指數退避，
-最多等 3,600 秒。daemon 與實際 job 都使用共享 lock，同一工作不會重複執行。
+最多等 3,600 秒。Compose 服務共用 `./logs` lock；macOS host 排程則共用前述
+owner-private scheduler state lock，同一台主機的不同 checkout 不會重複執行。
 排程狀態暫時讀不到時只會退避後重讀，不會直接啟動爬蟲；NHTSA bulk 已完成、
 API 失敗時，下一輪會從 API stage 續跑，不會重抓同一批 bulk sources。
 每次子程序會即時輸出 Docker log，並把最後 60,000 字、結束碼、執行時間與
 `manual`／`daemon`／`queue` 來源寫入 `scheduled_job_runs`。PartSouq
+在 Cloudflare refresh backoff 期間每 60 秒輸出一次 heartbeat；合法的最長
+20 分鐘冷卻不會被 600 秒 silent-stall watchdog 誤判成卡死。
 `crawl_runs.scheduled_job_run_id` 會保存實際 scheduler run；正式資料只接受
 `daemon`，不能用手動或 sample run 冒充。若 bounded 資料已完整 commit、但
-scheduler 在完成紀錄前中斷，下一個 daemon 會先核對筆數與關聯並補記完成，
-不會重爬同一批 10,000 筆。
+scheduler 在完成紀錄前中斷，即使 parent 已被記成 `failed`／非零 exit，下一個
+daemon 仍會先重播 live evidence、核對精確筆數與關聯，再以 CAS 補記完成；
+任一驗證不符就拒絕修復，不會把失敗資料冒充成功，也不會重爬已發布的 10,000 筆。
 
 檔案 lock 適用本機單主機，三個 Compose 服務必須共用 `./logs` volume。若改為
 多主機部署，需另外使用跨主機的 DB lease，不能把這套 flock 當成分散式鎖。

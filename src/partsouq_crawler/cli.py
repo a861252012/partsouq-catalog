@@ -10,6 +10,7 @@ from typing import Any
 
 import pymysql
 
+from partsouq_catalog.admission import AdmissionLockBusy
 from partsouq_crawler.config import DEFAULT_SEED, CrawlerConfig
 from partsouq_crawler.crawl.challenge import detect_challenge
 from partsouq_crawler.crawl.engine import CrawlerEngine
@@ -342,6 +343,9 @@ async def _dispatch_nhtsa(args: argparse.Namespace) -> int:
             _print_json(report)
             return 0 if report["status"] == "completed" else 1
         raise ValueError(f"unsupported NHTSA command: {args.command}")
+    except AdmissionLockBusy as error:
+        _print_json({"status": "deferred", "error_type": type(error).__name__})
+        return 75
     finally:
         repository.close()
 

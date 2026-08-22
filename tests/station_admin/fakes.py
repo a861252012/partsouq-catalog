@@ -25,11 +25,13 @@ class ScriptedDatabase:
         dataset_size: int = 1,
         event_count: int = 0,
         provenance_count: int = 0,
+        readiness_contract_ready: bool = True,
     ) -> None:
         self.trace = trace
         self.dataset_size = dataset_size
         self.event_count = event_count
         self.provenance_count = provenance_count
+        self.readiness_contract_ready = readiness_contract_ready
         self.calls: list[SqlCall] = []
         self.closed = False
 
@@ -62,7 +64,27 @@ class ScriptedDatabase:
         if tag == "quarantine.count":
             return {"total": self.dataset_size}
         if tag == "quarantine.lock-row":
-            return {"id": int(params[0])} if isinstance(params, Sequence) and params else None
+            return (
+                {
+                    "id": int(params[0]),
+                    "run_key": "bounded-1",
+                    "resolved_at": None,
+                }
+                if isinstance(params, Sequence) and params
+                else None
+            )
+        if tag == "health.published-provenance":
+            ready = int(self.readiness_contract_ready)
+            return {
+                "current_column_ready": ready,
+                "current_index_ready": ready,
+                "current_foreign_key_ready": ready,
+                "previous_column_ready": ready,
+                "previous_index_ready": ready,
+                "previous_foreign_key_ready": ready,
+                "formal_view_ready": ready,
+                "formal_view_columns_ready": ready,
+            }
         if tag == "dashboard.system-data-summary":
             return {
                 "partsouq_normalized_rows": 1000,

@@ -38,6 +38,19 @@ def _csrf_token(client: object, path: str) -> str:
     return match.group(1).decode()
 
 
+def _login(client: object, *, next_path: str = "/") -> object:
+    token = _csrf_token(client, "/login")
+    return client.post(
+        "/login",
+        data={
+            "csrf_token": token,
+            "username": "admin",
+            "password": "password",
+            "next": next_path,
+        },
+    )
+
+
 def test_health_exercises_database_readiness_before_reporting_ok() -> None:
     databases: list[ScriptedDatabase] = []
     app = _app(databases)
@@ -52,6 +65,7 @@ def test_health_exercises_database_readiness_before_reporting_ok() -> None:
         "health.quarantine-list",
         "health.quarantine-run-key",
         "health.backoffice-schema",
+        "health.published-provenance",
     ]
 
 
@@ -75,7 +89,199 @@ def test_authenticated_health_stays_public_but_opens_database() -> None:
         "health.quarantine-list",
         "health.quarantine-run-key",
         "health.backoffice-schema",
+        "health.published-provenance",
     ]
+
+
+def test_health_fails_closed_when_published_provenance_contract_is_stale() -> None:
+    databases: list[ScriptedDatabase] = []
+
+    def factory(_config: AdminConfig, trace: QueryTrace) -> ScriptedDatabase:
+        database = ScriptedDatabase(trace, readiness_contract_ready=False)
+        databases.append(database)
+        return database
+
+    app = create_app(
+        AdminConfig(secret_key="test-secret"),
+        database_factory=factory,
+    )
+    app.testing = True
+
+    response = app.test_client().get("/health")
+
+    assert response.status_code == 503
+    assert b"migration 019" in response.data
+    assert databases[-1].calls[-1].tag == "health.published-provenance"
+
+
+def test_host_allowlist_rejects_untrusted_host_before_opening_database() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases)
+
+    rejected = app.test_client().get("/", headers={"Host": "evil.example"})
+    allowed = app.test_client().get(
+        "/health",
+        headers={"Host": "admin.partsouq.localhost:8086"},
+    )
+
+    assert rejected.status_code == 400
+    assert allowed.status_code == 200
+    assert len(databases) == 1
+
+
+def test_authenticated_session_binds_username_and_ignores_submitted_actor() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(
+        databases,
+        config=AdminConfig(
+            secret_key="station-session-secret",
+            username="admin",
+            password="password",
+            page_size=25,
+        ),
+    )
+    client = app.test_client()
+
+    assert client.get("/entities/part_numbers/new").status_code == 302
+    login_response = _login(client)
+    assert login_response.status_code == 302
+    with client.session_transaction() as authenticated_session:
+        assert authenticated_session["admin_username"] == "admin"
+
+    editor = client.get("/entities/part_numbers/new")
+    assert editor.status_code == 200
+    assert b'name="actor" value="admin" required maxlength="191" readonly' in editor.data
+    token = _csrf_token(client, "/entities/part_numbers/new")
+    created = client.post(
+        "/entities/part_numbers/new",
+        data={
+            "csrf_token": token,
+            "field__number_raw": "P-1",
+            "field__name_en_raw": "Fixture part",
+            "actor": "forged-browser-actor",
+            "reason": "authenticated correction",
+        },
+    )
+
+    assert created.status_code == 302
+    event = next(
+        call for call in databases[-1].calls if call.tag == "write.append-event.part_numbers"
+    )
+    assert event.params[-2:] == ("admin", "authenticated correction")
+
+
+def test_legacy_boolean_only_session_is_not_authenticated() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(
+        databases,
+        config=AdminConfig(
+            secret_key="station-session-secret",
+            username="admin",
+            password="password",
+        ),
+    )
+    client = app.test_client()
+    with client.session_transaction() as legacy_session:
+        legacy_session["admin_authenticated"] = True
+
+    response = client.get("/")
+
+    assert response.status_code == 302
+    assert response.headers["Location"].startswith("/login?next=")
+    assert not databases
+    with client.session_transaction() as cleared_session:
+        assert "admin_authenticated" not in cleared_session
+
+
+def test_login_rejects_external_redirect_target() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(
+        databases,
+        config=AdminConfig(
+            secret_key="station-session-secret",
+            username="admin",
+            password="password",
+        ),
+    )
+
+    response = _login(app.test_client(), next_path="//evil.example/admin")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/"
+
+
+def test_bad_login_and_logout_csrf_keep_authenticated_session_fail_closed() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(
+        databases,
+        config=AdminConfig(
+            secret_key="station-session-secret",
+            username="admin",
+            password="password",
+            require_auth=True,
+        ),
+    )
+    client = app.test_client()
+    login_token = _csrf_token(client, "/login")
+
+    rejected_login = client.post(
+        "/login",
+        data={
+            "csrf_token": login_token,
+            "username": "admin",
+            "password": "wrong-password",
+        },
+    )
+    assert rejected_login.status_code == 200
+    assert "帳號或密碼錯誤。".encode() in rejected_login.data
+    assert not databases
+
+    authenticated = _login(client)
+    assert authenticated.status_code == 302
+    rejected_logout = client.post("/logout")
+    assert rejected_logout.status_code == 400
+    with client.session_transaction() as current_session:
+        assert current_session["admin_authenticated"] is True
+        logout_token = current_session["csrf_token"]
+
+    logged_out = client.post("/logout", data={"csrf_token": logout_token})
+    assert logged_out.status_code == 302
+    assert logged_out.headers["Location"] == "/login"
+    assert client.get("/").status_code == 302
+    with client.session_transaction() as logged_out_session:
+        assert "admin_authenticated" not in logged_out_session
+        assert "admin_username" not in logged_out_session
+
+
+def test_parallel_unauthenticated_get_does_not_invalidate_login_csrf() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(
+        databases,
+        config=AdminConfig(
+            secret_key="station-session-secret",
+            username="admin",
+            password="password",
+            require_auth=True,
+        ),
+    )
+    client = app.test_client()
+    login_token = _csrf_token(client, "/login?next=/entities/part_numbers")
+
+    favicon = client.get("/favicon.ico")
+    assert favicon.status_code == 302
+    assert favicon.headers["Location"].startswith("/login?next=")
+
+    rejected_login = client.post(
+        "/login?next=/entities/part_numbers",
+        data={
+            "csrf_token": login_token,
+            "username": "admin",
+            "password": "wrong-password",
+        },
+    )
+    assert rejected_login.status_code == 200
+    assert "帳號或密碼錯誤。".encode() in rejected_login.data
+    assert not databases
 
 
 def test_list_allows_supported_page_size_and_keeps_it_on_next_link() -> None:
@@ -246,6 +452,7 @@ def test_quarantine_page_lists_and_filters() -> None:
     assert "已處置 2098-12-31".encode() in response.data
     assert "未處置".encode() in response.data
     assert "共 1 頁".encode() in response.data
+    assert b'name="expected_run_key" value="bounded-1"' in response.data
     sql = "\n".join(call.sql for call in databases[-1].calls)
     assert "part_quarantine" in sql
     assert "resolved_at IS NULL" not in sql
@@ -264,6 +471,7 @@ def test_quarantine_resolve_requires_csrf_and_redirects() -> None:
             "resolution": "checked, removed from site",
             "state": "all",
             "run_key": "bounded-20260822-007",
+            "expected_run_key": "bounded-1",
             "page": "3",
             "pageSize": "25",
         },
@@ -278,7 +486,41 @@ def test_quarantine_resolve_requires_csrf_and_redirects() -> None:
         "quarantine.resolve",
     ]
     resolve_call = databases[-1].calls[-1]
-    assert resolve_call.params == ("checked, removed from site", 1)
+    assert resolve_call.params == ("checked, removed from site", 1, "bounded-1")
+
+
+def test_quarantine_resolve_returns_conflict_for_reopened_occurrence() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases, dataset_size=3)
+    client = app.test_client()
+    token = _csrf_token(client, "/quarantine")
+
+    response = client.post(
+        "/quarantine/1/resolve",
+        data={
+            "csrf_token": token,
+            "resolution": "stale attempt",
+            "expected_run_key": "bounded-old",
+        },
+    )
+
+    assert response.status_code == 409
+    assert [call.tag for call in databases[-1].calls] == ["quarantine.lock-row"]
+
+
+def test_quarantine_resolve_requires_expected_run_key() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases, dataset_size=3)
+    client = app.test_client()
+    token = _csrf_token(client, "/quarantine")
+
+    response = client.post(
+        "/quarantine/1/resolve",
+        data={"csrf_token": token, "resolution": "missing occurrence key"},
+    )
+
+    assert response.status_code == 400
+    assert not databases[-1].calls
 
 
 def test_quarantine_rejects_unsupported_page_size_before_query() -> None:

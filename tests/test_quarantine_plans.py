@@ -587,6 +587,43 @@ def test_admin_all_state_keeps_unresolved_first(
         assert part_numbers == expected
 
 
+def test_admin_quarantine_resolve_rejects_stale_run_then_commits_current_run(
+    seeded_quarantine_rows: dict[str, object],
+) -> None:
+    connection = seeded_quarantine_rows["connection"]
+    run_key = str(seeded_quarantine_rows["run_key"])
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT id FROM part_quarantine WHERE part_number = %s",
+            (seeded_quarantine_rows["unresolved_number"],),
+        )
+        row_id = int(cursor.fetchone()["id"])
+
+    with pytest.raises(data_admin_app.HTTPException) as exc_info:
+        data_admin_app.resolve_quarantine(
+            row_id,
+            data_admin_app.QuarantineResolveInput(
+                expected_run_key=f"{run_key}-stale",
+                resolution="stale request",
+            ),
+        )
+    assert exc_info.value.status_code == 409
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT resolved_at FROM part_quarantine WHERE id = %s", (row_id,))
+        assert cursor.fetchone()["resolved_at"] is None
+
+    resolved = data_admin_app.resolve_quarantine(
+        row_id,
+        data_admin_app.QuarantineResolveInput(
+            expected_run_key=run_key,
+            resolution="verified current run",
+        ),
+    )
+    assert resolved["resolved_at"] is not None
+    assert resolved["resolution"] == "verified current run"
+
+
 def test_station_admin_all_state_keeps_unresolved_first(
     seeded_quarantine_rows: dict[str, object],
 ) -> None:

@@ -28,8 +28,16 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from types import FrameType
+from typing import NotRequired, TypedDict
 
+from .admission import (
+    AdmissionLockBusy,
+    acquire_catalog_writer_admission,
+    release_catalog_writer_admission,
+)
 from .cloak import COOKIE_TTL
 from .config import COOKIE_FILE, CRAWL, LOG_DIR
 from .db import Database
@@ -61,18 +69,31 @@ CRAWLER_CMDLINE_RE = re.compile(
 )
 
 
+class RestartSummary(TypedDict):
+    time: str
+    reason: str
+
+
+class SupervisorSummary(TypedDict):
+    restarts: list[RestartSummary]
+    cooldowns: int
+    started: str
+    finished: str | None
+    status: NotRequired[str]
+
+
 class Supervisor:
     """監督迴圈：檢查、重啟、冷卻，負責讓爬蟲一路跑到完成。"""
 
-    def __init__(self, workers: int = 4):
+    def __init__(self, workers: int = 4) -> None:
         self.workers = workers
-        self.proc = None
-        self.restarts = []
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.restarts: list[float] = []
         # 單一心跳基準：目前 crawler 子程序的啟動時刻（monotonic）。
         # 卡死判斷統一以它為準，避免「寫入老化 + 寬限」疊加造成
         # 約 40 分鐘才偵測到卡死（P1 修復）。
         self.crawler_started_at = 0.0
-        self.db = None
+        self.db: Database | None = None
         self.cooldown_until = 0.0
         # process 內仍使用 monotonic，避免系統時間校正影響冷卻；磁碟上
         # 改存 wall-clock epoch，Supervisor 重啟後才能還原剩餘時間。
@@ -80,7 +101,7 @@ class Supervisor:
         self._restart_state_loaded = False
         self.started_at = time.monotonic()
         # 這趟的統計（結束時寫入 logs/summary.json）
-        self.summary = {
+        self.summary: SupervisorSummary = {
             "restarts": [],
             "cooldowns": 0,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -89,7 +110,7 @@ class Supervisor:
 
     # ------------------------------------------------------ restart state
 
-    def _load_restart_state(self):
+    def _load_restart_state(self) -> None:
         """載入跨程序的重啟窗口與冷卻狀態。
 
         state file 只存 wall-clock epoch；載入時換回本程序的 monotonic
@@ -146,7 +167,7 @@ class Supervisor:
         # 損毀檔；寫入失敗只降級為本程序內保護，不中止 supervisor。
         self._persist_restart_state()
 
-    def _persist_restart_state(self):
+    def _persist_restart_state(self) -> None:
         """以原子 replace 保存 restart/cooldown 的 wall-clock 狀態。"""
         if not self._restart_state_loaded:
             return
@@ -179,7 +200,7 @@ class Supervisor:
             except OSError:
                 pass
 
-    def _prune_restart_state(self, now: float | None = None):
+    def _prune_restart_state(self, now: float | None = None) -> None:
         """移除過期窗口；冷卻結束時清空本輪風暴紀錄。"""
         now = time.monotonic() if now is None else now
         changed = False
@@ -196,7 +217,7 @@ class Supervisor:
 
     # ------------------------------------------------------------ crawler
 
-    def _crawler_cmd(self) -> list:
+    def _crawler_cmd(self) -> list[str]:
         """回傳啟動爬蟲子程序的命令列。"""
         return [
             sys.executable,
@@ -236,14 +257,14 @@ class Supervisor:
             if isinstance(ps_rc, int) and ps_rc != 0:
                 log.error("cannot enumerate crawler processes: ps rc=%s", ps_out.returncode)
                 return None
-            crawler_pids = []
+            crawler_pids: list[tuple[int, int]] = []
             for line in ps_out.stdout.splitlines():
                 parts = line.split(None, 2)
                 if len(parts) < 3:
                     continue
-                pid, ppid, args = parts[0], parts[1], parts[2]
+                pid_text, ppid_text, args = parts[0], parts[1], parts[2]
                 try:
-                    pid_i, ppid_i = int(pid), int(ppid)
+                    pid_i, ppid_i = int(pid_text), int(ppid_text)
                 except ValueError:
                     continue
                 # 精確比對：命令列是「python[3] -m src.run_crawl ...」
@@ -252,7 +273,7 @@ class Supervisor:
                 # 且不是 shell 或帶其他字元的監控命令。
                 if CRAWLER_CMDLINE_RE.search(args):
                     crawler_pids.append((pid_i, ppid_i))
-            mine = {self.proc.pid} if self.proc else set()
+            mine: set[int] = {self.proc.pid} if self.proc else set()
             others = [pid for pid, _ in crawler_pids if pid not in mine]
             for pid in others:
                 # 診斷：被殺的進程是什麼（完整命令 + PPID）
@@ -329,7 +350,7 @@ class Supervisor:
         self.crawler_started_at = time.monotonic()
         return True
 
-    def restart(self, reason: str):
+    def restart(self, reason: str) -> None:
         """殺掉目前的爬蟲（若有的話）並重新啟動；記錄這次重啟。
 
         超過窗口內的重啟次數上限時進入冷卻，拒絕繼續重啟。
@@ -438,8 +459,13 @@ class Supervisor:
         HANG_TIMEOUT，寫入停滯 20 分鐘即偵測。
         """
         try:
-            row = self.db.query_one(PROGRESS_QUERY)
+            db = self.db
+            if db is None:
+                raise RuntimeError("supervisor database is not connected")
+            row = db.query_one(PROGRESS_QUERY)
             last_write = (row or {}).get("last_write")
+            if last_write is not None and not isinstance(last_write, (datetime, str, int, float)):
+                raise TypeError("last_write has an unsupported type")
             if last_write is not None and self._row_age_seconds(last_write) < HANG_TIMEOUT:
                 # 資料仍在持續寫入：健康
                 return False
@@ -453,14 +479,12 @@ class Supervisor:
             return False
 
     @staticmethod
-    def _row_age_seconds(dt) -> float:
+    def _row_age_seconds(dt: datetime | str | int | float | None) -> float:
         """把 MySQL 的 DATETIME / epoch 整數心跳值換算成距今秒數。"""
         if dt is None:
             return float("inf")
         if isinstance(dt, (int, float)):
             return time.time() - float(dt)
-        from datetime import datetime
-
         if isinstance(dt, str):
             dt = datetime.fromisoformat(dt)
         return time.time() - dt.timestamp()
@@ -496,7 +520,10 @@ class Supervisor:
     def _db_alive(self) -> bool:
         """判斷資料庫是否還回應（SELECT 1）。"""
         try:
-            row = self.db.query_one("SELECT 1 AS x")
+            db = self.db
+            if db is None:
+                raise RuntimeError("supervisor database is not connected")
+            row = db.query_one("SELECT 1 AS x")
             return bool(row)
         except Exception as e:
             log.error("mysql health check failed: %s", e)
@@ -527,7 +554,10 @@ class Supervisor:
         """
         try:
             run_key = time.strftime("%Y-%m")
-            row = self.db.query_one(
+            db = self.db
+            if db is None:
+                raise RuntimeError("supervisor database is not connected")
+            row = db.query_one(
                 "SELECT status FROM crawl_runs WHERE run_key = %s ORDER BY id DESC LIMIT 1",
                 (run_key,),
             )
@@ -536,7 +566,7 @@ class Supervisor:
             log.warning("run-status query failed: %s", e)
             return False
 
-    def _cleanup_stale_runs(self):
+    def _cleanup_stale_runs(self) -> None:
         """把卡在 running 狀態的舊爬取紀錄標記為 error。
 
         爬蟲被強殺（kill -9）時 finish_run 來不及執行，會留下
@@ -549,17 +579,32 @@ class Supervisor:
         run 的 started_at 恆在月初，用 24h 判斷會把「正常進行中、只是
         被重啟打斷」的當月 run 誤標 error。
         """
+        db = self.db
+        if db is None:
+            raise RuntimeError("supervisor database is not connected")
         try:
-            self.db._execute(
-                "UPDATE crawl_runs SET status = 'error', "
-                "error_msg = CONCAT(error_msg, ' | stale running cleaned by supervisor') "
-                "WHERE status = 'running' AND started_at < DATE_FORMAT(NOW(), '%Y-%m-01')"
-            )
-            self.db.commit()
-        except Exception as e:
-            log.warning("stale-run cleanup failed: %s", e)
+            admission_connection = db._thread_conn()
+            admission_lock = acquire_catalog_writer_admission(admission_connection)
+            try:
+                db._execute(
+                    "UPDATE crawl_runs SET status = 'error', "
+                    "error_msg = CONCAT(error_msg, ' | stale running cleaned by supervisor') "
+                    "WHERE status = 'running' AND started_at < DATE_FORMAT(NOW(), '%Y-%m-01')"
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                release_catalog_writer_admission(admission_connection, admission_lock)
+        except Exception:
+            # release helper 在 ownership 不明時會關閉 connection；無論哪個
+            # cleanup 階段失敗，都丟棄 thread-local，避免 Supervisor 下次
+            # 健康檢查沿用失敗交易或已關閉的 owner session。
+            db._discard_thread_conn()
+            raise
 
-    def _write_summary(self, status: str):
+    def _write_summary(self, status: str) -> None:
         """把這趟的統計寫入 logs/summary.json（事後 10 秒內可判讀）。"""
         self.summary["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.summary["status"] = status
@@ -578,7 +623,16 @@ class Supervisor:
         self._load_restart_state()
         self.db = Database().connect()
         try:
-            self._cleanup_stale_runs()
+            try:
+                self._cleanup_stale_runs()
+            except AdmissionLockBusy:
+                log.warning("schema migration in progress; supervisor deferred before child start")
+                self._write_summary("deferred-schema-migration")
+                return 75
+            except Exception:
+                log.exception("stale-run cleanup failed; refusing to start crawler")
+                self._write_summary("startup-error")
+                return 1
             if self._crawl_done():
                 log.info("crawl already completed; nothing to do")
                 if self._kill_other_crawlers() is not True:
@@ -606,7 +660,7 @@ class Supervisor:
             if self.db:
                 self.db.close()
 
-    def _tick(self):
+    def _tick(self) -> None:
         """單次健康檢查（迴圈的核心）。
 
         依序檢查：程序存活 → 重複爬蟲 → 心跳 → 記憶體 → 磁碟 → DB
@@ -619,7 +673,7 @@ class Supervisor:
         except Exception:
             log.exception("tick failed; supervisor continues")
 
-    def _tick_inner(self):
+    def _tick_inner(self) -> None:
         """實際的檢查順序（見 _tick 的 docstring）。"""
         self._prune_restart_state()
         # 1. 程序存活：崩潰的子程序必須被拉回來
@@ -630,6 +684,13 @@ class Supervisor:
                     log.info("crawler exited (rc=%s) and crawl marked success: done", rc)
                     self._write_summary("success")
                     sys.exit(0)
+                if rc == 75:
+                    # migration admission busy 是預期延後，不是 crawler crash；
+                    # 不累加 restart storm，也不立即重啟。下一個健康 tick
+                    # 才重新嘗試，且 run_crawl 在 admission 前不會開瀏覽器。
+                    log.info("crawler deferred by schema migration; retrying next check")
+                    self.proc = None
+                    return
                 self.restart(f"crawler exited with rc={rc}")
                 return
             if time.monotonic() < self.cooldown_until:
@@ -705,7 +766,7 @@ class Supervisor:
             sys.exit(1)
 
 
-def main():
+def main() -> int:
     import logging.handlers
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -751,7 +812,7 @@ def main():
     # launchd 以 SIGTERM 停服務時，預設處理會直接終止 interpreter，
     # Supervisor.run 的 finally 不一定有機會回收 child。轉成 SystemExit
     # 後仍保留標準退出語意，並確保 finally 執行。
-    def _terminate(signum, _frame):
+    def _terminate(signum: int, _frame: FrameType | None) -> None:
         # 第一次 TERM 轉成 SystemExit 讓 run.finally 回收 child；隨即忽略
         # 後續 TERM，避免 cleanup sleep/kill 被第二個 signal 重入中斷。
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

@@ -5,7 +5,7 @@
   <form class="editor" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>17 碼 VIN<input name="vin" minlength="17" maxlength="17" pattern="[A-HJ-NPR-Z0-9]{17}" required autocomplete="off"></label>
-    <label>操作者<input name="actor" value="{{ actor }}" required maxlength="191"></label>
+    <label>操作者<input name="actor" value="{{ actor }}" required maxlength="191" {% if actor_locked %}readonly{% endif %}></label>
     <button type="submit">加入解碼佇列</button>
   </form>
 {% endblock %}

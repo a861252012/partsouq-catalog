@@ -162,8 +162,9 @@
         <section>
           <h2>確認 VIN 與 PartSouq 車款</h2>
           <p class="note">先執行 NHTSA VIN 解碼，再從候選車款確認正確的 PartSouq vehicle ID。</p>
-          <form data-endpoint="/api/vin-vehicle-mappings">
-            <label>既有 mapping ID（更正時填寫）</label><input name="mapping_id" type="number" min="1">
+          <form id="vin-mapping-form" data-endpoint="/api/vin-vehicle-mappings">
+            <label>既有 mapping ID（更正時填寫）</label><div class="two"><input id="vin-mapping-id" name="mapping_id" type="number" min="1"><button id="vin-mapping-load" class="secondary" type="button">載入 mapping</button></div>
+            <input id="vin-mapping-version" name="expected_updated_at" type="hidden">
             <label>完整 VIN</label><input name="vin" required minlength="17" maxlength="17">
             <label>PartSouq vehicle ID</label><input name="partsouq_vehicle_id" type="number" min="1" required>
             <label>來源</label><input name="source_name" value="manual-confirmed">
@@ -199,6 +200,9 @@
       const partsNext = document.querySelector('#parts-next');
       const partsLast = document.querySelector('#parts-last');
       const partsState = { page: 1, pageSize: 10, totalPages: 0 };
+      const vinMappingForm = document.querySelector('#vin-mapping-form');
+      const vinMappingId = document.querySelector('#vin-mapping-id');
+      const vinMappingVersion = document.querySelector('#vin-mapping-version');
       const token = () => document.querySelector('#token').value;
       const emptyToNull = value => value === '' ? null : value;
       const statusMessage = (text, isError = false) => { message.className = isError ? 'error' : 'ok'; message.textContent = text; };
@@ -433,7 +437,7 @@
                 await call(`/api/quarantine/${row.id}/resolve`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ resolution }),
+                  body: JSON.stringify({ expected_run_key: row.run_key, resolution }),
                 });
                 statusMessage('已標記處置。');
                 await refreshQuarantine();
@@ -492,6 +496,19 @@
           statusMessage('已刷新資料。');
         } catch (error) { statusMessage(error.message, true); output.textContent = ''; }
       }
+      async function loadVinMapping() {
+        const mappingId = Number(vinMappingId.value);
+        if (!Number.isInteger(mappingId) || mappingId < 1) throw new Error('請先輸入有效的 mapping ID。');
+        const current = await call(`/api/vin-vehicle-mappings/${mappingId}`);
+        vinMappingForm.elements.vin.value = current.vin ?? '';
+        vinMappingForm.elements.partsouq_vehicle_id.value = current.partsouq_vehicle_id ?? '';
+        vinMappingForm.elements.source_name.value = current.source_name ?? 'manual-confirmed';
+        vinMappingForm.elements.source_reference.value = current.source_reference ?? '';
+        vinMappingForm.elements.allow_name_override.checked = current.source_name === 'manual-name-override';
+        vinMappingVersion.value = current.updated_at ?? '';
+        if (!vinMappingVersion.value) throw new Error('mapping 缺少版本資料，無法安全編輯。');
+        statusMessage(`已載入 mapping ${mappingId}。`);
+      }
       document.querySelectorAll('form[data-endpoint]').forEach(form => form.addEventListener('submit', async event => {
         event.preventDefault();
         try {
@@ -499,17 +516,22 @@
           let endpoint = form.dataset.endpoint;
           let method = 'POST';
           if (endpoint === '/api/vin-vehicle-mappings' && body.mapping_id) {
+            if (!body.expected_updated_at) throw new Error('請先載入 mapping，再送出更正。');
             endpoint = `${endpoint}/${body.mapping_id}`;
             method = 'PUT';
+          } else if (endpoint === '/api/vin-vehicle-mappings') {
+            delete body.expected_updated_at;
           }
           delete body.mapping_id;
           await call(endpoint, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
           form.reset();
-          statusMessage('已建立資料。');
+          statusMessage(method === 'PUT' ? '已更新資料。' : '已建立資料。');
           refresh();
         } catch (error) { statusMessage(error.message, true); }
       }));
       document.querySelector('#refresh').addEventListener('click', refresh);
+      document.querySelector('#vin-mapping-load').addEventListener('click', () => loadVinMapping().catch(error => statusMessage(error.message, true)));
+      vinMappingId.addEventListener('input', () => { vinMappingVersion.value = ''; });
       document.querySelector('#quarantine-refresh').addEventListener('click', refreshQuarantine);
       quarantineStateSelect.addEventListener('change', () => { quarantineState.page = 1; refreshQuarantine(); });
       quarantineRunKey.addEventListener('change', () => { quarantineState.page = 1; refreshQuarantine(); });

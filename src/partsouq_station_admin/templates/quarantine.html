@@ -44,6 +44,7 @@
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="state" value="{{ state }}">
                 <input type="hidden" name="run_key" value="{{ run_key }}">
+                <input type="hidden" name="expected_run_key" value="{{ row.run_key }}">
                 <input type="hidden" name="page" value="{{ page.page }}">
                 <input type="hidden" name="pageSize" value="{{ page.pageSize }}">
                 <input type="text" name="resolution" maxlength="255" placeholder="處置說明（可留空）">

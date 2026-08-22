@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import errno
-import io
 import sys
+import threading
+import time
+from contextlib import nullcontext
 from unittest import mock
 
 import pytest
@@ -23,12 +25,23 @@ class FakeStopEvent:
         return self.stopped
 
 
+@pytest.fixture(autouse=True)
+def isolate_scheduler_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scheduler, "acquire_catalog_writer_admission", lambda _connection: "test")
+    monkeypatch.setattr(
+        scheduler,
+        "release_catalog_writer_admission",
+        lambda _connection, _lock_name: None,
+    )
+
+
 def test_record_start_persists_trigger_mode(monkeypatch) -> None:
     cursor = mock.MagicMock(lastrowid=77)
     cursor.__enter__.return_value = cursor
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+    monkeypatch.setattr(scheduler, "catalog_writer_admission", nullcontext)
 
     assert scheduler._record_start("catalog") == 77
     assert cursor.execute.call_args.args[1] == ("catalog", "manual")
@@ -39,6 +52,18 @@ def test_record_start_persists_trigger_mode(monkeypatch) -> None:
         assert cursor.execute.call_args.args[1] == ("catalog", "daemon")
     finally:
         del scheduler._JOB_CONTEXT.trigger_mode
+
+
+def test_schema_migration_defers_scheduler_before_child_spawn(monkeypatch) -> None:
+    def migration_busy(_job: str) -> int:
+        raise scheduler.AdmissionLockBusy("migration")
+
+    monkeypatch.setattr(scheduler, "_record_start", migration_busy)
+    popen = mock.MagicMock()
+    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+
+    assert scheduler._run("catalog", ["python", "-m", "crawler"]) == 75
+    popen.assert_not_called()
 
 
 def test_api_progress_persists_actual_stage_completion_time(monkeypatch) -> None:
@@ -111,26 +136,8 @@ def test_record_finish_rolls_back_if_interrupted_crawl_update_fails(monkeypatch)
 
 
 def test_run_records_scheduler_id_in_child_environment(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
-    class Process:
-        returncode = 0
-        stdout = io.StringIO("completed\n")
-
-        def wait(self) -> int:
-            return self.returncode
-
-        def poll(self) -> int:
-            return 0
-
-    def popen(command, **kwargs):
-        captured["command"] = command
-        captured["kwargs"] = kwargs
-        return Process()
-
     finished: list[tuple[int, int, str]] = []
     monkeypatch.setattr(scheduler, "_record_start", lambda _job: 42)
-    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -139,38 +146,35 @@ def test_run_records_scheduler_id_in_child_environment(monkeypatch) -> None:
     monkeypatch.setenv("SCHEDULED_JOB_RUN_ID", "stale")
     monkeypatch.delenv("PSQ_BOUNDED_PARTS", raising=False)
 
-    assert scheduler._run("catalog", ["python", "-m", "crawler"]) == 0
+    command = [
+        sys.executable,
+        "-c",
+        "import os; print(os.environ['SCHEDULED_JOB_RUN_ID'])",
+    ]
+    assert scheduler._run("catalog", command) == 0
 
-    environment = captured["kwargs"]["env"]
-    assert environment["SCHEDULED_JOB_RUN_ID"] == "42"
-    assert finished == [(42, 0, "completed\n")]
+    assert finished == [(42, 0, "42\n")]
 
 
 def test_run_streams_output_and_only_records_bounded_redacted_tail(monkeypatch, capsys) -> None:
     vin = "1M8GDM9AXKP042788"
     prefix = "first-line\n"
-    large_output = [prefix, *[f"{vin} {'x' * 990}\n" for _ in range(100)]]
-
-    class Process:
-        returncode = 0
-        stdout = io.StringIO("".join(large_output))
-
-        def wait(self) -> int:
-            return self.returncode
-
-        def poll(self) -> int:
-            return self.returncode
 
     finished: list[tuple[int, int, str]] = []
     monkeypatch.setattr(scheduler, "_record_start", lambda _job: 43)
-    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *_args, **_kwargs: Process())
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
         lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
 
-    command = ["python", "-m", "partsouq_crawler", "nhtsa-decode-vin", vin]
+    script = (
+        "import sys\n"
+        "vin = sys.argv[2]\n"
+        "sys.stdout.write('first-line\\n' + ''.join(f\"{vin} {'x' * 990}\\n\" "
+        "for _ in range(100)))\n"
+    )
+    command = [sys.executable, "-c", script, "nhtsa-decode-vin", vin]
     assert scheduler._run("nhtsa-vin", command) == 0
 
     recorded = finished[0][2]
@@ -180,6 +184,366 @@ def test_run_streams_output_and_only_records_bounded_redacted_tail(monkeypatch, 
     assert vin not in recorded
     assert vin not in streamed
     assert "1M8**********2788" in recorded
+
+
+def test_run_masks_vin_split_across_pipe_reads(monkeypatch) -> None:
+    vin = "1M8GDM9AXKP042788"
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 54)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    script = (
+        "import sys, time\n"
+        "vin = sys.argv[2]\n"
+        "sys.stdout.write('before ' + vin[:8]); sys.stdout.flush(); time.sleep(0.05)\n"
+        "sys.stdout.write(vin[8:] + ' after'); sys.stdout.flush()\n"
+    )
+    command = [sys.executable, "-c", script, "nhtsa-decode-vin", vin]
+
+    assert scheduler._run("nhtsa-vin", command) == 0
+    assert finished == [(54, 0, "before 1M8**********2788 after")]
+
+
+def test_launchd_run_records_child_output_without_writing_unbounded_stdout(
+    monkeypatch, capsys
+) -> None:
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setenv("LAUNCHD_JOB", "1")
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 49)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.2)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os, time\n"
+            "for index in range(5):\n"
+            " if 'LAUNCHD_JOB' not in os.environ:\n"
+            "  print(f'heartbeat-{index}', flush=True)\n"
+            " time.sleep(0.05)\n"
+        ),
+    ]
+    assert scheduler._run("catalog", command) == 0
+    assert capsys.readouterr().out == ""
+    assert finished[0][0:2] == (49, 0)
+    assert "heartbeat-0" in finished[0][2]
+    assert "heartbeat-4" in finished[0][2]
+
+
+def test_run_terminates_silent_process_after_stall_timeout(monkeypatch) -> None:
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 44)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+
+    started = time.monotonic()
+    result = scheduler._run(
+        "catalog",
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    assert result == scheduler.CHILD_STALL_EXIT_CODE
+    assert time.monotonic() - started < 3
+    assert finished[0][0:2] == (44, scheduler.CHILD_STALL_EXIT_CODE)
+    assert "no output" in finished[0][2]
+
+
+def test_run_does_not_stall_while_child_keeps_reporting_progress(monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 45)
+    monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
+
+    script = "import time\nfor i in range(5):\n print(i, flush=True)\n time.sleep(0.05)\n"
+
+    assert scheduler._run("catalog", [sys.executable, "-c", script]) == 0
+
+
+def test_run_does_not_stall_during_cookie_backoff_heartbeats(monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.75)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 48)
+    monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
+    script = (
+        "print('child-started', flush=True)\n"
+        "import logging, sys, time\n"
+        "from partsouq_catalog import http_client\n"
+        "logging.basicConfig(stream=sys.stdout, level=logging.WARNING, force=True)\n"
+        "real_sleep = time.sleep\n"
+        "http_client.BACKOFF_HEARTBEAT_SECONDS = 1.0\n"
+        "http_client.session_backoff_remaining = lambda: 0.1\n"
+        "http_client.time.sleep = lambda _seconds: real_sleep(0.2)\n"
+        "manager = object.__new__(http_client.SessionManager)\n"
+        "manager._sleep_with_backoff(0)\n"
+    )
+
+    assert scheduler._run("catalog", [sys.executable, "-c", script]) == 0
+
+
+def test_run_counts_flushed_bytes_without_newlines_as_progress(monkeypatch) -> None:
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.25)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 51)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    script = (
+        "import sys, time\n"
+        "for _ in range(10):\n"
+        " sys.stdout.write('x'); sys.stdout.flush(); time.sleep(0.04)\n"
+    )
+
+    assert scheduler._run("catalog", [sys.executable, "-c", script]) == 0
+    assert finished == [(51, 0, "x" * 10)]
+
+
+def test_run_kills_descendant_that_keeps_stdout_open_after_wrapper_exits(monkeypatch) -> None:
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 46)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    script = (
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "print('parent-exit', flush=True)\n"
+    )
+
+    started = time.monotonic()
+    result = scheduler._run("catalog", [sys.executable, "-c", script])
+
+    assert result == scheduler.CHILD_STALL_EXIT_CODE
+    assert time.monotonic() - started < 3
+    assert finished[0][0:2] == (46, scheduler.CHILD_STALL_EXIT_CODE)
+    assert "stdout remained open" in finished[0][2]
+
+
+def test_run_allows_kill_timer_to_finish_owned_process_group(monkeypatch) -> None:
+    real_os = scheduler.os
+    read_fd, write_fd = real_os.pipe()
+    stdout = real_os.fdopen(read_fd, "rb", buffering=0)
+    signals: list[int] = []
+
+    class Process:
+        pid = 987_654
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = stdout
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, timeout=None) -> int:
+            return self.returncode
+
+    class ProcessGroupOS:
+        def __getattr__(self, name: str):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def killpg(_pid: int, child_signal: int) -> None:
+            signals.append(child_signal)
+            if child_signal == scheduler.signal.SIGKILL:
+                real_os.close(write_fd)
+
+    monkeypatch.setattr(scheduler, "os", ProcessGroupOS())
+    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 55)
+    monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
+
+    try:
+        assert scheduler._run("catalog", ["fake-command"]) == scheduler.CHILD_STALL_EXIT_CODE
+    finally:
+        try:
+            real_os.close(write_fd)
+        except OSError:
+            pass
+
+    assert signals == [scheduler.signal.SIGINT, 0, scheduler.signal.SIGKILL]
+    assert stdout.closed
+
+
+def test_run_does_not_wait_for_escaped_descendant_holding_stdout(tmp_path, monkeypatch) -> None:
+    pid_path = tmp_path / "escaped-child.pid"
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.15)
+    monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 52)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    script = (
+        "import pathlib, subprocess, sys\n"
+        "child = subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+    )
+
+    started = time.monotonic()
+    try:
+        result = scheduler._run("catalog", [sys.executable, "-c", script, str(pid_path)])
+    finally:
+        if pid_path.exists():
+            escaped_pid = int(pid_path.read_text())
+            try:
+                scheduler.os.killpg(escaped_pid, scheduler.signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    assert result == scheduler.CHILD_STALL_EXIT_CODE
+    assert time.monotonic() - started < 2
+    assert finished[0][0:2] == (52, scheduler.CHILD_STALL_EXIT_CODE)
+    assert "stdout remained open" in finished[0][2]
+
+
+def test_run_kills_child_that_closes_stdout_but_remains_alive(monkeypatch) -> None:
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 50)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    script = "import os, time\nos.close(1)\nos.close(2)\ntime.sleep(30)\n"
+
+    started = time.monotonic()
+    result = scheduler._run("catalog", [sys.executable, "-c", script])
+
+    assert result == scheduler.CHILD_STALL_EXIT_CODE
+    assert time.monotonic() - started < 3
+    assert finished[0][0:2] == (50, scheduler.CHILD_STALL_EXIT_CODE)
+    assert "closed stdout but remained alive" in finished[0][2]
+
+
+def test_run_observes_shutdown_while_child_stdout_is_blocked(monkeypatch) -> None:
+    stop_event = threading.Event()
+    finished: list[tuple[int, int, str]] = []
+    termination_timer = mock.Mock()
+    terminated_children: list[object] = []
+
+    def terminate_child(child) -> mock.Mock:
+        terminated_children.append(child)
+        scheduler._signal_child_group(child, scheduler.signal.SIGINT)
+        return termination_timer
+
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(scheduler, "_SHUTDOWN_EVENT", stop_event)
+    monkeypatch.setattr(scheduler, "_terminate_child", terminate_child)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 47)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    timer = threading.Timer(0.1, stop_event.set)
+    timer.start()
+    try:
+        result = scheduler._run(
+            "catalog",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+    finally:
+        timer.cancel()
+
+    assert result == scheduler.INTERRUPTED_EXIT_CODE
+    assert finished[0][0:2] == (47, scheduler.INTERRUPTED_EXIT_CODE)
+    assert len(terminated_children) == 1
+    termination_timer.cancel.assert_called_once_with()
+    termination_timer.join.assert_called_once_with()
+
+
+def test_signal_handler_only_sets_shutdown_event(monkeypatch) -> None:
+    stop_event = threading.Event()
+    registered_handlers: list[object] = []
+    terminate_child = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "_SHUTDOWN_EVENT", None)
+    monkeypatch.setattr(scheduler, "_terminate_child", terminate_child)
+    monkeypatch.setattr(
+        scheduler.signal,
+        "signal",
+        lambda _signal, handler: registered_handlers.append(handler),
+    )
+
+    scheduler._install_signal_handlers(stop_event)
+    for handler in registered_handlers:
+        handler(scheduler.signal.SIGTERM, None)
+
+    assert stop_event.is_set()
+    terminate_child.assert_not_called()
+
+
+def test_stdout_read_error_terminates_child_and_closes_pipe(monkeypatch) -> None:
+    real_os = scheduler.os
+    processes: list[scheduler.subprocess.Popen[bytes]] = []
+    timers: list[threading.Timer] = []
+    real_popen = scheduler.subprocess.Popen
+    real_terminate_child = scheduler._terminate_child
+
+    class FailingReadOS:
+        def __getattr__(self, name: str):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def read(_fd: int, _size: int) -> bytes:
+            raise OSError(errno.EIO, "read failed")
+
+    def popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def terminate_child(process):
+        timer = real_terminate_child(process)
+        timers.append(timer)
+        return timer
+
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "os", FailingReadOS())
+    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+    monkeypatch.setattr(scheduler, "_terminate_child", terminate_child)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 53)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    script = "import sys, time; print('ready', flush=True); time.sleep(30)"
+
+    assert scheduler._run("catalog", [sys.executable, "-c", script]) == 127
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+    assert processes[0].stdout is not None and processes[0].stdout.closed
+    assert len(timers) == 1 and not timers[0].is_alive()
+    assert "stdout read failed" in finished[0][2]
 
 
 def test_execution_lock_rejects_a_second_copy(tmp_path, monkeypatch) -> None:
@@ -305,6 +669,57 @@ def test_failed_latest_run_is_due_immediately(monkeypatch) -> None:
     assert scheduler._seconds_until_next_run("nhtsa", 100) == 0
 
 
+@pytest.mark.parametrize("error", [RuntimeError("manifest"), ValueError("invalid body")])
+def test_catalog_evidence_audit_rejects_persisted_validation_errors(
+    monkeypatch, capsys, error: Exception
+) -> None:
+    from partsouq_catalog import db as db_module
+    from partsouq_catalog import repositories as repositories_module
+
+    database = mock.MagicMock()
+    database_factory = mock.MagicMock()
+    database_factory.return_value.connect.return_value = database
+    repository = mock.MagicMock()
+    repository.audit_run_evidence.side_effect = error
+    monkeypatch.setattr(db_module, "Database", database_factory)
+    monkeypatch.setattr(
+        repositories_module,
+        "CrawlRepository",
+        mock.MagicMock(return_value=repository),
+    )
+
+    assert scheduler._audit_catalog_evidence(17, 10_000) is False
+
+    assert capsys.readouterr().err == (
+        f"crawl run 17 的 HTTP evidence 驗證失敗：{type(error).__name__}: {error}\n"
+    )
+    database.rollback.assert_called_once_with()
+    database.close.assert_called_once_with()
+
+
+def test_catalog_evidence_audit_does_not_hide_database_failure(monkeypatch) -> None:
+    from partsouq_catalog import db as db_module
+    from partsouq_catalog import repositories as repositories_module
+
+    database = mock.MagicMock()
+    database_factory = mock.MagicMock()
+    database_factory.return_value.connect.return_value = database
+    repository = mock.MagicMock()
+    repository.audit_run_evidence.side_effect = scheduler.pymysql.OperationalError("db down")
+    monkeypatch.setattr(db_module, "Database", database_factory)
+    monkeypatch.setattr(
+        repositories_module,
+        "CrawlRepository",
+        mock.MagicMock(return_value=repository),
+    )
+
+    with pytest.raises(scheduler.pymysql.OperationalError, match="db down"):
+        scheduler._audit_catalog_evidence(17, 10_000)
+
+    database.rollback.assert_called_once_with()
+    database.close.assert_called_once_with()
+
+
 def test_catalog_is_not_delayed_without_exact_bounded_success(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
@@ -312,21 +727,34 @@ def test_catalog_is_not_delayed_without_exact_bounded_success(monkeypatch) -> No
         "job_name": "catalog",
         "status": "completed",
         "age_seconds": 10,
+        "crawl_run_id": 17,
         "dataset_kind": "bounded",
         "crawl_status": "bounded_success",
         "target_parts": 10_000,
         "parts_ok": 10_000,
         "snapshot_rows": 9_999,
+        "evidence_status": "verified",
+        "evidence_manifest_sha256": "a" * 64,
+        "evidence_dataset_sha256": "b" * 64,
+        "evidence_artifact_count": 250,
+        "evidence_record_count": 10_000,
+        "evidence_verified_at": object(),
     }
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler.pymysql, "connect", lambda **_kwargs: connection)
     monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    evidence_audit = mock.MagicMock(return_value=True)
+    monkeypatch.setattr(scheduler, "_audit_catalog_evidence", evidence_audit)
 
     assert scheduler._seconds_until_next_run("catalog", 100) == 0
 
     cursor.fetchone.return_value["snapshot_rows"] = 10_000
     assert scheduler._seconds_until_next_run("catalog", 100) == 90
+    evidence_audit.assert_called_once_with(17, 10_000)
+
+    evidence_audit.return_value = False
+    assert scheduler._seconds_until_next_run("catalog", 100) == 0
     assert "jobs.trigger_mode = 'daemon'" in cursor.execute.call_args.args[0]
 
 
@@ -354,33 +782,91 @@ def test_catalog_sample_never_satisfies_daemon_cadence(monkeypatch) -> None:
 def test_catalog_crash_after_publish_is_reconciled_without_recrawl(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
+    cursor.fetchall.return_value = [
+        {
+            "scheduled_job_run_id": 88,
+            "crawl_run_id": 17,
+            "target_parts": 10_000,
+        }
+    ]
 
     def execute(statement: str, _params=None) -> None:
-        cursor.rowcount = 1 if "JOIN crawl_runs AS runs" in statement else 0
+        cursor.rowcount = 1 if statement.startswith("UPDATE scheduled_job_runs AS jobs") else 0
 
     cursor.execute.side_effect = execute
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
     monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    evidence_audit = mock.MagicMock(return_value=True)
+    monkeypatch.setattr(scheduler, "_audit_catalog_evidence", evidence_audit)
 
     assert scheduler._recover_interrupted_job_runs("catalog") is True
 
-    reconciliation_call = next(
-        call for call in cursor.execute.call_args_list if "JOIN crawl_runs" in call.args[0]
+    candidate_call = cursor.execute.call_args_list[0]
+    candidate_query = candidate_call.args[0]
+    assert "jobs.trigger_mode = 'daemon'" in candidate_query
+    assert "jobs.status = 'failed'" in candidate_query
+    assert "jobs.exit_code <> 0" in candidate_query
+    assert "runs.status = 'bounded_success'" in candidate_query
+    assert "runs.target_parts = 10000" in candidate_query
+    assert "runs.parts_ok = runs.target_parts" in candidate_query
+    assert "snapshots.snapshot_rows = runs.target_parts" in candidate_query
+    assert "runs.evidence_status = 'verified'" in candidate_query
+    assert "runs.evidence_record_count = runs.target_parts" in candidate_query
+    evidence_audit.assert_called_once_with(
+        17,
+        10_000,
+        allow_running_scheduler=True,
+        allow_failed_scheduler=True,
     )
-    reconciliation = reconciliation_call.args[0]
-    assert "jobs.trigger_mode = 'daemon'" in reconciliation
-    assert "runs.status = 'bounded_success'" in reconciliation
-    assert "jobs.finished_at = runs.finished_at" in reconciliation
-    assert "runs.finished_at IS NOT NULL" in reconciliation
-    # 對帳不依賴排程器自身的 PSQ_BOUNDED_PARTS：以 DB 內的
-    # target/parts_ok/snapshot 一致性為準。
-    assert "runs.target_parts > 0" in reconciliation
-    assert "runs.parts_ok = runs.target_parts" in reconciliation
-    assert "snapshots.snapshot_rows = runs.target_parts" in reconciliation
+
+    reconciliation_call = next(
+        call
+        for call in cursor.execute.call_args_list
+        if call.args[0].startswith("UPDATE scheduled_job_runs AS jobs")
+    )
+    assert "jobs.finished_at = runs.finished_at" in reconciliation_call.args[0]
+    assert "jobs.status = 'failed'" in reconciliation_call.args[0]
+    assert "jobs.exit_code <> 0" in reconciliation_call.args[0]
+    assert "runs.evidence_status = 'verified'" in reconciliation_call.args[0]
     assert reconciliation_call.args[1][0].endswith("reconciled automatically\n")
+    assert reconciliation_call.args[1][2:] == (88,)
     connection.begin.assert_called_once_with()
+    connection.commit.assert_called_once_with()
+    connection.rollback.assert_not_called()
+
+
+def test_catalog_recovery_does_not_reconcile_failed_evidence_audit(monkeypatch) -> None:
+    cursor = mock.MagicMock(rowcount=0)
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
+    cursor.fetchall.return_value = [
+        {
+            "scheduled_job_run_id": 88,
+            "crawl_run_id": 17,
+            "target_parts": 10_000,
+        }
+    ]
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+    evidence_audit = mock.MagicMock(return_value=False)
+    monkeypatch.setattr(scheduler, "_audit_catalog_evidence", evidence_audit)
+
+    assert scheduler._recover_interrupted_job_runs("catalog") is False
+
+    evidence_audit.assert_called_once_with(
+        17,
+        10_000,
+        allow_running_scheduler=True,
+        allow_failed_scheduler=True,
+    )
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert not any(
+        statement.startswith("UPDATE scheduled_job_runs AS jobs") for statement in statements
+    )
     connection.commit.assert_called_once_with()
     connection.rollback.assert_not_called()
 
@@ -398,17 +884,46 @@ def test_reconciled_catalog_daemon_skips_child(tmp_path, monkeypatch) -> None:
     dispatch.assert_not_called()
 
 
+def test_recent_remote_catalog_daemon_defers_child(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(
+        scheduler,
+        "_recover_interrupted_job_runs",
+        mock.MagicMock(side_effect=scheduler.ActiveDaemonRun("remote catalog")),
+    )
+    dispatch = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "dispatch", dispatch)
+
+    assert scheduler.dispatch_locked("catalog", "all") == scheduler.LOCK_BUSY_EXIT_CODE
+
+    dispatch.assert_not_called()
+
+
 def test_catalog_reconciliation_rolls_back_if_stale_cleanup_fails(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
     calls = 0
 
     def execute(statement: str, _params=None) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
+            cursor.fetchall.return_value = [
+                {
+                    "scheduled_job_run_id": 88,
+                    "crawl_run_id": 17,
+                    "target_parts": 10_000,
+                }
+            ]
+            assert statement.startswith("SELECT jobs.id AS scheduled_job_run_id")
+            return
+        if calls == 2:
             cursor.rowcount = 1
-            assert "JOIN crawl_runs AS runs" in statement
+            assert statement.startswith("UPDATE scheduled_job_runs AS jobs")
+            return
+        if calls == 3:
+            assert statement.startswith("SELECT id FROM scheduled_job_runs")
             return
         raise scheduler.pymysql.OperationalError("cleanup failed")
 
@@ -417,6 +932,7 @@ def test_catalog_reconciliation_rolls_back_if_stale_cleanup_fails(monkeypatch) -
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
     monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    monkeypatch.setattr(scheduler, "_audit_catalog_evidence", lambda *_args, **_kwargs: True)
 
     with pytest.raises(scheduler.pymysql.OperationalError, match="cleanup failed"):
         scheduler._recover_interrupted_job_runs("catalog")
@@ -428,6 +944,7 @@ def test_catalog_reconciliation_rolls_back_if_stale_cleanup_fails(monkeypatch) -
 def test_catalog_recovery_marks_stale_running_rows_interrupted(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
     cursor.rowcount = 0
     cursor.execute.side_effect = lambda *_args, **_kwargs: None
     connection = mock.MagicMock()
@@ -438,10 +955,12 @@ def test_catalog_recovery_marks_stale_running_rows_interrupted(monkeypatch) -> N
     assert scheduler._recover_interrupted_job_runs("catalog") is False
 
     statements = [call.args[0] for call in cursor.execute.call_args_list]
-    assert len(statements) == 3
-    reconcile_call, stale_jobs_call, stale_runs_call = cursor.execute.call_args_list
+    assert len(statements) == 4
+    reconcile_call, active_call, stale_jobs_call, stale_runs_call = cursor.execute.call_args_list
     # 第一筆是 bounded 對帳（env 獨立），rowcount=0 → 無需略過 dispatch
     assert "dataset_kind = 'bounded'" in reconcile_call.args[0]
+    assert "started_at >= UTC_TIMESTAMP()" in active_call.args[0]
+    assert active_call.args[1] == ("catalog", scheduler.RECOVERY_MIN_AGE_SECONDS)
     stale_jobs = stale_jobs_call.args[0]
     assert "SET status = 'failed'" in stale_jobs
     assert "job_name = %s" in stale_jobs
@@ -457,9 +976,30 @@ def test_catalog_recovery_marks_stale_running_rows_interrupted(monkeypatch) -> N
     connection.commit.assert_called_once_with()
 
 
+def test_catalog_recovery_rejects_recent_remote_running_row(monkeypatch) -> None:
+    cursor = mock.MagicMock(rowcount=0)
+    cursor.__enter__.return_value = cursor
+    cursor.fetchall.return_value = []
+    cursor.fetchone.return_value = {"id": 99}
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    with pytest.raises(scheduler.ActiveDaemonRun, match="recent catalog daemon"):
+        scheduler._recover_interrupted_job_runs("catalog")
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert len(statements) == 2
+    assert statements[1].startswith("SELECT id FROM scheduled_job_runs")
+    assert not any(statement.startswith("UPDATE") for statement in statements)
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
+
+
 def test_nhtsa_recovery_closes_scheduler_owned_domain_run(monkeypatch) -> None:
     cursor = mock.MagicMock(rowcount=0)
     cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
@@ -473,12 +1013,33 @@ def test_nhtsa_recovery_closes_scheduler_owned_domain_run(monkeypatch) -> None:
     )
     assert "status = 'interrupted'" in domain_recovery
     assert "run_key REGEXP" in domain_recovery
+    assert "updated_at < UTC_TIMESTAMP(6)" in domain_recovery
     connection.commit.assert_called_once_with()
+
+
+def test_nhtsa_recovery_rejects_recent_remote_running_row(monkeypatch) -> None:
+    cursor = mock.MagicMock(rowcount=0)
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = {"id": 99}
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    with pytest.raises(scheduler.ActiveDaemonRun, match="recent nhtsa daemon"):
+        scheduler._recover_interrupted_job_runs("nhtsa")
+
+    assert len(cursor.execute.call_args_list) == 1
+    active_query, params = cursor.execute.call_args.args
+    assert "job_name LIKE 'nhtsa%%'" in active_query
+    assert params == (scheduler.RECOVERY_MIN_AGE_SECONDS,)
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
 
 
 def test_nhtsa_api_commit_is_reconciled_without_repeating_stages(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
 
     def execute(statement: str, _params=None) -> None:
         cursor.rowcount = 1 if "output_text LIKE" in statement else 0
@@ -1039,13 +1600,16 @@ def test_shutdown_before_spawn_records_interrupted_without_starting_child(monkey
 def test_child_receives_sigint_without_inheriting_blocked_mask() -> None:
     child = scheduler.subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
-        text=True,
     )
+    termination_timer = None
     try:
-        scheduler._terminate_child(child)
+        termination_timer = scheduler._terminate_child(child)
         child.wait(timeout=2)
         assert child.returncode is not None
     finally:
+        if termination_timer is not None:
+            termination_timer.cancel()
+            termination_timer.join()
         if child.poll() is None:
             child.kill()
             child.wait()
@@ -1061,6 +1625,30 @@ def test_non_contention_lock_error_is_not_hidden(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(OSError, match="I/O error"):
         scheduler._try_lock("scheduler-job", "catalog")
+
+
+def test_lock_file_is_closed_when_permission_hardening_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "LOG_DIR", tmp_path)
+    opened = None
+    real_open = open
+
+    def tracked_open(*args, **kwargs):
+        nonlocal opened
+        opened = real_open(*args, **kwargs)
+        return opened
+
+    monkeypatch.setattr(scheduler, "open", tracked_open, raising=False)
+    monkeypatch.setattr(
+        scheduler.os,
+        "chmod",
+        mock.Mock(side_effect=OSError(errno.EACCES, "permission denied")),
+    )
+
+    with pytest.raises(OSError, match="permission denied"):
+        scheduler._try_lock("scheduler-job", "catalog")
+
+    assert opened is not None
+    assert opened.closed
 
 
 @pytest.mark.parametrize(

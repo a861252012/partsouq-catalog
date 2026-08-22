@@ -22,6 +22,7 @@ from flask import (
 )
 from flask.typing import ResponseReturnValue
 
+from partsouq_crawler.nhtsa.api import normalize_vin
 from partsouq_station_admin.config import AdminConfig
 from partsouq_station_admin.db import RequestDatabase
 from partsouq_station_admin.query_trace import QueryTrace
@@ -29,6 +30,7 @@ from partsouq_station_admin.repository import (
     ENTITY_SPECS,
     PAGE_SIZES,
     AdminDataError,
+    AdminReadinessError,
     AdminRepository,
     EntitySpec,
     RecordNotFoundError,
@@ -60,6 +62,16 @@ def _repository() -> AdminRepository:
     return AdminRepository(cast(RequestDatabase, g.partsouq_admin_database))
 
 
+def _audit_actor(submitted_actor: str) -> str:
+    config = _config()
+    return config.username if config.auth_required else submitted_actor
+
+
+def _display_actor() -> str:
+    config = _config()
+    return config.username if config.auth_required else config.default_actor
+
+
 def _csrf_token() -> str:
     token = session.get("csrf_token")
     if not isinstance(token, str):
@@ -73,8 +85,19 @@ def require_login() -> ResponseReturnValue | None:
     config = _config()
     if not config.auth_required or request.endpoint in AUTHENTICATION_EXEMPT_ENDPOINTS:
         return None
-    if session.get("admin_authenticated") is True:
+    username = session.get("admin_username")
+    if (
+        session.get("admin_authenticated") is True
+        and isinstance(username, str)
+        and hmac.compare_digest(username, config.username)
+    ):
         return None
+    # 未登入頁面可能與瀏覽器自動要求的 favicon 平行發生。若每個受保護
+    # GET 都 clear 整個 session，favicon 的 redirect 會把已渲染登入表單
+    # 的 CSRF token 清掉，使用者第一次送出必定得到 400。只移除失效的
+    # authentication 欄位；成功登入仍會 clear 全部並輪替 CSRF。
+    session.pop("admin_authenticated", None)
+    session.pop("admin_username", None)
     return redirect(url_for("admin.login", next=request.full_path.rstrip("?")))
 
 
@@ -116,6 +139,7 @@ def login() -> ResponseReturnValue:
         ):
             session.clear()
             session["admin_authenticated"] = True
+            session["admin_username"] = config.username
             session["csrf_token"] = secrets.token_urlsafe(32)
             destination = request.form.get("next", "")
             if (
@@ -187,6 +211,11 @@ def invalid_data(error: AdminDataError) -> tuple[str, int]:
     return render_template("error.html", message=str(error)), 400
 
 
+@bp.app_errorhandler(AdminReadinessError)
+def service_not_ready(error: AdminReadinessError) -> tuple[str, int]:
+    return render_template("error.html", message=str(error)), 503
+
+
 @bp.get("/")
 def dashboard() -> str:
     repository = _repository()
@@ -240,7 +269,11 @@ def quarantine_list() -> str:
 @bp.post("/quarantine/<int:row_id>/resolve")
 def quarantine_resolve(row_id: int) -> ResponseReturnValue:
     resolution = request.form.get("resolution", "").strip()
-    _repository().resolve_quarantine(row_id, resolution)
+    _repository().resolve_quarantine(
+        row_id,
+        resolution,
+        expected_run_key=request.form.get("expected_run_key", ""),
+    )
     flash("已標記處置（同一料號後續 run 再現時會自動重開）。", "success")
     return redirect(
         url_for(
@@ -290,14 +323,15 @@ def entity_create(entity_type: str) -> ResponseReturnValue:
             record=None,
             payload_json="{}",
             edit_payload={},
-            actor=_config().default_actor,
+            actor=_display_actor(),
+            actor_locked=_config().auth_required,
             mode="create",
         )
     payload = _payload_from_form(spec)
     identity_key = _repository().create_manual(
         entity_type,
         payload,
-        actor=request.form.get("actor", ""),
+        actor=_audit_actor(request.form.get("actor", "")),
         reason=request.form.get("reason", ""),
     )
     flash("已建立人工資料；來源型錄資料未被修改。", "success")
@@ -314,7 +348,8 @@ def entity_detail(entity_type: str, identity_key: str) -> str:
         "detail.html",
         spec=spec,
         detail=detail,
-        actor=_config().default_actor,
+        actor=_display_actor(),
+        actor_locked=_config().auth_required,
     )
 
 
@@ -333,7 +368,8 @@ def entity_edit(entity_type: str, identity_key: str) -> str:
         record=detail.record,
         payload_json=json.dumps(editable, ensure_ascii=False, indent=2, default=str),
         edit_payload=editable,
-        actor=_config().default_actor,
+        actor=_display_actor(),
+        actor_locked=_config().auth_required,
         mode="update",
     )
 
@@ -346,7 +382,7 @@ def entity_update(entity_type: str, identity_key: str) -> ResponseReturnValue:
         _payload_from_form(entity_spec(entity_type)),
         expected_revision=_revision_from_form(),
         expected_base_sha256=_base_sha256_from_form(),
-        actor=request.form.get("actor", ""),
+        actor=_audit_actor(request.form.get("actor", "")),
         reason=request.form.get("reason", ""),
     )
     flash("已新增一筆覆寫版本；來源型錄資料未被修改。", "success")
@@ -360,12 +396,17 @@ def vin_decode_request() -> ResponseReturnValue:
     if request.method == "GET":
         return render_template(
             "vin_request.html",
-            actor=_config().default_actor,
+            actor=_display_actor(),
+            actor_locked=_config().auth_required,
         )
-    vin = request.form.get("vin", "").strip().upper()
-    if re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin) is None:
-        raise AdminDataError("VIN 必須是 17 碼，且不可包含 I、O、Q")
-    _repository().request_vin_decode(vin, actor=request.form.get("actor", ""))
+    try:
+        vin = normalize_vin(request.form.get("vin", ""))
+    except ValueError as error:
+        raise AdminDataError(str(error)) from error
+    _repository().request_vin_decode(
+        vin,
+        actor=_audit_actor(request.form.get("actor", "")),
+    )
     flash(
         "VIN 已加入 NHTSA 解碼佇列；請執行 partsouq-scheduler --job pending，或由部署端排程消費。",
         "success",
@@ -379,7 +420,7 @@ def entity_retire(entity_type: str, identity_key: str) -> ResponseReturnValue:
         entity_type,
         identity_key,
         expected_revision=_revision_from_form(),
-        actor=request.form.get("actor", ""),
+        actor=_audit_actor(request.form.get("actor", "")),
         reason=request.form.get("reason", ""),
     )
     flash("資料已停用；沒有刪除來源資料。", "success")
@@ -394,7 +435,7 @@ def entity_restore(entity_type: str, identity_key: str) -> ResponseReturnValue:
         entity_type,
         identity_key,
         expected_revision=_revision_from_form(),
-        actor=request.form.get("actor", ""),
+        actor=_audit_actor(request.form.get("actor", "")),
         reason=request.form.get("reason", ""),
     )
     flash("資料已恢復啟用。", "success")

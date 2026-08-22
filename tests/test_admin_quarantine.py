@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -146,13 +149,23 @@ def test_quarantine_resolve_marks_row(monkeypatch: pytest.MonkeyPatch) -> None:
     connection = mock.MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
     cursor.fetchone.side_effect = [
-        {"id": 7, "part_number": "IMG10001", "resolved_at": None},
-        {"id": 7, "part_number": "IMG10001", "resolved_at": "2026-08-22 12:00:00"},
+        {"id": 7, "part_number": "IMG10001", "run_key": "bounded-1", "resolved_at": None},
+        {
+            "id": 7,
+            "part_number": "IMG10001",
+            "run_key": "bounded-1",
+            "resolved_at": "2026-08-22 12:00:00",
+        },
     ]
+    cursor.rowcount = 1
     monkeypatch.setattr(admin_app, "_connect", lambda: connection)
 
     row = admin_app.resolve_quarantine(
-        7, QuarantineResolveInput(resolution="checked: site removed")
+        7,
+        QuarantineResolveInput(
+            expected_run_key="bounded-1",
+            resolution="checked: site removed",
+        ),
     )
 
     assert row["resolved_at"] == "2026-08-22 12:00:00"
@@ -165,7 +178,37 @@ def test_quarantine_resolve_marks_row(monkeypatch: pytest.MonkeyPatch) -> None:
     assert lock_params == (7,)
     update_sql, update_params = cursor.execute.call_args_list[1].args
     assert "SET resolved_at = NOW(), resolution = %s" in update_sql
-    assert update_params == ("checked: site removed", 7)
+    assert "run_key = %s" in update_sql
+    assert "resolved_at IS NULL" in update_sql
+    assert update_params == ("checked: site removed", 7, "bounded-1")
+
+
+def test_quarantine_resolve_rejects_stale_run_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import HTTPException
+
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {
+        "id": 7,
+        "part_number": "IMG10001",
+        "run_key": "bounded-new",
+        "resolved_at": None,
+    }
+    monkeypatch.setattr(admin_app, "_connect", lambda: connection)
+
+    with pytest.raises(HTTPException) as exc_info:
+        admin_app.resolve_quarantine(
+            7,
+            QuarantineResolveInput(
+                expected_run_key="bounded-old",
+                resolution="stale form",
+            ),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert cursor.execute.call_count == 1
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
 
 
 def test_quarantine_resolve_unknown_row_404s(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,7 +220,10 @@ def test_quarantine_resolve_unknown_row_404s(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(admin_app, "_connect", lambda: connection)
 
     with pytest.raises(HTTPException) as exc_info:
-        admin_app.resolve_quarantine(999, QuarantineResolveInput(resolution=""))
+        admin_app.resolve_quarantine(
+            999,
+            QuarantineResolveInput(expected_run_key="bounded-1", resolution=""),
+        )
     assert exc_info.value.status_code == 404
     connection.rollback.assert_called_once_with()
     connection.commit.assert_not_called()
@@ -189,6 +235,17 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
 
     def capture_one(sql: str, params: tuple[object, ...] = ()) -> None:
         queries.append((sql, params))
+        if "information_schema.COLUMNS" in sql:
+            return {
+                "current_column_ready": 1,
+                "previous_column_ready": 1,
+                "current_index_ready": 1,
+                "previous_index_ready": 1,
+                "current_foreign_key_ready": 1,
+                "previous_foreign_key_ready": 1,
+                "formal_view_ready": 1,
+                "formal_view_columns_ready": 1,
+            }
 
     monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
 
@@ -202,8 +259,10 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
         "models",
         "vehicles",
         "categories",
+        "groups_t",
         "parts",
         "published_parts",
+        "published_parts_previous",
         "bounded_parts",
         "crawl_runs",
         "nhtsa_sync_runs",
@@ -217,13 +276,61 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
         "admin_reconciliation_items",
         "admin_crawl_requests",
         "scheduled_job_runs",
+        "part_quarantine",
         "v_current_catalog_parts",
         "v_vin_part_fitments",
         "admin_override_heads",
         "station_admin_effective_parts",
     ):
         assert table in readiness_sql
+    provenance_sql = queries[3][0]
+    assert "idx_published_crawl_run" in provenance_sql
+    assert "fk_published_crawl_run" in provenance_sql
+    assert "fk_published_previous_crawl_run" in provenance_sql
+    assert "formal_current_parts" in provenance_sql
+    assert "formal_previous_parts" in provenance_sql
+    assert "formal_full_parts" in provenance_sql
+    assert "published_parts_previous" in provenance_sql
+    assert "qualified_full_runs" in provenance_sql
+    assert "full_scheduler_run" in provenance_sql
+    assert "bounded_parts" in provenance_sql
+    assert "verified_bounded_evidence" in provenance_sql
+    assert "verified_bounded_records" in provenance_sql
+    assert "partsouq_http_artifacts" in provenance_sql
+    assert "partsouq_artifact_records" in provenance_sql
+    assert "evidence_status" in provenance_sql
+    assert "live_http" in provenance_sql
+    assert "source_crawl_run_id" in provenance_sql
+    assert "provenance_count" not in provenance_sql
     assert "LIMIT 0" in readiness_sql
+
+
+def test_health_fails_closed_when_published_provenance_schema_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    def fetch_one(sql: str, params: tuple[object, ...] = ()) -> dict[str, int]:
+        if "information_schema.COLUMNS" in sql:
+            return {
+                "current_column_ready": 1,
+                "previous_column_ready": 1,
+                "current_index_ready": 1,
+                "previous_index_ready": 1,
+                "current_foreign_key_ready": 1,
+                "previous_foreign_key_ready": 1,
+                "formal_view_ready": 0,
+                "formal_view_columns_ready": 1,
+            }
+        return {}
+
+    monkeypatch.setattr(admin_app, "_fetch_one", fetch_one)
+
+    with pytest.raises(HTTPException) as exc_info:
+        admin_app.health()
+
+    assert exc_info.value.status_code == 503
+    assert "migration 019" in exc_info.value.detail
 
 
 def test_database_summary_includes_quarantine_counts(
@@ -334,11 +441,7 @@ def test_quarantine_http_page_size_error_lists_all_allowed_sizes(
 def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
     """SOL review P1：前端必須有真正的分頁控制（頁碼、上一頁／下一頁、
     每頁筆數），且整份 inline JS 語法正確。"""
-    import subprocess
-    import tempfile
-
-    html_path = "src/partsouq_admin/static/admin.html"
-    html = open(html_path, encoding="utf-8").read()
+    html = Path("src/partsouq_admin/static/admin.html").read_text(encoding="utf-8")
     for element in (
         'id="quarantine-run-key"',
         'id="quarantine-page-size"',
@@ -352,6 +455,7 @@ def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
     ):
         assert element in html, f"admin.html 缺少 {element}"
     assert '<option value="30">30</option>' in html
+    assert "expected_run_key: row.run_key" in html
     script = html.split("<script>")[1].split("</script>")[0]
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
         fh.write(script)
@@ -359,7 +463,5 @@ def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
     try:
         result = subprocess.run(["node", "--check", js_path], capture_output=True, text=True)
     finally:
-        import os
-
-        os.unlink(js_path)
+        Path(js_path).unlink()
     assert result.returncode == 0, result.stderr

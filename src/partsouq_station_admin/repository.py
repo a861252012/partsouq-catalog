@@ -10,7 +10,13 @@ from decimal import Decimal
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from partsouq_crawler.parsers.common import normalize_part_number
+from partsouq_crawler.nhtsa.api import normalize_vin
+from partsouq_crawler.parsers.common import (
+    MAX_VEHICLE_YEAR,
+    MIN_VEHICLE_YEAR,
+    normalize_part_number,
+    parse_unambiguous_range,
+)
 from partsouq_station_admin.db import Database
 
 MAX_PAGE_SIZE = 200
@@ -123,6 +129,10 @@ def redact_sensitive_url(value: str) -> str:
 
 
 class AdminDataError(ValueError):
+    pass
+
+
+class AdminReadinessError(RuntimeError):
     pass
 
 
@@ -482,11 +492,38 @@ INTEGER_FIELDS = frozenset(
         "part_occurrence_id",
         "vin_vehicle_mapping_id",
         "model_year",
+        "engine_cylinders",
         "partsouq_vehicle_configuration_id",
         "response_id",
     }
 )
 NUMBER_FIELDS = frozenset({"confidence"})
+MONTH_FIELDS = frozenset(
+    {
+        "production_from",
+        "production_to",
+        "diagram_from",
+        "diagram_to",
+        "part_from",
+        "part_to",
+        "effective_from",
+        "effective_to",
+    }
+)
+MONTH_FIELD_PAIRS = (
+    ("production_from", "production_to"),
+    ("diagram_from", "diagram_to"),
+    ("part_from", "part_to"),
+    ("effective_from", "effective_to"),
+)
+ENUM_VALUES = {
+    ("vehicle_configurations", "production_precision"): frozenset({"unknown", "year", "month"}),
+    ("part_term_mappings", "mapping_status"): frozenset({"confirmed"}),
+    ("vin_vehicle_mappings", "decode_status"): frozenset({"decoded", "error"}),
+    ("reconciliation_cases", "severity"): frozenset({"normal"}),
+    ("reconciliation_cases", "status"): frozenset({"open", "matched", "rejected"}),
+}
+MAX_TEXT_LENGTH = 4096
 
 ENTITY_SPECS: dict[str, EntitySpec] = {
     "vehicle_configurations": EntitySpec(
@@ -773,6 +810,22 @@ class AdminRepository:
                 "scheduled_job_runs",
                 "nhtsa_current_artifacts",
                 "nhtsa_source_artifacts",
+                "brands",
+                "models",
+                "vehicles",
+                "categories",
+                "groups_t",
+                "parts",
+                "published_parts",
+                "published_parts_previous",
+                "bounded_parts",
+                "crawl_runs",
+                "v_current_catalog_parts",
+                "part_quarantine",
+                "admin_vehicle_mappings",
+                "admin_part_translations",
+                "admin_reconciliation_items",
+                "nhtsa_vin_decodes",
             )
         )
         self.database.fetch_one(
@@ -783,6 +836,136 @@ class AdminRepository:
             LIMIT 0
             """,
         )
+        provenance_contract = self.database.fetch_one(
+            "health.published-provenance",
+            """
+            SELECT
+              EXISTS (
+                SELECT 1 FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts'
+                  AND COLUMN_NAME = 'crawl_run_id' AND COLUMN_TYPE = 'int'
+                  AND IS_NULLABLE = 'YES'
+              ) AS current_column_ready,
+              (
+                SELECT IF(
+                  COUNT(*) = 1 AND MIN(NON_UNIQUE) = 1
+                  AND MIN(COLUMN_NAME) = 'crawl_run_id' AND MIN(SEQ_IN_INDEX) = 1
+                  AND COALESCE(SUM(EXPRESSION IS NOT NULL), 0) = 0
+                  AND COALESCE(SUM(SUB_PART IS NOT NULL), 0) = 0
+                  AND MIN(COLLATION) = 'A' AND MAX(COLLATION) = 'A'
+                  AND MIN(INDEX_TYPE) = 'BTREE' AND MAX(INDEX_TYPE) = 'BTREE'
+                  AND MIN(IS_VISIBLE) = 'YES' AND MAX(IS_VISIBLE) = 'YES',
+                  1, 0
+                )
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts'
+                  AND INDEX_NAME = 'idx_published_crawl_run'
+              ) AS current_index_ready,
+              (
+                SELECT IF(
+                  COUNT(*) = 1 AND MIN(key_columns.COLUMN_NAME) = 'crawl_run_id'
+                  AND MIN(key_columns.REFERENCED_TABLE_SCHEMA) = DATABASE()
+                  AND MIN(key_columns.REFERENCED_TABLE_NAME) = 'crawl_runs'
+                  AND MIN(key_columns.REFERENCED_COLUMN_NAME) = 'id'
+                  AND MIN(constraints_t.UPDATE_RULE) = 'NO ACTION'
+                  AND MIN(constraints_t.DELETE_RULE) = 'NO ACTION',
+                  1, 0
+                )
+                FROM information_schema.KEY_COLUMN_USAGE AS key_columns
+                JOIN information_schema.REFERENTIAL_CONSTRAINTS AS constraints_t
+                  ON constraints_t.CONSTRAINT_SCHEMA = key_columns.CONSTRAINT_SCHEMA
+                 AND constraints_t.TABLE_NAME = key_columns.TABLE_NAME
+                 AND constraints_t.CONSTRAINT_NAME = key_columns.CONSTRAINT_NAME
+                WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE()
+                  AND key_columns.TABLE_NAME = 'published_parts'
+                  AND key_columns.CONSTRAINT_NAME = 'fk_published_crawl_run'
+              ) AS current_foreign_key_ready,
+              EXISTS (
+                SELECT 1 FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'published_parts_previous'
+                  AND COLUMN_NAME = 'crawl_run_id' AND COLUMN_TYPE = 'int'
+                  AND IS_NULLABLE = 'YES'
+              ) AS previous_column_ready,
+              (
+                SELECT IF(
+                  COUNT(*) = 1 AND MIN(NON_UNIQUE) = 1
+                  AND MIN(COLUMN_NAME) = 'crawl_run_id' AND MIN(SEQ_IN_INDEX) = 1
+                  AND COALESCE(SUM(EXPRESSION IS NOT NULL), 0) = 0
+                  AND COALESCE(SUM(SUB_PART IS NOT NULL), 0) = 0
+                  AND MIN(COLLATION) = 'A' AND MAX(COLLATION) = 'A'
+                  AND MIN(INDEX_TYPE) = 'BTREE' AND MAX(INDEX_TYPE) = 'BTREE'
+                  AND MIN(IS_VISIBLE) = 'YES' AND MAX(IS_VISIBLE) = 'YES',
+                  1, 0
+                )
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'published_parts_previous'
+                  AND INDEX_NAME = 'idx_published_crawl_run'
+              ) AS previous_index_ready,
+              (
+                SELECT IF(
+                  COUNT(*) = 1 AND MIN(key_columns.COLUMN_NAME) = 'crawl_run_id'
+                  AND MIN(key_columns.REFERENCED_TABLE_SCHEMA) = DATABASE()
+                  AND MIN(key_columns.REFERENCED_TABLE_NAME) = 'crawl_runs'
+                  AND MIN(key_columns.REFERENCED_COLUMN_NAME) = 'id'
+                  AND MIN(constraints_t.UPDATE_RULE) = 'NO ACTION'
+                  AND MIN(constraints_t.DELETE_RULE) = 'NO ACTION',
+                  1, 0
+                )
+                FROM information_schema.KEY_COLUMN_USAGE AS key_columns
+                JOIN information_schema.REFERENTIAL_CONSTRAINTS AS constraints_t
+                  ON constraints_t.CONSTRAINT_SCHEMA = key_columns.CONSTRAINT_SCHEMA
+                 AND constraints_t.TABLE_NAME = key_columns.TABLE_NAME
+                 AND constraints_t.CONSTRAINT_NAME = key_columns.CONSTRAINT_NAME
+                WHERE key_columns.CONSTRAINT_SCHEMA = DATABASE()
+                  AND key_columns.TABLE_NAME = 'published_parts_previous'
+                  AND key_columns.CONSTRAINT_NAME = 'fk_published_previous_crawl_run'
+              ) AS previous_foreign_key_ready,
+              EXISTS (
+                SELECT 1 FROM information_schema.VIEWS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'v_current_catalog_parts'
+                  AND LOCATE('qualified_full_runs', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('formal_current_parts', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('formal_previous_parts', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('published_parts_previous', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('full_scheduler_run', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('linked_crawl_runs', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('bounded_parts', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('verified_bounded_evidence', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('verified_bounded_records', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('partsouq_http_artifacts', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('partsouq_artifact_records', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('evidence_status', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('live_http', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('trigger_mode', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('daemon', LOWER(VIEW_DEFINITION)) > 0
+              ) AS formal_view_ready,
+              (
+                SELECT IF(COUNT(*) = 2, 1, 0)
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'v_current_catalog_parts'
+                  AND COLUMN_NAME IN ('dataset_scope', 'source_crawl_run_id')
+              ) AS formal_view_columns_ready
+            """,
+        )
+        contract_keys = (
+            "current_column_ready",
+            "current_index_ready",
+            "current_foreign_key_ready",
+            "previous_column_ready",
+            "previous_index_ready",
+            "previous_foreign_key_ready",
+            "formal_view_ready",
+            "formal_view_columns_ready",
+        )
+        if provenance_contract is None or any(
+            int(provenance_contract.get(key) or 0) != 1 for key in contract_keys
+        ):
+            raise AdminReadinessError("bounded evidence provenance schema 尚未完成 migration 019")
 
     def list_quarantine(
         self,
@@ -868,26 +1051,42 @@ class AdminRepository:
             "totalPages": total_pages,
         }
 
-    def resolve_quarantine(self, row_id: int, resolution: str) -> None:
+    def resolve_quarantine(
+        self,
+        row_id: int,
+        resolution: str,
+        *,
+        expected_run_key: str,
+    ) -> None:
         if len(resolution) > 255:
             raise AdminDataError("處置說明不可超過 255 字元")
+        expected_run_key = expected_run_key.strip()
+        if not expected_run_key or len(expected_run_key) > 128:
+            raise AdminDataError("Quarantine run key 格式錯誤")
         with self.database.transaction():
             existing = self.database.fetch_one(
                 "quarantine.lock-row",
-                "SELECT id FROM part_quarantine WHERE id = %s FOR UPDATE",
+                "SELECT id, run_key, resolved_at FROM part_quarantine WHERE id = %s FOR UPDATE",
                 (row_id,),
             )
             if existing is None:
                 raise RecordNotFoundError("找不到這筆 quarantine 紀錄")
-            self.database.execute(
+            if (
+                existing.get("run_key") != expected_run_key
+                or existing.get("resolved_at") is not None
+            ):
+                raise RevisionConflictError("Quarantine 紀錄已更新，請重新載入")
+            result = self.database.execute(
                 "quarantine.resolve",
                 """
                 UPDATE part_quarantine
                 SET resolved_at = NOW(), resolution = %s, updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
+                WHERE id = %s AND run_key = %s AND resolved_at IS NULL
                 """,
-                (resolution, row_id),
+                (resolution, row_id, expected_run_key),
             )
+            if result.rowcount != 1:
+                raise RevisionConflictError("Quarantine 紀錄已更新，請重新載入")
 
     def dashboard_counts(self) -> dict[str, dict[str, int]]:
         source_columns = ",\n".join(
@@ -959,7 +1158,7 @@ class AdminRepository:
                        MAX(jobs.exit_code) AS bounded_scheduler_exit_code,
                        MAX(scheduler_links.crawl_run_count)
                            AS bounded_scheduler_linked_crawl_runs,
-                       MAX(CASE WHEN RIGHT(DATABASE(), 5) = '_test'
+                       MAX(CASE WHEN DATABASE() <> 'partsouq_catalog'
                            OR LOWER(COALESCE(r.run_key, '')) LIKE 'sample-%%'
                            OR LOWER(COALESCE(jobs.output_text, ''))
                                REGEXP 'browser-assisted|fixture|synthetic|fake'
@@ -1883,29 +2082,65 @@ class AdminRepository:
         for field, value in cleaned.items():
             if value is None:
                 continue
-            if field in {"common_names_zh_tw", "comments_json"} and not (
-                isinstance(value, list) and all(isinstance(item, str) for item in value)
-            ):
-                raise AdminDataError(f"{field_label(field)}必須是字串陣列")
-            if field in JSON_FIELDS - {"common_names_zh_tw", "comments_json"} and not isinstance(
-                value, dict
-            ):
-                raise AdminDataError(f"{field_label(field)}必須是 JSON object")
-            if field in BOOLEAN_FIELDS and not isinstance(value, bool):
-                raise AdminDataError(f"{field_label(field)}必須是布林值")
+            if field in {"common_names_zh_tw", "comments_json"}:
+                if not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
+                    raise AdminDataError(f"{field_label(field)}必須是字串陣列")
+                normalized_items = [item.strip() for item in value]
+                if any(not item or len(item) > 512 for item in normalized_items):
+                    raise AdminDataError(f"{field_label(field)}的項目必須為 1 到 512 字元")
+                cleaned[field] = normalized_items
+                continue
+            if field in JSON_FIELDS:
+                if not isinstance(value, dict):
+                    raise AdminDataError(f"{field_label(field)}必須是 JSON object")
+                continue
+            if field in BOOLEAN_FIELDS:
+                if not isinstance(value, bool):
+                    raise AdminDataError(f"{field_label(field)}必須是布林值")
+                continue
             if field in INTEGER_FIELDS:
                 if not isinstance(value, int) or isinstance(value, bool):
                     raise AdminDataError(f"{field_label(field)}必須是整數")
                 minimum = 0 if field == "depth" else 1
                 if value < minimum:
                     raise AdminDataError(f"{field_label(field)}不可小於 {minimum}")
-                if field == "model_year" and value > 9998:
-                    raise AdminDataError("年份不可大於 9998")
+                if field == "model_year" and not MIN_VEHICLE_YEAR <= value <= MAX_VEHICLE_YEAR:
+                    raise AdminDataError(f"年份必須介於 {MIN_VEHICLE_YEAR} 與 {MAX_VEHICLE_YEAR}")
+                continue
             if field in NUMBER_FIELDS:
                 if not isinstance(value, int | float) or isinstance(value, bool):
                     raise AdminDataError(f"{field_label(field)}必須是數值")
                 if not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
                     raise AdminDataError(f"{field_label(field)}必須介於 0 與 1")
+                continue
+            if not isinstance(value, str):
+                raise AdminDataError(f"{field_label(field)}必須是字串")
+            normalized_text = value.strip()
+            if len(normalized_text) > MAX_TEXT_LENGTH:
+                raise AdminDataError(f"{field_label(field)}不可超過 {MAX_TEXT_LENGTH} 字元")
+            if field == "vin":
+                try:
+                    normalized_text = normalize_vin(normalized_text)
+                except ValueError as error:
+                    raise AdminDataError(str(error)) from error
+            if field in MONTH_FIELDS:
+                period = parse_unambiguous_range(normalized_text)
+                if period.start != normalized_text or period.end != normalized_text:
+                    raise AdminDataError(
+                        f"{field_label(field)}必須是 {MIN_VEHICLE_YEAR}-01 到 "
+                        f"{MAX_VEHICLE_YEAR}-12 之間的 YYYY-MM"
+                    )
+            allowed_values = ENUM_VALUES.get((spec.key, field))
+            if allowed_values is not None and normalized_text not in allowed_values:
+                raise AdminDataError(
+                    f"{field_label(field)}只接受 {', '.join(sorted(allowed_values))}"
+                )
+            cleaned[field] = normalized_text
+        for start_field, end_field in MONTH_FIELD_PAIRS:
+            start = cleaned.get(start_field)
+            end = cleaned.get(end_field)
+            if isinstance(start, str) and isinstance(end, str) and start > end:
+                raise AdminDataError(f"{field_label(start_field)}不可晚於{field_label(end_field)}")
         return cleaned
 
     @staticmethod
