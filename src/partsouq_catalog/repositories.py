@@ -1044,7 +1044,7 @@ class CrawlRepository:
             ),
         )
 
-    def publish_success_parts(self, run_id: int):
+    def publish_success_parts(self, run_id: int) -> int:
         """在同一交易內更新不可變的 current snapshot。
 
         normalized tables 可被後續 failed/partial attempt 原地 upsert；因此
@@ -1052,6 +1052,41 @@ class CrawlRepository:
         標記的資料，再刪除不屬於本次 run 的舊列。與 finish_run(success)
         同次 commit；任一步失敗 rollback 後，舊 snapshot 仍完整可讀。
         """
+        run = self.db._execute(
+            "SELECT cr.run_key, cr.dataset_kind, cr.target_parts, cr.status, "
+            "cr.scheduled_job_run_id, sj.job_name AS scheduled_job_name, "
+            "sj.trigger_mode AS scheduled_trigger_mode, sj.status AS scheduled_job_status "
+            "FROM crawl_runs AS cr "
+            "LEFT JOIN scheduled_job_runs AS sj ON sj.id = cr.scheduled_job_run_id "
+            "WHERE cr.id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if not run:
+            raise RuntimeError(f"full run {run_id} does not exist")
+        if (
+            run.get("dataset_kind") != "full"
+            or run.get("target_parts") is not None
+            or run.get("status") != "running"
+        ):
+            raise RuntimeError(f"run {run_id} is not a matching running full crawl")
+        scheduled_job_run_id = run.get("scheduled_job_run_id")
+        if scheduled_job_run_id is not None and (
+            run.get("scheduled_job_name") != "catalog"
+            or run.get("scheduled_trigger_mode") not in {"daemon", "manual"}
+            or run.get("scheduled_job_status") != "running"
+        ):
+            raise RuntimeError(f"full run {run_id} has invalid scheduler provenance")
+
+        run_key = str(run.get("run_key") or "")
+        if not run_key:
+            raise RuntimeError(f"full run {run_id} has no run key")
+        failure_rows = self.db._execute(
+            "SELECT id FROM crawl_state WHERE run_key = %s AND status = 'error' FOR UPDATE",
+            (run_key,),
+        ).fetchall()
+        if failure_rows:
+            raise RuntimeError(f"full run {run_id} has crawl failures: count={len(failure_rows)}")
+
         source_row = self.db._execute(
             "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
             (run_id,),
@@ -1059,6 +1094,36 @@ class CrawlRepository:
         source_count = int((source_row or {}).get("row_count", 0))
         if source_count <= 0:
             raise RuntimeError(f"run {run_id} produced an empty published snapshot")
+
+        quality = self.db._execute(
+            "SELECT COUNT(*) AS invalid_rows FROM parts AS p "
+            "LEFT JOIN groups_t AS g ON g.id = p.group_id "
+            "LEFT JOIN categories AS c ON c.id = g.category_id "
+            "LEFT JOIN vehicles AS v ON v.id = c.vehicle_id "
+            "LEFT JOIN models AS m ON m.id = v.model_id "
+            "LEFT JOIN brands AS b ON b.id = m.brand_id "
+            "WHERE p.seen_run_id = %s AND ("
+            "g.id IS NULL OR c.id IS NULL OR v.id IS NULL OR m.id IS NULL OR b.id IS NULL "
+            "OR NULLIF(TRIM(p.part_number), '') IS NULL "
+            "OR NULLIF(TRIM(UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', ''))), '') "
+            "IS NULL "
+            "OR NULLIF(TRIM(p.name), '') IS NULL OR NULLIF(TRIM(p.code), '') IS NULL "
+            "OR NULLIF(TRIM(b.name), '') IS NULL OR NULLIF(TRIM(m.name), '') IS NULL "
+            "OR NULLIF(TRIM(v.name), '') IS NULL OR NULLIF(TRIM(v.model_code), '') IS NULL "
+            "OR NULLIF(TRIM(v.vid), '') IS NULL OR NULLIF(TRIM(c.cid), '') IS NULL "
+            "OR NULLIF(TRIM(c.name), '') IS NULL OR NULLIF(TRIM(g.name), '') IS NULL "
+            "OR NULLIF(TRIM(g.code), '') IS NULL OR NULLIF(TRIM(g.uid), '') IS NULL "
+            "OR NULLIF(TRIM(g.url), '') IS NULL OR g.url NOT LIKE "
+            "'https://partsouq.com/en/catalog/genuine/unit?%%' "
+            "OR (v.production_from IS NULL AND v.production_to IS NULL "
+            "AND p.part_from IS NULL AND p.part_to IS NULL))",
+            (run_id,),
+        ).fetchone()
+        invalid_rows = int((quality or {}).get("invalid_rows", 0))
+        if invalid_rows:
+            raise RuntimeError(
+                f"full run {run_id} failed source/field quality gate: invalid_rows={invalid_rows}"
+            )
 
         self.db._execute(
             "INSERT INTO published_parts ("

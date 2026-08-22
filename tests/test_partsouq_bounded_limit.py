@@ -420,6 +420,98 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
 
 @pytest.mark.skipif(
     os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL full snapshot tests",
+)
+def test_mysql_full_publish_rejects_non_full_and_invalid_source_atomically() -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        _clear_mysql_fixture(database)
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        parts = PartRepository(database)
+        brand_id = brands.upsert_brand("TOYOTA", None)
+        model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-SSD", None)
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CAMRY",
+                "model_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "vid": "SITE-VID-1",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10001",
+            "https://partsouq.com/en/catalog/genuine/unit?uid=10001",
+        )
+
+        first = CrawlRepository(database, "full-publish-valid")
+        first_run_id = first.start_run("full-publish-valid", fresh=True)
+        parts.upsert_parts(group_id, _parts(1), first_run_id)
+        assert first.publish_success_parts(first_run_id) == 1
+        first.finish_run(first_run_id, "success", {"parts": 1})
+        database.commit()
+        expected_snapshot = database._execute(
+            "SELECT part_number, part_name, code FROM published_parts"
+        ).fetchone()
+
+        sample = CrawlRepository(database, "full-publish-sample")
+        sample_run_id = sample.start_run(
+            "full-publish-sample",
+            fresh=True,
+            dataset_kind="sample",
+            target_parts=1,
+        )
+        parts.upsert_parts(group_id, [{**_parts(1)[0], "name": "SAMPLE PART"}], sample_run_id)
+        database.commit()
+        with pytest.raises(RuntimeError, match="not a matching running full crawl"):
+            sample.publish_success_parts(sample_run_id)
+        database.rollback()
+        assert (
+            database._execute("SELECT part_number, part_name, code FROM published_parts").fetchone()
+            == expected_snapshot
+        )
+
+        invalid = CrawlRepository(database, "full-publish-invalid")
+        invalid_run_id = invalid.start_run("full-publish-invalid", fresh=True)
+        parts.upsert_parts(group_id, _parts(1), invalid_run_id)
+        invalid.mark_error("vehicle", "TOYOTA::CAMRY", "upstream failed")
+        database.commit()
+        with pytest.raises(RuntimeError, match="has crawl failures: count=1"):
+            invalid.publish_success_parts(invalid_run_id)
+        database.rollback()
+
+        invalid.mark_done("vehicle", "TOYOTA::CAMRY")
+        database._execute(
+            "UPDATE parts SET code = '' WHERE seen_run_id = %s",
+            (invalid_run_id,),
+        )
+        database.commit()
+        with pytest.raises(RuntimeError, match="failed source/field quality gate"):
+            invalid.publish_success_parts(invalid_run_id)
+        database.rollback()
+        assert (
+            database._execute("SELECT part_number, part_name, code FROM published_parts").fetchone()
+            == expected_snapshot
+        )
+    finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
     reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
 )
 def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
