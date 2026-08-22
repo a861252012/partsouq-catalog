@@ -13,6 +13,7 @@
 # `{}`（dict literal），改用 .format()/f-string 會與腳本內容衝突。
 import contextlib
 import fcntl
+import hashlib
 import logging
 import os
 import signal
@@ -25,6 +26,11 @@ from pathlib import Path
 from typing import TextIO, TypedDict
 
 from .config import CLOAK, CRAWL, SITE, Cookies, load_cookies, save_cookies
+from .state_files import (
+    ensure_private_state_directory,
+    open_private_state_file,
+    private_path_has_symlink,
+)
 
 log = logging.getLogger("cloak")
 
@@ -93,9 +99,29 @@ def _cf_value(cookies: Cookies | None) -> str:
 
 
 def _ensure_state_directory(path: Path) -> None:
-    # mode 只套用在新建目錄；不得 chmod 既有任意 parent（例如使用者把
-    # override 指向 /tmp/file 時，絕不能把 /tmp 改成 0700）。
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_state_directory(path)
+
+
+def _open_state_file_no_follow(path: Path, flags: int) -> int:
+    return open_private_state_file(path, flags)
+
+
+def _free_cache_has_pro_artifacts(free_cache: Path) -> bool:
+    return any(
+        path.exists()
+        for path in (
+            free_cache / "license.key",
+            free_cache / ".license_cache",
+            free_cache / ".last_pro_version_check",
+            free_cache / ".last_pro_update_check",
+            *free_cache.glob("latest_pro_version_*"),
+            *(
+                path
+                for path in free_cache.iterdir()
+                if path.is_dir() and "pro" in path.name.lower()
+            ),
+        )
+    )
 
 
 @contextlib.contextmanager
@@ -108,7 +134,15 @@ def _process_refresh_lock() -> Iterator[bool]:
     """
     lock_path = CLOAK["lock_file"]
     _ensure_state_directory(lock_path.parent)
-    lock_file = open(lock_path, "a+")
+    lock_fd = _open_state_file_no_follow(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_APPEND,
+    )
+    try:
+        lock_file = os.fdopen(lock_fd, "a+")
+    except BaseException:
+        os.close(lock_fd)
+        raise
     acquired = False
     deadline = time.monotonic() + COOKIE_EXPORT_TIMEOUT + 120
     try:
@@ -236,19 +270,88 @@ def _launch_cloak() -> bool:
         )
         return False
 
+    cache_override = os.environ.get("CLOAKBROWSER_CACHE_DIR")
+    if cache_override:
+        free_cache = Path(cache_override).expanduser()
+        private_state_root = free_cache.parent
+    else:
+        private_state_root = Path(
+            os.environ.get("PSQ_CLOAK_STATE_DIR", CLOAK["state_dir"])
+        ).expanduser()
+        free_cache = private_state_root / "free-browser-cache"
+    browser_home = free_cache.parent / "browser-home"
+    if any(
+        private_path_has_symlink(private_path)
+        for private_path in (private_state_root, free_cache, browser_home)
+    ):
+        log.error("refusing symlinked CloakBrowser private state path")
+        return False
+    _ensure_state_directory(free_cache)
+    if _free_cache_has_pro_artifacts(free_cache):
+        log.error("refusing CloakBrowser Pro artifacts in the dedicated free cache")
+        return False
+    _ensure_state_directory(browser_home)
+
+    expected_binary = os.environ.get("CLOAKBROWSER_BINARY_PATH", "")
+    expected_sha256 = os.environ.get("PSQ_CLOAK_EXPECTED_SHA256", "")
+    binary_contract_required = os.environ.get("PARTSOUQ_LAUNCHD_JOB") == "1"
+    binary_contract_enabled = bool(expected_binary or expected_sha256)
+    if (binary_contract_required or binary_contract_enabled) and (
+        not expected_binary
+        or not expected_sha256
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        log.error("incomplete verified CloakBrowser free binary contract")
+        return False
+    if binary_contract_enabled:
+        try:
+            resolved_binary = Path(expected_binary).expanduser().resolve(strict=True)
+            relative_binary = resolved_binary.relative_to(free_cache.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            log.error("verified CloakBrowser binary is outside the dedicated free cache: %s", error)
+            return False
+        if (
+            len(relative_binary.parts) < 2
+            or not relative_binary.parts[0].startswith("chromium-")
+            or "pro" in relative_binary.parts[0].lower()
+        ):
+            log.error("verified CloakBrowser binary is not in a free Chromium version directory")
+            return False
+        expected_binary = str(resolved_binary)
+        try:
+            with resolved_binary.open("rb") as binary_file:
+                binary_sha256 = hashlib.file_digest(binary_file, "sha256").hexdigest()
+        except OSError as error:
+            log.error("could not read verified CloakBrowser binary: %s", error)
+            return False
+        if binary_sha256 != expected_sha256:
+            log.error("verified CloakBrowser binary changed before launch")
+            return False
+
     ready_file = CLOAK["cookie_export_file"].with_name(f"{CLOAK['cookie_export_file'].name}.ready")
     ready_tmp = ready_file.with_name(f"{ready_file.name}.tmp")
     _ensure_state_directory(ready_file.parent)
     ready_file.unlink(missing_ok=True)
     ready_tmp.unlink(missing_ok=True)
     script = (
-        "import asyncio, json, os, time, cloakbrowser\n"
+        "import asyncio, hashlib, json, os, time, cloakbrowser\n"
         "OUT = %r\n"
         "READY = %r\n"
         "SITE = %r\n"
+        "BINARY = %r\n"
+        "BINARY_SHA256 = %r\n"
+        "def verify_binary():\n"
+        "    if not BINARY:\n"
+        "        return\n"
+        "    with open(BINARY, 'rb') as binary_file:\n"
+        "        actual = hashlib.file_digest(binary_file, 'sha256').hexdigest()\n"
+        "    if actual != BINARY_SHA256:\n"
+        "        raise RuntimeError('verified CloakBrowser binary changed before launch')\n"
         "async def main():\n"
         "    b = None\n"
         "    try:\n"
+        "        verify_binary()\n"
         "        b = await cloakbrowser.launch_async(\n"
         "            headless=False)\n"
         "        ready_tmp = READY + '.tmp'\n"
@@ -307,6 +410,8 @@ def _launch_cloak() -> bool:
         str(CLOAK["cookie_export_file"]),
         str(ready_file),
         SITE["genuine"],
+        expected_binary,
+        expected_sha256,
         int(PAGE_LOAD_TIMEOUT_SECONDS * 1000),
         CATALOG_VERIFY_TIMEOUT_SECONDS,
         CRAWL["min_brands"],
@@ -317,47 +422,46 @@ def _launch_cloak() -> bool:
         # 只保留最後一次的 stderr，並在寫入前設為 owner-only。
         error_log_file = CLOAK["error_log_file"]
         _ensure_state_directory(error_log_file.parent)
-        err_fd = os.open(
+        err_fd = _open_state_file_no_follow(
             error_log_file,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
         )
-        os.fchmod(err_fd, 0o600)
-        err_log = os.fdopen(err_fd, "w")
+        try:
+            err_log = os.fdopen(err_fd, "w")
+        except BaseException:
+            os.close(err_fd)
+            raise
         browser_environment = {
             key: value
             for key, value in os.environ.items()
             if key
             in {
-                "ALL_PROXY",
                 "CLOAKBROWSER_CACHE_DIR",
+                "CLOAKBROWSER_BINARY_PATH",
                 "DISPLAY",
                 "HOME",
-                "HTTPS_PROXY",
-                "HTTP_PROXY",
                 "LANG",
                 "LC_ALL",
                 "LOGNAME",
-                "NO_PROXY",
                 "PATH",
                 "PLAYWRIGHT_NODEJS_PATH",
+                "PSQ_CLOAK_EXPECTED_SHA256",
                 "SHELL",
-                "SSL_CERT_DIR",
-                "SSL_CERT_FILE",
                 "TEMP",
                 "TMP",
                 "TMPDIR",
                 "USER",
                 "XAUTHORITY",
-                "all_proxy",
-                "http_proxy",
-                "https_proxy",
-                "no_proxy",
             }
         }
         # Browser binary 與 HTTP UA 必須維持同一個已驗證版本；也避免
         # runtime 背景下載。DB 密碼、後台 token 等非必要環境不會傳入。
+        browser_environment["CLOAKBROWSER_CACHE_DIR"] = str(free_cache)
         browser_environment["CLOAKBROWSER_AUTO_UPDATE"] = "false"
+        browser_environment["HOME"] = str(browser_home)
+        browser_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        if binary_contract_enabled:
+            browser_environment["CLOAKBROWSER_BINARY_PATH"] = expected_binary
         proc = subprocess.Popen(
             [*CLOAK["launcher"], CLOAK["venv_python"], "-u", "-c", script],
             stdout=subprocess.DEVNULL,
@@ -385,6 +489,10 @@ def _launch_cloak() -> bool:
             _stop_owned_browser()
             return False
         if ready_file.exists():
+            if _free_cache_has_pro_artifacts(free_cache):
+                log.error("CloakBrowser created Pro artifacts in the dedicated free cache")
+                _stop_owned_browser()
+                return False
             log.info("CloakBrowser ready (pid=%s)", proc.pid)
             return True
         time.sleep(2)

@@ -6,10 +6,10 @@
   <string>com.partsouq.catalog-scheduler</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__PROJECT_ROOT__/deploy/run-macos-catalog-scheduler.zsh</string>
+    <string>__RUNTIME_PROJECT_ROOT__/deploy/run-macos-catalog-scheduler.zsh</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>__PROJECT_ROOT__</string>
+  <string>__RUNTIME_PROJECT_ROOT__</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PARTSOUQ_LAUNCHD_JOB</key>

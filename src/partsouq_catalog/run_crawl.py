@@ -11,7 +11,6 @@ HTTP 工作階段與爬蟲服務，然後交給服務層執行 —— 本身不�
 import argparse
 import fcntl
 import logging
-import logging.handlers
 import os
 import sys
 from pathlib import Path
@@ -22,6 +21,11 @@ from .crawler import Crawler
 from .db import Database
 from .governor import RequestGovernor
 from .http_client import SessionManager
+from .state_files import (
+    PrivateRotatingFileHandler,
+    ensure_private_state_directory,
+    open_private_state_file,
+)
 
 
 def main() -> int:
@@ -39,12 +43,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_state_directory(LOG_DIR)
     # 由 launchd 啟動時 stdout 會寫入無上限的 launchd.out.log：
     # 此時只寫輪替檔，不重複寫 stdout。
     handlers: list[logging.Handler] = [
         # 20 MB x 5 輪替：跑好幾天的爬蟲不能讓日誌無限長大
-        logging.handlers.RotatingFileHandler(
+        PrivateRotatingFileHandler(
             LOG_DIR / "crawl.log",
             maxBytes=20 * 1024 * 1024,
             backupCount=5,
@@ -67,16 +71,30 @@ def main() -> int:
     # 與發布 snapshot。
     configured_state_dir = os.getenv("PSQ_SCHEDULER_STATE_DIR", "").strip()
     lock_dir = (
-        Path(configured_state_dir).expanduser().resolve() if configured_state_dir else LOG_DIR
+        Path(configured_state_dir).expanduser().absolute() if configured_state_dir else LOG_DIR
     )
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_path = lock_dir / "crawler.lock"
-    lock_fd = open(lock_path, "a")
-    os.chmod(lock_path, 0o600)
+    try:
+        ensure_private_state_directory(lock_dir)
+        lock_descriptor = open_private_state_file(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_APPEND,
+        )
+        try:
+            lock_fd = os.fdopen(lock_descriptor, "a")
+        except BaseException:
+            os.close(lock_descriptor)
+            raise
+    except BaseException:
+        root_logger = logging.getLogger()
+        for handler in handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        raise
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except BlockingIOError:
             log.error("another crawler holds the lock; exiting")
             return 2
 

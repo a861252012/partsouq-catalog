@@ -1,9 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # Hosted runners for this private repository are opt-in only. The supported
+  # default is the local gate documented in README.md.
   workflow_dispatch:
 
 permissions:
@@ -71,6 +70,7 @@ jobs:
       - name: Reject undocumented skips
         run: |
           uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/unit.xml \
+            --expected-count 167 \
             --allow-message "set NHTSA_TEST_MYSQL=1 to run MySQL integration tests" \
             --allow-message "set STATION_ADMIN_E2E=1 to run the station-admin browser E2E gate" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests" \
@@ -80,15 +80,8 @@ jobs:
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL quarantine plan tests" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL sample tests" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run station-admin MySQL tests" \
-            --allow-message "set UNIFIED_TEST_MYSQL=1 to run the isolated MySQL gate"
-      - name: Upload unit report
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-junit
-          path: artifacts/unit.xml
-          if-no-files-found: error
-
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run the isolated MySQL gate" \
+            --allow-message "requires macOS zsh, plutil, and LaunchAgent filesystem semantics"
   mysql-browser-e2e:
     name: MySQL + Chromium E2E / Python 3.12
     runs-on: ubuntu-24.04
@@ -151,12 +144,8 @@ jobs:
           uv run --locked pytest --override-ini addopts="" -W error -q -ra \
             --strict-config --strict-markers \
             --junitxml=artifacts/mysql-browser-e2e.xml
-      - name: Require zero skipped tests
-        run: uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/mysql-browser-e2e.xml
-      - name: Upload E2E JUnit report
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: mysql-browser-e2e-junit
-          path: artifacts/mysql-browser-e2e.xml
-          if-no-files-found: error
+      - name: Reject undocumented skips
+        run: |
+          uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/mysql-browser-e2e.xml \
+            --expected-count 56 \
+            --allow-message "requires macOS zsh, plutil, and LaunchAgent filesystem semantics"

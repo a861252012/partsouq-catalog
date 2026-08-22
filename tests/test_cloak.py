@@ -5,10 +5,13 @@
 啟動流程（_launch_cloak / _refresh_impl 的內部等待）以 mock 取代。
 """
 
+import errno
 import fcntl
+import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import threading
@@ -35,10 +38,21 @@ NEW_COOKIES = [
 
 
 @pytest.fixture(autouse=True)
-def _reset_session_state(monkeypatch, tmp_path):
+def _reset_session_state(monkeypatch, tmp_path, request):
     # 本檔所有 launch 測試都以 FakeProc/FakeBrowser 驗證，先移除真實
     # Codex marker；專門的 preflight regression 會自行設回。
     monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+    if "launch_cloak" in request.node.name:
+        browser_cache = tmp_path / "free-browser-cache"
+        browser_binary = browser_cache / "chromium-test/verified-free-chromium"
+        browser_binary.parent.mkdir(parents=True)
+        browser_binary.write_bytes(b"verified free browser")
+        monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(browser_cache))
+        monkeypatch.setenv("CLOAKBROWSER_BINARY_PATH", str(browser_binary))
+        monkeypatch.setenv(
+            "PSQ_CLOAK_EXPECTED_SHA256",
+            hashlib.sha256(browser_binary.read_bytes()).hexdigest(),
+        )
     cloak._session_state.update(
         {
             "cookies": None,
@@ -121,6 +135,7 @@ def test_singleflight_concurrent_calls_refresh_once(monkeypatch) -> None:
     entered = threading.Event()
     release = threading.Event()
     calls = 0
+    real_sleep = time.sleep
 
     def impl():
         nonlocal calls
@@ -130,7 +145,8 @@ def test_singleflight_concurrent_calls_refresh_once(monkeypatch) -> None:
         return NEW_COOKIES
 
     monkeypatch.setattr(cloak, "_refresh_impl", impl)
-    monkeypatch.setattr(cloak.time, "sleep", lambda _seconds: None)
+    # 保留排程讓出點，避免等待 flock 的 thread 忙迴圈餓死刷新 thread。
+    monkeypatch.setattr(cloak.time, "sleep", lambda _seconds: real_sleep(0.001))
 
     results: list[list | None] = []
     threads = [
@@ -143,6 +159,7 @@ def test_singleflight_concurrent_calls_refresh_once(monkeypatch) -> None:
     for thread in threads:
         thread.join(timeout=10)
 
+    assert all(not thread.is_alive() for thread in threads)
     assert calls == 1
     assert results == [NEW_COOKIES, NEW_COOKIES]
 
@@ -540,6 +557,34 @@ def test_default_cloak_files_share_project_private_state_directory(tmp_path) -> 
     assert paths["error_log_file"] != Path("/tmp/cloak_launch_err.log")
 
 
+def test_private_state_overrides_keep_symlink_components_for_preflight(tmp_path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    environment = os.environ.copy()
+    environment["PSQ_CLOAK_STATE_DIR"] = str(alias / "cloak")
+    environment["PSQ_RUNTIME_LOG_DIR"] = str(alias / "logs")
+    script = (
+        "import json\n"
+        "from partsouq_catalog.config import CLOAK_STATE_DIR, LOG_DIR\n"
+        "print(json.dumps({'cloak': str(CLOAK_STATE_DIR), 'logs': str(LOG_DIR)}))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert json.loads(result.stdout) == {
+        "cloak": str(alias / "cloak"),
+        "logs": str(alias / "logs"),
+    }
+
+
 def test_state_directory_setup_never_chmods_existing_override_parent(tmp_path) -> None:
     shared_parent = tmp_path / "shared"
     shared_parent.mkdir(mode=0o755)
@@ -548,6 +593,95 @@ def test_state_directory_setup_never_chmods_existing_override_parent(tmp_path) -
     cloak._ensure_state_directory(shared_parent)
 
     assert shared_parent.stat().st_mode & 0o777 == 0o755
+
+
+def test_state_directory_rejects_symlinked_home_boundary_without_writes(
+    monkeypatch, tmp_path
+) -> None:
+    external = tmp_path / "external-home"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    home_alias = tmp_path / "home-alias"
+    home_alias.symlink_to(external, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home_alias))
+
+    with pytest.raises(OSError, match="refusing symlinked private state path"):
+        cloak._ensure_state_directory(home_alias / "state")
+
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
+
+
+def test_process_refresh_lock_rejects_symlinked_leaf_without_touching_target(
+    monkeypatch, tmp_path
+) -> None:
+    external = tmp_path / "external-lock-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    lock_path = tmp_path / ".cloak-refresh.lock"
+    lock_path.symlink_to(external)
+    monkeypatch.setitem(cloak.CLOAK, "lock_file", lock_path)
+
+    with (
+        pytest.raises(OSError, match="refusing symlinked state file"),
+        cloak._process_refresh_lock(),
+    ):
+        pytest.fail("symlinked lock must not be acquired")
+
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_process_refresh_lock_rejects_symlinked_ancestor_without_writes(
+    monkeypatch, tmp_path
+) -> None:
+    external = tmp_path / "external-state"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(external, target_is_directory=True)
+    monkeypatch.setitem(cloak.CLOAK, "lock_file", alias / "state/.cloak-refresh.lock")
+
+    with (
+        pytest.raises(OSError, match="refusing symlinked private state path"),
+        cloak._process_refresh_lock(),
+    ):
+        pytest.fail("symlinked lock ancestor must not be traversed")
+
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
+
+
+def test_process_refresh_lock_closes_descriptor_when_fdopen_fails(monkeypatch, tmp_path) -> None:
+    state_file = tmp_path / "refresh.lock"
+    descriptor = os.open(state_file, os.O_RDWR | os.O_CREAT, 0o600)
+    monkeypatch.setitem(cloak.CLOAK, "lock_file", state_file)
+    monkeypatch.setattr(cloak, "_open_state_file_no_follow", lambda *_args: descriptor)
+    monkeypatch.setattr(cloak.os, "fdopen", mock.Mock(side_effect=OSError("fdopen failed")))
+
+    with pytest.raises(OSError, match="fdopen failed"), cloak._process_refresh_lock():
+        pytest.fail("fdopen failure must abort before yielding")
+
+    with pytest.raises(OSError) as error:
+        os.fstat(descriptor)
+    assert error.value.errno == errno.EBADF
+
+
+def test_launch_cloak_closes_error_descriptor_when_fdopen_fails(monkeypatch, tmp_path) -> None:
+    error_log = tmp_path / "cloak-launch.err.log"
+    descriptor = os.open(error_log, os.O_WRONLY | os.O_CREAT, 0o600)
+    popen = mock.Mock()
+    monkeypatch.setitem(cloak.CLOAK, "error_log_file", error_log)
+    monkeypatch.setattr(cloak, "_open_state_file_no_follow", lambda *_args: descriptor)
+    monkeypatch.setattr(cloak.os, "fdopen", mock.Mock(side_effect=OSError("fdopen failed")))
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+
+    popen.assert_not_called()
+    with pytest.raises(OSError) as error:
+        os.fstat(descriptor)
+    assert error.value.errno == errno.EBADF
 
 
 def test_stop_owned_browser_signals_group_even_after_wrapper_exits(monkeypatch) -> None:
@@ -710,8 +844,22 @@ def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch, tmp_path) ->
 
     monkeypatch.setenv("PARTSOUQ_DB_PASSWORD", "must-not-reach-browser")
     monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "must-not-reach-browser")
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(tmp_path / "cloak-cache"))
+    browser_cache = tmp_path / "cloak-cache"
+    browser_binary = browser_cache / "chromium-test/verified-free-chromium"
+    browser_binary.parent.mkdir(parents=True)
+    browser_binary.write_bytes(b"verified free browser")
+    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(browser_cache))
+    monkeypatch.setenv("CLOAKBROWSER_BINARY_PATH", str(browser_binary))
+    monkeypatch.setenv(
+        "PSQ_CLOAK_EXPECTED_SHA256",
+        hashlib.sha256(browser_binary.read_bytes()).hexdigest(),
+    )
     monkeypatch.setenv("CLOAKBROWSER_TOKEN", "must-not-reach-browser")
+    monkeypatch.setenv("HTTP_PROXY", "http://must-not-reach-browser.invalid")
+    monkeypatch.setenv("HTTPS_PROXY", "http://must-not-reach-browser.invalid")
+    monkeypatch.setenv("ALL_PROXY", "socks5://must-not-reach-browser.invalid")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "custom-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "custom-ca"))
     monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(cloak, "_stop_owned_browser", lambda: None)
 
@@ -731,11 +879,210 @@ def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch, tmp_path) ->
         assert isinstance(child_environment, dict)
         assert "PARTSOUQ_DB_PASSWORD" not in child_environment
         assert "PARTSOUQ_ADMIN_TOKEN" not in child_environment
-        assert child_environment["CLOAKBROWSER_CACHE_DIR"] == str(tmp_path / "cloak-cache")
+        assert child_environment["CLOAKBROWSER_CACHE_DIR"] == str(browser_cache)
+        assert (
+            child_environment["CLOAKBROWSER_BINARY_PATH"] == os.environ["CLOAKBROWSER_BINARY_PATH"]
+        )
+        assert (
+            child_environment["PSQ_CLOAK_EXPECTED_SHA256"]
+            == os.environ["PSQ_CLOAK_EXPECTED_SHA256"]
+        )
         assert "CLOAKBROWSER_TOKEN" not in child_environment
+        assert "HTTP_PROXY" not in child_environment
+        assert "HTTPS_PROXY" not in child_environment
+        assert "ALL_PROXY" not in child_environment
+        assert "SSL_CERT_FILE" not in child_environment
+        assert "SSL_CERT_DIR" not in child_environment
         assert child_environment["CLOAKBROWSER_AUTO_UPDATE"] == "false"
+        assert child_environment["PYTHONDONTWRITEBYTECODE"] == "1"
+        assert "verify_binary()" in captured[6]
     finally:
         cloak._browser_proc = None
+
+
+def test_launch_cloak_keeps_non_launchd_entrypoint_without_binary_contract(
+    monkeypatch, tmp_path
+) -> None:
+    export = tmp_path / "cookies.json"
+    ready_file = export.with_name(f"{export.name}.ready")
+    browser_environment: dict[str, str] = {}
+
+    class FakeProc:
+        pid = 99999
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(_argv, **kwargs):
+        browser_environment.update(kwargs["env"])
+        ready_file.write_text("ready", encoding="utf-8")
+        return FakeProc()
+
+    monkeypatch.delenv("CLOAKBROWSER_BINARY_PATH")
+    monkeypatch.delenv("PSQ_CLOAK_EXPECTED_SHA256")
+    monkeypatch.delenv("PARTSOUQ_LAUNCHD_JOB", raising=False)
+    home = tmp_path / "home"
+    default_cache = home / ".cloakbrowser"
+    default_cache.mkdir(parents=True)
+    (default_cache / "license.key").write_text("must be ignored", encoding="utf-8")
+    state_dir = tmp_path / "private-state"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLOAKBROWSER_CACHE_DIR", raising=False)
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", state_dir)
+    monkeypatch.setitem(cloak.CLOAK, "cookie_export_file", export)
+    monkeypatch.setitem(cloak.CLOAK, "launcher", [])
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cloak, "_stop_owned_browser", lambda: None)
+
+    try:
+        assert cloak._launch_cloak() is True
+        assert browser_environment["CLOAKBROWSER_CACHE_DIR"] == str(
+            state_dir / "free-browser-cache"
+        )
+        assert browser_environment["HOME"] == str(state_dir / "browser-home")
+    finally:
+        cloak._browser_proc = None
+
+
+def test_launch_cloak_rejects_symlinked_browser_home_without_touching_target(
+    monkeypatch, tmp_path
+) -> None:
+    free_cache = Path(os.environ["CLOAKBROWSER_CACHE_DIR"])
+    external = tmp_path / "external-browser-home"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    (free_cache.parent / "browser-home").symlink_to(external, target_is_directory=True)
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+
+
+@pytest.mark.parametrize("entrypoint", ["default", "override"])
+def test_launch_cloak_rejects_symlinked_private_state_ancestor_without_writes(
+    monkeypatch, tmp_path, entrypoint: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / f"external-{entrypoint}-state"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    marker.chmod(0o640)
+    alias_parent = home / f"{entrypoint}-alias-parent"
+    alias_parent.symlink_to(external, target_is_directory=True)
+    private_state = alias_parent / "state"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLOAKBROWSER_BINARY_PATH", raising=False)
+    monkeypatch.delenv("PSQ_CLOAK_EXPECTED_SHA256", raising=False)
+    monkeypatch.delenv("PARTSOUQ_LAUNCHD_JOB", raising=False)
+    if entrypoint == "default":
+        monkeypatch.delenv("CLOAKBROWSER_CACHE_DIR", raising=False)
+        monkeypatch.setitem(cloak.CLOAK, "state_dir", private_state)
+    else:
+        monkeypatch.setenv(
+            "CLOAKBROWSER_CACHE_DIR",
+            str(private_state / "free-browser-cache"),
+        )
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+    external_before = {path.relative_to(external) for path in external.rglob("*")}
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o640
+    assert {path.relative_to(external) for path in external.rglob("*")} == external_before
+
+
+def test_launch_cloak_rejects_symlinked_error_log_without_truncating_target(
+    monkeypatch, tmp_path
+) -> None:
+    external = tmp_path / "external-error-log"
+    external.write_text("must remain intact\n", encoding="utf-8")
+    error_log = tmp_path / "cloak-launch.err.log"
+    error_log.symlink_to(external)
+    monkeypatch.setitem(cloak.CLOAK, "error_log_file", error_log)
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
+    assert external.read_text(encoding="utf-8") == "must remain intact\n"
+
+
+def test_launch_cloak_launchd_requires_complete_binary_contract(monkeypatch) -> None:
+    monkeypatch.delenv("CLOAKBROWSER_BINARY_PATH")
+    monkeypatch.delenv("PSQ_CLOAK_EXPECTED_SHA256")
+    monkeypatch.setenv("PARTSOUQ_LAUNCHD_JOB", "1")
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize("location", ["outside", "pro"])
+def test_launch_cloak_rejects_binary_contract_outside_free_version_directory(
+    monkeypatch,
+    tmp_path,
+    location: str,
+) -> None:
+    cache = tmp_path / "free-browser-cache"
+    cache.mkdir(exist_ok=True)
+    binary = (
+        tmp_path / "outside-browser"
+        if location == "outside"
+        else cache / "chromium-pro-test/browser"
+    )
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b"matching but forbidden browser")
+    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache))
+    monkeypatch.setenv("CLOAKBROWSER_BINARY_PATH", str(binary))
+    monkeypatch.setenv(
+        "PSQ_CLOAK_EXPECTED_SHA256",
+        hashlib.sha256(binary.read_bytes()).hexdigest(),
+    )
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("artifact", "directory"),
+    [
+        ("license.key", False),
+        (".license_cache", False),
+        ("latest_pro_version_test", False),
+        ("chromium-pro-test", True),
+    ],
+)
+def test_launch_cloak_rejects_pro_artifacts_in_dedicated_cache(
+    monkeypatch,
+    tmp_path,
+    artifact: str,
+    directory: bool,
+) -> None:
+    cache = tmp_path / "free-browser-cache"
+    target = cache / artifact
+    if directory:
+        target.mkdir(parents=True)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("paid artifact", encoding="utf-8")
+    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache))
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak._launch_cloak() is False
+    popen.assert_not_called()
 
 
 def test_launch_cloak_only_exports_verified_catalog_page(monkeypatch, tmp_path) -> None:

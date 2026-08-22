@@ -5,11 +5,12 @@ import sys
 import threading
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from partsouq_catalog import scheduler
+from partsouq_catalog import scheduler, state_files
 
 
 class FakeStopEvent:
@@ -272,7 +273,7 @@ def test_run_does_not_stall_while_child_keeps_reporting_progress(monkeypatch) ->
 
 
 def test_run_does_not_stall_during_cookie_backoff_heartbeats(monkeypatch) -> None:
-    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.75)
+    monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 2.0)
     monkeypatch.setattr(scheduler, "_record_start", lambda _job: 48)
     monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
     script = (
@@ -282,8 +283,8 @@ def test_run_does_not_stall_during_cookie_backoff_heartbeats(monkeypatch) -> Non
         "logging.basicConfig(stream=sys.stdout, level=logging.WARNING, force=True)\n"
         "real_sleep = time.sleep\n"
         "http_client.BACKOFF_HEARTBEAT_SECONDS = 1.0\n"
-        "http_client.session_backoff_remaining = lambda: 0.1\n"
-        "http_client.time.sleep = lambda _seconds: real_sleep(0.2)\n"
+        "http_client.session_backoff_remaining = lambda: 10.0\n"
+        "http_client.time.sleep = lambda _seconds: real_sleep(0.25)\n"
         "manager = object.__new__(http_client.SessionManager)\n"
         "manager._sleep_with_backoff(0)\n"
     )
@@ -567,6 +568,98 @@ def test_execution_lock_rejects_a_second_copy(tmp_path, monkeypatch) -> None:
 
     assert scheduler.dispatch_locked("nhtsa-api", "all") == 0
     assert called is True
+
+
+@pytest.mark.parametrize("prefix", ("scheduler-job", "scheduler-daemon"))
+def test_scheduler_lock_rejects_symlinked_leaf_without_touching_target(
+    prefix, tmp_path, monkeypatch
+) -> None:
+    external = tmp_path / "external-lock-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / f"{prefix}-catalog.lock").symlink_to(external)
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(state_dir))
+
+    with pytest.raises(OSError, match="refusing symlinked state file"):
+        scheduler._try_lock(prefix, "catalog")
+
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_scheduler_job_is_not_dispatched_through_symlinked_lock(tmp_path, monkeypatch) -> None:
+    external = tmp_path / "external-job-lock-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "scheduler-job-catalog.lock").symlink_to(external)
+    dispatch = mock.Mock()
+    recover = mock.Mock()
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(scheduler, "dispatch", dispatch)
+    monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", recover)
+
+    with pytest.raises(OSError, match="refusing symlinked state file"):
+        scheduler.dispatch_locked("catalog", "all")
+
+    dispatch.assert_not_called()
+    recover.assert_not_called()
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_scheduler_daemon_does_not_run_through_symlinked_lock(tmp_path, monkeypatch) -> None:
+    external = tmp_path / "external-daemon-lock-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "scheduler-daemon-catalog.lock").symlink_to(external)
+    stop_event = FakeStopEvent()
+
+    def mark_work_started(_job, _scope):
+        stop_event.stopped = True
+        return 0
+
+    dispatch = mock.Mock(side_effect=mark_work_started)
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+    monkeypatch.setattr(scheduler, "_seconds_until_next_run", lambda _job, _interval: 0.0)
+
+    with pytest.raises(OSError, match="refusing symlinked state file"):
+        scheduler.run_daemon(
+            "catalog",
+            "all",
+            60,
+            10,
+            100,
+            stop_event=stop_event,
+        )
+
+    dispatch.assert_not_called()
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_scheduler_lock_rejects_symlinked_state_ancestor_without_writes(
+    tmp_path, monkeypatch
+) -> None:
+    external = tmp_path / "external-state"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(external, target_is_directory=True)
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(alias / "scheduler"))
+
+    with pytest.raises(OSError, match="refusing symlinked private state path"):
+        scheduler._try_lock("scheduler-job", "catalog")
+
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
 
 
 def test_pending_request_stays_pending_when_same_job_is_running(monkeypatch) -> None:
@@ -1094,6 +1187,97 @@ def test_daemon_retries_with_bounded_exponential_backoff(monkeypatch) -> None:
     assert trigger_modes == ["daemon", "daemon", "daemon"]
     assert not hasattr(scheduler._JOB_CONTEXT, "trigger_mode")
     daemon_lock.close.assert_called_once_with()
+
+
+def test_daemon_writes_ready_marker_only_after_lock_is_acquired(tmp_path, monkeypatch) -> None:
+    stop_event = FakeStopEvent()
+    stop_event.stopped = True
+    daemon_lock = mock.MagicMock()
+    marker = tmp_path / "scheduler.ready"
+    monkeypatch.setenv("PARTSOUQ_SCHEDULER_READY_MARKER", str(marker))
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        lambda _job, _stop_event: daemon_lock,
+    )
+
+    assert scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event) == 0
+    assert marker.read_text(encoding="utf-8").strip() == str(scheduler.os.getpid())
+    assert marker.stat().st_mode & 0o777 == 0o600
+    daemon_lock.close.assert_called_once_with()
+
+
+def test_daemon_ready_marker_ignores_predictable_symlinked_temp_without_touching_target(
+    tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "launch-ready-release"
+    external = tmp_path / "external-ready-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    predictable_temporary = marker.with_name(f"{marker.name}.{scheduler.os.getpid()}")
+    predictable_temporary.symlink_to(external)
+    monkeypatch.setenv("PARTSOUQ_SCHEDULER_READY_MARKER", str(marker))
+
+    scheduler._write_daemon_ready_marker()
+
+    assert marker.read_text(encoding="utf-8") == f"{scheduler.os.getpid()}\n"
+    assert marker.stat().st_mode & 0o777 == 0o600
+    assert predictable_temporary.is_symlink()
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_daemon_ready_marker_replaces_symlinked_leaf_without_touching_target(
+    tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "launch-ready-release"
+    external = tmp_path / "external-ready-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    marker.symlink_to(external)
+    monkeypatch.setenv("PARTSOUQ_SCHEDULER_READY_MARKER", str(marker))
+
+    scheduler._write_daemon_ready_marker()
+
+    assert not marker.is_symlink()
+    assert marker.read_text(encoding="utf-8") == f"{scheduler.os.getpid()}\n"
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_daemon_ready_marker_rejects_symlinked_ancestor_without_writes(
+    tmp_path, monkeypatch
+) -> None:
+    external = tmp_path / "external-ready-state"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    alias = tmp_path / "ready-alias"
+    alias.symlink_to(external, target_is_directory=True)
+    monkeypatch.setenv(
+        "PARTSOUQ_SCHEDULER_READY_MARKER",
+        str(alias / "scheduler/launch-ready-release"),
+    )
+
+    with pytest.raises(OSError, match="refusing symlinked private state path"):
+        scheduler._write_daemon_ready_marker()
+
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
+
+
+def test_daemon_does_not_write_ready_marker_without_lock(tmp_path, monkeypatch) -> None:
+    stop_event = FakeStopEvent()
+    marker = tmp_path / "scheduler.ready"
+    monkeypatch.setenv("PARTSOUQ_SCHEDULER_READY_MARKER", str(marker))
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        lambda _job, _stop_event: None,
+    )
+
+    assert scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event) == 0
+    assert not marker.exists()
 
 
 def test_daemon_stops_retrying_after_max_consecutive_failures(monkeypatch) -> None:
@@ -1629,26 +1813,226 @@ def test_non_contention_lock_error_is_not_hidden(tmp_path, monkeypatch) -> None:
 
 def test_lock_file_is_closed_when_permission_hardening_fails(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(scheduler, "LOG_DIR", tmp_path)
-    opened = None
-    real_open = open
+    opened_descriptor = None
+    real_open = state_files.os.open
 
     def tracked_open(*args, **kwargs):
-        nonlocal opened
-        opened = real_open(*args, **kwargs)
-        return opened
+        nonlocal opened_descriptor
+        opened_descriptor = real_open(*args, **kwargs)
+        return opened_descriptor
 
-    monkeypatch.setattr(scheduler, "open", tracked_open, raising=False)
+    monkeypatch.setattr(state_files.os, "open", tracked_open)
     monkeypatch.setattr(
-        scheduler.os,
-        "chmod",
+        state_files.os,
+        "fchmod",
         mock.Mock(side_effect=OSError(errno.EACCES, "permission denied")),
     )
 
     with pytest.raises(OSError, match="permission denied"):
         scheduler._try_lock("scheduler-job", "catalog")
 
-    assert opened is not None
-    assert opened.closed
+    assert opened_descriptor is not None
+    with pytest.raises(OSError) as error:
+        state_files.os.fstat(opened_descriptor)
+    assert error.value.errno == errno.EBADF
+
+
+def test_private_state_open_rejects_fifo_before_open(tmp_path, monkeypatch) -> None:
+    fifo = tmp_path / "state.fifo"
+    state_files.os.mkfifo(fifo)
+    opened_paths: list[object] = []
+    real_open = state_files.os.open
+
+    def tracked_open(path, *args, **kwargs):
+        opened_paths.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(state_files.os, "open", tracked_open)
+
+    with pytest.raises(OSError) as error:
+        state_files.open_private_state_file(fifo, state_files.os.O_RDONLY)
+
+    assert error.value.errno == errno.EINVAL
+    assert opened_paths == [fifo.parent]
+
+
+def test_private_state_open_rejects_hardlink_without_mutating_target(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.write_text("preserve\n", encoding="utf-8")
+    target.chmod(0o640)
+    linked = tmp_path / "state"
+    state_files.os.link(target, linked)
+
+    with pytest.raises(OSError) as error:
+        state_files.open_private_state_file(
+            linked,
+            state_files.os.O_WRONLY | state_files.os.O_TRUNC,
+        )
+
+    assert error.value.errno == errno.EMLINK
+    assert target.read_text(encoding="utf-8") == "preserve\n"
+    assert target.stat().st_mode & 0o777 == 0o640
+
+
+def test_private_state_open_validates_before_truncate_and_uses_nonblocking(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state"
+    state_path.write_text("old\n", encoding="utf-8")
+    opened_flags = 0
+    real_open = state_files.os.open
+
+    def tracked_open(path, flags, mode=0o777, **kwargs):
+        nonlocal opened_flags
+        opened_flags = flags
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(state_files.os, "open", tracked_open)
+
+    descriptor = state_files.open_private_state_file(
+        state_path,
+        state_files.os.O_WRONLY | state_files.os.O_TRUNC,
+    )
+    state_files.os.close(descriptor)
+
+    assert opened_flags & state_files.os.O_NONBLOCK
+    assert not opened_flags & state_files.os.O_TRUNC
+    assert state_path.read_bytes() == b""
+
+
+def test_private_state_open_retries_transient_create_enoent_on_same_parent(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state"
+    real_open = state_files.os.open
+    parent_calls = 0
+    leaf_dir_fds: list[int] = []
+
+    def transient_open(path, flags, mode=0o777, **kwargs):
+        nonlocal parent_calls
+        if path == state_path.parent:
+            parent_calls += 1
+        elif path == state_path.name:
+            leaf_dir_fds.append(kwargs["dir_fd"])
+            if len(leaf_dir_fds) == 1:
+                raise FileNotFoundError(errno.ENOENT, "transient openat failure", path)
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(state_files.os, "open", transient_open)
+
+    descriptor = state_files.open_private_state_file(
+        state_path,
+        state_files.os.O_WRONLY | state_files.os.O_CREAT,
+    )
+    state_files.os.close(descriptor)
+
+    assert parent_calls == 1
+    assert len(leaf_dir_fds) == 2
+    assert leaf_dir_fds[0] == leaf_dir_fds[1]
+
+
+def test_private_state_open_propagates_persistent_create_enoent_after_one_retry(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state"
+    real_open = state_files.os.open
+    leaf_calls = 0
+
+    def missing_leaf_open(path, flags, mode=0o777, **kwargs):
+        nonlocal leaf_calls
+        if path == state_path.name:
+            leaf_calls += 1
+            raise FileNotFoundError(errno.ENOENT, "persistent openat failure", path)
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(state_files.os, "open", missing_leaf_open)
+
+    with pytest.raises(FileNotFoundError, match="persistent openat failure"):
+        state_files.open_private_state_file(
+            state_path,
+            state_files.os.O_WRONLY | state_files.os.O_CREAT,
+        )
+
+    assert leaf_calls == 2
+
+
+def test_private_state_open_does_not_retry_enoent_without_create(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "state"
+    real_open = state_files.os.open
+    leaf_calls = 0
+
+    def missing_leaf_open(path, flags, mode=0o777, **kwargs):
+        nonlocal leaf_calls
+        if path == state_path.name:
+            leaf_calls += 1
+            raise FileNotFoundError(errno.ENOENT, "missing state file", path)
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(state_files.os, "open", missing_leaf_open)
+
+    with pytest.raises(FileNotFoundError, match="missing state file"):
+        state_files.open_private_state_file(state_path, state_files.os.O_RDONLY)
+
+    assert leaf_calls == 1
+
+
+def test_private_state_open_rejects_parent_swap_to_symlink_without_external_write(
+    tmp_path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    moved_state_dir = tmp_path / "moved-state"
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    real_open = state_files.os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path) == state_dir:
+            swapped = True
+            state_dir.rename(moved_state_dir)
+            state_dir.symlink_to(external, target_is_directory=True)
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(state_files.os, "open", swapping_open)
+
+    with pytest.raises(OSError):
+        state_files.open_private_state_file(
+            state_dir / "state-file",
+            state_files.os.O_WRONLY | state_files.os.O_CREAT | state_files.os.O_TRUNC,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
+
+
+def test_private_rotating_handler_replaces_symlinked_backup_without_touching_target(
+    tmp_path,
+) -> None:
+    log_path = tmp_path / "crawl.log"
+    external = tmp_path / "external-backup-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    backup = tmp_path / "crawl.log.1"
+    backup.symlink_to(external)
+    handler = state_files.PrivateRotatingFileHandler(log_path, maxBytes=1, backupCount=1)
+    try:
+        assert handler.stream is not None
+        handler.stream.write("entry\n")
+        handler.stream.flush()
+        handler.doRollover()
+    finally:
+        handler.close()
+
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+    assert log_path.is_file() and not log_path.is_symlink()
+    assert backup.is_file() and not backup.is_symlink()
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    assert backup.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize(

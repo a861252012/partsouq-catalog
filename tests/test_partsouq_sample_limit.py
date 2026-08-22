@@ -1,7 +1,9 @@
+import errno
 import fcntl
 import os
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -444,6 +446,144 @@ def test_cli_uses_shared_scheduler_state_lock_across_worktrees(monkeypatch, tmp_
     finally:
         fcntl.flock(held_lock, fcntl.LOCK_UN)
         held_lock.close()
+
+
+def test_cli_rejects_symlinked_crawler_lock_without_touching_target_or_running_work(
+    monkeypatch, tmp_path
+):
+    log_dir = tmp_path / "logs"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    external = tmp_path / "external-lock-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    (state_dir / "crawler.lock").symlink_to(external)
+    database = mock.Mock()
+    load_cookies = mock.Mock(return_value={})
+    session_manager = mock.Mock()
+    request_governor = mock.Mock()
+    crawler = mock.Mock()
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(run_crawl, "LOG_DIR", log_dir)
+    monkeypatch.setattr(run_crawl, "Database", database)
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr(run_crawl, "SessionManager", session_manager)
+    monkeypatch.setattr(run_crawl, "RequestGovernor", request_governor)
+    monkeypatch.setattr(run_crawl, "Crawler", crawler)
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    with pytest.raises(OSError, match="refusing symlinked state file"):
+        run_crawl.main()
+
+    database.assert_not_called()
+    load_cookies.assert_not_called()
+    session_manager.assert_not_called()
+    request_governor.assert_not_called()
+    crawler.assert_not_called()
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_cli_rejects_symlinked_crawl_log_without_touching_target_or_running_work(
+    monkeypatch, tmp_path
+):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    external = tmp_path / "external-log-target"
+    external.write_text("preserve\n", encoding="utf-8")
+    external.chmod(0o640)
+    (log_dir / "crawl.log").symlink_to(external)
+    database = mock.Mock()
+    load_cookies = mock.Mock(return_value={})
+    session_manager = mock.Mock()
+    request_governor = mock.Mock()
+    crawler = mock.Mock()
+    monkeypatch.delenv("PSQ_SCHEDULER_STATE_DIR", raising=False)
+    monkeypatch.setattr(run_crawl, "LOG_DIR", log_dir)
+    monkeypatch.setattr(run_crawl, "Database", database)
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr(run_crawl, "SessionManager", session_manager)
+    monkeypatch.setattr(run_crawl, "RequestGovernor", request_governor)
+    monkeypatch.setattr(run_crawl, "Crawler", crawler)
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    with pytest.raises(OSError, match="refusing symlinked state file"):
+        run_crawl.main()
+
+    database.assert_not_called()
+    load_cookies.assert_not_called()
+    session_manager.assert_not_called()
+    request_governor.assert_not_called()
+    crawler.assert_not_called()
+    assert external.read_text(encoding="utf-8") == "preserve\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_cli_rejects_symlinked_runtime_log_ancestor_before_any_write_or_work(monkeypatch, tmp_path):
+    external = tmp_path / "external-logs"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    alias = tmp_path / "logs-alias"
+    alias.symlink_to(external, target_is_directory=True)
+    database = mock.Mock()
+    monkeypatch.setattr(run_crawl, "LOG_DIR", alias / "runtime")
+    monkeypatch.setattr(run_crawl, "Database", database)
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    with pytest.raises(OSError, match="refusing symlinked private state path"):
+        run_crawl.main()
+
+    database.assert_not_called()
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
+
+
+def test_cli_rejects_symlinked_scheduler_state_ancestor_before_crawler_work(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    external = tmp_path / "external-state"
+    external.mkdir()
+    marker = external / "preserve"
+    marker.write_text("unchanged\n", encoding="utf-8")
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(external, target_is_directory=True)
+    database = mock.Mock()
+    load_cookies = mock.Mock()
+    monkeypatch.setattr(run_crawl, "LOG_DIR", log_dir)
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(alias / "scheduler"))
+    monkeypatch.setattr(run_crawl, "Database", database)
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    with pytest.raises(OSError, match="refusing symlinked private state path"):
+        run_crawl.main()
+
+    database.assert_not_called()
+    load_cookies.assert_not_called()
+    assert marker.read_text(encoding="utf-8") == "unchanged\n"
+    assert {path.relative_to(external) for path in external.rglob("*")} == {Path("preserve")}
+
+
+def test_cli_propagates_non_contention_lock_error_before_crawler_work(monkeypatch, tmp_path):
+    database = mock.Mock()
+    load_cookies = mock.Mock()
+    monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(run_crawl, "Database", database)
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr(
+        run_crawl.fcntl,
+        "flock",
+        mock.Mock(side_effect=OSError(errno.EIO, "I/O error")),
+    )
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    with pytest.raises(OSError) as error:
+        run_crawl.main()
+
+    assert error.value.errno == errno.EIO
+    database.assert_not_called()
+    load_cookies.assert_not_called()
 
 
 def test_direct_cli_defers_when_schema_migration_has_admission_lock(monkeypatch, tmp_path):

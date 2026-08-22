@@ -17,6 +17,8 @@ from partsouq_catalog.config import CLOAK
 from partsouq_catalog.http_client import (
     CATALOG_USER_AGENT,
     CHALLENGE_MARKERS,
+    ROBOTS_BODY_MAX_BYTES,
+    ROBOTS_CACHE_TTL_SECONDS,
     ChallengeError,
     NotFoundError,
     RobotsPolicyError,
@@ -26,7 +28,15 @@ from partsouq_catalog.http_client import (
 
 
 def response(status_code: int, text: str, url: str, headers=None) -> Mock:
-    return Mock(status_code=status_code, text=text, url=url, headers=headers or {})
+    result = Mock(
+        status_code=status_code,
+        text=text,
+        content=text.encode(),
+        url=url,
+        headers=headers or {},
+    )
+    result.iter_content.return_value = iter([text.encode()])
+    return result
 
 
 CHALLENGE_RESPONSE = response(403, "Just a moment...", "https://partsouq.example/catalog")
@@ -305,6 +315,7 @@ def test_robots_fetch_uses_identifiable_crawler_user_agent() -> None:
     assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
     robots_call = manager.session.get.call_args_list[0]
     assert robots_call.kwargs["headers"] == {"User-Agent": CATALOG_USER_AGENT}
+    assert robots_call.kwargs["stream"] is True
     assert "Mozilla" not in CATALOG_USER_AGENT
     assert "github.com/a861252012" in CATALOG_USER_AGENT
 
@@ -345,6 +356,79 @@ def test_catalog_reuses_robots_but_checks_each_url() -> None:
     assert manager.get("https://partsouq.com/en/catalog/genuine") == "one"
     assert manager.get("https://partsouq.com/en/catalog/genuine/locate") == "two"
     assert manager.session.get.call_count == 3
+
+
+def test_catalog_refetches_robots_after_24_hours() -> None:
+    now = [0.0]
+    manager = SessionManager(monotonic=lambda: now[0])
+    manager.session.get = Mock(
+        side_effect=[
+            response(200, "User-agent: *\nDisallow:\n", "https://partsouq.com/robots.txt"),
+            response(200, "catalog", "https://partsouq.com/en/catalog/genuine"),
+            response(200, "cached", "https://partsouq.com/en/catalog/genuine/locate"),
+            response(
+                200,
+                "User-agent: *\nDisallow: /en/catalog/\n",
+                "https://partsouq.com/robots.txt",
+            ),
+        ]
+    )
+
+    assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
+    now[0] = float(ROBOTS_CACHE_TTL_SECONDS - 1)
+    assert manager.get("https://partsouq.com/en/catalog/genuine/locate") == "cached"
+    now[0] = float(ROBOTS_CACHE_TTL_SECONDS)
+    with pytest.raises(RobotsPolicyError, match="disallows"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert [call.args[0] for call in manager.session.get.call_args_list] == [
+        "https://partsouq.com/robots.txt",
+        "https://partsouq.com/en/catalog/genuine",
+        "https://partsouq.com/en/catalog/genuine/locate",
+        "https://partsouq.com/robots.txt",
+    ]
+
+
+@pytest.mark.parametrize("size_delta", [0, 1])
+def test_robots_body_size_limit_is_fail_closed(size_delta: int) -> None:
+    prefix = "User-agent: *\nDisallow:\n"
+    robots_text = prefix + "#" * (ROBOTS_BODY_MAX_BYTES + size_delta - len(prefix))
+    robots_response = response(200, robots_text, "https://partsouq.com/robots.txt")
+    responses = [robots_response]
+    if size_delta == 0:
+        responses.append(response(200, "catalog", "https://partsouq.com/en/catalog/genuine"))
+    manager = SessionManager()
+    manager.session.get = Mock(side_effect=responses)
+
+    if size_delta == 0:
+        assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
+        assert manager.session.get.call_count == 2
+    else:
+        with pytest.raises(RobotsPolicyError, match="byte limit"):
+            manager.get("https://partsouq.com/en/catalog/genuine")
+        assert manager.session.get.call_count == 1
+    robots_response.iter_content.assert_called_once_with(chunk_size=64 * 1024)
+    robots_response.close.assert_called_once_with()
+
+
+def test_robots_stream_stops_after_oversized_chunk_and_closes() -> None:
+    second_chunk_requested = [False]
+
+    def chunks():
+        yield b"x" * (ROBOTS_BODY_MAX_BYTES + 100)
+        second_chunk_requested[0] = True
+        yield b"unreachable"
+
+    robots_response = response(200, "", "https://partsouq.com/robots.txt")
+    robots_response.iter_content.return_value = chunks()
+    manager = SessionManager()
+    manager.session.get = Mock(return_value=robots_response)
+
+    with pytest.raises(RobotsPolicyError, match="byte limit"):
+        manager.get("https://partsouq.com/en/catalog/genuine")
+
+    assert second_chunk_requested == [False]
+    robots_response.close.assert_called_once_with()
 
 
 def test_disallowed_catalog_url_is_never_requested() -> None:
@@ -412,7 +496,8 @@ Disallow: /en/catalog/
         "User-agent: unrelated-bot\nDisallow: /\n",
         "User-agent: partsouq-catalog-crawler\nCrawl-delay: 10\n",
         "User-agent: *\nDisallow /en/catalog/\n",
-        "User-agent: partsouq-catalog-crawler\nDisallow: /en/catalog/$bad\n",
+        "User-agent: partsouq-catalog-crawler\nAllow: *secret\n",
+        "User-agent: partsouq-catalog-crawler\nDisallow: *secret\n",
     ],
 )
 def test_robots_without_explicit_applicable_access_rule_fails_closed(
@@ -427,6 +512,64 @@ def test_robots_without_explicit_applicable_access_rule_fails_closed(
         manager.get("https://partsouq.com/en/catalog/genuine")
 
     assert manager.session.get.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("access_rule", "blocked"),
+    [
+        ("Disallow: /en/catalog/*", True),
+        ("Disallow: /en/catalog/$", False),
+        ("Disallow: /en/catalog/$bad", False),
+        ("Allow: /en/catalog/*", False),
+        ("Allow:", False),
+        ("Disallow:", False),
+    ],
+)
+def test_catalog_supports_robots_wildcard_and_end_anchor(
+    access_rule: str,
+    blocked: bool,
+) -> None:
+    manager = SessionManager()
+    responses = [
+        response(
+            200,
+            f"User-agent: partsouq-catalog-crawler\n{access_rule}\n",
+            "https://partsouq.com/robots.txt",
+        )
+    ]
+    if not blocked:
+        responses.append(response(200, "catalog", "https://partsouq.com/en/catalog/genuine"))
+    manager.session.get = Mock(side_effect=responses)
+
+    if blocked:
+        with pytest.raises(RobotsPolicyError, match="disallows"):
+            manager.get("https://partsouq.com/en/catalog/genuine")
+        assert manager.session.get.call_count == 1
+    else:
+        assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
+        assert manager.session.get.call_count == 2
+
+
+def test_robots_pattern_for_unrelated_agent_does_not_block_catalog() -> None:
+    manager = SessionManager()
+    manager.session.get = Mock(
+        side_effect=[
+            response(
+                200,
+                """User-agent: unrelated-bot
+Disallow: /private/*
+
+User-agent: *
+Disallow:
+""",
+                "https://partsouq.com/robots.txt",
+            ),
+            response(200, "catalog", "https://partsouq.com/en/catalog/genuine"),
+        ]
+    )
+
+    assert manager.get("https://partsouq.com/en/catalog/genuine") == "catalog"
+    assert manager.session.get.call_count == 2
 
 
 @pytest.mark.parametrize(

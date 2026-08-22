@@ -11,6 +11,8 @@ import tempfile
 from pathlib import Path
 from typing import TypedDict
 
+from .state_files import ensure_private_state_directory
+
 type Cookie = dict[str, str]
 type Cookies = list[Cookie]
 
@@ -72,7 +74,7 @@ BASE_DIR = (
 # host runner 會把不同 checkout 指向同一個使用者私有 state dir，確保
 # cookie 與 refresh lock 跨 worktree 協調；未設定時維持專案內隔離。
 CLOAK_STATE_DIR = (
-    Path(os.environ.get("PSQ_CLOAK_STATE_DIR", BASE_DIR / "data")).expanduser().resolve()
+    Path(os.environ.get("PSQ_CLOAK_STATE_DIR", BASE_DIR / "data")).expanduser().absolute()
 )
 COOKIE_FILE = CLOAK_STATE_DIR / "cookies.json"
 
@@ -194,8 +196,8 @@ CRAWL: CrawlConfig = {
     "block_breather": int(os.environ.get("PSQ_BLOCK_BREATHER", "45")),
 }
 
-# 日誌目錄
-LOG_DIR = BASE_DIR / "logs"
+# 正式 host runtime 會把可變日誌放在 release 外；其他入口維持既有預設。
+LOG_DIR = Path(os.environ.get("PSQ_RUNTIME_LOG_DIR", BASE_DIR / "logs")).expanduser().absolute()
 
 
 def load_cookies(path: Path = COOKIE_FILE) -> Cookies | None:
@@ -236,7 +238,7 @@ def load_cookies(path: Path = COOKIE_FILE) -> Cookies | None:
 
 def save_cookies(cookies: Cookies) -> None:
     """以 owner-only 暫存檔原子更新 cookie，避免半份 JSON 或權限窗口。"""
-    COOKIE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_state_directory(COOKIE_FILE.parent)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(

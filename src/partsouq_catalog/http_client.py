@@ -31,16 +31,20 @@ import hashlib
 import logging
 import random
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol, cast
+from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
-from urllib.robotparser import RobotFileParser
 
 import requests
 from requests.adapters import HTTPAdapter
 
-from partsouq_crawler.crawl.robots import RobotsRules, parse_robots
+from partsouq_crawler.crawl.robots import (
+    RobotsRules,
+    has_applicable_access_rules,
+    parse_robots,
+)
 
 from .cloak import (
     REFRESH_RETRY_BACKOFF,
@@ -58,24 +62,14 @@ CATALOG_USER_AGENT = "partsouq-catalog-crawler/0.1 (+https://github.com/a8612520
 CATALOG_PRODUCT_TOKEN = "partsouq-catalog-crawler"
 CATALOG_HOSTS = frozenset({"partsouq.com", "www.partsouq.com"})
 BACKOFF_HEARTBEAT_SECONDS = 60.0
+ROBOTS_CACHE_TTL_SECONDS = 24 * 60 * 60
+ROBOTS_BODY_MAX_BYTES = 500 * 1024
 
 
 class RequestGovernor(Protocol):
     def acquire(self) -> None: ...
 
     def throttle(self, seconds: float) -> None: ...
-
-
-class RobotEntry(Protocol):
-    useragents: list[str]
-    rulelines: list[object]
-
-    def applies_to(self, useragent: str) -> bool: ...
-
-
-class RobotParser(Protocol):
-    entries: list[RobotEntry]
-    default_entry: RobotEntry | None
 
 
 def _cf_value(cookies: Cookies | None) -> str:
@@ -140,12 +134,15 @@ class SessionManager:
         cookies: Cookies | None = None,
         no_browser: bool = False,
         gov: RequestGovernor | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.session = requests.Session()
         # 傳輸層不得沿用環境代理（避免流量被本機 proxy 攔截/改寫）。
         self.session.trust_env = False
         self.session.proxies.clear()
         self._robots: RobotsRules | None = None
+        self._robots_fetched_at: float | None = None
+        self._monotonic = monotonic
         # F5：全域 request governor（可選）。提供時，429 的 Retry-After
         # 會同時暫停「所有」worker —— 限流是全域的，單一 worker 的
         # 退避不該讓其他 worker 繼續撞牆。
@@ -204,8 +201,9 @@ class SessionManager:
     def _wire_get(self, url: str, headers: dict[str, str] | None = None) -> requests.Response:
         """送出「不跟隨 redirect」的單一 GET；cookie jar 會暫時清空。
 
-        robots.txt 與其他不應帶 session cookie 的請求走這條路；請求
-        完成後 jar 還原，不影響後續 catalog 請求的 cookie。
+        robots.txt 與其他不應帶 session cookie 的請求走這條路；以
+        stream 回傳，讓呼叫端限制讀取量並負責 close。請求完成後 jar
+        還原，不影響後續 catalog 請求的 cookie。
         """
         saved = requests.cookies.RequestsCookieJar()
         saved.update(self.session.cookies)
@@ -216,6 +214,7 @@ class SessionManager:
                 timeout=float(str(CRAWL["http_timeout"])),
                 allow_redirects=False,
                 headers=headers,
+                stream=True,
             )
         finally:
             self.session.cookies.clear()
@@ -460,11 +459,29 @@ class SessionManager:
             raise RobotsPolicyError(f"unsupported catalog origin: {parts.scheme}://{parts.netloc}")
 
         robots_url = urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
-        if self._robots is None:
+        robots_expired = (
+            self._robots_fetched_at is None
+            or self._monotonic() - self._robots_fetched_at >= ROBOTS_CACHE_TTL_SECONDS
+        )
+        if self._robots is None or robots_expired:
             if self.gov is not None:
                 self.gov.acquire()
             response = self._wire_get(robots_url, headers={"User-Agent": CATALOG_USER_AGENT})
-            text = response.text or ""
+            body_buffer = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    remaining = ROBOTS_BODY_MAX_BYTES + 1 - len(body_buffer)
+                    body_buffer.extend(chunk[:remaining])
+                    if len(body_buffer) > ROBOTS_BODY_MAX_BYTES:
+                        raise RobotsPolicyError(
+                            f"robots exceeds {ROBOTS_BODY_MAX_BYTES} byte limit at {robots_url}"
+                        )
+            finally:
+                response.close()
+            body = bytes(body_buffer)
+            text = body.decode("utf-8", errors="replace")
             if response.status_code == 403 or self._is_challenge(response, text):
                 raise ChallengeError(f"http {response.status_code} challenge at {robots_url}")
             if not 200 <= response.status_code < 300:
@@ -480,7 +497,8 @@ class SessionManager:
                 raise RobotsPolicyError(f"robots redirected outside catalog origin: {final_url}")
             if not text.strip() or not self._has_applicable_robots_rules(text):
                 raise RobotsPolicyError(f"robots has no explicit applicable rules at {robots_url}")
-            self._robots = parse_robots(robots_url, text.encode(), "utf-8")
+            self._robots = parse_robots(robots_url, body, "utf-8")
+            self._robots_fetched_at = self._monotonic()
 
         if not self._robots.allows(CATALOG_USER_AGENT, url) or not self._robots.allows(
             CLOAK["user_agent"], url
@@ -493,17 +511,7 @@ class SessionManager:
     @staticmethod
     def _has_applicable_robots_rules(text: str) -> bool:
         """確認本 crawler 或萬用 UA group 具有 Allow／Disallow 指令。"""
-        parser = RobotFileParser()
-        parser.parse(text.splitlines())
-        typed_parser = cast(RobotParser, parser)
-        for entry in typed_parser.entries:
-            if entry.applies_to(CATALOG_PRODUCT_TOKEN):
-                return bool(entry.rulelines)
-        for entry in typed_parser.entries:
-            if any(agent.strip() == "*" for agent in entry.useragents):
-                return bool(entry.rulelines)
-        default_entry = typed_parser.default_entry
-        return bool(default_entry and default_entry.rulelines)
+        return has_applicable_access_rules(text, CATALOG_PRODUCT_TOKEN)
 
     @staticmethod
     def _retry_after_seconds(r: requests.Response) -> float:

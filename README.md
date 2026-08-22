@@ -225,35 +225,45 @@ macOS host 則取得 18 個品牌連結，且 cookie 交給 HTTP client 後可�
 `scheduler` 只保留給未來已通過相同 smoke 的 Linux 環境，不得只以 browser ready
 或 cookie 檔存在就啟動 10,000 筆驗收。
 
-host 入口是 `deploy/run-macos-catalog-scheduler.zsh`，會讀取 `.env`，但只把 DB、
-爬蟲與 Aqua 執行所需的 allowlist 變數傳給子程序；MySQL root、8000 token 與
-8086 認證資訊不會進入 crawler。正式排程硬性要求既有 `partsouq_catalog`，並
-覆寫為 `PSQ_LIMIT_PARTS=0` 與 `PSQ_BOUNDED_PARTS=10000`，不能被舊的 sample
-設定或 `_test` DB 降級。CloakBrowser cookie／refresh lock 與 scheduler lock
-固定共用 owner-private 的
-`~/Library/Application Support/partsouq-catalog/`，避免不同 checkout 同時啟動
-瀏覽器或互相覆寫 cookie。
+host 安裝入口是 `deploy/install-macos-catalog-scheduler.zsh`。installer 只在互動
+安裝時以隔離子程序讀取 repository 的 `.env`，只輸出固定 DB／crawler allowlist，
+不會讓 `.env` 改寫 installer 控制變數；同時拒絕含未提交 tracked 變更的 source tree。
+接著從目前 commit 封裝 `pyproject.toml`、`uv.lock`、`README.md`、`src/`、`db/`、
+`migrations/` 與 `deploy/` 到 owner-private 的
+`~/Library/Application Support/partsouq-catalog/releases/`。release 不含 `.git`、
+`.env`、tests 或 GitHub 認證資料，依賴分別以 `uv sync --locked` 與
+`pip --require-hashes` 安裝在 release 的最終路徑，避免移動 venv 後 shebang 失效。
+
+installer 只將 DB 與 crawler allowlist 寫入 owner-only
+`scheduler.env`；MySQL root、8000 token、8086 認證與 GitHub 資訊都不會進入
+runtime。CloakBrowser 使用獨立的 free-only cache；一般 host CLI 也不讀取預設
+`~/.cloakbrowser` 的 license，且不把 proxy 或自訂 TLS 設定傳給 browser child。
+付費 key、Pro cache artifact、
+token、外部自訂 binary／下載網址、proxy 與自訂 TLS 路徑都會被拒絕。installer
+建立新 release 時先用空 cache 呼叫 hash-locked CloakBrowser 的官方簽章下載流程，
+既有同版本目錄與 `latest_version*` marker 會先移到 owner-only quarantine；只有帶有
+trusted marker、且 manifest 完整相符的同 commit release 才能重用。installer 驗證
+free browser checksum 後，runner 才以內部固定 binary path 啟動；這不是開放使用者
+覆寫；binary resolve 後必須位於 dedicated cache 的 `chromium-*` 非 Pro 版本目錄。
+checksum 不符的目標 free version 會移到 owner-only quarantine，再由
+hash-locked CloakBrowser 重新下載及複驗，其他 cache 不會被刪除。正式排程硬性要求既有
+`partsouq_catalog`，並覆寫為
+`PSQ_LIMIT_PARTS=0` 與 `PSQ_BOUNDED_PARTS=10000`，不能被舊 sample 設定或
+`_test` DB 降級。cookie／refresh lock 與 scheduler lock 固定共用上述
+Application Support 目錄，避免不同 checkout 同時啟動瀏覽器或覆寫 cookie。
 
 headed Chromium 必須從 macOS Aqua session 啟動；LaunchAgent 除了
-`LimitLoadToSessionType=Aqua`，也會傳入 host runner marker。runner 會拒絕未帶
-marker、SSH、CI 與 Codex sandbox 直接執行，避免 AppKit 以 `SIGABRT` 結束
-Chromium 並跳出「未預期的結束」提示。
+`LimitLoadToSessionType=Aqua`，也會傳入 host runner marker。plist 與 runner
+只讀取 Application Support 內的 release，不再讀取 Desktop／Documents 內的
+repository，因此不需要替 LaunchAgent 手動授予 Full Disk Access。runner 仍會
+拒絕未帶 marker、SSH、CI 與 Codex sandbox 直接執行，避免 AppKit 以 `SIGABRT`
+結束 Chromium 並跳出「未預期的結束」提示。
 
 ```bash
-# 第一次安裝 host CloakBrowser；requirements 內含全部 transitive hash：
-uv venv --python 3.14.5 "$HOME/.venvs/partsouq-cloak"
-uv pip install --python "$HOME/.venvs/partsouq-cloak/bin/python" \
-  --require-hashes -r deploy/requirements-cloakbrowser.txt
-"$HOME/.venvs/partsouq-cloak/bin/python" -m cloakbrowser install
-
-# 驗證 host runtime，不啟動 Chromium：
-"$HOME/.venvs/partsouq-cloak/bin/python" -c \
-  'import cloakbrowser; print(cloakbrowser.__version__)'
-
-# 只 render、lint 與安裝 plist，不啟動爬蟲：
+# 建立 hash-locked release、render／lint 並安裝 plist，不啟動爬蟲：
 deploy/install-macos-catalog-scheduler.zsh --no-start
 
-# 安裝並立即開始正式 10,000 筆排程：
+# 建立或重用完整 release，並開始正式 10,000 筆排程：
 deploy/install-macos-catalog-scheduler.zsh
 
 # 查看目前 LaunchAgent 狀態：
@@ -263,13 +273,26 @@ launchctl print "gui/$(id -u)/com.partsouq.catalog-scheduler"
 deploy/disable-macos-catalog-scheduler.zsh
 ```
 
-installer 以 `plutil` 安全填入 repository 與 log 絕對路徑，render 後會檢查
-placeholder、plist 格式與權限。重複執行時，已載入且內容未變的 LaunchAgent 不會
-被重啟；若 plist 有變更，會先精確 bootout 同一 label 再 bootstrap。變更安裝設定
-會中斷當下工作，因此正式 10,000 筆執行期間不要重裝。stdout／stderr 位於
-`~/Library/Application Support/partsouq-catalog/logs/`，不是共用 `/tmp` 檔案。
-`.env` 的 `PSQ_CLOAK_PYTHON` 留空時會使用上述預設 venv；若改用其他路徑，必須
-填入可執行且已安裝相同 hash-locked 套件的 Python 絕對路徑。
+installer 以 host-wide lock 串行切換，並用 `plutil` 填入 release 與 log 絕對路徑；
+render 後檢查 placeholder、plist 格式、owner-only 權限、source、`scheduler.env`、
+project／CloakBrowser venv 的所有 regular file、bytecode、symlink 字串及其 resolved
+regular target 內容、root／目前使用者 ownership，以及目前帳號不可透過 group／other
+寫入的權限，
+以及 free Chromium checksum。build 產生的正常 bytecode 會在
+manifest 建立前清掉；runtime 又固定 `PYTHONDONTWRITEBYTECODE=1`，因此後續新增的
+`.pyc`、`.pyo` 或 `__pycache__` 會 fail closed。只有依賴
+安裝、CloakBrowser import 與完整性檢查都成功，release 才會寫入
+`.install-complete`。Python scheduler 取得 daemon lock 後才寫含 PID 的 readiness
+marker；installer 每輪重新讀取 `launchctl`，要求 program、running state、live PID
+與 marker PID 完全一致，連續穩定三輪才切換成功。立即退出、bootstrap 失敗、timeout、
+signal 或切換中的其他錯誤都會回復實際已載入的先前 plist。完整的舊 release 不會
+自動刪除，便於查核與回復；只有
+本次安裝失敗且尚未完成的新 release 會清除。stdout／stderr、crawler runtime log
+與可變 state 都位於 `~/Library/Application Support/partsouq-catalog/` 的 release
+外部，不會改動 immutable app manifest，也不是共用 `/tmp` 檔案。macOS-only 的 56 個
+展開測試會在 Linux CI 以精確訊息與筆數跳過；不新增需付費的 macOS GitHub runner。
+同一帳號若在檢查與啟動間惡意改寫 cache，仍屬本機同使用者 TOCTOU 殘餘風險；正式
+runner 會在啟動前後重驗固定 binary SHA，但不以額外 daemon 或付費服務過度設計。
 
 預設排程如下；都可用同名環境變數調整，不需要人工逐次觸發：
 
@@ -316,6 +339,10 @@ exit code 為 `3`；真正錯誤仍為 `1`，完整成功才是 `0`。
 正式環境可用前述環境變數調整。這是本專案的部署選擇，不宣稱是來源網站規定。
 
 ## 驗證
+
+GitHub Actions 對此 private repository 僅保留手動 `workflow_dispatch`，push 與 PR
+不會自動使用 hosted runner 或 artifact storage。預設一律執行下列本機 gate；若要
+手動啟動 hosted workflow，必須先自行確認帳號額度與可能費用。
 
 ```bash
 uv sync --extra dev

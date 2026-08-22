@@ -12,6 +12,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("report", type=Path)
     parser.add_argument("--allow-message", action="append", default=[])
+    parser.add_argument("--expected-count", type=int)
     return parser.parse_args()
 
 
@@ -38,6 +39,12 @@ def main() -> int:
         print("Unexpected pytest skips:", file=sys.stderr)
         for message in unexpected:
             print(f"- {message or '<missing reason>'}", file=sys.stderr)
+        return 1
+    if args.expected_count is not None and len(messages) != args.expected_count:
+        print(
+            f"Expected {args.expected_count} pytest skip(s), found {len(messages)}.",
+            file=sys.stderr,
+        )
         return 1
     print(f"Verified {len(messages)} documented pytest skip(s).")
     return 0

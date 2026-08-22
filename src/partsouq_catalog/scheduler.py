@@ -10,6 +10,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -26,6 +27,7 @@ from .admission import (
     release_catalog_writer_admission,
 )
 from .config import BASE_DIR, DB_CONFIG, LOG_DIR
+from .state_files import ensure_private_state_directory, open_private_state_file
 
 MAX_OUTPUT_CHARS = 60_000
 OUTPUT_CHUNK_CHARS = 8_192
@@ -519,13 +521,20 @@ def _job_family(job: str) -> str:
 def _try_lock(prefix: str, job: str) -> TextIO | None:
     configured_state_dir = os.getenv("PSQ_SCHEDULER_STATE_DIR", "").strip()
     state_dir = (
-        Path(configured_state_dir).expanduser().resolve() if configured_state_dir else LOG_DIR
+        Path(configured_state_dir).expanduser().absolute() if configured_state_dir else LOG_DIR
     )
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_state_directory(state_dir)
     lock_path = state_dir / f"{prefix}-{_job_family(job)}.lock"
-    lock_file = open(lock_path, "a")
+    lock_fd = open_private_state_file(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_APPEND,
+    )
     try:
-        os.chmod(lock_path, 0o600)
+        lock_file = os.fdopen(lock_fd, "a")
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock_file.close()
@@ -819,6 +828,31 @@ def _wait_for_daemon_lock(job: str, stop_event: threading.Event) -> TextIO | Non
     return None
 
 
+def _write_daemon_ready_marker() -> None:
+    configured_path = os.getenv("PARTSOUQ_SCHEDULER_READY_MARKER", "").strip()
+    if not configured_path:
+        return
+    marker = Path(configured_path).expanduser().absolute()
+    ensure_private_state_directory(marker.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{marker.name}.{os.getpid()}.",
+        dir=marker.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        try:
+            stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(f"{os.getpid()}\n")
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def run_daemon(
     job: str,
     scope: str,
@@ -833,6 +867,7 @@ def run_daemon(
         return 0
     previous_trigger_mode = getattr(_JOB_CONTEXT, "trigger_mode", None)
     _JOB_CONTEXT.trigger_mode = "daemon"
+    _write_daemon_ready_marker()
     failures = 0
     non_site_failures = 0
     schedule_read_failures = 0

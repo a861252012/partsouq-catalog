@@ -27,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,11 @@ from .admission import (
 from .cloak import COOKIE_TTL
 from .config import COOKIE_FILE, CRAWL, LOG_DIR
 from .db import Database
+from .state_files import (
+    PrivateRotatingFileHandler,
+    ensure_private_state_directory,
+    open_private_state_file,
+)
 
 log = logging.getLogger("supervisor")
 
@@ -121,7 +127,14 @@ class Supervisor:
         self.restarts = []
         self.cooldown_until = 0.0
         try:
-            state = json.loads(self.restart_state_path.read_text())
+            descriptor = open_private_state_file(self.restart_state_path, os.O_RDONLY)
+            try:
+                state_file = os.fdopen(descriptor, "r", encoding="utf-8")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with state_file:
+                state = json.load(state_file)
             if not isinstance(state, dict) or state.get("version") != 1:
                 raise ValueError("unsupported restart state")
             restart_times = state.get("restart_times", [])
@@ -188,17 +201,32 @@ class Supervisor:
             "restart_times": restart_times,
             "cooldown_until": cooldown_wall,
         }
-        tmp_path = self.restart_state_path.with_name(f".{self.restart_state_path.name}.tmp")
+        temporary_path: Path | None = None
         try:
-            self.restart_state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path.write_text(json.dumps(state, separators=(",", ":")) + "\n")
-            os.replace(tmp_path, self.restart_state_path)
+            ensure_private_state_directory(self.restart_state_path.parent)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{self.restart_state_path.name}.",
+                dir=self.restart_state_path.parent,
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                temporary_file = os.fdopen(descriptor, "w", encoding="utf-8")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with temporary_file:
+                os.fchmod(temporary_file.fileno(), 0o600)
+                json.dump(state, temporary_file, separators=(",", ":"))
+                temporary_file.write("\n")
+            os.replace(temporary_path, self.restart_state_path)
         except OSError as e:
             log.warning("restart state write failed: %s", e)
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _prune_restart_state(self, now: float | None = None) -> None:
         """移除過期窗口；冷卻結束時清空本輪風暴紀錄。"""
@@ -609,9 +637,18 @@ class Supervisor:
         self.summary["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.summary["status"] = status
         try:
-            (LOG_DIR / "summary.json").write_text(
-                json.dumps(self.summary, indent=2, ensure_ascii=False)
+            summary_path = LOG_DIR / "summary.json"
+            descriptor = open_private_state_file(
+                summary_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
             )
+            try:
+                summary_file = os.fdopen(descriptor, "w", encoding="utf-8")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with summary_file:
+                json.dump(self.summary, summary_file, indent=2, ensure_ascii=False)
             log.info("summary written to %s (status=%s)", LOG_DIR / "summary.json", status)
         except Exception as e:
             log.warning("summary write failed: %s", e)
@@ -767,64 +804,81 @@ class Supervisor:
 
 
 def main() -> int:
-    import logging.handlers
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_state_directory(LOG_DIR)
+    handlers: list[logging.Handler] = [
+        PrivateRotatingFileHandler(
+            LOG_DIR / "supervisor.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+        ),
+        # launchd 會把 stdout 寫到無上限的 launchd.out.log；
+        # 在 launchd 環境下不要重複寫 stdout
+        *([] if "LAUNCHD_JOB" in os.environ else [logging.StreamHandler(sys.stdout)]),
+    ]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        handlers=[
-            logging.handlers.RotatingFileHandler(
-                LOG_DIR / "supervisor.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=3,
-            ),
-            # launchd 會把 stdout 寫到無上限的 launchd.out.log；
-            # 在 launchd 環境下不要重複寫 stdout
-            *(
-                []
-                if "LAUNCHD_JOB" in __import__("os").environ
-                else [logging.StreamHandler(sys.stdout)]
-            ),
-        ],
+        handlers=handlers,
     )
-    import argparse
-
-    parser = argparse.ArgumentParser(description="PartSouq 爬蟲監督迴圈")
-    parser.add_argument("--workers", type=int, default=int(CRAWL.get("workers", 4)))
-    args = parser.parse_args()
-
     # P1 修復（單實例鎖）：watchdog（每小時）與 launchd 每月 job 都可能
     # 拉起 supervisor；兩隻並存時各自的 _kill_other_crawlers 會互殺對方
     # 的爬蟲，形成永不停歇的重啟爭奪。flock 拿到獨佔鎖的才是唯一實例，
     # 後到者直接乾淨退場（exit 0，watchdog 視為健康）。
     import fcntl
 
-    lock_path = LOG_DIR / "supervisor.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(lock_path, "a")
+    lock_fd = None
+    signal_installed = False
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        log.info("another supervisor holds the lock; exiting")
-        return 0
+        import argparse
 
-    # launchd 以 SIGTERM 停服務時，預設處理會直接終止 interpreter，
-    # Supervisor.run 的 finally 不一定有機會回收 child。轉成 SystemExit
-    # 後仍保留標準退出語意，並確保 finally 執行。
-    def _terminate(signum: int, _frame: FrameType | None) -> None:
-        # 第一次 TERM 轉成 SystemExit 讓 run.finally 回收 child；隨即忽略
-        # 後續 TERM，避免 cleanup sleep/kill 被第二個 signal 重入中斷。
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise SystemExit(128 + signum)
+        parser = argparse.ArgumentParser(description="PartSouq 爬蟲監督迴圈")
+        parser.add_argument("--workers", type=int, default=int(CRAWL.get("workers", 4)))
+        args = parser.parse_args()
 
-    try:
-        signal.signal(signal.SIGTERM, _terminate)
-    except ValueError:
-        # 測試可在非 main thread 呼叫 main；production launchd 一定在
-        # main thread，會安裝 handler。
-        pass
-    return Supervisor(workers=args.workers).run()
+        lock_path = LOG_DIR / "supervisor.lock"
+        ensure_private_state_directory(lock_path.parent)
+        lock_descriptor = open_private_state_file(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_APPEND,
+        )
+        try:
+            lock_fd = os.fdopen(lock_descriptor, "a")
+        except BaseException:
+            os.close(lock_descriptor)
+            raise
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log.info("another supervisor holds the lock; exiting")
+            return 0
+
+        # launchd 以 SIGTERM 停服務時，預設處理會直接終止 interpreter，
+        # Supervisor.run 的 finally 不一定有機會回收 child。轉成 SystemExit
+        # 後仍保留標準退出語意，並確保 finally 執行。
+        def _terminate(signum: int, _frame: FrameType | None) -> None:
+            # 第一次 TERM 轉成 SystemExit 讓 run.finally 回收 child；隨即忽略
+            # 後續 TERM，避免 cleanup sleep/kill 被第二個 signal 重入中斷。
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            raise SystemExit(128 + signum)
+
+        try:
+            signal.signal(signal.SIGTERM, _terminate)
+            signal_installed = True
+        except ValueError:
+            # 測試可在非 main thread 呼叫 main；production launchd 一定在
+            # main thread，會安裝 handler。
+            pass
+        return Supervisor(workers=args.workers).run()
+    finally:
+        if signal_installed:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        if lock_fd is not None:
+            lock_fd.close()
+        root_logger = logging.getLogger()
+        for handler in handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
 
 
 if __name__ == "__main__":
