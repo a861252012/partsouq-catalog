@@ -20,6 +20,12 @@
 --
 -- 本 migration 不含 USE，可重複執行（沿用 012/013 模式）；會移除
 -- migration 013 建立的 idx_quarantine_run_key_updated。
+--
+-- 第九輪 review P2：只檢查 INDEX_NAME 不夠——同名但欄位順序錯誤或
+-- INVISIBLE 的索引會讓 FORCE INDEX 回 MySQL 1176。本 migration 對
+-- idx_quarantine_run_key_resolved_updated 與 idx_quarantine_list 都驗
+-- 完整 signature（GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)）與
+-- IS_VISIBLE = 'YES'，不符時 drop 重建；postflight 再斷言一次。
 
 SET SESSION lock_wait_timeout = 30;
 SET SESSION innodb_lock_wait_timeout = 30;
@@ -36,26 +42,64 @@ BEGIN
     SIGNAL SQLSTATE '45000'
       SET MESSAGE_TEXT = 'migration 014: select database and apply catalog schema first';
   END IF;
+  -- idx_quarantine_run_key_resolved_updated (run_key, resolved_at, updated_at)
+  IF EXISTS (
+    SELECT 1 FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+      AND INDEX_NAME = 'idx_quarantine_run_key_resolved_updated'
+  ) AND NOT (
+    (SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)
+       FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+         AND INDEX_NAME = 'idx_quarantine_run_key_resolved_updated')
+      = 'run_key,resolved_at,updated_at'
+    AND (SELECT MAX(IS_VISIBLE)
+       FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+         AND INDEX_NAME = 'idx_quarantine_run_key_resolved_updated') = 'YES'
+  ) THEN
+    ALTER TABLE part_quarantine DROP KEY idx_quarantine_run_key_resolved_updated;
+  END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.STATISTICS
     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
       AND INDEX_NAME = 'idx_quarantine_run_key_resolved_updated'
   ) THEN
-    IF EXISTS (
-      SELECT 1 FROM information_schema.STATISTICS
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
-        AND INDEX_NAME = 'idx_quarantine_run_key_updated'
-    ) THEN
-      ALTER TABLE part_quarantine DROP KEY idx_quarantine_run_key_updated;
-    END IF;
     ALTER TABLE part_quarantine
       ADD KEY idx_quarantine_run_key_resolved_updated (run_key, resolved_at, updated_at);
-  ELSEIF EXISTS (
+  END IF;
+  IF EXISTS (
     SELECT 1 FROM information_schema.STATISTICS
     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
       AND INDEX_NAME = 'idx_quarantine_run_key_updated'
   ) THEN
     ALTER TABLE part_quarantine DROP KEY idx_quarantine_run_key_updated;
+  END IF;
+  -- idx_quarantine_list (resolved_at, updated_at)，012 建立；unresolved
+  -- 無 run_key 路徑 FORCE INDEX 它，同樣必須驗 signature 與可見性。
+  IF EXISTS (
+    SELECT 1 FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+      AND INDEX_NAME = 'idx_quarantine_list'
+  ) AND NOT (
+    (SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)
+       FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+         AND INDEX_NAME = 'idx_quarantine_list')
+      = 'resolved_at,updated_at'
+    AND (SELECT MAX(IS_VISIBLE)
+       FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+         AND INDEX_NAME = 'idx_quarantine_list') = 'YES'
+  ) THEN
+    ALTER TABLE part_quarantine DROP KEY idx_quarantine_list;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+      AND INDEX_NAME = 'idx_quarantine_list'
+  ) THEN
+    ALTER TABLE part_quarantine ADD KEY idx_quarantine_list (resolved_at, updated_at);
   END IF;
 END//
 DELIMITER ;
@@ -66,17 +110,29 @@ DROP PROCEDURE IF EXISTS assert_partsouq_014_output;
 DELIMITER //
 CREATE PROCEDURE assert_partsouq_014_output()
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.STATISTICS
+  DECLARE v_sig VARCHAR(255);
+  DECLARE v_vis VARCHAR(3);
+  DECLARE v_list_sig VARCHAR(255);
+  DECLARE v_list_vis VARCHAR(3);
+  SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX), MAX(IS_VISIBLE)
+    INTO v_sig, v_vis
+    FROM information_schema.STATISTICS
     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
-      AND INDEX_NAME = 'idx_quarantine_run_key_resolved_updated'
-  ) OR EXISTS (
-    SELECT 1 FROM information_schema.STATISTICS
+      AND INDEX_NAME = 'idx_quarantine_run_key_resolved_updated';
+  SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX), MAX(IS_VISIBLE)
+    INTO v_list_sig, v_list_vis
+    FROM information_schema.STATISTICS
     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
-      AND INDEX_NAME = 'idx_quarantine_run_key_updated'
-  ) THEN
+      AND INDEX_NAME = 'idx_quarantine_list';
+  IF v_sig IS NULL OR v_sig <> 'run_key,resolved_at,updated_at' OR v_vis <> 'YES'
+     OR v_list_sig IS NULL OR v_list_sig <> 'resolved_at,updated_at' OR v_list_vis <> 'YES'
+     OR EXISTS (
+       SELECT 1 FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine'
+         AND INDEX_NAME = 'idx_quarantine_run_key_updated'
+     ) THEN
     SIGNAL SQLSTATE '45000'
-      SET MESSAGE_TEXT = 'migration 014: run_key+resolved_at+updated_at index postflight failed';
+      SET MESSAGE_TEXT = 'migration 014: index signature/visibility postflight failed';
   END IF;
 END//
 DELIMITER ;

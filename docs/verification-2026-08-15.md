@@ -616,7 +616,7 @@ ruff check/format 全過、`git diff --check` 無輸出、migration 013 兩次
 ### SOL review 第八輪（2026-08-22，`31cdb7b` 之後）
 
 GPT5.6 SOL MAX 覆核 `31cdb7b` 後指出 1 個 P1 + 3 個 P2；已全數修正並
-commit 為本節末尾 hash（已 push 到 origin/main）：
+commit（`0b26a20` → `4b6120f` → `81724bd`，已 push 到 origin/main）：
 
 1. **P1 主 DB 漏套 migration 013，run_key 查詢實際 500**：README 的既有
    volume 升級清單停在 migration 012，主 DB 沒有
@@ -658,3 +658,52 @@ state=all 兩路（無/有 run_key）的 filesort 仍為使用者裁決的可接
 完整 gate：`372 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
 ruff check/format 全過、`git diff --check` 無輸出、migration 013/014
 在主 DB 與測試 DB 皆重跑 exit 0、image 執行中檔案 hash 與 HEAD 一致。
+
+### SOL review 第九輪（2026-08-22，`81724bd` 之後）
+
+GPT5.6 SOL MAX 覆核 `81724bd` 後指出 2 個 P2 + 1 個 P2（scheduler
+image）+ 4 個 P3；已全數修正並 commit（本節末尾 hash，已 push 到
+origin/main）：
+
+1. **P2 索引契約只驗名稱**：migration 014 與 preflight 測試原先只檢查
+   `INDEX_NAME`，同名但欄位順序錯誤或 `INVISIBLE` 的索引仍會通過（且
+   `FORCE INDEX` 對 INVISIBLE 索引回 MySQL 1176）。修正：migration 014
+   與 postflight 對 `idx_quarantine_run_key_resolved_updated` 與
+   `idx_quarantine_list` 都驗完整 signature
+   （`GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)`）與
+   `IS_VISIBLE = 'YES'`，不符時 drop 重建；preflight 測試同步斷言
+   signature 與可見性。mutation 驗證：錯誤 signature
+   （run_key, updated_at）套 014 後修正為
+   （run_key, resolved_at, updated_at）；兩索引設 INVISIBLE 套 014 後
+   回復 visible；重跑 exit 0。
+2. **P2 偏斜 regression 用的是估算值**：`EXPLAIN FORMAT=JSON` 的
+   `rows_examined_per_scan` 是 optimizer estimate（空結果也可能估算為
+   1）。修正：偏斜測試改用 `EXPLAIN ANALYZE`（實際執行查詢），解析
+   part_quarantine 節點的 `(actual time=... rows=N)`，斷言實際只掃 1 列
+   ——與 reviewer 獨立實測（9,999 已處置 + 1 未處置，實際 index lookup
+   1 筆、無 sort、約 0.03 ms）一致。
+3. **P2 scheduler image 未全數 rebuild**：nhtsa-scheduler 與
+   queue-scheduler 仍是舊 image。修正：三個 scheduler（scheduler /
+   nhtsa-scheduler / queue-scheduler）與 admin / station-admin 全部
+   rebuild，核心程式與 db/catalog.sql 的 image 內 hash 與 HEAD 逐一比對
+   MATCH。
+4. **P3 cleanup 仍可能遮蔽原始錯誤**：任一 DELETE 失敗會中止剩餘清理並
+   以 cleanup exception 取代原始測試例外。修正：每個 DELETE 獨立
+   try/except，失敗只紀錄、繼續清理其餘資料表；只有當沒有原始例外在
+   飛行中（`sys.exc_info()[0] is None`）才 raise cleanup 錯誤。
+5. **P3 state=all 測試不應要求 filesort 必須存在**：需求是接受低頻
+   state=all 路徑的 filesort，不是禁止未來消除它。修正：測試改為只斷言
+   無 `FORCE INDEX` / `STRAIGHT_JOIN` hint 與排序語意，不鎖定 filesort
+   存在與否（filesort 可能隨資料量或 optimizer 改善而消失）。
+6. **P3 FastAPI pageSize 錯誤訊息漏列 30**：`_validate_page_size` 改為
+   動態列出 `sorted(ALLOWED_PAGE_SIZES)`（10、25、30、50、100、200），
+   新增契約測試：pageSize=30 回 200、pageSize=7 回 422 且訊息含全部允許
+   值。
+7. **P3 Round-8 文件缺實際 hash 與 migration EOF newline**：本節起頭改
+   為明確 commit 鏈（`0b26a20` → `4b6120f` → `81724bd`）；migration
+   013 與 014 補 EOF newline。
+
+完整 gate：`373 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
+ruff check/format 全過、`git diff --check` 無輸出、migration 014 在主
+DB 與測試 DB 重跑 exit 0、五個 service image 全部 rebuild 且核心檔案
+hash 與 HEAD 一致。

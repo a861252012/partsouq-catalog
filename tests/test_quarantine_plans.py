@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import sys
 import uuid
 from collections.abc import Iterator
 
@@ -113,28 +115,26 @@ def _explain_plan_keys(
     return keys
 
 
-def _explain_part_quarantine_rows_examined(
+def _explain_analyze_part_quarantine_rows(
     connection: Connection[DictCursor],
     sql: str,
     params: tuple[object, ...],
 ) -> int:
-    plan = _explain_json(connection, sql, params)
-    rows: list[int] = []
-
-    def visit(value: object) -> None:
-        if isinstance(value, dict):
-            if value.get("table_name") == "part_quarantine":
-                examined = value.get("rows_examined_per_scan")
-                if isinstance(examined, (int, float)):
-                    rows.append(int(examined))
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-
-    visit(plan)
-    return max(rows) if rows else -1
+    """Run EXPLAIN ANALYZE (which executes the query) and return the actual
+    rows examined at the part_quarantine node. Unlike EXPLAIN FORMAT=JSON's
+    rows_examined_per_scan this is an executed measurement, not an
+    optimizer estimate (an empty result can be estimated as 1)."""
+    with connection.cursor() as cursor:
+        cursor.execute("EXPLAIN ANALYZE " + sql, params)
+        text = str(cursor.fetchone()["EXPLAIN"])
+    examined: list[int] = []
+    for line in text.splitlines():
+        if "part_quarantine" not in line:
+            continue
+        match = re.search(r"\(actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", line)
+        if match:
+            examined.append(int(match.group(1)))
+    return max(examined) if examined else -1
 
 
 def _seed_chain(
@@ -215,20 +215,40 @@ def _seed_chain(
 
 def _cleanup_chain(connection: Connection[DictCursor], rows: dict[str, object]) -> None:
     """Delete seeded rows child-first; every statement is conditional on the
-    id having been produced, so a partial seed never masks the original error
-    and never leaves orphaned rows."""
+    id having been produced, so a partial seed never leaves orphaned rows.
+    Each statement is isolated: a failed DELETE records the error and the
+    remaining tables are still cleaned up. Cleanup errors are re-raised only
+    when no original exception is in flight, so they never mask the error
+    the test body raised."""
+    cleanup_errors: list[str] = []
+    statements: list[tuple[str, str, tuple[object, ...]]] = []
+    if "group_id" in rows:
+        statements.append(
+            (
+                "part_quarantine",
+                "DELETE FROM part_quarantine WHERE group_id = %s",
+                (rows["group_id"],),
+            )
+        )
+        statements.append(("groups_t", "DELETE FROM groups_t WHERE id = %s", (rows["group_id"],)))
+    if "category_id" in rows:
+        statements.append(
+            ("categories", "DELETE FROM categories WHERE id = %s", (rows["category_id"],))
+        )
+    if "vehicle_id" in rows:
+        statements.append(("vehicles", "DELETE FROM vehicles WHERE id = %s", (rows["vehicle_id"],)))
+    if "model_id" in rows:
+        statements.append(("models", "DELETE FROM models WHERE id = %s", (rows["model_id"],)))
+    if "brand_id" in rows:
+        statements.append(("brands", "DELETE FROM brands WHERE id = %s", (rows["brand_id"],)))
     with connection.cursor() as cursor:
-        if "group_id" in rows:
-            cursor.execute("DELETE FROM part_quarantine WHERE group_id = %s", (rows["group_id"],))
-            cursor.execute("DELETE FROM groups_t WHERE id = %s", (rows["group_id"],))
-        if "category_id" in rows:
-            cursor.execute("DELETE FROM categories WHERE id = %s", (rows["category_id"],))
-        if "vehicle_id" in rows:
-            cursor.execute("DELETE FROM vehicles WHERE id = %s", (rows["vehicle_id"],))
-        if "model_id" in rows:
-            cursor.execute("DELETE FROM models WHERE id = %s", (rows["model_id"],))
-        if "brand_id" in rows:
-            cursor.execute("DELETE FROM brands WHERE id = %s", (rows["brand_id"],))
+        for table, statement, params in statements:
+            try:
+                cursor.execute(statement, params)
+            except Exception as error:
+                cleanup_errors.append(f"{table}: {error}")
+    if cleanup_errors and sys.exc_info()[0] is None:
+        raise RuntimeError("cleanup failed: " + "; ".join(cleanup_errors))
 
 
 @pytest.fixture
@@ -360,20 +380,31 @@ def _station_list_quarantine_sql(state: str, run_key: str | None) -> tuple[str, 
 
 
 def test_quarantine_index_preflight(seeded_quarantine_rows: dict[str, object]) -> None:
-    """Both FORCE INDEX names used by app.py and repository.py must exist in
-    the schema and the superseded 013 index must be gone. Without this,
-    a migration/code name drift reproduces the round-8 P1 (MySQL 1176,
-    both backends 500 on run_key queries)."""
+    """Both FORCE INDEX names used by app.py and repository.py must exist
+    with their exact column order and stay visible; the superseded 013
+    index must be gone. Guards round-8 P1 (MySQL 1176, both backends 500
+    on run_key queries) and round-9 P2: a name-only check would pass a
+    same-name index with the wrong column order or an INVISIBLE index,
+    which still makes FORCE INDEX fail with 1176."""
     connection = seeded_quarantine_rows["connection"]
+    expected = {
+        "idx_quarantine_list": "resolved_at,updated_at",
+        RUN_KEY_RESOLVED_UPDATED_INDEX: "run_key,resolved_at,updated_at",
+    }
     with connection.cursor() as cursor:
-        for index_name in ("idx_quarantine_list", RUN_KEY_RESOLVED_UPDATED_INDEX):
+        for index_name, columns in expected.items():
             cursor.execute(
-                "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
+                "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols, "
+                "MAX(IS_VISIBLE) AS visible "
+                "FROM information_schema.STATISTICS "
                 "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
                 "AND INDEX_NAME = %s",
                 (index_name,),
             )
-            assert cursor.fetchone()["n"] == 1, index_name
+            row = cursor.fetchone()
+            assert row is not None, index_name
+            assert row["cols"] == columns, index_name
+            assert row["visible"] == "YES", index_name
         cursor.execute(
             "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
@@ -417,27 +448,33 @@ def test_station_admin_unresolved_queries_have_no_filesort(
     )
 
 
-def test_admin_all_state_run_key_path_uses_filesort(
+def test_admin_all_state_run_key_does_not_force_plan(
     seeded_quarantine_rows: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = seeded_quarantine_rows["connection"]
+    """state=all keeps unresolved-first ordering on a low-frequency history
+    view; the design accepts a filesort here, so this pins only the absence
+    of FORCE INDEX / STRAIGHT_JOIN hints and the ordering semantics — not
+    the presence of filesort, which may legitimately disappear as data
+    volume grows or the optimizer improves."""
     run_key = str(seeded_quarantine_rows["run_key"])
     sql, params = _admin_list_quarantine_sql(monkeypatch, "all", run_key)
     assert "FORCE INDEX" not in sql
     assert "STRAIGHT_JOIN" not in sql
-    assert _explain_json_has_filesort(connection, sql, params)
 
 
-def test_station_admin_all_state_run_key_path_uses_filesort(
+def test_station_admin_all_state_run_key_does_not_force_plan(
     seeded_quarantine_rows: dict[str, object],
 ) -> None:
-    connection = seeded_quarantine_rows["connection"]
+    """state=all keeps unresolved-first ordering on a low-frequency history
+    view; the design accepts a filesort here, so this pins only the absence
+    of FORCE INDEX / STRAIGHT_JOIN hints and the ordering semantics — not
+    the presence of filesort, which may legitimately disappear as data
+    volume grows or the optimizer improves."""
     run_key = str(seeded_quarantine_rows["run_key"])
     sql, params = _station_list_quarantine_sql("all", run_key)
     assert "FORCE INDEX" not in sql
     assert "STRAIGHT_JOIN" not in sql
-    assert _explain_json_has_filesort(connection, sql, params)
 
 
 def test_admin_all_state_keeps_unresolved_first(
@@ -483,7 +520,7 @@ def test_admin_unresolved_run_key_skewed_data_scans_only_open_rows(
     assert part_numbers == [str(seeded_skewed_quarantine_rows["open_number"])]
     sql, params = _admin_list_quarantine_sql(monkeypatch, "unresolved", run_key)
     assert not _explain_json_has_filesort(connection, sql, params)
-    assert _explain_part_quarantine_rows_examined(connection, sql, params) == 1
+    assert _explain_analyze_part_quarantine_rows(connection, sql, params) == 1
 
 
 def test_station_admin_unresolved_run_key_skewed_data_scans_only_open_rows(
@@ -502,4 +539,4 @@ def test_station_admin_unresolved_run_key_skewed_data_scans_only_open_rows(
     assert part_numbers == [str(seeded_skewed_quarantine_rows["open_number"])]
     sql, params = _station_list_quarantine_sql("unresolved", run_key)
     assert not _explain_json_has_filesort(connection, sql, params)
-    assert _explain_part_quarantine_rows_examined(connection, sql, params) == 1
+    assert _explain_analyze_part_quarantine_rows(connection, sql, params) == 1

@@ -241,6 +241,43 @@ def test_quarantine_http_accepts_pageSize_alias_and_page(
     assert "resolved_at IS NULL" not in queries[0][0]
 
 
+def test_quarantine_http_page_size_error_lists_all_allowed_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SOL review round 9 P3：ALLOWED_PAGE_SIZES 含 30，錯誤訊息必須
+    完整列出所有允許值（含 30），否則前端照訊息送 30 會被拒絕。"""
+    from fastapi.testclient import TestClient
+
+    from partsouq_admin.app import ALLOWED_PAGE_SIZES
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
+        return {"n": 0}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+
+    with TestClient(admin_app.app) as client:
+        response = client.get(
+            "/api/quarantine?state=unresolved&pageSize=30",
+            headers={"X-Admin-Token": "test-token"},
+        )
+        invalid = client.get(
+            "/api/quarantine?state=unresolved&pageSize=7",
+            headers={"X-Admin-Token": "test-token"},
+        )
+
+    assert response.status_code == 200
+    assert invalid.status_code == 422
+    detail = invalid.json()["detail"]
+    for size in sorted(ALLOWED_PAGE_SIZES):
+        assert str(size) in detail
+    assert "30" in detail
+
+
 def test_quarantine_admin_html_has_pagination_ui_and_valid_js() -> None:
     """SOL review P1：前端必須有真正的分頁控制（頁碼、上一頁／下一頁、
     每頁筆數），且整份 inline JS 語法正確。"""

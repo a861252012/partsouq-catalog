@@ -226,7 +226,7 @@ def _validate_page_size(page_size: int) -> None:
     if page_size not in ALLOWED_PAGE_SIZES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="pageSize 僅允許 10、25、50、100、200",
+            detail="pageSize 僅允許 " + "、".join(str(size) for size in sorted(ALLOWED_PAGE_SIZES)),
         )
 
 
