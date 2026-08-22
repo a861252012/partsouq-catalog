@@ -779,7 +779,9 @@ class AdminRepository:
         # 否則 MySQL 會依資料量自由切換（例如改由 groups_t 驅動）而退回
         # filesort。state=all 的排序含表達式，不做此鎖定。
         if state == "unresolved":
-            index_name = "idx_quarantine_run_key_updated" if run_key else "idx_quarantine_list"
+            index_name = (
+                "idx_quarantine_run_key_resolved_updated" if run_key else "idx_quarantine_list"
+            )
             from_clause = (
                 f"FROM part_quarantine FORCE INDEX ({index_name}) "
                 f"STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id"

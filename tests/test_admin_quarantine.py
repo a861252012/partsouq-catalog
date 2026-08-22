@@ -40,7 +40,7 @@ def test_quarantine_list_filters_unresolved_and_paginates(
     assert count_params == ("bounded-1",)
     assert "LIMIT %s OFFSET %s" in list_sql
     assert list_params == ("bounded-1", 25, 0)
-    assert "FORCE INDEX (idx_quarantine_run_key_updated)" in list_sql
+    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in list_sql
     assert "STRAIGHT_JOIN groups_t" in list_sql
     assert "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC" in list_sql
     assert "resolved_at IS NOT NULL" not in list_sql
@@ -115,7 +115,7 @@ def test_quarantine_unresolved_uses_forced_ordered_index(
 
     assert "FORCE INDEX (idx_quarantine_list)" in captured[0]
     assert "STRAIGHT_JOIN groups_t" in captured[0]
-    assert "FORCE INDEX (idx_quarantine_run_key_updated)" in captured[1]
+    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in captured[1]
     assert "STRAIGHT_JOIN groups_t" in captured[1]
 
 

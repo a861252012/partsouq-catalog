@@ -612,3 +612,49 @@ GPT5.6 SOL MAX 覆核 `5144619` 後指出 3 個 P2 + 1 個 P3 + 1 個 P2
 完整 gate：`368 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
 ruff check/format 全過、`git diff --check` 無輸出、migration 013 兩次
 重跑 exit 0、image 執行中檔案 hash 與 HEAD 一致。
+
+### SOL review 第八輪（2026-08-22，`31cdb7b` 之後）
+
+GPT5.6 SOL MAX 覆核 `31cdb7b` 後指出 1 個 P1 + 3 個 P2；已全數修正並
+commit 為本節末尾 hash（已 push 到 origin/main）：
+
+1. **P1 主 DB 漏套 migration 013，run_key 查詢實際 500**：README 的既有
+   volume 升級清單停在 migration 012，主 DB 沒有
+   `idx_quarantine_run_key_updated`，但程式已 `FORCE INDEX` → MySQL
+   `1176 Key doesn't exist`，兩套後台帶 run_key 皆 500。修正：README
+   升級清單補上 migration 013 與 014 兩行；主 DB 實際套用 013 + 014
+   （exit 0）；rebuild 後驗證 FastAPI 與 station-admin 各帶/不帶 run_key
+   共四種組合全回 200。
+2. **P2 migration 013 的 (run_key, updated_at) 在偏斜資料下更慢**：
+   交易內 10,000 列（9,999 已處置 + 1 未處置）實測：新索引掃 10,000 列
+   （約 4.86 ms），既有 (run_key, resolved_at) 只掃 1 列（約 0.0175
+   ms）—— 索引缺 resolved_at 就無法用索引過濾「未處置」。修正：
+   migration 014 移除 013 的索引，改為
+   `idx_quarantine_run_key_resolved_updated (run_key, resolved_at,
+   updated_at)`；run_key 等值 + `resolved_at IS NULL` 形成連續範圍，
+   範圍內依 (updated_at, 隱含 PK id) 排序，Backward index scan 直接
+   滿足 `ORDER BY updated_at DESC, id DESC`。10,000 列偏斜情境實測
+   EXPLAIN：`ref idx_quarantine_run_key_resolved_updated`、
+   `rows_examined_per_scan = 1`、無 filesort。catalog.sql 同步、
+   測試 DB 與主 DB 都套用 014（重跑 exit 0、postflight 確認舊索引已
+   移除）。
+3. **P2 四路矩陣缺 all + run_key**：`tests/test_quarantine_plans.py`
+   補齊兩套後台的 all + run_key 真實資料排序測試（未處置仍排在較新的
+   已處置前）與計畫測試（無 hint、filesort 存在）；unresolved 兩路
+   維持無 filesort + 預期索引斷言（idx_quarantine_list /
+   idx_quarantine_run_key_resolved_updated）。另補偏斜資料 regression
+   （2,000 已處置 + 1 未處置，斷言 `rows_examined_per_scan == 1` 且
+   結果只有未處置列）。preflight 測試改為斷言新索引存在 + 舊索引
+   （idx_quarantine_run_key_updated）不存在。
+4. **P2 seed 失敗會遮蔽原始錯誤**：fixture 改為逐步保存每筆 INSERT 的
+   id，cleanup 對每個 id 條件式刪除（子表到父表）；seed 中途失敗不會
+   再以 KeyError 遮蔽根因，也不留孤立資料。
+
+state=all 兩路（無/有 run_key）的 filesort 仍為使用者裁決的可接受
+設計；注意 filesort 是否存在與資料量有關（極小資料量 MySQL 可直接
+跳過排序），文件以 unresolved 兩路「保證無 filesort」與 all 兩路的
+排序語意為準。
+
+完整 gate：`372 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
+ruff check/format 全過、`git diff --check` 無輸出、migration 013/014
+在主 DB 與測試 DB 皆重跑 exit 0、image 執行中檔案 hash 與 HEAD 一致。

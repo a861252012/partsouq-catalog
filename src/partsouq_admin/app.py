@@ -1318,7 +1318,7 @@ def list_quarantine(
     if state == "unresolved":
         from_clause = (
             f"FROM part_quarantine FORCE INDEX ("
-            f"{'idx_quarantine_run_key_updated' if run_key else 'idx_quarantine_list'}) "
+            f"{'idx_quarantine_run_key_resolved_updated' if run_key else 'idx_quarantine_list'}) "
             f"STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id"
         )
     else:
