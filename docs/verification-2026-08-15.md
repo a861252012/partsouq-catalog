@@ -569,7 +569,7 @@ ruff check/format 全過、`git diff --check` 無輸出、migration 012 兩次
 ### SOL review 第七輪（2026-08-22，`5144619` 之後）
 
 GPT5.6 SOL MAX 覆核 `5144619` 後指出 3 個 P2 + 1 個 P3 + 1 個 P2
-（uvicorn 啟動等待）；已全數修正並 commit 為本節末尾 hash（已 push
+（uvicorn 啟動等待）；已全數修正並 commit 為 `23cd69f`（已 push
 到 origin/main）：
 
 1. **P2 四種查詢組合的 filesort 只消除一條路徑**：實際 EXPLAIN 矩陣
