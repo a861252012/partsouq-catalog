@@ -360,15 +360,20 @@ def _station_list_quarantine_sql(state: str, run_key: str | None) -> tuple[str, 
 
 
 def test_quarantine_index_preflight(seeded_quarantine_rows: dict[str, object]) -> None:
+    """Both FORCE INDEX names used by app.py and repository.py must exist in
+    the schema and the superseded 013 index must be gone. Without this,
+    a migration/code name drift reproduces the round-8 P1 (MySQL 1176,
+    both backends 500 on run_key queries)."""
     connection = seeded_quarantine_rows["connection"]
     with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
-            "AND INDEX_NAME = %s",
-            (RUN_KEY_RESOLVED_UPDATED_INDEX,),
-        )
-        assert cursor.fetchone()["n"] == 1
+        for index_name in ("idx_quarantine_list", RUN_KEY_RESOLVED_UPDATED_INDEX):
+            cursor.execute(
+                "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
+                "AND INDEX_NAME = %s",
+                (index_name,),
+            )
+            assert cursor.fetchone()["n"] == 1, index_name
         cursor.execute(
             "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'part_quarantine' "
