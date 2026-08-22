@@ -777,7 +777,10 @@ class AdminRepository:
         # 預設 unresolved 路徑是索引可服務的 ORDER BY；FORCE INDEX +
         # STRAIGHT_JOIN 鎖定「part_quarantine 驅動 + 反向掃描」的執行計畫，
         # 否則 MySQL 會依資料量自由切換（例如改由 groups_t 驅動）而退回
-        # filesort。state=all 的排序含表達式，不做此鎖定。
+        # filesort。run_key 路徑用 (run_key, resolved_at, updated_at)：等值
+        # run_key + resolved_at IS NULL 形成連續索引範圍，範圍內反向掃描
+        # 滿足 ORDER BY，偏斜資料（大量已處置 + 少數未處置）時只掃未處置
+        # 列。state=all 的排序含表達式，不做此鎖定。
         if state == "unresolved":
             index_name = (
                 "idx_quarantine_run_key_resolved_updated" if run_key else "idx_quarantine_list"
