@@ -307,6 +307,8 @@ def test_quarantine_list_filters_unresolved_and_run_key() -> None:
     assert count_call.params == ("bounded-1",)
     assert "part_quarantine.resolved_at IS NULL" in list_call.sql
     assert "JOIN groups_t" in list_call.sql
+    assert "FORCE INDEX (idx_quarantine_run_key_updated)" in list_call.sql
+    assert "STRAIGHT_JOIN groups_t" in list_call.sql
     assert "ORDER BY part_quarantine.updated_at DESC," in list_call.sql
     assert "part_quarantine.id DESC" in list_call.sql
     assert "resolved_at IS NOT NULL" not in list_call.sql
@@ -321,6 +323,26 @@ def test_quarantine_list_all_state_has_no_resolved_filter() -> None:
 
     sql = "\n".join(call.sql for call in database.calls)
     assert "resolved_at IS NULL" not in sql
+    assert "(part_quarantine.resolved_at IS NOT NULL)" in sql
+    assert sql.index("(part_quarantine.resolved_at IS NOT NULL)") < sql.index(
+        "part_quarantine.updated_at DESC"
+    )
+    assert "FORCE INDEX" not in sql
+    assert "STRAIGHT_JOIN" not in sql
+
+
+def test_quarantine_unresolved_uses_forced_ordered_index() -> None:
+    trace = QueryTrace()
+    database = ScriptedDatabase(trace)
+
+    AdminRepository(database).list_quarantine(state="unresolved", limit=10)
+    AdminRepository(database).list_quarantine(state="unresolved", run_key="bounded-1", limit=10)
+
+    calls = [call for call in database.calls if call.tag == "quarantine.list"]
+    assert "FORCE INDEX (idx_quarantine_list)" in calls[0].sql
+    assert "STRAIGHT_JOIN groups_t" in calls[0].sql
+    assert "FORCE INDEX (idx_quarantine_run_key_updated)" in calls[1].sql
+    assert "STRAIGHT_JOIN groups_t" in calls[1].sql
 
 
 def test_quarantine_resolve_updates_row_in_transaction() -> None:

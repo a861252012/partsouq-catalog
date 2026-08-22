@@ -1302,25 +1302,47 @@ def list_quarantine(
     if run_key:
         clause += " AND part_quarantine.run_key = %s"
         params.append(run_key)
+    # state=all 依使用者裁決恢復「未處置優先」：resolved_at IS NULL 的列
+    # （表達式 0）排在已處置列（1）前面，再依 updated_at DESC, id DESC
+    # 確保分頁排序穩定。此路徑為低頻歷史檢視，filesort 屬可接受設計。
+    order_by = (
+        "ORDER BY (part_quarantine.resolved_at IS NOT NULL), "
+        "part_quarantine.updated_at DESC, part_quarantine.id DESC"
+        if state == "all"
+        else "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC"
+    )
+    # 預設 unresolved 路徑是索引可服務的 ORDER BY；FORCE INDEX +
+    # STRAIGHT_JOIN 鎖定「part_quarantine 驅動 + 反向掃描」的執行計畫，
+    # 否則 MySQL 會依資料量自由切換（例如改由 groups_t 驅動）而退回
+    # filesort。state=all 的排序含表達式，不做此鎖定。
+    if state == "unresolved":
+        from_clause = (
+            f"FROM part_quarantine FORCE INDEX ("
+            f"{'idx_quarantine_run_key_updated' if run_key else 'idx_quarantine_list'}) "
+            f"STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id"
+        )
+    else:
+        from_clause = "FROM part_quarantine JOIN groups_t ON groups_t.id = part_quarantine.group_id"
     total = _fetch_one(f"SELECT COUNT(*) AS n FROM part_quarantine {clause}", tuple(params))["n"]
+    total_pages = max(1, (int(total) + page_size - 1) // page_size)
+    current_page = min(page, total_pages)
     rows = _fetch_all(
         f"SELECT part_quarantine.id, part_quarantine.part_number, "
         f"part_quarantine.range_str, part_quarantine.reason, part_quarantine.code, "
         f"part_quarantine.quantity, part_quarantine.note, part_quarantine.run_key, "
         f"part_quarantine.resolved_at, part_quarantine.resolution, "
         f"part_quarantine.updated_at, groups_t.code AS group_code, groups_t.uid "
-        f"FROM part_quarantine "
-        f"JOIN groups_t ON groups_t.id = part_quarantine.group_id {clause} "
-        f"ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC "
+        f"{from_clause} {clause} "
+        f"{order_by} "
         f"LIMIT %s OFFSET %s",
-        (*params, page_size, (page - 1) * page_size),
+        (*params, page_size, (current_page - 1) * page_size),
     )
     return {
         "items": rows,
-        "page": page,
+        "page": current_page,
         "pageSize": page_size,
         "total": int(total),
-        "totalPages": (int(total) + page_size - 1) // page_size,
+        "totalPages": total_pages,
     }
 
 

@@ -326,14 +326,23 @@ def _running_admin_server(database: E2EDatabase) -> Iterator[str]:
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
+    started = False
     try:
+        deadline = time.monotonic() + 30
         while not server.started:
-            time.sleep(0.01)
+            if not thread.is_alive():
+                raise RuntimeError("uvicorn server thread exited before startup completed")
+            if time.monotonic() > deadline:
+                raise TimeoutError("uvicorn server failed to start within 30 seconds")
+            time.sleep(0.02)
+        started = True
         port = server.servers[0].sockets[0].getsockname()[1]
         yield f"http://127.0.0.1:{port}"
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+        if not started and thread.is_alive():
+            raise RuntimeError("uvicorn server still running after failed startup")
 
 
 def _launch_chromium(playwright: Playwright) -> Browser:

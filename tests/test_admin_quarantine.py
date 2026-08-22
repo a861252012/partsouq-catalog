@@ -40,6 +40,8 @@ def test_quarantine_list_filters_unresolved_and_paginates(
     assert count_params == ("bounded-1",)
     assert "LIMIT %s OFFSET %s" in list_sql
     assert list_params == ("bounded-1", 25, 0)
+    assert "FORCE INDEX (idx_quarantine_run_key_updated)" in list_sql
+    assert "STRAIGHT_JOIN groups_t" in list_sql
     assert "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC" in list_sql
     assert "resolved_at IS NOT NULL" not in list_sql
 
@@ -63,8 +65,79 @@ def test_quarantine_list_all_state_has_no_resolved_filter(
     admin_app.list_quarantine(state="all", page=1, page_size=10)
 
     assert "resolved_at IS NULL" not in captured[0]
-    assert "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC" in captured[1]
-    assert "resolved_at IS NOT NULL" not in captured[1]
+    assert "ORDER BY (part_quarantine.resolved_at IS NOT NULL), " in captured[1]
+    assert "part_quarantine.updated_at DESC, part_quarantine.id DESC" in captured[1]
+    assert "FORCE INDEX" not in captured[1]
+    assert "STRAIGHT_JOIN" not in captured[1]
+
+
+def test_quarantine_all_state_unresolved_first_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
+        captured.append(sql)
+        return {"n": 2}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        captured.append(sql)
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+
+    admin_app.list_quarantine(state="all", page=1, page_size=10)
+    assert "resolved_at IS NULL" not in captured[0]
+    assert "(part_quarantine.resolved_at IS NOT NULL)" in captured[1]
+    assert captured[1].index("(part_quarantine.resolved_at IS NOT NULL)") < captured[1].index(
+        "part_quarantine.updated_at DESC"
+    )
+
+
+def test_quarantine_unresolved_uses_forced_ordered_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
+        return {"n": 2}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        captured.append(sql)
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+
+    admin_app.list_quarantine(state="unresolved", page=1, page_size=10)
+    admin_app.list_quarantine(state="unresolved", run_key="bounded-1", page=1, page_size=10)
+
+    assert "FORCE INDEX (idx_quarantine_list)" in captured[0]
+    assert "STRAIGHT_JOIN groups_t" in captured[0]
+    assert "FORCE INDEX (idx_quarantine_run_key_updated)" in captured[1]
+    assert "STRAIGHT_JOIN groups_t" in captured[1]
+
+
+def test_quarantine_out_of_range_page_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    queries: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture_one(sql: str, params: tuple[object, ...] = ()) -> dict:
+        return {"n": 50}
+
+    def capture_all(sql: str, params: tuple[object, ...] = ()) -> list[dict]:
+        queries.append((sql, params))
+        return []
+
+    monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+
+    result = admin_app.list_quarantine(state="unresolved", page=2, page_size=50)
+
+    assert result["page"] == 1
+    assert result["totalPages"] == 1
+    list_sql, list_params = queries[0]
+    assert list_params == (50, 0)
 
 
 def test_quarantine_resolve_marks_row(monkeypatch: pytest.MonkeyPatch) -> None:

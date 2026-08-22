@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS part_quarantine (
   KEY idx_quarantine_group (group_id),
   KEY idx_quarantine_resolved (run_key, resolved_at),
   KEY idx_quarantine_list (resolved_at, updated_at),
+  KEY idx_quarantine_run_key_updated (run_key, updated_at),
   CONSTRAINT fk_quarantine_group FOREIGN KEY (group_id)
     REFERENCES groups_t(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

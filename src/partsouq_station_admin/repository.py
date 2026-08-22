@@ -765,6 +765,29 @@ class AdminRepository:
         total_pages = max(1, math.ceil(total / limit))
         current_page = min(page, total_pages)
         offset = (current_page - 1) * limit
+        # state=all 依使用者裁決恢復「未處置優先」：resolved_at IS NULL 的列
+        # （表達式 0）排在已處置列（1）前面，再依 updated_at DESC, id DESC
+        # 確保分頁排序穩定。此路徑為低頻歷史檢視，filesort 屬可接受設計。
+        order_by = (
+            "ORDER BY (part_quarantine.resolved_at IS NOT NULL), "
+            "part_quarantine.updated_at DESC, part_quarantine.id DESC"
+            if state == "all"
+            else "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC"
+        )
+        # 預設 unresolved 路徑是索引可服務的 ORDER BY；FORCE INDEX +
+        # STRAIGHT_JOIN 鎖定「part_quarantine 驅動 + 反向掃描」的執行計畫，
+        # 否則 MySQL 會依資料量自由切換（例如改由 groups_t 驅動）而退回
+        # filesort。state=all 的排序含表達式，不做此鎖定。
+        if state == "unresolved":
+            index_name = "idx_quarantine_run_key_updated" if run_key else "idx_quarantine_list"
+            from_clause = (
+                f"FROM part_quarantine FORCE INDEX ({index_name}) "
+                f"STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id"
+            )
+        else:
+            from_clause = (
+                "FROM part_quarantine JOIN groups_t ON groups_t.id = part_quarantine.group_id"
+            )
         rows = self.database.fetch_all(
             "quarantine.list",
             f"""
@@ -775,11 +798,9 @@ class AdminRepository:
                    part_quarantine.resolved_at, part_quarantine.resolution,
                    part_quarantine.updated_at,
                    groups_t.code AS group_code, groups_t.uid
-            FROM part_quarantine
-            JOIN groups_t ON groups_t.id = part_quarantine.group_id
+            {from_clause}
             {clause}
-            ORDER BY part_quarantine.updated_at DESC,
-                     part_quarantine.id DESC
+            {order_by}
             LIMIT %s OFFSET %s
             """,
             (*params, limit, offset),

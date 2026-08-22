@@ -526,8 +526,9 @@ GPT5.6 SOL MAX 覆核 `ff66574` 後指出 2 個 P1 + 3 個 P2 + P3 文件；
 ### SOL review 第六輪（2026-08-22，`d3142d2` 之後）
 
 GPT5.6 SOL MAX 覆核 `d3142d2` 後指出 1 個 P1 + 2 個 P2 + P3 文件 +
-FastAPI 處置列欄位錯位；已全數修正並 commit 為本節末尾 hash（已 push
-到 origin/main）：
+FastAPI 處置列欄位錯位；已全數修正並 commit 為
+`eef6142`（程式修正）與 `5144619`（文件修正，已 push 到
+origin/main）：
 
 1. **P1 無 token 初次載入會破壞 Quarantine 分頁狀態**：`refresh()` 在
    無 token 時把 `quarantine` 設成 `[]`，但 `renderQuarantine()` 預期
@@ -556,9 +557,58 @@ FastAPI 處置列欄位錯位；已全數修正並 commit 為本節末尾 hash�
    （缺少動作欄的空白格），已處置列補空 `<td>`；瀏覽器回歸測試斷言
    未處置與已處置列都是 8 個 `<td>`。
 5. **P3 文件**：第五輪章節更新為「已全數修正並 commit 為 `d3142d2`
-   （已 push）」；新增本第六輪章節，附本輪 commit hash。
+   （已 push）」；新增本第六輪章節。`eef6142` 為程式修正 commit，
+   `5144619` 為後續文件 commit（round-2 標頭改引 `90d858e`、round-4
+   標頭改引實際 hash）。
 
 完整 gate：`359 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
 ruff check/format 全過、`git diff --check` 無輸出、migration 012 兩次
 重跑 exit 0、三個 image 的執行中檔案 hash 與 HEAD 一致、CloakBrowser
 容器實測 `CDP_READY 146.0.7680.177`。
+
+### SOL review 第七輪（2026-08-22，`5144619` 之後）
+
+GPT5.6 SOL MAX 覆核 `5144619` 後指出 3 個 P2 + 1 個 P3 + 1 個 P2
+（uvicorn 啟動等待）；已全數修正並 commit 為本節末尾 hash（已 push
+到 origin/main）：
+
+1. **P2 四種查詢組合的 filesort 只消除一條路徑**：實際 EXPLAIN 矩陣
+   顯示 unresolved 無 run_key 之外，all 無 run_key、unresolved 有
+   run_key、all 有 run_key 仍 `Using filesort`；且 `state=all` 的
+   「未處置優先」語意在第六輪被一併移除。使用者 2026-08-22 裁決：
+   **只恢復 state=all 的未處置優先，unresolved 維持純時間排序**。
+   - `state=unresolved`：維持 `ORDER BY updated_at DESC, id DESC`，
+     並以 `FORCE INDEX (idx_quarantine_list | idx_quarantine_run_key_
+     updated) STRAIGHT_JOIN` 鎖定「part_quarantine 驅動 + 反向掃描」
+     執行計畫 —— 實測 MySQL 8.4 在資料量小時會改由 groups_t 驅動
+     而退回 filesort，鎖定後四種資料量下 EXPLAIN 都是 `ref` +
+     eq_ref、無 filesort（unresolved 兩條路徑）。
+   - `state=all`：恢復 `ORDER BY (resolved_at IS NOT NULL),
+     updated_at DESC, id DESC`（未處置優先、分頁穩定）。排序含
+     表達式，filesort 屬可接受設計（使用者裁決：低頻歷史檢視，
+     不為此加 generated column）。
+   - migration 013 新增 `idx_quarantine_run_key_updated
+     (run_key, updated_at)`（隱含 PK id 尾欄），unresolved + run_key
+     路徑不再靠 idx_quarantine_resolved + filesort。
+2. **P2 FastAPI 分頁沒有修正越界頁碼**：station-admin 會 clamp
+   `current_page = min(page, total_pages)`，FastAPI admin 不會 ——
+   page=2、pageSize=50、total=50 時前端得到「顯示 51 到 50」、
+   value=2/max=1。FastAPI 比照 clamp 後才算 OFFSET 並回傳
+   `page = current_page`；新增越界頁碼單元測試（page=2 → 回 page=1、
+   OFFSET 0）。
+3. **P2 新 E2E server 啟動可能永久等待**：`while not server.started`
+   沒有 deadline，也沒有檢查 uvicorn thread 是否已失敗結束。加入
+   30 秒 startup timeout、`thread.is_alive()` 檢查、失敗時
+   `should_exit` 清理並 raise。
+4. **P3 第六輪章節缺實際 hash**：本節已改為明確標示 `eef6142` 與
+   `5144619`。
+5. **查詢計畫回歸驗證**（code-comment 要求）：新增
+   `tests/test_quarantine_plans.py`（MySQL gated）—— 對四種 UI 查詢
+   組合以兩套後台的實際 SQL 跑 `EXPLAIN FORMAT=JSON`，斷言 unresolved
+   兩條路徑（無/有 run_key）均無 `using_filesort` 且使用預期索引；
+   state=all 兩條路徑以真實資料斷言「已處置列即使 updated_at 較新，
+   未處置列仍排前面」。
+
+完整 gate：`368 passed`（含 MySQL gated + 真實 Chrome 兩個 E2E）、
+ruff check/format 全過、`git diff --check` 無輸出、migration 013 兩次
+重跑 exit 0、image 執行中檔案 hash 與 HEAD 一致。
