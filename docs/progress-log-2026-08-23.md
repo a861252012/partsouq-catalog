@@ -4,6 +4,7 @@
 
 | Commit | 內容 | Remote |
 |---|---|---|
+| `d0b328a` | 凍結最終交接與最新阻擋證據 | 已 push `origin/main` |
 | `b7711d4` | 完成最終交接與現況查證紀錄 | 已 push `origin/main` |
 | `f80483e` | 更新最終交接與正式資料缺口 | 已 push `origin/main` |
 | `e687c4b` | diagnostic exact contract、fresh cleanup、真 MySQL 404 交易測試 | 已 push `origin/main` |
@@ -255,3 +256,29 @@
    LaunchAgent的`launchctl print`皆exit 113。
 10. Git在本次文件修改前仍為`HEAD == origin/main == 3f8d4e6`；程式工作樹23 tracked
     modified、2 untracked，tracked diff約`+4135/-617`。
+
+## 2026-08-23 15:15–15:46 P1修正與第二次交接凍結
+
+1. NHTSA migration legacy recovery改為5秒有向因果窗，要求run↔child雙向唯一；補+5秒通過、
+   +6秒拒絕、1:N、N:1、recent failed child／parent、wrong trigger與候選後CAS mutation案例。
+2. Post-024 hard-kill recovery加入expired lease、stale heartbeat／domain／child、精確parent
+   lineage與active sibling拒絕；同交易將running child失敗、domain interrupted並清lease，必要時
+   收斂running parent。舊error保留且時間不倒退。
+3. migration新增focused真MySQL gate：`10 passed, 38 deselected`；Ruff check／format與
+   `git diff --check`通過。依交接優先指示，未跑migration整檔或完整suite。
+4. NHTSA 304 raw integrity P1已由subagent落盤：conditional前後驗parser、status、verified、
+   rejection、regular file、byte count與SHA-256；200用temporary file＋atomic replace修復tamper。
+   scoped unit＋真MySQL為`57 passed`，品質gate通過；尚未做主代理整合review。
+5. scheduler `_record_start()` release-lock `RuntimeError`與CI／finalization契約由subagent落盤；
+   scoped結果`107 passed`，真MySQL`2 passed`；尚未做主代理整合review。
+6. 尚未實作：VIN payload／artifact／source key exact binding、`replace_datasets` lease scope限制、
+   deterministic lease barrier與完整API orchestration regression。
+7. PartSouq direct bounded explicit `PSQ_BOUNDED_RUN_KEY` bypass仍未修。
+8. 15:46唯讀重查主DB：raw／distinct為10,000／3,823；bounded／published／current為0／0／0；
+   quarantine total／unresolved為2,260／2,260；VIN decode／mapping／fitment為0／0／0；ledger到022。
+9. crawl run5仍是error、target／parts_ok為10,000／10,000、evidence collecting且artifact／record
+   為0／0。NHTSA run1／2仍running；source/current artifacts為6／0。
+10. MySQL、admin、station-admin healthy；queue-scheduler running；catalog／NHTSA LaunchAgent
+    皆未載入。未碰主DB、未啟動Chromium／正式爬蟲、未使用付費服務。
+11. Git仍為`HEAD == origin/main == d0b328a`，ahead／behind 0／0。工作樹25 tracked modified、
+    2 untracked，tracked diff約`+5796/-645`；不得整批提交。
