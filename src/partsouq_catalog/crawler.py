@@ -377,6 +377,48 @@ class Crawler:
             skipped_record_count=skipped_record_count,
         )
 
+    def _capture_http_diagnostic(
+        self,
+        response: CatalogHttpResponse,
+        group_id: int,
+        *,
+        expected_public_url: str,
+        parser_context: Mapping[str, object],
+        reason: str,
+    ) -> int | None:
+        """保存與正式 evidence 隔離的 secret-safe unit 失敗診斷。"""
+
+        if not self.evidence_mode:
+            return None
+        if self.run_id is None or self.scheduled_job_run_id is None:
+            raise RuntimeError("formal diagnostics require crawl and scheduler run ids")
+        response_public_url = public_source_url(response.final_url)
+        if response_public_url != expected_public_url:
+            raise RuntimeError("unit diagnostic response URL does not match its group")
+        sanitized = sanitize_parser_html(response.text)
+        if sanitized.original_bytes > int(CRAWL["evidence_max_body_bytes"]):
+            raise RuntimeError(
+                "unit diagnostic body exceeds configured limit: "
+                f"{sanitized.original_bytes}>{CRAWL['evidence_max_body_bytes']}"
+            )
+        return self.crawl.record_http_diagnostic(
+            self.run_id,
+            self.scheduled_job_run_id,
+            group_id,
+            public_url=response_public_url,
+            raw_body_sha256=response.raw_body_sha256,
+            status_code=response.status_code,
+            content_type=response.content_type,
+            fetched_at=response.fetched_at,
+            elapsed_ms=response.elapsed_ms,
+            attempt=response.attempt,
+            sanitized_body=sanitized,
+            parser_name="parse_parts",
+            parser_version=PARSER_CONTRACT_VERSION,
+            parser_context=parser_context,
+            reason=reason,
+        )
+
     def _bump(self, key: str, n: int = 1) -> None:
         """統計計數累加（鎖保護，避免並行 worker 的 race condition）。"""
         with self.lock:
@@ -731,7 +773,10 @@ class Crawler:
         # SOL P2：wait() 一次可能回傳多個完成 Future，每輪要「依完成
         # 數量」補工，否則多個同時完成時 in-flight 會從 workers*2 掉
         # 到 1、退化成近乎單工；失敗門檻觸發後（gave_up）不再補工。
-        max_inflight = max(2, self.workers * 2)
+        # 有筆數上限時只允許一個 in-flight vehicle。即使 workers 已降為
+        # 1，預送兩個 future 仍可能讓第二台在第一台達標後啟動，並在
+        # run 已結束後寫 evidence，造成 terminal-state race。
+        max_inflight = 1 if self.part_limit else max(2, self.workers * 2)
         futures: dict[Future[None], ParsedRecord] = {}
         pending_iter = iter(pending)
         gave_up = False
@@ -1289,26 +1334,73 @@ class Crawler:
                 group.get("uid"),
             )
 
-        try:
-            html, unit_response = self._fetch(unit_url)
-        except NotFoundError:
-            # 404 = 此 group 在網站端沒有資料（合法狀態）：視為完成，
-            # 不讓整台車失敗（實際發生：部分車型的某些 group 頁 404）。
-            # F1b：404 也是合法的 terminal state，照樣標記本 run 已抓；
-            # F5：status='not_found'，續爬不再重抓 404 組。
+        def finish_not_found() -> bool:
             if self.run_id is None:
-                raise RuntimeError("crawl run is not initialized") from None
+                raise RuntimeError("crawl run is not initialized")
             try:
-                self.parts.clear_group_membership(group_id)
+                if source_group_key is not None:
+                    self.crawl.supersede_http_evidence(
+                        self.run_id,
+                        source_url,
+                        parser_name="parse_parts",
+                        parser_context={"group_key": source_group_key},
+                    )
+                removed = self.parts.clear_group_membership(group_id, self.run_id)
                 self.crawl.mark_group_fetched(group_id, run_key, status="not_found")
                 self.db.commit()
             except Exception:
                 self.db.rollback()
                 raise
+            self._bump("parts", -removed)
             if fetched is not None:
                 fetched[map_key] = 0
             return False
+
+        try:
+            html, unit_response = self._fetch(unit_url)
+        except NotFoundError as error:
+            # 404 = 此 group 在網站端沒有資料（合法狀態）：視為完成，
+            # 不讓整台車失敗（實際發生：部分車型的某些 group 頁 404）。
+            # F1b：404 也是合法的 terminal state，照樣標記本 run 已抓；
+            # F5：status='not_found'，續爬不再重抓 404 組。
+            if self.evidence_mode and (error.response is None or error.response.status_code != 404):
+                raise RuntimeError("formal HTTP 404 is missing its response envelope") from error
+            if error.response is not None and source_group_key is not None:
+                self._capture_http_diagnostic(
+                    error.response,
+                    group_id,
+                    expected_public_url=source_url,
+                    parser_context={"group_key": source_group_key},
+                    reason="http_not_found",
+                )
+                # 先讓診斷獨立落盤；後續 receipt／membership 交易失敗時，
+                # 仍保留可重播的失敗 response 供下一輪排查。
+                self.db.commit()
+            return finish_not_found()
         parts, malformed, skipped_nameless, skipped_rows = parse_parts(html, diagnostics=True)
+        if (
+            not parts
+            and not skipped_nameless
+            and self.evidence_mode
+            and (unit_response is None or source_group_key is None)
+        ):
+            raise RuntimeError("formal empty parse is missing its HTTP or group context")
+        if (
+            not parts
+            and not skipped_nameless
+            and unit_response is not None
+            and source_group_key is not None
+        ):
+            self._capture_http_diagnostic(
+                unit_response,
+                group_id,
+                expected_public_url=source_url,
+                parser_context={"group_key": source_group_key},
+                reason="empty_parse",
+            )
+            # 外層 worker 的失敗 rollback 不能連診斷一起抹掉；group
+            # upsert 早已在 HTTP 前提交，這裡只提交隔離的 diagnostic。
+            self.db.commit()
         parsed_source_parts = list(parts)
         # 站方合法存在、但完全沒有可驗證文字名稱的純料號列：不落庫
         # （發布資料必須能把料號對到產品名稱），但也不是版型異常 ——

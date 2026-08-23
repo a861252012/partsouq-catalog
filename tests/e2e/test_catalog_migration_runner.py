@@ -595,11 +595,11 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     near_name = "my_partsouqX013_backup"
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23)")
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
 
-        assert runner.apply() == (18, 19, 20, 21, 22)
+        assert runner.apply() == (18, 19, 20, 21, 22, 23)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -626,7 +626,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
     connection = migration_database.connect()
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=22")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (22,23)")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_verified_evidence")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_evidence_status")
             cursor.execute(
@@ -809,7 +809,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
                     (category_id, code, code, url, run_key),
                 )
 
-        assert runner.apply() == (22,)
+        assert runner.apply() == (22, 23)
         runner.check()
         assert runner.apply() == ()
 
@@ -985,9 +985,9 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "ALTER TABLE partsouq_http_artifacts DROP CHECK chk_partsouq_artifact_sanitizer"
             )
             cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23)")
 
-        assert runner.apply() == (20, 21, 22)
+        assert runner.apply() == (20, 21, 22, 23)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1049,7 +1049,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "verification_status='verified', verified_at=NOW(6) WHERE crawl_run_id=%s",
                 ("partsouq-html-public-v1", crawl_run_id),
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23)")
             cursor.execute(
                 "INSERT INTO catalog_schema_ledger "
                 "(change_key,kind,version,filename,sha256,state,attempt_count,started_at,"
@@ -1063,7 +1063,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
 
         with pytest.raises(MigrationError, match="retry that exact version"):
             runner.apply()
-        assert runner.apply(retry_version=20) == (20, 21, 22)
+        assert runner.apply(retry_version=20) == (20, 21, 22, 23)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1079,12 +1079,13 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             }
             cursor.execute(
                 "SELECT version,state,attempt_count FROM catalog_schema_ledger "
-                "WHERE version IN (20,21,22) ORDER BY version"
+                "WHERE version IN (20,21,22,23) ORDER BY version"
             )
             assert list(cursor.fetchall()) == [
                 {"version": 20, "state": "applied", "attempt_count": 2},
                 {"version": 21, "state": "applied", "attempt_count": 1},
                 {"version": 22, "state": "applied", "attempt_count": 1},
+                {"version": 23, "state": "applied", "attempt_count": 1},
             ]
             cursor.execute(
                 "SELECT COUNT(*) AS row_count FROM information_schema.ROUTINES "

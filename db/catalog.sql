@@ -524,6 +524,84 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- HTTP 404 and zero-parse diagnostics are deliberately isolated from formal
+-- evidence.  Only secret-sanitized HTML is retained; one latest row per
+-- run/group/reason prevents repeated failures from growing without bound.
+CREATE TABLE IF NOT EXISTS partsouq_http_diagnostics (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  crawl_run_id INT NOT NULL,
+  scheduled_job_run_id BIGINT UNSIGNED NOT NULL,
+  group_id INT NOT NULL,
+  reason VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  public_source_url VARCHAR(1024) NOT NULL,
+  source_url_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  raw_body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  compression VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  body_blob MEDIUMBLOB NOT NULL,
+  original_bytes INT UNSIGNED NOT NULL,
+  stored_bytes INT UNSIGNED NOT NULL,
+  sanitizer_version VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  http_status SMALLINT UNSIGNED NOT NULL,
+  content_type VARCHAR(128) NOT NULL,
+  fetched_at DATETIME(6) NOT NULL,
+  elapsed_ms INT UNSIGNED NOT NULL,
+  attempt SMALLINT UNSIGNED NOT NULL,
+  parser_name VARCHAR(128) NOT NULL,
+  parser_version VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  parser_context_json JSON NOT NULL,
+  parser_context_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+    ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_partsouq_diagnostic_group_reason (crawl_run_id, group_id, reason),
+  KEY idx_partsouq_diagnostic_run_reason (crawl_run_id, reason, updated_at),
+  KEY idx_partsouq_diagnostic_schedule (scheduled_job_run_id),
+  KEY idx_partsouq_diagnostic_body (body_sha256),
+  CONSTRAINT fk_partsouq_diagnostic_run FOREIGN KEY (crawl_run_id)
+    REFERENCES crawl_runs(id),
+  CONSTRAINT fk_partsouq_diagnostic_schedule FOREIGN KEY (scheduled_job_run_id)
+    REFERENCES scheduled_job_runs(id),
+  CONSTRAINT fk_partsouq_diagnostic_group FOREIGN KEY (group_id)
+    REFERENCES groups_t(id),
+  CONSTRAINT chk_partsouq_diagnostic_reason CHECK (
+    (BINARY reason = BINARY 'http_not_found' AND http_status = 404)
+    OR (BINARY reason = BINARY 'empty_parse' AND http_status = 200)
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_public_url CHECK (
+    public_source_url LIKE 'https://partsouq.com/en/catalog/genuine/unit?%'
+    AND LOWER(public_source_url) NOT REGEXP '(^|[?&])ssd='
+    AND public_source_url NOT LIKE '%#%'
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_hashes CHECK (
+    source_url_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND raw_body_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND body_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND parser_context_sha256 REGEXP '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_context CHECK (
+    JSON_VALID(parser_context_json)
+    AND LOWER(CAST(parser_context_json AS CHAR)) NOT REGEXP
+      '("ssd"[[:space:]]*:|ssd=|cf_clearance|phpsessid|authorization|set-cookie)'
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_http CHECK (
+    content_type <> '' AND elapsed_ms >= 0 AND attempt > 0
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_storage CHECK (
+    BINARY compression = BINARY 'zlib'
+    AND original_bytes > 0
+    AND stored_bytes > 0
+    AND stored_bytes = OCTET_LENGTH(body_blob)
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_parser CHECK (
+    parser_name = 'parse_parts' AND parser_version <> ''
+  ),
+  CONSTRAINT chk_partsouq_diagnostic_sanitizer CHECK (
+    BINARY sanitizer_version = BINARY 'partsouq-html-public-v2'
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Every parsed row is retained as a content hash.  Rows accepted into the
 -- bounded quota additionally point to the exact normalized part.  The final
 -- quota-truncated page therefore retains both the complete parser result and

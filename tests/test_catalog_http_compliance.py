@@ -9,6 +9,7 @@
 - ensure_fresh 以 cf_clearance 版本訊號偵測 session 已更新
 """
 
+import hashlib
 from unittest.mock import Mock
 
 import pytest
@@ -178,12 +179,27 @@ def test_challenge_after_fresh_browser_session_is_rejected_stops_without_relaunc
     reject.assert_called_once_with("fresh-v1")
 
 
-def test_404_raises_not_found_error() -> None:
+def test_404_raises_not_found_error_with_response_envelope_and_secret_safe_message() -> None:
     manager = SessionManager(cookies=cookies(), no_browser=True)
-    manager.session.get = Mock(return_value=response(404, "", "https://partsouq.example/unit"))
+    secret = "SECRET-SSD-VALUE"
+    url = f"https://partsouq.example/unit?uid=1&ssd={secret}"
+    html = "<html><title>PartSouq - Error</title><p>Error 404</p></html>"
+    manager.session.get = Mock(
+        return_value=response(404, html, url, headers={"content-type": "text/html; charset=utf-8"})
+    )
 
-    with pytest.raises(NotFoundError):
-        manager.get("https://partsouq.example/unit")
+    with pytest.raises(NotFoundError) as captured:
+        manager.get(url)
+
+    assert secret not in str(captured.value)
+    assert "ssd=" not in str(captured.value)
+    envelope = captured.value.response
+    assert envelope is not None
+    assert envelope.status_code == 404
+    assert envelope.content_type == "text/html"
+    assert envelope.text == html
+    assert envelope.raw_body_sha256 == hashlib.sha256(html.encode()).hexdigest()
+    assert envelope.attempt == 1
 
 
 def test_429_respects_retry_after_and_cap(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -251,6 +267,51 @@ def test_connection_error_resets_pool_and_retries(monkeypatch: pytest.MonkeyPatc
 
     assert manager.get("https://partsouq.example/catalog") == "catalog"
     assert manager.session.get.call_count == 2
+
+
+def test_transport_exception_never_exposes_ssd_in_log_or_final_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import requests
+
+    manager = SessionManager(cookies=cookies(), no_browser=True)
+    secret = "TRANSPORT-SECRET-SSD"
+    url = f"https://partsouq.example/unit?uid=1&ssd={secret}"
+    manager.session.get = Mock(
+        side_effect=requests.exceptions.ConnectionError(f"failed to fetch {url}")
+    )
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
+    caplog.set_level("WARNING", logger="http")
+
+    with pytest.raises(requests.RequestException) as captured:
+        manager.get(url)
+
+    assert secret not in str(captured.value)
+    assert "ssd=" not in str(captured.value)
+    assert secret not in caplog.text
+    assert "ssd=" not in caplog.text
+
+
+def test_transport_exception_never_exposes_url_userinfo(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import requests
+
+    manager = SessionManager(cookies=cookies(), no_browser=True)
+    url = "https://private-user:private-password@partsouq.example/unit?uid=1"
+    manager.session.get = Mock(side_effect=requests.exceptions.ConnectionError(f"failed {url}"))
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
+    caplog.set_level("WARNING", logger="http")
+
+    with pytest.raises(requests.RequestException) as captured:
+        manager.get(url)
+
+    assert "private-user" not in str(captured.value)
+    assert "private-password" not in str(captured.value)
+    assert "private-user" not in caplog.text
+    assert "private-password" not in caplog.text
 
 
 def test_is_challenge_detects_header_and_markers() -> None:

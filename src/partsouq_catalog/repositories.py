@@ -549,9 +549,19 @@ class PartRepository:
                 new_count += 1
         return new_count
 
-    def clear_group_membership(self, group_id: int) -> None:
+    def clear_group_membership(self, group_id: int, run_id: int | None = None) -> int:
         """清除單一 group 的舊 run membership；與後續 upsert 同交易。"""
-        self.db._execute("UPDATE parts SET seen_run_id = NULL WHERE group_id = %s", (group_id,))
+        if run_id is None:
+            cursor = self.db._execute(
+                "UPDATE parts SET seen_run_id = NULL WHERE group_id = %s",
+                (group_id,),
+            )
+        else:
+            cursor = self.db._execute(
+                "UPDATE parts SET seen_run_id = NULL WHERE group_id = %s AND seen_run_id = %s",
+                (group_id, run_id),
+            )
+        return cursor.rowcount
 
     def quarantine_parts(
         self,
@@ -1536,6 +1546,183 @@ class CrawlRepository:
             (run_id,),
         )
         return artifact_id
+
+    def record_http_diagnostic(
+        self,
+        run_id: int,
+        scheduled_job_run_id: int,
+        group_id: int,
+        *,
+        public_url: str,
+        raw_body_sha256: str,
+        status_code: int,
+        content_type: str,
+        fetched_at: datetime,
+        elapsed_ms: int,
+        attempt: int,
+        sanitized_body: SanitizedBody,
+        parser_name: str,
+        parser_version: str,
+        parser_context: Mapping[str, object],
+        reason: str,
+    ) -> int:
+        """保存與正式 evidence 隔離的 unit HTTP 失敗診斷。"""
+
+        if reason not in {"http_not_found", "empty_parse"}:
+            raise ValueError("unsupported PartSouq diagnostic reason")
+        canonical_url = public_source_url(public_url)
+        if canonical_url != public_url:
+            raise ValueError("diagnostic public_url must be canonical and secret-free")
+        _require_sha256(raw_body_sha256, "diagnostic raw_body_sha256")
+        _require_sha256(sanitized_body.body_sha256, "diagnostic body_sha256")
+        expected_status = 404 if reason == "http_not_found" else 200
+        if status_code != expected_status or content_type != "text/html":
+            raise ValueError("PartSouq diagnostic HTTP metadata does not match its reason")
+        if elapsed_ms < 0 or attempt <= 0:
+            raise ValueError("invalid PartSouq diagnostic timing metadata")
+        if parser_name != "parse_parts" or not parser_version.strip():
+            raise ValueError("unsupported PartSouq diagnostic parser identity")
+
+        max_body_bytes = int(CRAWL["evidence_max_body_bytes"])
+        if (
+            sanitized_body.original_bytes <= 0
+            or sanitized_body.original_bytes > max_body_bytes
+            or sanitized_body.original_bytes != len(sanitized_body.body)
+            or sanitized_body.stored_bytes != len(sanitized_body.compressed)
+            or sanitized_body.sanitizer_version != SANITIZER_VERSION
+        ):
+            raise ValueError("sanitized PartSouq diagnostic violates its size contract")
+        restored = restore_sanitized_body(
+            "zlib",
+            sanitized_body.compressed,
+            expected_size=sanitized_body.original_bytes,
+            max_bytes=max_body_bytes,
+        )
+        if restored != sanitized_body.body:
+            raise ValueError("sanitized PartSouq diagnostic round trip mismatch")
+        if hashlib.sha256(restored).hexdigest() != sanitized_body.body_sha256:
+            raise ValueError("sanitized PartSouq diagnostic body hash mismatch")
+        assert_no_secret_material(restored)
+
+        parser_context_json = canonical_parser_context(parser_name, parser_context)
+        parser_context_sha256 = hashlib.sha256(parser_context_json).hexdigest()
+        run = self.db._execute(
+            "SELECT cr.started_at, cr.status, cr.scheduled_job_run_id, "
+            "sj.job_name, sj.trigger_mode, sj.status AS scheduled_status "
+            "FROM crawl_runs AS cr JOIN scheduled_job_runs AS sj "
+            "ON sj.id = cr.scheduled_job_run_id WHERE cr.id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if not run or run.get("status") != "running":
+            raise RuntimeError(f"diagnostic crawl run {run_id} is not running")
+        if _db_int(run.get("scheduled_job_run_id") or 0) != scheduled_job_run_id:
+            raise RuntimeError("diagnostic scheduler id does not match its crawl run")
+        if (
+            run.get("job_name") != "catalog"
+            or run.get("trigger_mode") != "daemon"
+            or run.get("scheduled_status") != "running"
+        ):
+            raise RuntimeError("diagnostic crawl run has invalid scheduler provenance")
+        started_at = cast(datetime, run["started_at"])
+        latest_allowed = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5)
+        if fetched_at < started_at or fetched_at > latest_allowed:
+            raise RuntimeError("diagnostic fetched_at is outside the active crawl window")
+
+        source_url_sha256 = hashlib.sha256(public_url.encode("utf-8")).hexdigest()
+        cursor = self.db._execute(
+            "INSERT INTO partsouq_http_diagnostics ("
+            "crawl_run_id, scheduled_job_run_id, group_id, reason, public_source_url, "
+            "source_url_sha256, raw_body_sha256, body_sha256, compression, body_blob, "
+            "original_bytes, stored_bytes, sanitizer_version, http_status, content_type, "
+            "fetched_at, elapsed_ms, attempt, "
+            "parser_name, parser_version, parser_context_json, parser_context_sha256) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'zlib', %s, %s, %s, %s, %s, "
+            "%s, %s, %s, %s, %s, %s, %s, %s) AS new ON DUPLICATE KEY UPDATE "
+            "id = LAST_INSERT_ID(id), scheduled_job_run_id = new.scheduled_job_run_id, "
+            "public_source_url = new.public_source_url, "
+            "source_url_sha256 = new.source_url_sha256, "
+            "raw_body_sha256 = new.raw_body_sha256, body_sha256 = new.body_sha256, "
+            "compression = new.compression, body_blob = new.body_blob, "
+            "original_bytes = new.original_bytes, stored_bytes = new.stored_bytes, "
+            "sanitizer_version = new.sanitizer_version, http_status = new.http_status, "
+            "content_type = new.content_type, fetched_at = new.fetched_at, "
+            "elapsed_ms = new.elapsed_ms, attempt = new.attempt, "
+            "parser_version = new.parser_version, parser_context_json = new.parser_context_json, "
+            "parser_context_sha256 = new.parser_context_sha256, "
+            "updated_at = UTC_TIMESTAMP(6)",
+            (
+                run_id,
+                scheduled_job_run_id,
+                group_id,
+                reason,
+                public_url,
+                source_url_sha256,
+                raw_body_sha256,
+                sanitized_body.body_sha256,
+                sanitized_body.compressed,
+                sanitized_body.original_bytes,
+                sanitized_body.stored_bytes,
+                sanitized_body.sanitizer_version,
+                status_code,
+                content_type[:128],
+                fetched_at,
+                elapsed_ms,
+                attempt,
+                parser_name,
+                parser_version[:64],
+                parser_context_json.decode("utf-8"),
+                parser_context_sha256,
+            ),
+        )
+        budget = self.db._execute(
+            "SELECT COUNT(*) AS diagnostic_count, "
+            "COALESCE(SUM(original_bytes), 0) AS original_bytes "
+            "FROM partsouq_http_diagnostics WHERE crawl_run_id = %s",
+            (run_id,),
+        ).fetchone()
+        if _db_int((budget or {}).get("diagnostic_count", 0)) > int(
+            CRAWL["evidence_max_artifacts"]
+        ) or _db_int((budget or {}).get("original_bytes", 0)) > int(
+            CRAWL["evidence_max_run_bytes"]
+        ):
+            raise RuntimeError("PartSouq diagnostic run exceeded its fail-closed storage budget")
+        return cast(int, cursor.lastrowid)
+
+    def supersede_http_evidence(
+        self,
+        run_id: int,
+        public_url: str,
+        *,
+        parser_name: str,
+        parser_context: Mapping[str, object],
+    ) -> int:
+        """來源變成 404 時停用同 run、同 parser context 的舊正式 evidence。"""
+
+        canonical_url = public_source_url(public_url)
+        if canonical_url != public_url:
+            raise ValueError("evidence public_url must be canonical and secret-free")
+        parser_context_json = canonical_parser_context(parser_name, parser_context)
+        cursor = self.db._execute(
+            "UPDATE partsouq_http_artifacts SET verification_status = 'superseded' "
+            "WHERE crawl_run_id = %s AND source_url_sha256 = %s "
+            "AND parser_name = %s AND parser_context_sha256 = %s "
+            "AND BINARY verification_status = BINARY 'verified'",
+            (
+                run_id,
+                hashlib.sha256(public_url.encode("utf-8")).hexdigest(),
+                parser_name,
+                hashlib.sha256(parser_context_json).hexdigest(),
+            ),
+        )
+        self.db._execute(
+            "UPDATE crawl_runs SET evidence_status = 'collecting', "
+            "evidence_manifest_sha256 = NULL, evidence_dataset_sha256 = NULL, "
+            "evidence_artifact_count = 0, evidence_record_count = 0, "
+            "evidence_original_bytes = 0, evidence_stored_bytes = 0, "
+            "evidence_verified_at = NULL WHERE id = %s",
+            (run_id,),
+        )
+        return cursor.rowcount
 
     def verify_run_evidence(self, run_id: int) -> tuple[str, str]:
         """Replay-check and seal a complete formal bounded evidence manifest."""

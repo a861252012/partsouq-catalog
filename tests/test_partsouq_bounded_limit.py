@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest import mock
@@ -16,11 +17,14 @@ from partsouq_catalog.db import Database
 from partsouq_catalog.evidence import (
     PARSER_CONTRACT_VERSION,
     SANITIZER_VERSION,
+    CatalogHttpResponse,
     RecordEvidence,
     public_source_url,
     replay_catalog_records,
+    restore_sanitized_body,
     sanitize_parser_html,
 )
+from partsouq_catalog.http_client import NotFoundError
 from partsouq_catalog.repositories import (
     BrandRepository,
     CrawlRepository,
@@ -65,6 +69,24 @@ def _group() -> dict:
         "uid": "10001",
         "url": "/en/catalog/genuine/unit?uid=10001",
     }
+
+
+def _catalog_response(
+    html: str,
+    *,
+    status_code: int = 200,
+    url: str = "https://partsouq.com/en/catalog/genuine/unit?uid=10001&ssd=secret",
+) -> CatalogHttpResponse:
+    return CatalogHttpResponse(
+        final_url=url,
+        status_code=status_code,
+        content_type="text/html",
+        raw_body_sha256=hashlib.sha256(html.encode()).hexdigest(),
+        text=html,
+        fetched_at=datetime.now(UTC).replace(tzinfo=None),
+        elapsed_ms=25,
+        attempt=1,
+    )
 
 
 def _record_verified_live_evidence(
@@ -260,6 +282,70 @@ def test_crawl_model_commits_pick_evidence_before_vehicle_worker(monkeypatch) ->
 
     assert result == (0, True)
     assert events == ["commit", "pick-evidence", "commit", "commit", "commit"]
+    instance.crawl.mark_error.assert_not_called()
+
+
+@pytest.mark.parametrize("limit_setting", ("bounded_parts", "limit_parts"))
+def test_limited_crawl_does_not_start_a_second_vehicle_after_limit(
+    monkeypatch,
+    limit_setting: str,
+) -> None:
+    _bounded_config(monkeypatch, target=0)
+    monkeypatch.setitem(CRAWL, limit_setting, 10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=4)
+    instance._pool.shutdown(wait=True)
+
+    class ImmediateExecutor:
+        def submit(self, function, *args):
+            future: Future[None] = Future()
+            try:
+                future.set_result(function(*args))
+            except BaseException as error:
+                future.set_exception(error)
+            return future
+
+        def shutdown(self, *_args, **_kwargs) -> None:
+            pass
+
+    instance._pool = ImmediateExecutor()  # type: ignore[assignment]
+    instance.brands = mock.MagicMock()
+    instance.brands.upsert_model.return_value = 31
+    instance.crawl = mock.MagicMock()
+    instance.crawl.is_done.return_value = False
+    instance._fetch = mock.MagicMock(return_value=("<html>pick</html>", None))
+    vehicles = [
+        {
+            "name": f"CAMRY-{index}",
+            "model_code": f"AXVA7{index}",
+            "prod_period": "01.2018 - 12.2020",
+            "vid": f"SITE-VID-{index}",
+            "ssd": f"VEHICLE-SSD-{index}",
+        }
+        for index in range(2)
+    ]
+    started: list[str] = []
+
+    def crawl_vehicle(_brand, _model_id, vehicle, _model_name) -> None:
+        started.append(vehicle["name"])
+        instance._sample_limit_reached.set()
+        raise SampleLimitReached
+
+    instance.crawl_vehicle = mock.MagicMock(side_effect=crawl_vehicle)
+    with mock.patch(
+        "partsouq_catalog.crawler.parse_vehicles",
+        return_value=(vehicles, 0),
+    ):
+        try:
+            with pytest.raises(SampleLimitReached):
+                instance.crawl_model(
+                    "TOYOTA",
+                    17,
+                    {"name": "CAMRY", "ssd": "MODEL-SSD", "url": "/pick"},
+                )
+        finally:
+            instance.close()
+
+    assert started == ["CAMRY-0"]
     instance.crawl.mark_error.assert_not_called()
 
 
@@ -534,6 +620,291 @@ def test_bounded_partial_group_retry_excludes_already_seen_keys(monkeypatch, raw
         status="done",
         row_count=10,
     )
+
+
+def test_official_error_page_returned_as_http_200_remains_fail_closed(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    html = (
+        "<html><head><title>PartSouq - Error</title></head>"
+        "<body><h1>Error 404</h1><p>Invalid parameter</p></body></html>"
+    )
+    instance._fetch = mock.MagicMock(return_value=(html, _catalog_response(html)))
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "1000",
+        "name": "TOYOTA1000",
+        "model_code": "KP30-",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        with pytest.raises(RuntimeError, match="parsed 0 parts"):
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched={},
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+    finally:
+        instance.close()
+
+    instance.parts.clear_group_membership.assert_not_called()
+    instance.crawl.mark_group_fetched.assert_not_called()
+    diagnostic = instance.crawl.record_http_diagnostic.call_args
+    assert diagnostic.args[:3] == (17, 77, 41)
+    assert diagnostic.kwargs["reason"] == "empty_parse"
+    assert diagnostic.kwargs["status_code"] == 200
+    assert "ssd=" not in diagnostic.kwargs["public_url"]
+
+
+def test_unrecognized_empty_http_200_page_remains_fail_closed(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    monkeypatch.setitem(CRAWL, "block_breather", 0)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    html = (
+        "<html><head><title>PartSouq - Error</title></head>"
+        "<body><p>Unexpected response</p></body></html>"
+    )
+    instance._fetch = mock.MagicMock(return_value=(html, _catalog_response(html)))
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "1000",
+        "name": "TOYOTA1000",
+        "model_code": "KP30-",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        with pytest.raises(RuntimeError, match="parsed 0 parts"):
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched={},
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+    finally:
+        instance.close()
+
+    instance.parts.clear_group_membership.assert_not_called()
+    instance.crawl.mark_group_fetched.assert_not_called()
+    assert instance.crawl.record_http_diagnostic.call_args.kwargs["reason"] == "empty_parse"
+
+
+def test_http_404_records_diagnostic_and_marks_only_current_run_not_found(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.counts["parts"] = 3
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.parts.clear_group_membership.return_value = 3
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    html = "<html><title>PartSouq - Error</title><p>Error 404</p></html>"
+    response = _catalog_response(html, status_code=404)
+    instance._fetch = mock.MagicMock(side_effect=NotFoundError("http 404", response))
+    fetched: dict[tuple[str, str, str], int] = {}
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "1000",
+        "name": "TOYOTA1000",
+        "model_code": "KP30-",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        assert (
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched=fetched,
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+            is False
+        )
+    finally:
+        instance.close()
+
+    diagnostic = instance.crawl.record_http_diagnostic.call_args
+    assert diagnostic.args[:3] == (17, 77, 41)
+    assert diagnostic.kwargs["reason"] == "http_not_found"
+    assert diagnostic.kwargs["status_code"] == 404
+    assert "ssd=" not in diagnostic.kwargs["public_url"]
+    instance.crawl.supersede_http_evidence.assert_called_once()
+    instance.parts.clear_group_membership.assert_called_once_with(41, 17)
+    instance.crawl.mark_group_fetched.assert_called_once_with(
+        41,
+        "bounded-resume-test",
+        status="not_found",
+    )
+    assert instance.counts["parts"] == 0
+    assert fetched == {("1", "1101", "10001"): 0}
+
+
+def test_formal_not_found_without_response_envelope_remains_fail_closed(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    instance._fetch = mock.MagicMock(side_effect=NotFoundError("http 404"))
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "1000",
+        "name": "TOYOTA1000",
+        "model_code": "KP30-",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        with pytest.raises(RuntimeError, match="missing its response envelope"):
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched={},
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+    finally:
+        instance.close()
+
+    instance.crawl.record_http_diagnostic.assert_not_called()
+    instance.parts.clear_group_membership.assert_not_called()
+    instance.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_http_diagnostic_rejects_secret_bearing_content_type() -> None:
+    database = mock.MagicMock()
+    repository = CrawlRepository(database)
+
+    with pytest.raises(ValueError, match="HTTP metadata"):
+        repository.record_http_diagnostic(
+            17,
+            23,
+            41,
+            public_url=public_source_url(
+                "https://partsouq.com/en/catalog/genuine/unit?uid=10001&ssd=secret"
+            ),
+            raw_body_sha256="a" * 64,
+            status_code=200,
+            content_type="text/html ssd=SECRET",
+            fetched_at=datetime.now(UTC).replace(tzinfo=None),
+            elapsed_ms=1,
+            attempt=1,
+            sanitized_body=sanitize_parser_html("<html><body>empty</body></html>"),
+            parser_name="parse_parts",
+            parser_version=PARSER_CONTRACT_VERSION,
+            parser_context={},
+            reason="empty_parse",
+        )
+
+    database._execute.assert_not_called()
+
+
+def test_formal_not_found_with_mismatched_unit_url_remains_fail_closed(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    html = "<html><p>Error 404</p></html>"
+    mismatched = _catalog_response(
+        html,
+        status_code=404,
+        url="https://partsouq.com/en/catalog/genuine/unit?uid=99999&ssd=secret",
+    )
+    instance._fetch = mock.MagicMock(side_effect=NotFoundError("http 404", mismatched))
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "1000",
+        "name": "TOYOTA1000",
+        "model_code": "KP30-",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        with pytest.raises(RuntimeError, match="does not match its group"):
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched={},
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+    finally:
+        instance.close()
+
+    instance.crawl.record_http_diagnostic.assert_not_called()
+    instance.parts.clear_group_membership.assert_not_called()
+    instance.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_http_404_keeps_diagnostic_when_terminal_transaction_rolls_back(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    events: list[str] = []
+    database = mock.MagicMock()
+    database.commit.side_effect = lambda: events.append("commit")
+    database.rollback.side_effect = lambda: events.append("rollback")
+    instance = Crawler(mock.MagicMock(), database, workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    instance.crawl.supersede_http_evidence.side_effect = RuntimeError("terminal write failed")
+    html = "<html><title>PartSouq - Error</title><p>Error 404</p></html>"
+    instance._fetch = mock.MagicMock(
+        side_effect=NotFoundError("http 404", _catalog_response(html, status_code=404))
+    )
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "1000",
+        "name": "TOYOTA1000",
+        "model_code": "KP30-",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        with pytest.raises(RuntimeError, match="terminal write failed"):
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched={},
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+    finally:
+        instance.close()
+
+    # group upsert + diagnostic 各自提交；終態交易失敗只 rollback 後半段。
+    assert events == ["commit", "commit", "rollback"]
+    instance.crawl.record_http_diagnostic.assert_called_once()
+    instance.parts.clear_group_membership.assert_not_called()
+    instance.crawl.mark_group_fetched.assert_not_called()
 
 
 def test_bounded_partial_group_retry_removes_disappeared_membership(monkeypatch) -> None:
@@ -2052,11 +2423,167 @@ def test_mysql_bounded_resume_durably_rejects_pending_artifact_without_fallback(
         database.close()
 
 
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
+)
+def test_mysql_http_diagnostic_upserts_inline_sanitized_body_without_formal_evidence() -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        _clear_mysql_fixture(database)
+        scheduled_job_run_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        crawl = CrawlRepository(database, "diagnostic-mysql-run")
+        run_id = crawl.start_run(
+            "diagnostic-mysql-run",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=scheduled_job_run_id,
+        )
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        brand_id = brands.upsert_brand("TOYOTA", None)
+        model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-SSD", None)
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CAMRY",
+                "model_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "vid": "SITE-VID-1",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        public_url = "https://partsouq.com/en/catalog/genuine/unit?uid=10001"
+        group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10001",
+            public_url,
+        )
+        context = {
+            "group_key": {
+                "category": {
+                    "vehicle": {
+                        "brand": "TOYOTA",
+                        "model": "CAMRY",
+                        "name": "CAMRY",
+                        "model_code": "AXVA70",
+                        "prod_period": "01.2018 - 12.2020",
+                        "production_from": "2018-01",
+                        "production_to": "2020-12",
+                        "engine": None,
+                        "trim_name": None,
+                        "vid": "SITE-VID-1",
+                    },
+                    "cid": "1",
+                    "category_name": "ENGINE/FUEL/TOOL",
+                },
+                "group_code": "1101",
+                "uid": "10001",
+            }
+        }
+        first_html = (
+            "<html><input name='ssd' value='FIRST-SECRET'><p>Unexpected response one</p></html>"
+        )
+        first = sanitize_parser_html(first_html)
+        first_id = crawl.record_http_diagnostic(
+            run_id,
+            scheduled_job_run_id,
+            group_id,
+            public_url=public_url,
+            raw_body_sha256=hashlib.sha256(first_html.encode()).hexdigest(),
+            status_code=200,
+            content_type="text/html",
+            fetched_at=datetime.now(UTC).replace(tzinfo=None),
+            elapsed_ms=25,
+            attempt=1,
+            sanitized_body=first,
+            parser_name="parse_parts",
+            parser_version=PARSER_CONTRACT_VERSION,
+            parser_context=context,
+            reason="empty_parse",
+        )
+        second_html = (
+            "<html><input name='ssd' value='SECOND-SECRET'><p>Unexpected response two</p></html>"
+        )
+        second = sanitize_parser_html(second_html)
+        second_id = crawl.record_http_diagnostic(
+            run_id,
+            scheduled_job_run_id,
+            group_id,
+            public_url=public_url,
+            raw_body_sha256=hashlib.sha256(second_html.encode()).hexdigest(),
+            status_code=200,
+            content_type="text/html",
+            fetched_at=datetime.now(UTC).replace(tzinfo=None),
+            elapsed_ms=30,
+            attempt=2,
+            sanitized_body=second,
+            parser_name="parse_parts",
+            parser_version=PARSER_CONTRACT_VERSION,
+            parser_context=context,
+            reason="empty_parse",
+        )
+        database.commit()
+
+        assert second_id == first_id
+        diagnostic = database._execute(
+            "SELECT public_source_url, body_sha256, compression, body_blob, "
+            "original_bytes, stored_bytes, http_status, attempt "
+            "FROM partsouq_http_diagnostics WHERE id = %s",
+            (first_id,),
+        ).fetchone()
+        assert diagnostic == {
+            "public_source_url": public_url,
+            "body_sha256": second.body_sha256,
+            "compression": "zlib",
+            "body_blob": second.compressed,
+            "original_bytes": second.original_bytes,
+            "stored_bytes": second.stored_bytes,
+            "http_status": 200,
+            "attempt": 2,
+        }
+        assert database._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_http_diagnostics"
+        ).fetchone() == {"row_count": 1}
+        assert database._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts"
+        ).fetchone() == {"row_count": 0}
+        assert database._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_response_bodies"
+        ).fetchone() == {"row_count": 0}
+        assert b"FIRST-SECRET" not in bytes(diagnostic["body_blob"])
+        assert b"SECOND-SECRET" not in bytes(diagnostic["body_blob"])
+        restored = restore_sanitized_body(
+            str(diagnostic["compression"]),
+            bytes(diagnostic["body_blob"]),
+            expected_size=int(diagnostic["original_bytes"]),
+        )
+        assert b"FIRST-SECRET" not in restored
+        assert b"SECOND-SECRET" not in restored
+    finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
 def _clear_mysql_fixture(database: Database) -> None:
     for table in (
         "bounded_parts",
         "published_parts_previous",
         "published_parts",
+        "partsouq_http_diagnostics",
         "partsouq_http_artifacts",
         "partsouq_response_bodies",
         "admin_vehicle_mappings",

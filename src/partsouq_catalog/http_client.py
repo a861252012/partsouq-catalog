@@ -54,7 +54,7 @@ from .cloak import (
     session_backoff_remaining,
 )
 from .config import CLOAK, CRAWL, Cookies
-from .evidence import CatalogHttpResponse
+from .evidence import CatalogHttpResponse, public_source_url
 
 log = logging.getLogger("http")
 
@@ -118,9 +118,38 @@ class NotFoundError(Exception):
     避免與「空白 HTTP 200」混淆。
     """
 
+    def __init__(self, message: str, response: CatalogHttpResponse | None = None) -> None:
+        super().__init__(message)
+        self.response = response
+
 
 class RobotsPolicyError(Exception):
     """代表 robots.txt 無法確認允許正式 catalog 請求。"""
+
+
+def _response_envelope(
+    response: requests.Response,
+    requested_url: str,
+    text: str,
+    attempt: int,
+) -> CatalogHttpResponse:
+    final_url = response.url if isinstance(response.url, str) else requested_url
+    raw_content = response.content
+    raw_body = raw_content if isinstance(raw_content, bytes) else text.encode("utf-8")
+    elapsed_seconds = response.elapsed.total_seconds()
+    elapsed_ms = (
+        max(0, int(elapsed_seconds * 1000)) if isinstance(elapsed_seconds, (int, float)) else 0
+    )
+    return CatalogHttpResponse(
+        final_url=final_url,
+        status_code=response.status_code,
+        content_type=response.headers.get("content-type", "").split(";", 1)[0].strip().lower(),
+        raw_body_sha256=hashlib.sha256(raw_body).hexdigest(),
+        text=text,
+        fetched_at=datetime.now(UTC).replace(tzinfo=None),
+        elapsed_ms=elapsed_ms,
+        attempt=attempt,
+    )
 
 
 class SessionManager:
@@ -294,6 +323,17 @@ class SessionManager:
         # 正式 catalog 請求先過 robots/origin/path 檢查；robots 無法確認
         # 允許時立即停止（不發 catalog 請求）。
         self._ensure_catalog_allowed(url)
+        url_parts = urlsplit(url)
+        normalized_path = url_parts.path.rstrip("/") or "/"
+        safe_url = (
+            public_source_url(url)
+            if (url_parts.hostname or "").lower() in CATALOG_HOSTS
+            and (
+                normalized_path == "/en/catalog/genuine"
+                or normalized_path.startswith("/en/catalog/genuine/")
+            )
+            else urlunsplit((url_parts.scheme, url_parts.hostname or "", url_parts.path, "", ""))
+        )[:100]
         while attempt < CRAWL["max_retries"]:
             attempt += 1
             try:
@@ -309,7 +349,7 @@ class SessionManager:
                 # 驗證偵測優先（F4）：403 或任何帶驗證特徵的回應
                 # （含 429 + cf-mitigated: challenge）一律進驗證分支。
                 if r.status_code in (403,) or self._is_challenge(r, text):
-                    raise ChallengeError(f"http {r.status_code} challenge at {url[:100]}")
+                    raise ChallengeError(f"http {r.status_code} challenge at {safe_url}")
                 if r.status_code == 429:
                     # P2 修復：429 是「限流」不是「驗證被拒」—— 舊碼把
                     # 429 併入 challenge 分支，每次都會殺掉健康的瀏覽器、
@@ -317,10 +357,10 @@ class SessionManager:
                     # 歸零，等於無視退避連續燒瀏覽器。限流應尊重伺服器
                     # 節奏：依 retry-after（或固定下限）休眠後重試，不動
                     # 瀏覽器、不刷新 cookie。
-                    last_err = requests.RequestException(f"http 429 rate-limited at {url[:100]}")
+                    last_err = requests.RequestException(f"http 429 rate-limited at {safe_url}")
                     log.warning(
                         "rate-limited (429) at %s (attempt %d/%d); backing off",
-                        url[:100],
+                        safe_url,
                         attempt,
                         CRAWL["max_retries"],
                     )
@@ -332,53 +372,39 @@ class SessionManager:
                     time.sleep(retry_after)
                     continue
                 if r.status_code == 404:
-                    raise NotFoundError(f"http 404 at {url[:100]}")
+                    raise NotFoundError(
+                        f"http 404 at {safe_url}",
+                        _response_envelope(r, url, text, attempt),
+                    )
                 if 300 <= r.status_code < 400:
-                    raise RobotsPolicyError(f"catalog redirect refused at {url[:100]}")
+                    raise RobotsPolicyError(f"catalog redirect refused at {safe_url}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
-                    raise requests.RequestException(f"http {r.status_code} at {url[:100]}")
-                final_url = r.url if isinstance(r.url, str) else url
-                raw_content = r.content
-                raw_body = raw_content if isinstance(raw_content, bytes) else text.encode("utf-8")
-                elapsed_seconds = r.elapsed.total_seconds()
-                elapsed_ms = (
-                    max(0, int(elapsed_seconds * 1000))
-                    if isinstance(elapsed_seconds, (int, float))
-                    else 0
-                )
-                return CatalogHttpResponse(
-                    final_url=final_url,
-                    status_code=r.status_code,
-                    content_type=r.headers.get("content-type", "").split(";", 1)[0].strip().lower(),
-                    raw_body_sha256=hashlib.sha256(raw_body).hexdigest(),
-                    text=text,
-                    fetched_at=datetime.now(UTC).replace(tzinfo=None),
-                    elapsed_ms=elapsed_ms,
-                    attempt=attempt,
-                )
+                    last_err = requests.RequestException(f"http {r.status_code} at {safe_url}")
+                    raise last_err
+                return _response_envelope(r, url, text, attempt)
             except ChallengeError as e:
                 last_err = e
                 if self.no_browser:
                     # no_browser 模式：不允許啟動瀏覽器刷新，直接放棄
-                    log.error("challenge while no-browser mode; giving up on %s", url[:100])
+                    log.error("challenge while no-browser mode; giving up on %s", safe_url)
                     break
                 if refresh_successes:
                     reject_session(_cf_value(self.cookies))
                     last_err = ChallengeError(
-                        f"fresh browser session still challenged at {url[:100]}"
+                        f"fresh browser session still challenged at {safe_url}"
                     )
                     log.error(
                         "fresh browser session still challenged; refusing another "
                         "browser refresh for %s",
-                        url[:100],
+                        safe_url,
                     )
                     break
                 if refresh_failures >= CRAWL["challenge_retries"]:
                     log.error(
                         "too many failed refreshes (%d); giving up on %s",
                         refresh_failures,
-                        url[:100],
+                        safe_url,
                     )
                     break
                 log.warning("challenge hit (attempt %d/%d)", attempt, CRAWL["max_retries"])
@@ -410,23 +436,40 @@ class SessionManager:
                 # CLOSE_WAIT / 連線被拒）才需要重建連線池 —— 500 等
                 # 有正常 response 的錯誤 keep-alive 仍健康，舊碼一律
                 # 丟棄池化 socket，白費重新撥號。
-                last_err = e
+                last_err = requests.RequestException(f"connection failed at {safe_url}")
                 log.warning(
-                    "connection error (attempt %d/%d): %s", attempt, CRAWL["max_retries"], e
+                    "connection error at %s (attempt %d/%d; %s)",
+                    safe_url,
+                    attempt,
+                    CRAWL["max_retries"],
+                    type(e).__name__,
                 )
                 self._reset_connections()
                 time.sleep(2 + random.random() * 2)
             except requests.exceptions.Timeout as e:
-                last_err = e
-                log.warning("request timeout (attempt %d/%d): %s", attempt, CRAWL["max_retries"], e)
+                last_err = requests.RequestException(f"request timed out at {safe_url}")
+                log.warning(
+                    "request timeout at %s (attempt %d/%d; %s)",
+                    safe_url,
+                    attempt,
+                    CRAWL["max_retries"],
+                    type(e).__name__,
+                )
                 self._reset_connections()
                 time.sleep(2 + random.random() * 2)
             except requests.RequestException as e:
                 # 其他（500/502 等）：有正常 response，連線池保持健康
-                last_err = e
-                log.warning("request error (attempt %d/%d): %s", attempt, CRAWL["max_retries"], e)
+                if e is not last_err:
+                    last_err = requests.RequestException(f"request failed at {safe_url}")
+                log.warning(
+                    "request error at %s (attempt %d/%d; %s)",
+                    safe_url,
+                    attempt,
+                    CRAWL["max_retries"],
+                    type(e).__name__,
+                )
                 time.sleep(2 + random.random() * 2)
-        raise last_err or RuntimeError(f"get failed: {url[:100]}")
+        raise last_err or RuntimeError(f"get failed: {safe_url}")
 
     def _ensure_catalog_allowed(self, url: str) -> None:
         """正式 PartSouq catalog 首次請求前取得 robots，無法確認即停止。
@@ -506,7 +549,7 @@ class SessionManager:
             # 兩個身分都必須允許：揭露的 crawler 身分與實際送出的
             # browser UA。只查 crawler 身分而用 browser 身分送出，
             # 等於繞過站方對一般流量的 robots 規則。
-            raise RobotsPolicyError(f"robots disallows catalog URL: {url[:100]}")
+            raise RobotsPolicyError(f"robots disallows catalog URL: {public_source_url(url)[:100]}")
 
     @staticmethod
     def _has_applicable_robots_rules(text: str) -> bool:
