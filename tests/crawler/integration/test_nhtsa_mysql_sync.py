@@ -2474,7 +2474,6 @@ def test_vin_publish_rejects_nonformal_source_key(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("overrides", "expected_error"),
     (
-        ({"ErrorCode": "1", "ErrorText": "Invalid VIN"}, "ErrorCode=1"),
         ({"VIN": OTHER_VIN}, "does not match the requested VIN"),
         ({"Make": ""}, "missing required fields: Make"),
         ({"ModelYear": ""}, "missing required fields: ModelYear"),
@@ -2631,6 +2630,50 @@ def test_failure_during_vin_finalization_rolls_back_publication(
                 (scheduled_job_run_id,),
             )
             assert cursor.fetchone() == {"status": "failed", "exit_code": 1}
+    finally:
+        repository.clear_for_tests()
+        repository.close()
+
+
+def test_vin_decode_accepts_nonzero_error_code_with_core_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """歐系 VIN 常見 ErrorCode=1（檢查碼非北美規則）但 Make/Model/Year
+    齊全 —— 使用者決策：存得到就留，code/text 保留供消費端判讀。"""
+    _patch_vin_client(
+        monkeypatch,
+        tmp_path,
+        _vin_payload(
+            EngineConfiguration="",
+            DisplacementL="",
+            Trim="",
+            ErrorCode="1",
+            ErrorText="1 - Check Digit (9th position) does not calculate properly.",
+        ),
+    )
+    repository = NhtsaMySQLRepository.create(_config(tmp_path))
+    try:
+        repository.clear_for_tests()
+        report = asyncio.run(
+            NhtsaApiSyncService(repository, _config(tmp_path)).decode_vin(
+                run_key="vin-errorcode-1",
+                vin=VIN,
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
+            )
+        )
+
+        assert report["status"] == "completed"
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT make_name, error_code, error_text FROM nhtsa_vin_decodes WHERE vin = %s",
+                (VIN,),
+            )
+            row = cursor.fetchone()
+            assert row is not None
+            assert row["make_name"] == "TEST MAKE"
+            assert row["error_code"] == "1"
+            assert "Check Digit" in str(row["error_text"])
     finally:
         repository.clear_for_tests()
         repository.close()

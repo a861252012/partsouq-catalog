@@ -732,11 +732,11 @@ class NhtsaMySQLRepository:
         model_year = int(model_year_raw)
         if not 1886 <= model_year <= 2100:
             raise ValueError(f"NHTSA VIN decode returned an invalid model year: {model_year}")
-        if error_code != "0":
-            raise ValueError(
-                f"NHTSA VIN decode failed with ErrorCode={error_code}: "
-                f"{str(payload.get('ErrorText') or '').strip()}"
-            )
+        # ErrorCode != 0（如歐系 VIN 的檢查碼警告 code=1、部分申報缺失
+        # code=14）不再整筆拒絕：只要 Make／ModelYear 存在，解出的欄位
+        # 照常入庫；原始 code/text 完整保留在 payload_json 與 error_text，
+        # 由消費端自行斟酌可信度。真正「完全解不出」的情況已在上方缺
+        # 必要欄位時攔下。
         displacement_l: Decimal | None = None
         if displacement_raw:
             try:
@@ -906,7 +906,7 @@ class NhtsaMySQLRepository:
             "model_year": model_year,
             "engine_configuration": engine_configuration,
             "engine_model": engine_model or None,
-            "displacement_l": str(displacement_l),
+            "displacement_l": None if displacement_l is None else str(displacement_l),
             "trim_name": trim_name,
         }
 
