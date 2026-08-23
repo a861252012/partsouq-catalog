@@ -233,3 +233,25 @@
     key bypass仍是待修 P2。
 12. 依上述最新證據重寫 `docs/handoff-2026-08-23.md` 與桌面摘要；正式 10,000 publish、
     授權 VIN decode／mapping／fitment及正式資料 real Chrome E2E仍未完成。
+
+## 2026-08-23 15:00–15:15 最終交接凍結
+
+1. 完整無 DB／browser suite第二輪完成：`789 passed, 164 skipped, 0 failed`；JUnit為
+   `/private/tmp/nhtsa-current-full-unit-round2.xml`。
+2. 本輪真 MySQL整合 gate最終為 `66 passed`；使用 `partsouq_catalog_test`，測後4個NHTSA
+   相關計數均讀回0。沒有寫主 DB。
+3. scheduler新增3個DB錯誤分類／progress regression後，單檔為 `98 passed`。
+4. staging audit確認 NHTSA-only應提交23個路徑，排除`repositories.py`與
+   `test_partsouq_bounded_limit.py`；NHTSA-only CI契約為217 skips，混合工作樹為220。
+5. 最終 adversarial review發現3個尚未修正P1：304 reuse繞過parser/raw integrity、migration
+   legacy recovery依賴秒級時間相等、hard-kill running child＋expired domain無法自動回收。
+6. 另記錄P2：`_record_start()` release-lock RuntimeError、VIN artifact/payload綁定、
+   `replace_datasets`範圍、migration audit欄位與多個測試假綠缺口。
+7. 因仍有P1，NHTSA程式草稿沒有stage／commit／push，migration 024沒有套主 DB，也沒有啟動
+   Chromium或正式爬蟲。
+8. 唯讀重查主 DB：raw 10,000、distinct 3,823、bounded/published/current 0/0/0、
+   quarantine 2,260、VIN decode/mapping/fitment 0/0/0、ledger 022；NHTSA run 1/2仍running。
+9. MySQL、admin、station-admin仍healthy；queue-scheduler running；catalog／NHTSA
+   LaunchAgent的`launchctl print`皆exit 113。
+10. Git在本次文件修改前仍為`HEAD == origin/main == 3f8d4e6`；程式工作樹23 tracked
+    modified、2 untracked，tracked diff約`+4135/-617`。
