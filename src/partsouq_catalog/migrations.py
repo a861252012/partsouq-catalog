@@ -54,6 +54,7 @@ CATALOG_MANIFEST = (
     (24, "024_nhtsa_run_leases.sql", "7faeb30a4aa83a1aca8c768bf3a3170d0bed5783fa9aa53c2d207419dcc17182"),
     (25, "025_tw_vncs_vehicles.sql", "dbe9d714c90da6d1ad56911ca31f3ba2fa02582a4d50fee9ca017b9307d329f0"),
     (26, "026_vin_decode_nullable_model.sql", "3fc054b17c8194a9b298a414ef15710cafadb5d973642ec168b85669dd19ab5e"),
+    (27, "027_partsouq_empty_unit_evidence.sql", "773295d258f82ba9620720155458f51d4533d5ca79763cfd31982391d63193fd"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(

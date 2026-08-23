@@ -510,8 +510,9 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
     BINARY verification_status <> BINARY 'verified'
     OR BINARY sanitizer_version = BINARY 'partsouq-html-public-v2'
   ),
+  -- 027：unit 頁允許合法空組（表殼存在零資料列），parsed 可為 0。
   CONSTRAINT chk_partsouq_artifact_counts CHECK (
-    parsed_record_count > 0
+    parsed_record_count >= 0
     AND accepted_record_count <= parsed_record_count
   ),
   CONSTRAINT chk_partsouq_artifact_status CHECK (
