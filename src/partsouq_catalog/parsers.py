@@ -821,7 +821,15 @@ def parse_parts(
             elif normalized in {"note", "unified", "filter note", "specification"}:
                 note_indexes.append(index)
         required_headers = {"part_number", "name", "code", "quantity"}
-        header_is_usable = not header_cells or required_headers <= header_indexes.keys()
+        # 3 欄最小版型（Number|Name|Code，無 Quantity）為站方合法變體：
+        # 實證 Toyota cid=4 uid=4160（配件類 unit），9 列皆 Number=Code、
+        # Name 留空。此類列走既有 nameless→quarantine 政策，不算 malformed。
+        minimal_headers = {"part_number", "name", "code"}
+        header_is_usable = (
+            not header_cells
+            or required_headers <= header_indexes.keys()
+            or minimal_headers <= header_indexes.keys()
+        )
 
         trs = direct_rows + [
             tr
@@ -853,7 +861,7 @@ def parse_parts(
                 part_number = cells[header_indexes["part_number"]]
                 part_name = cells[header_indexes["name"]]
                 code = cells[header_indexes["code"]]
-                quantity = cells[header_indexes["quantity"]]
+                quantity = cells[header_indexes["quantity"]] if "quantity" in header_indexes else ""
                 range_str = (
                     cells[header_indexes["range_str"]] if "range_str" in header_indexes else ""
                 )

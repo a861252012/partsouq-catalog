@@ -92,16 +92,43 @@ def test_parse_legacy_six_column_range_header(range_header: str) -> None:
     assert parts[0]["part_to"] == "2019-12"
 
 
+def test_parse_five_column_without_quantity_is_valid() -> None:
+    """Quantity 為選填欄位（3 欄最小版型的延伸）：缺 Quantity 的表頭
+    不再整列 malformed。"""
+    html = _unit_table(
+        ["Number", "Name", "Code", "Unified", "Note"],
+        ["SYN40004", "SYNTHETIC ITEM", "X40", "U-C", "NOTE"],
+    )
+
+    parts, malformed = parse_parts(html)
+
+    assert malformed == 0
+    assert parts == [
+        {
+            "part_number": "SYN40004",
+            "name": "SYNTHETIC ITEM",
+            "code": "X40",
+            "note": "Unified: U-C; Note: NOTE",
+            "quantity": "",
+            "range_str": "",
+            "part_from": None,
+            "part_to": None,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("headers", "values"),
     [
         (
-            ["Number", "Name", "Code", "Unified", "Note"],
-            ["SYN40004", "SYNTHETIC ITEM", "X40", "U-C", "NOTE"],
-        ),
-        (
+            # 表頭含 Quantity 但資料列少一欄 → 欄數不符，malformed。
             ["Number", "Name", "Code", "Quantity", "Unified", "Note"],
             ["SYN50005", "SYNTHETIC ITEM", "X50", "01", "U-D"],
+        ),
+        (
+            # 缺 Name 表頭（無法對到產品名稱）→ 版型異常。
+            ["Number", "Code", "Quantity"],
+            ["SYN60006", "X60", "02"],
         ),
     ],
 )
@@ -140,3 +167,35 @@ def test_has_empty_parts_table_is_false_for_populated_or_missing_tables() -> Non
     assert has_empty_parts_table(populated) is False
     # 完全沒有零件表（反爬變體、空白頁）→ False，交由 guard 拒絕。
     assert has_empty_parts_table("<html><body>challenge page</body></html>") is False
+
+
+def test_parse_minimal_three_column_header_nameless_rows_are_quarantined() -> None:
+    """實測案例（2026-08-23，Toyota cid=4 uid=4160，group 8112）：站方
+    3 欄最小版型 Number|Name|Code（無 Quantity），9 列 Name 全空、
+    Number=Code。屬合法版型；空名稱列走 nameless→quarantine 政策
+    （ignore-and-record），不得整列 malformed 讓 run 失敗。"""
+    rows_html = "".join(
+        f'<tr class="part-search-tr">'
+        f'<td class="oem"><span style="white-space:nowrap">'
+        f'<a href="/en/search/all?q={number}" id="yt{i}">{number}</a></span></td>'
+        f"<td></td>"
+        f'<td class="codeonimage">{number}</td></tr>'
+        for i, number in enumerate(("9010004015", "9353014010", "9351014012"))
+    )
+    html = (
+        "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th>"
+        f"</tr></thead><tbody>{rows_html}</tbody></table>"
+    )
+
+    parts, malformed, skipped_nameless, skipped = parse_parts(html, diagnostics=True)
+
+    assert parts == []
+    assert malformed == 0
+    assert skipped_nameless == 3
+    assert [row["part_number"] for row in skipped] == [
+        "9010004015",
+        "9353014010",
+        "9351014012",
+    ]
+    # 無 diagnostics 的呼叫路徑同樣不計 malformed。
+    assert parse_parts(html) == ([], 0)
