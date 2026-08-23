@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS groups_t (
   fetched_status VARCHAR(16) NULL,           -- done / not_found（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt；partial 為歷史值，不再產生）
   fetched_row_count INT DEFAULT 0,           -- 本組零件筆數（F5 receipt，content hash 基礎）
   verified_row_count INT NOT NULL DEFAULT 0, -- 歷次 done 的最高筆數；縮水偵測基準，只升不降
+  KEY idx_group_fetched_run_key (fetched_run_key),
   UNIQUE KEY uq_group (category_id, code, uid),
   CONSTRAINT fk_group_cat FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -365,7 +366,8 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
   parts_ok     INT DEFAULT 0,
   parts_new    INT DEFAULT 0,
   error_msg    TEXT NULL,
-  evidence_status VARCHAR(16) NOT NULL DEFAULT 'missing',
+  evidence_status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin
+    NOT NULL DEFAULT 'missing',
   evidence_manifest_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
   evidence_dataset_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
   evidence_artifact_count INT UNSIGNED NOT NULL DEFAULT 0,
@@ -380,10 +382,13 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
     REFERENCES scheduled_job_runs(id),
   CONSTRAINT chk_crawl_run_target CHECK (target_parts IS NULL OR target_parts > 0),
   CONSTRAINT chk_crawl_run_evidence_status CHECK (
-    evidence_status IN ('missing', 'collecting', 'verified', 'rejected')
+    BINARY evidence_status = BINARY 'missing'
+    OR BINARY evidence_status = BINARY 'collecting'
+    OR BINARY evidence_status = BINARY 'verified'
+    OR BINARY evidence_status = BINARY 'rejected'
   ),
   CONSTRAINT chk_crawl_run_verified_evidence CHECK (
-    evidence_status <> 'verified' OR (
+    BINARY evidence_status <> BINARY 'verified' OR (
       evidence_manifest_sha256 REGEXP '^[0-9a-f]{64}$'
       AND evidence_dataset_sha256 REGEXP '^[0-9a-f]{64}$'
       AND evidence_artifact_count > 0
@@ -445,7 +450,8 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
   parsed_records_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   accepted_record_count INT UNSIGNED NOT NULL,
   accepted_records_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  verification_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+  verification_status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin
+    NOT NULL DEFAULT 'pending',
   verified_at DATETIME(6) NULL,
   created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   PRIMARY KEY (id),
@@ -497,7 +503,7 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
   ),
   CONSTRAINT chk_partsouq_artifact_sanitizer CHECK (sanitizer_version <> ''),
   CONSTRAINT chk_partsouq_artifact_verified_sanitizer CHECK (
-    verification_status <> 'verified'
+    BINARY verification_status <> BINARY 'verified'
     OR BINARY sanitizer_version = BINARY 'partsouq-html-public-v2'
   ),
   CONSTRAINT chk_partsouq_artifact_counts CHECK (
@@ -505,8 +511,16 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
     AND accepted_record_count <= parsed_record_count
   ),
   CONSTRAINT chk_partsouq_artifact_status CHECK (
-    verification_status IN ('pending', 'verified', 'superseded', 'rejected')
-    AND (verification_status <> 'verified' OR verified_at IS NOT NULL)
+    (
+      BINARY verification_status = BINARY 'pending'
+      OR BINARY verification_status = BINARY 'verified'
+      OR BINARY verification_status = BINARY 'superseded'
+      OR BINARY verification_status = BINARY 'rejected'
+    )
+    AND (
+      BINARY verification_status <> BINARY 'verified'
+      OR verified_at IS NOT NULL
+    )
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

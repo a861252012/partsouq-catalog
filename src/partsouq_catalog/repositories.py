@@ -91,6 +91,28 @@ def _require_sha256(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a lowercase SHA-256")
 
 
+def _canonical_unit_url_sql(column: str, uid_column: str | None = None) -> str:
+    """回傳與 public_source_url 相同邊界的 secret-free unit URL 條件。"""
+
+    contract = (
+        f"REGEXP_LIKE({column}, "
+        "'^https://partsouq[.]com/en/catalog/genuine/unit[?]"
+        "((c|model|vid|cid|cname|uid|q)=[^&#]*&)*"
+        "(c|model|vid|cid|cname|uid|q)=[^&#]*$', 'c') "
+        f"AND REGEXP_LIKE({column}, '(^|[?&])uid=[^&#]+(&|$)', 'c')"
+    )
+    if uid_column is None:
+        return contract
+    return (
+        f"{contract} "
+        f"AND REGEXP_LIKE({uid_column}, '^[A-Za-z0-9._~-]+$', 'c') "
+        f"AND REGEXP_INSTR({column}, '(^|[?&])uid=', 1, 2, 0, 'c') = 0 "
+        "AND BINARY SUBSTRING_INDEX("
+        f"REGEXP_SUBSTR({column}, '(^|[?&])uid=[^&#]+', 1, 1, 'c'), "
+        f"'uid=', -1) = BINARY {uid_column}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _RunEvidenceSummary:
     manifest_sha256: str
@@ -611,8 +633,7 @@ class PartRepository:
             "AND NULLIF(TRIM(g.name), '') IS NOT NULL "
             "AND NULLIF(TRIM(g.code), '') IS NOT NULL "
             "AND NULLIF(TRIM(g.uid), '') IS NOT NULL "
-            "AND g.url LIKE "
-            "'https://partsouq.com/en/catalog/genuine/unit?%%') AS source_valid "
+            f"AND {_canonical_unit_url_sql('g.url', 'g.uid')}) AS source_valid "
             "FROM groups_t AS g "
             "JOIN categories AS c ON c.id = g.category_id "
             "JOIN vehicles AS v ON v.id = c.vehicle_id "
@@ -814,7 +835,10 @@ class CrawlRepository:
             "SELECT 1 FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
             "WHERE c.vehicle_id = %s AND g.code = %s AND g.uid = %s "
-            "AND g.fetched_run_key = %s LIMIT 1",
+            "AND g.fetched_run_key = %s "
+            "AND (BINARY g.fetched_status = BINARY 'done' "
+            "OR BINARY g.fetched_status = BINARY 'not_found') "
+            f"AND ({_canonical_unit_url_sql('g.url', 'g.uid')}) LIMIT 1",
             (vehicle_id, group_code, group_uid, run_key),
         )
         return cur.fetchone() is not None
@@ -837,7 +861,10 @@ class CrawlRepository:
             "SELECT c.cid, g.code, g.uid, g.fetched_row_count "
             "FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
-            "WHERE c.vehicle_id = %s AND g.fetched_run_key = %s",
+            "WHERE c.vehicle_id = %s AND g.fetched_run_key = %s "
+            "AND (BINARY g.fetched_status = BINARY 'done' "
+            "OR BINARY g.fetched_status = BINARY 'not_found') "
+            f"AND ({_canonical_unit_url_sql('g.url', 'g.uid')})",
             (vehicle_id, run_key),
         )
         return {
@@ -1125,8 +1152,8 @@ class CrawlRepository:
             "AND p.part_to < v.production_from) "
             "OR (v.production_to IS NOT NULL AND p.part_from IS NOT NULL "
             "AND v.production_to < p.part_from) "
-            "OR NULLIF(TRIM(g.url), '') IS NULL OR g.url NOT LIKE "
-            "'https://partsouq.com/en/catalog/genuine/unit?%%')",
+            "OR NULLIF(TRIM(g.url), '') IS NULL OR NOT ("
+            f"{_canonical_unit_url_sql('g.url', 'g.uid')}))",
             (run_id,),
         )
         return cur.rowcount
@@ -1144,18 +1171,53 @@ class CrawlRepository:
         """
         if scheduled_job_run_id is None:
             row = self.db._execute(
-                "SELECT run_key FROM crawl_runs WHERE dataset_kind = 'bounded' "
+                "SELECT candidate.id, candidate.run_key, candidate.evidence_status, "
+                "NOT (BINARY candidate.evidence_status = BINARY 'missing' OR "
+                "BINARY candidate.evidence_status = BINARY 'collecting' OR "
+                "BINARY candidate.evidence_status = BINARY 'verified') AS bad_run_status, "
+                "EXISTS (SELECT 1 FROM partsouq_http_artifacts AS artifact "
+                "WHERE artifact.crawl_run_id = candidate.id "
+                "AND (BINARY artifact.sanitizer_version <> BINARY %s OR NOT ("
+                "BINARY artifact.verification_status = BINARY 'verified' OR "
+                "BINARY artifact.verification_status = BINARY 'superseded'))) "
+                "AS bad_evidence, "
+                "EXISTS (SELECT 1 FROM groups_t AS receipt_group "
+                "WHERE receipt_group.fetched_run_key = candidate.run_key "
+                "AND (receipt_group.fetched_status IS NULL OR NOT ("
+                "BINARY receipt_group.fetched_status = BINARY 'done' OR "
+                "BINARY receipt_group.fetched_status = BINARY 'not_found') "
+                "OR NULLIF(TRIM(receipt_group.url), '') IS NULL OR NOT ("
+                f"{_canonical_unit_url_sql('receipt_group.url', 'receipt_group.uid')}))) "
+                "AS bad_receipt "
+                "FROM (SELECT id, run_key, evidence_status FROM crawl_runs "
+                "WHERE dataset_kind = 'bounded' "
                 "AND target_parts = %s AND status IN ('running', 'error', 'interrupted') "
                 "AND scheduled_job_run_id IS NULL "
-                "AND NOT EXISTS (SELECT 1 FROM partsouq_http_artifacts AS artifact "
-                "WHERE artifact.crawl_run_id = crawl_runs.id "
-                "AND BINARY artifact.sanitizer_version <> BINARY %s) "
-                "ORDER BY started_at DESC, id DESC LIMIT 1",
-                (target_parts, SANITIZER_VERSION),
+                "ORDER BY started_at DESC, id DESC LIMIT 1) AS candidate",
+                (SANITIZER_VERSION, target_parts),
             ).fetchone()
         else:
             row = self.db._execute(
-                "SELECT cr.run_key FROM scheduled_job_runs AS current_job "
+                "SELECT candidate.id, candidate.run_key, candidate.evidence_status, "
+                "NOT (BINARY candidate.evidence_status = BINARY 'missing' OR "
+                "BINARY candidate.evidence_status = BINARY 'collecting' OR "
+                "BINARY candidate.evidence_status = BINARY 'verified') AS bad_run_status, "
+                "EXISTS (SELECT 1 FROM partsouq_http_artifacts AS artifact "
+                "WHERE artifact.crawl_run_id = candidate.id "
+                "AND (BINARY artifact.sanitizer_version <> BINARY %s OR NOT ("
+                "BINARY artifact.verification_status = BINARY 'verified' OR "
+                "BINARY artifact.verification_status = BINARY 'superseded'))) "
+                "AS bad_evidence, "
+                "EXISTS (SELECT 1 FROM groups_t AS receipt_group "
+                "WHERE receipt_group.fetched_run_key = candidate.run_key "
+                "AND (receipt_group.fetched_status IS NULL OR NOT ("
+                "BINARY receipt_group.fetched_status = BINARY 'done' OR "
+                "BINARY receipt_group.fetched_status = BINARY 'not_found') "
+                "OR NULLIF(TRIM(receipt_group.url), '') IS NULL OR NOT ("
+                f"{_canonical_unit_url_sql('receipt_group.url', 'receipt_group.uid')}))) "
+                "AS bad_receipt "
+                "FROM (SELECT cr.id, cr.run_key, cr.evidence_status "
+                "FROM scheduled_job_runs AS current_job "
                 "JOIN crawl_runs AS cr ON cr.dataset_kind = 'bounded' "
                 "AND cr.target_parts = %s "
                 "AND cr.status IN ('running', 'error', 'interrupted') "
@@ -1168,13 +1230,28 @@ class CrawlRepository:
                 "AND (previous_job.id = current_job.id OR ("
                 "previous_job.status = 'failed' AND previous_job.finished_at IS NOT NULL "
                 "AND previous_job.exit_code IS NOT NULL AND previous_job.exit_code <> 0)) "
-                "AND NOT EXISTS (SELECT 1 FROM partsouq_http_artifacts AS artifact "
-                "WHERE artifact.crawl_run_id = cr.id "
-                "AND BINARY artifact.sanitizer_version <> BINARY %s) "
-                "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1",
-                (target_parts, scheduled_job_run_id, SANITIZER_VERSION),
+                "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1) AS candidate",
+                (SANITIZER_VERSION, target_parts, scheduled_job_run_id),
             ).fetchone()
-        return str(row["run_key"]) if row and row.get("run_key") else None
+        if not row or not row.get("run_key"):
+            return None
+        incompatible = (
+            _db_int(row.get("bad_run_status") or 0) != 0
+            or _db_int(row.get("bad_evidence") or 0) != 0
+            or _db_int(row.get("bad_receipt") or 0) != 0
+        )
+        if incompatible:
+            self.db._execute(
+                "UPDATE crawl_runs SET evidence_status = 'rejected', "
+                "evidence_manifest_sha256 = NULL, evidence_dataset_sha256 = NULL, "
+                "evidence_artifact_count = 0, evidence_record_count = 0, "
+                "evidence_original_bytes = 0, evidence_stored_bytes = 0, "
+                "evidence_verified_at = NULL WHERE id = %s "
+                "AND status IN ('running', 'error', 'interrupted')",
+                (_db_int(row["id"]),),
+            )
+            return None
+        return str(row["run_key"])
 
     def record_http_evidence(
         self,
@@ -1420,7 +1497,7 @@ class CrawlRepository:
             "UPDATE partsouq_http_artifacts SET verification_status = 'superseded' "
             "WHERE crawl_run_id = %s AND source_url_sha256 = %s AND page_type = %s "
             "AND parser_name = %s AND parser_context_sha256 = %s "
-            "AND verification_status = 'verified' AND id <> %s",
+            "AND BINARY verification_status = BINARY 'verified' AND id <> %s",
             (
                 run_id,
                 source_url_sha256,
@@ -1440,7 +1517,8 @@ class CrawlRepository:
             "COALESCE(SUM(body.original_bytes), 0) AS original_bytes "
             "FROM partsouq_http_artifacts AS artifact "
             "JOIN partsouq_response_bodies AS body ON body.body_sha256 = artifact.body_sha256 "
-            "WHERE artifact.crawl_run_id = %s AND artifact.verification_status = 'verified'",
+            "WHERE artifact.crawl_run_id = %s "
+            "AND BINARY artifact.verification_status = BINARY 'verified'",
             (run_id,),
         ).fetchone()
         if _db_int((budget or {}).get("artifact_count", 0)) > int(
@@ -1595,7 +1673,8 @@ class CrawlRepository:
         incomplete = self.db._execute(
             "SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts "
             "WHERE crawl_run_id = %s "
-            "AND verification_status NOT IN ('verified', 'superseded')",
+            "AND NOT (BINARY verification_status = BINARY 'verified' OR "
+            "BINARY verification_status = BINARY 'superseded')",
             (run_id,),
         ).fetchone()
         if _db_int((incomplete or {}).get("row_count", 0)):
@@ -1624,7 +1703,7 @@ class CrawlRepository:
                 "JOIN scheduled_job_runs AS evidence_job "
                 "ON evidence_job.id = artifact.scheduled_job_run_id "
                 "WHERE artifact.crawl_run_id = %s "
-                "AND artifact.verification_status = 'verified' "
+                "AND BINARY artifact.verification_status = BINARY 'verified' "
                 "ORDER BY artifact.source_url_sha256, artifact.page_type, artifact.id",
                 (run_id,),
             ).fetchall()
@@ -1639,7 +1718,8 @@ class CrawlRepository:
             "body.original_bytes, body.stored_bytes, body.sanitizer_version "
             "FROM partsouq_response_bodies AS body JOIN ("
             "SELECT DISTINCT body_sha256 FROM partsouq_http_artifacts "
-            "WHERE crawl_run_id = %s AND verification_status = 'verified'"
+            "WHERE crawl_run_id = %s "
+            "AND BINARY verification_status = BINARY 'verified'"
             ") AS referenced ON referenced.body_sha256 = body.body_sha256",
             (run_id,),
         ).fetchall()
@@ -1652,7 +1732,8 @@ class CrawlRepository:
             "FROM partsouq_artifact_records AS records "
             "JOIN partsouq_http_artifacts AS artifact ON artifact.id = records.artifact_id "
             "AND artifact.crawl_run_id = records.crawl_run_id "
-            "WHERE records.crawl_run_id = %s AND artifact.verification_status = 'verified' "
+            "WHERE records.crawl_run_id = %s "
+            "AND BINARY artifact.verification_status = BINARY 'verified' "
             "ORDER BY records.artifact_id, records.record_type, records.natural_key_sha256",
             (run_id,),
         ).fetchall()
@@ -2150,8 +2231,8 @@ class CrawlRepository:
             "OR NULLIF(TRIM(v.vid), '') IS NULL OR NULLIF(TRIM(c.cid), '') IS NULL "
             "OR NULLIF(TRIM(c.name), '') IS NULL OR NULLIF(TRIM(g.name), '') IS NULL "
             "OR NULLIF(TRIM(g.code), '') IS NULL OR NULLIF(TRIM(g.uid), '') IS NULL "
-            "OR NULLIF(TRIM(g.url), '') IS NULL OR g.url NOT LIKE "
-            "'https://partsouq.com/en/catalog/genuine/unit?%%' "
+            "OR NULLIF(TRIM(g.url), '') IS NULL OR NOT ("
+            f"{_canonical_unit_url_sql('g.url', 'g.uid')}) "
             "OR (v.production_from IS NULL AND v.production_to IS NULL "
             "AND p.part_from IS NULL AND p.part_to IS NULL) "
             "OR (p.part_to IS NOT NULL AND v.production_from IS NOT NULL "
@@ -2440,8 +2521,8 @@ class CrawlRepository:
             "AND bp.part_to < bp.production_from) "
             "OR (bp.production_to IS NOT NULL AND bp.part_from IS NOT NULL "
             "AND bp.production_to < bp.part_from) "
-            "OR bp.source_url NOT LIKE "
-            "'https://partsouq.com/en/catalog/genuine/unit?%%')",
+            "OR NOT ("
+            f"{_canonical_unit_url_sql('bp.source_url', 'bp.group_uid')}))",
             (run_id,),
         ).fetchone()
         invalid_rows = _db_int((quality or {}).get("invalid_rows", 0))

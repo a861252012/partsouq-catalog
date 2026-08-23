@@ -419,7 +419,10 @@ def public_source_url(url: str) -> str:
         raise ValueError("evidence source URL must use the official HTTPS PartSouq origin")
     if parts.username is not None or parts.password is not None or parts.port not in (None, 443):
         raise ValueError("evidence source URL contains unsupported authority components")
-    if not (parts.path == "/en/catalog/genuine" or parts.path.startswith("/en/catalog/genuine/")):
+    canonical_path = parts.path.rstrip("/") or "/"
+    if not (
+        canonical_path == "/en/catalog/genuine" or canonical_path.startswith("/en/catalog/genuine/")
+    ):
         raise ValueError("evidence source URL must be a genuine catalog path")
     query = [
         (key, value)
@@ -427,7 +430,7 @@ def public_source_url(url: str) -> str:
         if key in PUBLIC_QUERY_KEYS
     ]
     query.sort()
-    return urlunsplit(("https", "partsouq.com", parts.path, urlencode(query), ""))
+    return urlunsplit(("https", "partsouq.com", canonical_path, urlencode(query), ""))
 
 
 def sanitize_parser_html(html: str) -> SanitizedBody:
@@ -656,8 +659,35 @@ def _public_record(record: Mapping[str, object]) -> dict[str, JsonValue]:
         if normalized_key.lower().endswith("url") and isinstance(value, str):
             parts = urlsplit(value)
             record_url = value
+            normalized_path = parts.path.rstrip("/") or "/"
             if not parts.scheme and not parts.netloc and parts.path.startswith("/"):
-                record_url = urlunsplit(("https", "partsouq.com", parts.path, parts.query, ""))
+                record_url = urlunsplit(("https", "partsouq.com", normalized_path, parts.query, ""))
+            else:
+                try:
+                    port = parts.port
+                except ValueError:
+                    port = -1
+                hostname = (parts.hostname or "").lower()
+                valid_http = parts.scheme.lower() == "http" and port in (None, 80)
+                valid_https = parts.scheme.lower() == "https" and port in (None, 443)
+                valid_protocol_relative = (
+                    not parts.scheme
+                    and bool(parts.netloc)
+                    and port
+                    in (
+                        None,
+                        443,
+                    )
+                )
+                if (
+                    hostname in OFFICIAL_HOSTS
+                    and parts.username is None
+                    and parts.password is None
+                    and (valid_http or valid_https or valid_protocol_relative)
+                ):
+                    record_url = urlunsplit(
+                        ("https", "partsouq.com", normalized_path, parts.query, "")
+                    )
             public[normalized_key] = public_source_url(record_url)
         else:
             public[normalized_key] = _normalize_json(value)

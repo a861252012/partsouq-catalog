@@ -16,6 +16,7 @@ from pymysql.cursors import DictCursor
 from partsouq_catalog import migrations as catalog_migrations
 from partsouq_catalog import scheduler
 from partsouq_catalog.admission import AdmissionLockBusy
+from partsouq_catalog.config import CRAWL
 from partsouq_catalog.crawler import Crawler
 from partsouq_catalog.db import Database
 from partsouq_catalog.migrations import (
@@ -528,11 +529,11 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     near_name = "my_partsouqX013_backup"
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22)")
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
 
-        assert runner.apply() == (18, 19, 20, 21)
+        assert runner.apply() == (18, 19, 20, 21, 22)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -543,6 +544,309 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
                 (exact_name, near_name),
             )
             assert [row["ROUTINE_NAME"] for row in cursor.fetchall()] == [near_name]
+    finally:
+        connection.close()
+
+
+def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=22")
+            cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_verified_evidence")
+            cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_evidence_status")
+            cursor.execute(
+                "ALTER TABLE crawl_runs MODIFY COLUMN evidence_status "
+                "VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci "
+                "NOT NULL DEFAULT 'missing' AFTER error_msg"
+            )
+            cursor.execute(
+                "ALTER TABLE crawl_runs ADD CONSTRAINT chk_crawl_run_evidence_status "
+                "CHECK (evidence_status IN "
+                "('missing','collecting','verified','rejected'))"
+            )
+            cursor.execute(
+                "ALTER TABLE crawl_runs ADD CONSTRAINT chk_crawl_run_verified_evidence "
+                "CHECK (evidence_status <> 'verified' OR ("
+                "evidence_manifest_sha256 REGEXP '^[0-9a-f]{64}$' "
+                "AND evidence_dataset_sha256 REGEXP '^[0-9a-f]{64}$' "
+                "AND evidence_artifact_count > 0 AND evidence_record_count > 0 "
+                "AND evidence_original_bytes > 0 AND evidence_stored_bytes > 0 "
+                "AND evidence_verified_at IS NOT NULL))"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts "
+                "DROP CHECK chk_partsouq_artifact_verified_sanitizer"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts DROP CHECK chk_partsouq_artifact_status"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts MODIFY COLUMN verification_status "
+                "VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci "
+                "NOT NULL DEFAULT 'pending' AFTER accepted_records_sha256"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts ADD CONSTRAINT "
+                "chk_partsouq_artifact_verified_sanitizer CHECK ("
+                "verification_status <> 'verified' OR "
+                "BINARY sanitizer_version = BINARY 'partsouq-html-public-v2')"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts ADD CONSTRAINT "
+                "chk_partsouq_artifact_status CHECK ("
+                "verification_status IN ('pending','verified','superseded','rejected') "
+                "AND (verification_status <> 'verified' OR verified_at IS NOT NULL))"
+            )
+            cursor.execute("ALTER TABLE groups_t DROP KEY idx_group_fetched_run_key")
+            cursor.execute(
+                "ALTER TABLE groups_t ADD KEY idx_group_fetched_run_key (fetched_status)"
+            )
+            cursor.execute("INSERT INTO brands (name) VALUES ('MIGRATION-022')")
+            brand_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO models (brand_id,name) VALUES (%s,'MIGRATION-022')",
+                (brand_id,),
+            )
+            model_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO vehicles (model_id,identity_hash,name,model_code,vid) "
+                "VALUES (%s,%s,'MIGRATION-022','MIGRATION-022','MIGRATION-022')",
+                (model_id, "1" * 64),
+            )
+            vehicle_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO categories (vehicle_id,name,cid) VALUES (%s,'MIGRATION-022','22')",
+                (vehicle_id,),
+            )
+            category_id = cursor.lastrowid
+
+            run_ids: dict[str, int] = {}
+            for run_key, dataset_kind in (
+                ("migration-022-invalid", "bounded"),
+                ("migration-022-valid", "bounded"),
+                ("migration-022-full", "full"),
+            ):
+                cursor.execute(
+                    "INSERT INTO crawl_runs ("
+                    "run_key,started_at,finished_at,status,dataset_kind,target_parts,"
+                    "evidence_status,evidence_manifest_sha256,evidence_dataset_sha256,"
+                    "evidence_artifact_count,evidence_record_count,evidence_original_bytes,"
+                    "evidence_stored_bytes,evidence_verified_at) VALUES "
+                    "(%s,NOW(6),NOW(6),'interrupted',%s,%s,'collecting',%s,%s,1,1,1,1,NOW(6))",
+                    (
+                        run_key,
+                        dataset_kind,
+                        10_000 if dataset_kind == "bounded" else None,
+                        "a" * 64,
+                        "b" * 64,
+                    ),
+                )
+                assert cursor.lastrowid is not None
+                run_ids[run_key] = int(cursor.lastrowid)
+
+            cursor.execute(
+                "INSERT INTO crawl_runs ("
+                "run_key,started_at,finished_at,status,dataset_kind,target_parts,"
+                "evidence_status,evidence_manifest_sha256,evidence_dataset_sha256,"
+                "evidence_artifact_count,evidence_record_count,evidence_original_bytes,"
+                "evidence_stored_bytes,evidence_verified_at) VALUES "
+                "('migration-022-status-case',NOW(6),NOW(6),'interrupted','bounded',10000,"
+                "'REJECTED',%s,%s,1,1,1,1,NOW(6))",
+                ("c" * 64, "d" * 64),
+            )
+            assert cursor.lastrowid is not None
+            run_ids["migration-022-status-case"] = int(cursor.lastrowid)
+
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('catalog','daemon','failed',NOW(6),NOW(6),125)"
+            )
+            artifact_job_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO crawl_runs ("
+                "run_key,started_at,finished_at,status,dataset_kind,target_parts,"
+                "scheduled_job_run_id,evidence_status,evidence_manifest_sha256,"
+                "evidence_dataset_sha256,evidence_artifact_count,evidence_record_count,"
+                "evidence_original_bytes,evidence_stored_bytes,evidence_verified_at) "
+                "VALUES ('migration-022-artifact-case',NOW(6),NOW(6),'interrupted',"
+                "'bounded',10000,%s,'collecting',%s,%s,1,1,1,1,NOW(6))",
+                (artifact_job_id, "e" * 64, "f" * 64),
+            )
+            assert cursor.lastrowid is not None
+            artifact_run_id = int(cursor.lastrowid)
+            run_ids["migration-022-artifact-case"] = artifact_run_id
+            cursor.execute(
+                "INSERT INTO partsouq_response_bodies "
+                "(body_sha256,compression,body_blob,original_bytes,stored_bytes,"
+                "sanitizer_version) VALUES (%s,'zlib',%s,1,1,%s)",
+                ("9" * 64, b"x", "partsouq-html-public-v2"),
+            )
+            cursor.execute(
+                "INSERT INTO partsouq_http_artifacts ("
+                "crawl_run_id,scheduled_job_run_id,capture_kind,page_type,"
+                "public_source_url,source_url_sha256,raw_body_sha256,body_sha256,"
+                "sanitizer_version,http_status,content_type,challenge_detected,"
+                "fetched_at,elapsed_ms,attempt,parser_name,parser_version,"
+                "parser_context_json,parser_context_sha256,malformed_row_count,"
+                "skipped_record_count,parsed_record_count,parsed_records_sha256,"
+                "accepted_record_count,accepted_records_sha256,verification_status,"
+                "verified_at) VALUES ("
+                "%s,%s,'live_http','genuine','https://partsouq.com/en/catalog/genuine',"
+                "%s,%s,%s,%s,200,'text/html',0,NOW(6),1,1,'parse_brands',"
+                "'partsouq-catalog-parser-v1',JSON_OBJECT(),%s,0,0,1,%s,0,%s,"
+                "'VERIFIED',NOW(6))",
+                (
+                    artifact_run_id,
+                    artifact_job_id,
+                    "8" * 64,
+                    "7" * 64,
+                    "9" * 64,
+                    "partsouq-html-public-v2",
+                    "6" * 64,
+                    "5" * 64,
+                    "4" * 64,
+                ),
+            )
+            artifact_id = cursor.lastrowid
+
+            for code, run_key, url in (
+                (
+                    "2201",
+                    "migration-022-invalid",
+                    "https://partsouq.com/en/catalog/genuine/unit?uid=9999",
+                ),
+                (
+                    "2202",
+                    "migration-022-valid",
+                    "https://partsouq.com/en/catalog/genuine/unit?cid=22&uid=2202",
+                ),
+                (
+                    "2203",
+                    "migration-022-full",
+                    "https://partsouq.com/en/catalog/genuine/unit?uid=2203&token=SECRET",
+                ),
+            ):
+                cursor.execute(
+                    "INSERT INTO groups_t ("
+                    "category_id,code,name,uid,url,fetched_run_key,fetched_status) "
+                    "VALUES (%s,%s,'MIGRATION-022',%s,%s,%s,'done')",
+                    (category_id, code, code, url, run_key),
+                )
+
+        assert runner.apply() == (22,)
+        runner.check()
+        assert runner.apply() == ()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns_list "
+                "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME='groups_t' AND INDEX_NAME='idx_group_fetched_run_key'"
+            )
+            assert cursor.fetchone() == {"columns_list": "fetched_run_key"}
+            cursor.execute(
+                "SELECT id,evidence_status,evidence_manifest_sha256,"
+                "evidence_dataset_sha256,evidence_artifact_count,evidence_record_count,"
+                "evidence_original_bytes,evidence_stored_bytes,evidence_verified_at "
+                "FROM crawl_runs WHERE id IN (%s,%s,%s,%s,%s) ORDER BY id",
+                tuple(run_ids.values()),
+            )
+            rows = list(cursor.fetchall())
+            cursor.execute(
+                "SELECT CHARACTER_SET_NAME,COLLATION_NAME,IS_NULLABLE,COLUMN_DEFAULT "
+                "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME='crawl_runs' AND COLUMN_NAME='evidence_status'"
+            )
+            evidence_column = cursor.fetchone()
+            cursor.execute(
+                "SELECT verification_status,verified_at FROM partsouq_http_artifacts WHERE id=%s",
+                (artifact_id,),
+            )
+            artifact = cursor.fetchone()
+            cursor.execute(
+                "SELECT CHARACTER_SET_NAME,COLLATION_NAME,IS_NULLABLE,COLUMN_DEFAULT "
+                "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME='partsouq_http_artifacts' "
+                "AND COLUMN_NAME='verification_status'"
+            )
+            artifact_status_column = cursor.fetchone()
+
+        assert rows[0] == {
+            "id": run_ids["migration-022-invalid"],
+            "evidence_status": "rejected",
+            "evidence_manifest_sha256": None,
+            "evidence_dataset_sha256": None,
+            "evidence_artifact_count": 0,
+            "evidence_record_count": 0,
+            "evidence_original_bytes": 0,
+            "evidence_stored_bytes": 0,
+            "evidence_verified_at": None,
+        }
+        assert rows[1]["id"] == run_ids["migration-022-valid"]
+        assert rows[1]["evidence_status"] == "collecting"
+        assert rows[1]["evidence_manifest_sha256"] == "a" * 64
+        assert rows[2]["id"] == run_ids["migration-022-full"]
+        assert rows[2]["evidence_status"] == "collecting"
+        assert rows[2]["evidence_manifest_sha256"] == "a" * 64
+        assert rows[3] == {
+            "id": run_ids["migration-022-status-case"],
+            "evidence_status": "rejected",
+            "evidence_manifest_sha256": None,
+            "evidence_dataset_sha256": None,
+            "evidence_artifact_count": 0,
+            "evidence_record_count": 0,
+            "evidence_original_bytes": 0,
+            "evidence_stored_bytes": 0,
+            "evidence_verified_at": None,
+        }
+        assert rows[4] == {
+            "id": run_ids["migration-022-artifact-case"],
+            "evidence_status": "rejected",
+            "evidence_manifest_sha256": None,
+            "evidence_dataset_sha256": None,
+            "evidence_artifact_count": 0,
+            "evidence_record_count": 0,
+            "evidence_original_bytes": 0,
+            "evidence_stored_bytes": 0,
+            "evidence_verified_at": None,
+        }
+        assert evidence_column == {
+            "CHARACTER_SET_NAME": "ascii",
+            "COLLATION_NAME": "ascii_bin",
+            "IS_NULLABLE": "NO",
+            "COLUMN_DEFAULT": "missing",
+        }
+        assert artifact == {"verification_status": "rejected", "verified_at": None}
+        assert artifact_status_column == {
+            "CHARACTER_SET_NAME": "ascii",
+            "COLLATION_NAME": "ascii_bin",
+            "IS_NULLABLE": "NO",
+            "COLUMN_DEFAULT": "pending",
+        }
+        with connection.cursor() as cursor:
+            with pytest.raises(pymysql.MySQLError) as error:
+                cursor.execute(
+                    "UPDATE crawl_runs SET evidence_status='REJECTED' WHERE id=%s",
+                    (run_ids["migration-022-valid"],),
+                )
+            assert error.value.args[0] == 3819
+            with pytest.raises(pymysql.MySQLError) as error:
+                cursor.execute(
+                    "UPDATE partsouq_http_artifacts "
+                    "SET verification_status='VERIFIED',verified_at=NOW(6) WHERE id=%s",
+                    (artifact_id,),
+                )
+            assert error.value.args[0] == 3819
     finally:
         connection.close()
 
@@ -615,9 +919,9 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "ALTER TABLE partsouq_http_artifacts DROP CHECK chk_partsouq_artifact_sanitizer"
             )
             cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22)")
 
-        assert runner.apply() == (20, 21)
+        assert runner.apply() == (20, 21, 22)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -679,7 +983,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "verification_status='verified', verified_at=NOW(6) WHERE crawl_run_id=%s",
                 ("partsouq-html-public-v1", crawl_run_id),
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22)")
             cursor.execute(
                 "INSERT INTO catalog_schema_ledger "
                 "(change_key,kind,version,filename,sha256,state,attempt_count,started_at,"
@@ -693,7 +997,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
 
         with pytest.raises(MigrationError, match="retry that exact version"):
             runner.apply()
-        assert runner.apply(retry_version=20) == (20, 21)
+        assert runner.apply(retry_version=20) == (20, 21, 22)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -709,11 +1013,12 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             }
             cursor.execute(
                 "SELECT version,state,attempt_count FROM catalog_schema_ledger "
-                "WHERE version IN (20,21) ORDER BY version"
+                "WHERE version IN (20,21,22) ORDER BY version"
             )
             assert list(cursor.fetchall()) == [
                 {"version": 20, "state": "applied", "attempt_count": 2},
                 {"version": 21, "state": "applied", "attempt_count": 1},
+                {"version": 22, "state": "applied", "attempt_count": 1},
             ]
             cursor.execute(
                 "SELECT COUNT(*) AS row_count FROM information_schema.ROUTINES "
@@ -792,6 +1097,8 @@ def test_migration_lock_defers_every_writer_before_running_marker(
         cursorclass=DictCursor,
     )
     catalog_db._local.conn = catalog_connection
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "limit_parts", 0)
     crawler = Crawler(mock.MagicMock(), catalog_db, workers=1)
     nhtsa = NhtsaMySQLRepository(migration_database.connect())
     try:

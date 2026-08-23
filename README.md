@@ -91,7 +91,7 @@ docker compose up -d mysql
 ```
 
 runner 會以固定 manifest 從 001 開始檢查並重播尚未記錄的 active migration
-（001–012、015–021），不靠人工猜測既有 volume 的版本。013／014 已被 015
+（001–012、015–022），不靠人工猜測既有 volume 的版本。013／014 已被 015
 取代，不會在新升級執行。
 migration 019 會讓正式 bounded view fail closed：除了精確 10,000 筆與成功的
 daemon provenance，還必須有已 seal 的 live HTTP evidence、六種頁面類型與逐筆
@@ -106,6 +106,11 @@ migration 020 會把 sanitizer 版本記到每筆 HTTP artifact；不相容的�
 混成同一份正式驗收 manifest。
 migration 021 會用大小寫與尾端空白都精確的版本比對，並禁止非目前 sanitizer
 版本的 artifact 保持 verified，讓 resume、正式 view 與 Python verifier 一致 fail closed。
+migration 022 會為 group terminal receipt 的 run key 建立索引，避免 resume 相容性
+檢查隨型錄資料量成長而退化成全表掃描；舊版留下的非終態或非 canonical URL
+receipt 也會讓所屬未完成 bounded run 永久標為 rejected，不會被後續 URL 更新洗白。
+同一 migration 會把 run 與 artifact 的 evidence 狀態欄位收斂成 byte-exact 契約；
+大小寫變體、pending／rejected artifact 或不相容 sanitizer 都不能被當成可續跑證據。
 migration 005 若判定舊 vehicle tree 必須重建，仍會在刪除前 fail closed，且只接受
 備份後由操作者明確授權。
 

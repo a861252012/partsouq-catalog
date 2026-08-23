@@ -28,6 +28,21 @@ def test_public_source_url_discards_ephemeral_and_unknown_query_values() -> None
     )
 
 
+def test_public_source_url_canonicalizes_trailing_catalog_slash() -> None:
+    with_slash = public_source_url(
+        "https://partsouq.com/en/catalog/genuine/unit/?uid=123&ssd=SECRET"
+    )
+    without_slash = public_source_url(
+        "https://partsouq.com/en/catalog/genuine/unit?uid=123&ssd=OTHER"
+    )
+
+    assert with_slash == without_slash
+    assert (
+        hashlib.sha256(with_slash.encode()).digest()
+        == hashlib.sha256(without_slash.encode()).digest()
+    )
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -42,11 +57,20 @@ def test_public_source_url_rejects_non_catalog_origins(url: str) -> None:
         public_source_url(url)
 
 
-def test_record_evidence_canonicalizes_parser_relative_catalog_url() -> None:
-    relative = record_evidence(
+@pytest.mark.parametrize(
+    "parser_url",
+    (
+        "/en/catalog/genuine/locate?c=TOYOTA",
+        "//partsouq.com/en/catalog/genuine/locate?c=TOYOTA",
+        "http://partsouq.com/en/catalog/genuine/locate?c=TOYOTA",
+        "http://partsouq.com:80/en/catalog/genuine/locate?c=TOYOTA",
+    ),
+)
+def test_record_evidence_canonicalizes_parser_catalog_url(parser_url: str) -> None:
+    parser_record = record_evidence(
         "brand",
         {"name": "TOYOTA"},
-        {"name": "TOYOTA", "url": "/en/catalog/genuine/locate?c=TOYOTA"},
+        {"name": "TOYOTA", "url": parser_url},
     )
     absolute = record_evidence(
         "brand",
@@ -54,7 +78,51 @@ def test_record_evidence_canonicalizes_parser_relative_catalog_url() -> None:
         {"name": "TOYOTA", "url": "https://partsouq.com/en/catalog/genuine/locate?c=TOYOTA"},
     )
 
-    assert relative.record_sha256 == absolute.record_sha256
+    assert parser_record.record_sha256 == absolute.record_sha256
+
+
+@pytest.mark.parametrize(
+    "parser_url",
+    (
+        "//partsouq.com:80/en/catalog/genuine/locate?c=TOYOTA",
+        "http://partsouq.com:443/en/catalog/genuine/locate?c=TOYOTA",
+    ),
+)
+def test_record_evidence_rejects_cross_scheme_catalog_port(parser_url: str) -> None:
+    with pytest.raises(ValueError):
+        record_evidence(
+            "brand",
+            {"name": "TOYOTA"},
+            {"name": "TOYOTA", "url": parser_url},
+        )
+
+
+@pytest.mark.parametrize(
+    ("record_type", "path"),
+    (
+        ("group", "/en/catalog/genuine/unit"),
+        ("vehicle", "/en/catalog/genuine/vehicle"),
+    ),
+)
+@pytest.mark.parametrize("origin", ("", "https://partsouq.com", "https://partsouq.com:443"))
+def test_record_evidence_canonicalizes_trailing_catalog_slash(
+    record_type: str,
+    path: str,
+    origin: str,
+) -> None:
+    natural_key = {"id": "stable"}
+    without_slash = record_evidence(
+        record_type,
+        natural_key,
+        {"url": f"{origin}{path}?uid=10001"},
+    )
+    with_slash = record_evidence(
+        record_type,
+        natural_key,
+        {"url": f"{origin}{path}/?uid=10001"},
+    )
+
+    assert with_slash.record_sha256 == without_slash.record_sha256
 
 
 def test_sanitized_body_is_secret_free_and_replays_parser_identically() -> None:

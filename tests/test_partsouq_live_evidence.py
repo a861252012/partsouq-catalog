@@ -24,6 +24,7 @@ from partsouq_catalog.evidence import (
     category_natural_key,
     dataset_sha256,
     group_natural_key,
+    group_record_evidence,
     model_natural_key,
     part_record_evidence,
     public_source_url,
@@ -33,7 +34,7 @@ from partsouq_catalog.evidence import (
     sanitize_parser_html,
     vehicle_record_evidence,
 )
-from partsouq_catalog.parsers import parse_parts, parse_vehicles
+from partsouq_catalog.parsers import parse_groups, parse_parts, parse_vehicles
 from partsouq_catalog.repositories import CrawlRepository
 
 
@@ -330,6 +331,53 @@ def test_public_source_url_is_stable_and_drops_session_material() -> None:
 def test_public_source_url_rejects_non_catalog_authorities_and_paths(url: str) -> None:
     with pytest.raises(ValueError):
         public_source_url(url)
+
+
+@pytest.mark.parametrize(
+    "unit_url",
+    (
+        "/en/catalog/genuine/unit?c=TOYOTA&ssd=SECRET&vid=SITE-VID-1&cid=1&uid=10001",
+        "//partsouq.com/en/catalog/genuine/unit?c=TOYOTA&ssd=SECRET&vid=SITE-VID-1&cid=1&uid=10001",
+        "http://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&ssd=SECRET&vid=SITE-VID-1&cid=1&uid=10001",
+    ),
+)
+def test_formal_group_evidence_canonicalizes_parser_url_variants(unit_url: str) -> None:
+    vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "CAMRY",
+        "name": "CAMRY",
+        "model_code": "AXVA70",
+        "prod_period": "01.2018 - 12.2020",
+        "production_from": "2018-01",
+        "production_to": "2020-12",
+        "engine": None,
+        "trim_name": None,
+        "vid": "SITE-VID-1",
+    }
+    html = f'<a href="{unit_url}">1101: PARTIAL ENGINE ASSEMBLY</a>'
+    groups, malformed, skipped, image_only = parse_groups(
+        html,
+        "TOYOTA",
+        diagnostics=True,
+        expected_vid="SITE-VID-1",
+    )
+    assert (malformed, skipped, image_only) == (0, 0, 0)
+
+    live_records = group_record_evidence(vehicle_key, groups)
+    replayed, replay_malformed, replay_skipped = replay_catalog_records(
+        sanitize_parser_html(html).body,
+        parser_name="parse_groups",
+        parser_version=PARSER_CONTRACT_VERSION,
+        context={
+            "brand": "TOYOTA",
+            "vehicle_key": vehicle_key,
+            "default_cid": "1",
+            "expected_vid": "SITE-VID-1",
+        },
+    )
+
+    assert (replay_malformed, replay_skipped) == (0, 0)
+    assert replayed == live_records
 
 
 def test_sanitized_replay_is_deterministic_secret_free_and_parser_equivalent() -> None:
@@ -1253,7 +1301,7 @@ def test_formal_bounded_crawler_seals_evidence_before_publish(monkeypatch) -> No
     monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     monkeypatch.setitem(CRAWL, "limit_parts", 0)
     monkeypatch.setitem(CRAWL, "bounded_parts", 10_000)
-    monkeypatch.setitem(CRAWL, "bounded_run_key", "bounded-evidence-seal")
+    monkeypatch.setitem(CRAWL, "bounded_run_key", "")
     monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 77)
     monkeypatch.setitem(CRAWL, "min_brands", 1)
     for key in ("start_brand", "limit_brands", "limit_models", "limit_vehicles", "limit_groups"):

@@ -119,6 +119,61 @@ def test_same_group_code_with_distinct_uids_keeps_both_units_and_receipts() -> N
             "SELECT COUNT(*) AS n FROM parts WHERE group_id IN (%s, %s)",
             (first_group_id, second_group_id),
         ).fetchone() == {"n": 2}
+
+        # 舊版曾把相對 unit URL 寫進已完成 receipt；這種 receipt 不得讓
+        # resume 跳過，否則該組永遠無法通過 bounded source gate。
+        database._execute(
+            "UPDATE groups_t SET url = %s WHERE id = %s",
+            ("/en/catalog/genuine/unit?uid=UID-A", first_group_id),
+        )
+        database.commit()
+        assert crawl.fetched_group_map(vehicle_id, "group-uid-fixture") == {
+            ("1", "1101", "UID-B"): 1,
+        }
+        assert not crawl.is_group_fetched(vehicle_id, "1101", "UID-A", "group-uid-fixture")
+        assert crawl.is_group_fetched(vehicle_id, "1101", "UID-B", "group-uid-fixture")
+
+        database._execute(
+            "UPDATE groups_t SET url = %s WHERE id = %s",
+            (
+                "https://partsouq.com/en/catalog/genuine/unit?uid=UID-WRONG",
+                second_group_id,
+            ),
+        )
+        database.commit()
+        assert crawl.fetched_group_map(vehicle_id, "group-uid-fixture") == {}
+        assert not crawl.is_group_fetched(
+            vehicle_id,
+            "1101",
+            "UID-B",
+            "group-uid-fixture",
+        )
+
+        database._execute(
+            "UPDATE groups_t SET fetched_status = 'partial' WHERE id = %s",
+            (second_group_id,),
+        )
+        database.commit()
+        assert crawl.fetched_group_map(vehicle_id, "group-uid-fixture") == {}
+        assert not crawl.is_group_fetched(vehicle_id, "1101", "UID-B", "group-uid-fixture")
+
+        database._execute(
+            "UPDATE groups_t SET fetched_status = 'DONE' WHERE id = %s",
+            (second_group_id,),
+        )
+        database.commit()
+        assert crawl.fetched_group_map(vehicle_id, "group-uid-fixture") == {}
+
+        database._execute(
+            "UPDATE groups_t SET fetched_status = 'done', url = %s WHERE id = %s",
+            (
+                "https://partsouq.com/en/catalog/genuine/unit?uid=UID-B&ssd=SECRET",
+                second_group_id,
+            ),
+        )
+        database.commit()
+        assert crawl.fetched_group_map(vehicle_id, "group-uid-fixture") == {}
+        assert not crawl.is_group_fetched(vehicle_id, "1101", "UID-B", "group-uid-fixture")
     finally:
         database.rollback()
         database._execute("DELETE FROM crawl_state")

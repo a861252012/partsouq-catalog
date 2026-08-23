@@ -47,6 +47,7 @@ CATALOG_MANIFEST = (
     (19, "019_verified_bounded_catalog_view.sql", "a65d8375fc2b9d9f257558b980ddd7292c928e0c03f2ad09b99aab565c0a0e65"),
     (20, "020_artifact_sanitizer_version.sql", "03fae175dfb027353874bdb796ed7dd751eafbb0a10e6558a7412cff038c4877"),
     (21, "021_exact_artifact_sanitizer_contract.sql", "46a974719bde384e9853660181b658cadbdbe4559cb4bae4e4597a8bf3332873"),
+    (22, "022_group_receipt_run_key_index.sql", "41303ad2d06bbe682655bb276893893aa4f2a3d5f817bc34275b406920cd47fd"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(

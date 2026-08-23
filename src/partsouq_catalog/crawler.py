@@ -86,6 +86,32 @@ class SampleLimitReached(Exception):
     """代表筆數受限 run 已達零件上限；不是網站或解析錯誤。"""
 
 
+def _canonical_catalog_request_url(raw_url: object, expected_path: str) -> str:
+    """把 parser 接受的站內網址統一成正式 HTTPS request URL。"""
+
+    joined_url = urllib.parse.urljoin(f"{SITE['base']}/", str(raw_url))
+    parsed_url = urllib.parse.urlsplit(joined_url)
+    try:
+        port = parsed_url.port
+    except ValueError as error:
+        raise RuntimeError("invalid PartSouq catalog URL port") from error
+    normalized_path = parsed_url.path.rstrip("/")
+    valid_port = (parsed_url.scheme == "http" and port in (None, 80)) or (
+        parsed_url.scheme == "https" and port in (None, 443)
+    )
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or parsed_url.hostname != "partsouq.com"
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or not valid_port
+        or normalized_path != expected_path
+        or not parsed_url.query
+    ):
+        raise RuntimeError("invalid PartSouq catalog URL")
+    return urllib.parse.urlunsplit(("https", "partsouq.com", normalized_path, parsed_url.query, ""))
+
+
 def _group_closure_mismatches(
     known_codes: dict[str, set[str]],
     parsed_groups: list[ParsedRecord],
@@ -658,6 +684,11 @@ class Crawler:
                 continue
             pending.append(vehicle)
 
+        # pick evidence 會鎖住 crawl_runs，seen 也屬於同一筆主執行緒交易。
+        # worker 隨後會用自己的連線記錄 vehicle evidence；派工前若不提交，
+        # 主執行緒會等待 worker，而 worker 會反過來等待這裡持有的 row lock。
+        self.db.commit()
+
         if not pending:
             # 所有車型都已完成，但若有截斷表示這次沒有全爬 —— 仍計入
             # 失敗（讓 model 不標 done，全量續爬補齊）。
@@ -693,7 +724,8 @@ class Crawler:
             try:
                 self.db.commit()
             except Exception:
-                pass
+                self.db.rollback()
+                log.exception("failed to persist late vehicle state")
 
         # F5：bounded 派工 —— 一次只保留 workers*2 個未完成 Future。
         # SOL P2：wait() 一次可能回傳多個完成 Future，每輪要「依完成
@@ -704,18 +736,29 @@ class Crawler:
         pending_iter = iter(pending)
         gave_up = False
 
+        def _crawl_vehicle(vehicle: ParsedRecord) -> None:
+            # 每個 worker 連線的交易都必須在 task 邊界閉合。即使本車的
+            # group 全部命中 receipt 而跳過，vehicle/group evidence 仍可能
+            # 持有 crawl_runs row lock；失敗路徑也不能把未提交交易留給
+            # thread pool 的下一個 task。
+            try:
+                self.crawl_vehicle(
+                    brand,
+                    model_id,
+                    vehicle,
+                    str(model["name"]),
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+
         def _submit_next() -> bool:
             try:
                 vehicle = next(pending_iter)
             except StopIteration:
                 return False
-            fut = self._pool.submit(
-                self.crawl_vehicle,
-                brand,
-                model_id,
-                vehicle,
-                str(model["name"]),
-            )
+            fut = self._pool.submit(_crawl_vehicle, vehicle)
             futures[fut] = vehicle
             return True
 
@@ -922,9 +965,10 @@ class Crawler:
                 if self._sample_limit_reached.is_set():
                     truncated += len(remaining_categories) - index
                     break
-                category_url = cast(str, category["url"])
-                if not category_url.startswith("http"):
-                    category_url = SITE["base"] + category_url
+                category_url = _canonical_catalog_request_url(
+                    category["url"],
+                    "/en/catalog/genuine/vehicle",
+                )
                 category_html, category_response = self._fetch(category_url)
                 category_soup = _soup(category_html)
                 truncated += self.crawl_groups(
@@ -1204,6 +1248,11 @@ class Crawler:
 
         category_name = group["category_name"]
         category_key = str(group.get("cid") or category_name)
+        unit_url = _canonical_catalog_request_url(
+            group["url"],
+            "/en/catalog/genuine/unit",
+        )
+        source_url = public_source_url(unit_url)
         if category_ids is not None and category_key in category_ids:
             category_id = category_ids[category_key]
         else:
@@ -1223,7 +1272,7 @@ class Crawler:
             group["group_code"],
             group["group_name"],
             group["uid"],
-            group["url"],
+            source_url,
             identity=identity,
         )
         self.db.commit()
@@ -1240,9 +1289,6 @@ class Crawler:
                 group.get("uid"),
             )
 
-        unit_url = group["url"]
-        if not unit_url.startswith("http"):
-            unit_url = SITE["base"] + unit_url
         try:
             html, unit_response = self._fetch(unit_url)
         except NotFoundError:
@@ -1568,21 +1614,32 @@ class Crawler:
                 "bounded_parts",
             )
         )
+        if self.evidence_mode and self.scheduled_job_run_id is None:
+            raise ValueError("formal 10000-part bounded run requires the daemon scheduler")
+        if bounded_mode and self.scheduled_job_run_id and CRAWL["bounded_run_key"]:
+            raise ValueError("PSQ_BOUNDED_RUN_KEY cannot be set for a scheduled bounded run")
         # Direct CLI 沒有 scheduler marker；先取得與 migration 相同的短鎖，
         # 並在 running crawl marker 與 fresh reset 一起 commit 後立即釋放。
         # 取得前不能查任何業務表，避免 metadata lock 反向等待。
         with catalog_writer_admission(self.db._thread_conn()):
             if bounded_mode:
-                run_key = (
-                    CRAWL["bounded_run_key"]
-                    or self.crawl.resumable_bounded_run_key(
+                run_key = str(CRAWL["bounded_run_key"])
+                if not run_key:
+                    resumable_run_key = self.crawl.resumable_bounded_run_key(
                         self.part_limit,
                         scheduled_job_run_id=self.scheduled_job_run_id,
                     )
-                    or f"bounded-{self.part_limit}-"
-                    f"{'s' if self.scheduled_job_run_id else 'd'}"
-                    f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
-                )
+                    # 不相容的最新 run 會在 resolver 內標成 rejected。
+                    # 先獨立提交，避免後續新 marker 建立失敗時把拒絕狀態
+                    # 一併 rollback，舊 run 又在下一輪被重新考慮。
+                    self.db.commit()
+                    run_key = resumable_run_key or ""
+                if not run_key:
+                    run_key = (
+                        f"bounded-{self.part_limit}-"
+                        f"{'s' if self.scheduled_job_run_id else 'd'}"
+                        f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
+                    )
                 if len(run_key) > 32:
                     raise ValueError("PSQ_BOUNDED_RUN_KEY must be at most 32 characters")
             elif sample_mode:

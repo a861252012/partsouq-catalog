@@ -1,6 +1,7 @@
 import hashlib
 import os
 import re
+import threading
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -216,6 +217,159 @@ def _bounded_config(monkeypatch, target: int = 10) -> None:
         monkeypatch.setitem(CRAWL, key, "" if key == "start_brand" else 0)
 
 
+def test_crawl_model_commits_pick_evidence_before_vehicle_worker(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    events: list[str] = []
+    database = mock.MagicMock()
+    database.commit.side_effect = lambda: events.append("commit")
+    instance = Crawler(mock.MagicMock(), database, workers=1)
+    instance.brands = mock.MagicMock()
+    instance.brands.upsert_model.return_value = 31
+    instance.crawl = mock.MagicMock()
+    instance.crawl.is_done.return_value = False
+    instance._fetch = mock.MagicMock(return_value=("<html>pick</html>", object()))
+    instance._capture_http_evidence = mock.MagicMock(
+        side_effect=lambda *args, **kwargs: events.append("pick-evidence")
+    )
+    vehicle = {
+        "name": "CAMRY",
+        "model_code": "AXVA70",
+        "prod_period": "01.2018 - 12.2020",
+        "production_from": "2018-01",
+        "production_to": "2020-12",
+        "vid": "SITE-VID-1",
+        "ssd": "VEHICLE-SSD",
+    }
+
+    def crawl_vehicle(*_args) -> None:
+        assert events[-1] == "commit"
+
+    instance.crawl_vehicle = mock.MagicMock(side_effect=crawl_vehicle)
+    with mock.patch(
+        "partsouq_catalog.crawler.parse_vehicles",
+        return_value=([vehicle], 0),
+    ):
+        try:
+            result = instance.crawl_model(
+                "TOYOTA",
+                17,
+                {"name": "CAMRY", "ssd": "MODEL-SSD", "url": "/pick"},
+            )
+        finally:
+            instance.close()
+
+    assert result == (0, True)
+    assert events == ["commit", "pick-evidence", "commit", "commit", "commit"]
+    instance.crawl.mark_error.assert_not_called()
+
+
+def test_crawl_model_rolls_back_failed_vehicle_worker(monkeypatch) -> None:
+    _bounded_config(monkeypatch)
+    database = mock.MagicMock()
+    instance = Crawler(mock.MagicMock(), database, workers=1)
+    instance.brands = mock.MagicMock()
+    instance.brands.upsert_model.return_value = 31
+    instance.crawl = mock.MagicMock()
+    instance.crawl.is_done.return_value = False
+    instance._fetch = mock.MagicMock(return_value=("<html>pick</html>", None))
+    instance.crawl_vehicle = mock.MagicMock(side_effect=RuntimeError("vehicle failed"))
+    vehicle = {
+        "name": "CAMRY",
+        "model_code": "AXVA70",
+        "prod_period": "01.2018 - 12.2020",
+        "vid": "SITE-VID-1",
+        "ssd": "VEHICLE-SSD",
+    }
+    with mock.patch(
+        "partsouq_catalog.crawler.parse_vehicles",
+        return_value=([vehicle], 0),
+    ):
+        try:
+            result = instance.crawl_model(
+                "TOYOTA",
+                17,
+                {"name": "CAMRY", "ssd": "MODEL-SSD", "url": "/pick"},
+            )
+        finally:
+            instance.close()
+
+    assert result == (1, True)
+    database.rollback.assert_called_once_with()
+    instance.crawl.mark_error.assert_called_once()
+
+
+def test_crawl_model_rolls_back_failed_late_state_commit(monkeypatch) -> None:
+    _bounded_config(monkeypatch)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    thread_state = threading.local()
+    release_late_vehicle = threading.Event()
+    late_vehicle_started = threading.Event()
+    late_rollback = threading.Event()
+    database = mock.MagicMock()
+
+    def commit() -> None:
+        if not getattr(thread_state, "late_vehicle", False):
+            return
+        thread_state.commit_count = getattr(thread_state, "commit_count", 0) + 1
+        if thread_state.commit_count == 2:
+            raise RuntimeError("late state commit failed")
+
+    def rollback() -> None:
+        if getattr(thread_state, "late_vehicle", False):
+            thread_state.dirty = False
+            late_rollback.set()
+
+    database.commit.side_effect = commit
+    database.rollback.side_effect = rollback
+    instance = Crawler(mock.MagicMock(), database, workers=4)
+    instance.brands = mock.MagicMock()
+    instance.brands.upsert_model.return_value = 31
+    instance.crawl = mock.MagicMock()
+    instance.crawl.is_done.return_value = False
+    instance._fetch = mock.MagicMock(return_value=("<html>pick</html>", None))
+    vehicles = [
+        {
+            "name": f"CAMRY-{index}",
+            "model_code": f"AXVA7{index}",
+            "prod_period": "01.2018 - 12.2020",
+            "vid": f"SITE-VID-{index}",
+            "ssd": f"VEHICLE-SSD-{index}",
+        }
+        for index in range(4)
+    ]
+
+    def crawl_vehicle(_brand, _model_id, vehicle, _model_name) -> None:
+        if vehicle["name"] != "CAMRY-3":
+            assert late_vehicle_started.wait(timeout=3)
+            raise RuntimeError("vehicle failed")
+        thread_state.late_vehicle = True
+        thread_state.dirty = True
+        late_vehicle_started.set()
+        assert release_late_vehicle.wait(timeout=3)
+
+    instance.crawl_vehicle = mock.MagicMock(side_effect=crawl_vehicle)
+    release_timer = threading.Timer(1.0, release_late_vehicle.set)
+    release_timer.start()
+    try:
+        with mock.patch(
+            "partsouq_catalog.crawler.parse_vehicles",
+            return_value=(vehicles, 0),
+        ):
+            result = instance.crawl_model(
+                "TOYOTA",
+                17,
+                {"name": "CAMRY", "ssd": "MODEL-SSD", "url": "/pick"},
+            )
+        assert late_rollback.wait(timeout=3)
+    finally:
+        release_late_vehicle.set()
+        release_timer.cancel()
+        instance.close()
+
+    assert result == (3, True)
+    assert late_rollback.is_set()
+
+
 def test_bounded_retry_resumes_db_membership_and_publishes_exact_target(monkeypatch) -> None:
     monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     _bounded_config(monkeypatch)
@@ -268,6 +422,7 @@ def test_bounded_retry_resumes_db_membership_and_publishes_exact_target(monkeypa
 def test_bounded_resume_failure_closes_durable_running_marker(monkeypatch) -> None:
     monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     _bounded_config(monkeypatch)
+    monkeypatch.setitem(CRAWL, "bounded_run_key", "")
     events: list[str] = []
     database = mock.MagicMock()
     database.commit.side_effect = lambda: events.append("commit")
@@ -284,7 +439,7 @@ def test_bounded_resume_failure_closes_durable_running_marker(monkeypatch) -> No
         instance.close()
 
     assert instance.last_status == "error"
-    assert events == ["commit", "rollback", "finish-error", "commit"]
+    assert events == ["commit", "commit", "rollback", "finish-error", "commit"]
     instance.crawl.finish_run.assert_called_once_with(
         17,
         "error",
@@ -293,7 +448,49 @@ def test_bounded_resume_failure_closes_durable_running_marker(monkeypatch) -> No
     )
 
 
-def test_bounded_partial_group_retry_excludes_already_seen_keys(monkeypatch) -> None:
+def test_incompatible_resume_rejection_commits_before_new_marker(monkeypatch) -> None:
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
+    _bounded_config(monkeypatch)
+    monkeypatch.setitem(CRAWL, "bounded_run_key", "")
+    events: list[str] = []
+    database = mock.MagicMock()
+    database.commit.side_effect = lambda: events.append("commit-rejection")
+    database.rollback.side_effect = lambda: events.append("rollback-new-marker")
+    instance = Crawler(mock.MagicMock(), database, workers=1)
+    instance.crawl = mock.MagicMock()
+    instance.crawl.resumable_bounded_run_key.side_effect = lambda *_args, **_kwargs: (
+        events.append("reject-old-run") or None
+    )
+
+    def fail_new_marker(*_args, **_kwargs) -> None:
+        assert events[-1] == "commit-rejection"
+        events.append("start-new-marker")
+        raise RuntimeError("new marker failed")
+
+    instance.crawl.start_run.side_effect = fail_new_marker
+    try:
+        with pytest.raises(RuntimeError, match="new marker failed"):
+            instance.run()
+    finally:
+        instance.close()
+
+    assert events == [
+        "reject-old-run",
+        "commit-rejection",
+        "start-new-marker",
+        "rollback-new-marker",
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw_url",
+    (
+        "/en/catalog/genuine/unit?uid=10001",
+        "//partsouq.com/en/catalog/genuine/unit?uid=10001",
+        "http://partsouq.com/en/catalog/genuine/unit/?uid=10001",
+    ),
+)
+def test_bounded_partial_group_retry_excludes_already_seen_keys(monkeypatch, raw_url: str) -> None:
     _bounded_config(monkeypatch)
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
     instance.run_id = 17
@@ -315,8 +512,10 @@ def test_bounded_partial_group_retry_excludes_already_seen_keys(monkeypatch) -> 
     instance.crawl.run_key = "bounded-resume-test"
     instance.crawl.previous_row_count.return_value = 0
     instance._get = mock.MagicMock(return_value=_parts_html(10))
+    group = _group()
+    group["url"] = raw_url
     try:
-        truncated = instance.crawl_group("TOYOTA", 7, _group(), fetched={})
+        truncated = instance.crawl_group("TOYOTA", 7, group, fetched={})
     finally:
         instance.close()
 
@@ -325,6 +524,10 @@ def test_bounded_partial_group_retry_excludes_already_seen_keys(monkeypatch) -> 
     written = instance.parts.upsert_parts.call_args
     assert [row["part_number"] for row in written.args[1]] == ["P-00008", "P-00009"]
     assert written.kwargs == {"complete_group": True}
+    assert instance.vehicles.upsert_group.call_args.args[4] == (
+        "https://partsouq.com/en/catalog/genuine/unit?uid=10001"
+    )
+    instance._get.assert_called_once_with("https://partsouq.com/en/catalog/genuine/unit?uid=10001")
     instance.crawl.mark_group_fetched.assert_called_once_with(
         41,
         "bounded-resume-test",
@@ -379,6 +582,7 @@ def test_bounded_run_publishes_despite_quarantined_rows(monkeypatch) -> None:
     bounded_success，即使存在 quarantine 列。"""
     monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     _bounded_config(monkeypatch)
+    monkeypatch.setitem(CRAWL, "bounded_run_key", "")
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
     instance.brands = mock.MagicMock()
     instance.crawl = mock.MagicMock()
@@ -411,6 +615,42 @@ def test_bounded_and_sample_limits_are_mutually_exclusive(monkeypatch) -> None:
         Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
 
 
+def test_scheduled_bounded_run_rejects_operator_supplied_run_key(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.crawl = mock.MagicMock()
+    try:
+        with pytest.raises(
+            ValueError,
+            match="PSQ_BOUNDED_RUN_KEY cannot be set for a scheduled bounded run",
+        ):
+            instance.run()
+    finally:
+        instance.close()
+
+    instance.crawl.start_run.assert_not_called()
+
+
+@pytest.mark.parametrize("run_key", ("", "operator-key"))
+def test_formal_bounded_run_requires_scheduler_before_db_writes(monkeypatch, run_key: str) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 0)
+    monkeypatch.setitem(CRAWL, "bounded_run_key", run_key)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.crawl = mock.MagicMock()
+    try:
+        with pytest.raises(
+            ValueError,
+            match="formal 10000-part bounded run requires the daemon scheduler",
+        ):
+            instance.run()
+    finally:
+        instance.close()
+
+    instance.crawl.start_run.assert_not_called()
+    instance.http.ensure_fresh.assert_not_called()
+
+
 def test_bounded_publish_rejects_non_formal_target_before_query() -> None:
     database = mock.MagicMock()
 
@@ -440,7 +680,115 @@ def test_scheduled_bounded_resume_requires_a_finished_failed_prior_attempt() -> 
     assert "previous_job.exit_code IS NOT NULL" in query
     assert "previous_job.exit_code <> 0" in query
     assert "BINARY artifact.sanitizer_version <> BINARY %s" in query
-    assert params == (10_000, 77, SANITIZER_VERSION)
+    assert "BINARY artifact.verification_status = BINARY 'verified'" in query
+    assert "BINARY artifact.verification_status = BINARY 'superseded'" in query
+    assert "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1) AS candidate" in query
+    assert "receipt_group.fetched_run_key = candidate.run_key" in query
+    assert "receipt_group.fetched_status" in query
+    assert "REGEXP_LIKE(receipt_group.url" in query
+    assert params == (SANITIZER_VERSION, 10_000, 77)
+
+    database.reset_mock()
+    database._execute.return_value.fetchone.return_value = None
+    assert (
+        CrawlRepository(database, "bounded-direct-resume-contract").resumable_bounded_run_key(
+            10_000,
+            scheduled_job_run_id=None,
+        )
+        is None
+    )
+    query, params = database._execute.call_args.args
+    assert "ORDER BY started_at DESC, id DESC LIMIT 1) AS candidate" in query
+    assert "BINARY artifact.verification_status = BINARY 'verified'" in query
+    assert "BINARY artifact.verification_status = BINARY 'superseded'" in query
+    assert "receipt_group.fetched_run_key = candidate.run_key" in query
+    assert "receipt_group.fetched_status" in query
+    assert "REGEXP_LIKE(receipt_group.url" in query
+    assert params == (SANITIZER_VERSION, 10_000)
+
+
+def test_incompatible_bounded_resume_is_durably_rejected() -> None:
+    database = mock.MagicMock()
+    cursor = mock.MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 17,
+        "run_key": "bounded-poisoned-receipt",
+        "evidence_status": "collecting",
+        "bad_evidence": 0,
+        "bad_receipt": 1,
+    }
+    database._execute.return_value = cursor
+
+    assert (
+        CrawlRepository(database, "bounded-resume-contract").resumable_bounded_run_key(
+            10_000,
+            scheduled_job_run_id=None,
+        )
+        is None
+    )
+
+    update_query, update_params = database._execute.call_args_list[-1].args
+    assert "SET evidence_status = 'rejected'" in update_query
+    assert update_params == (17,)
+
+
+def test_non_exact_rejected_resume_is_normalized_and_clears_stale_seals() -> None:
+    database = mock.MagicMock()
+    cursor = mock.MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 19,
+        "run_key": "bounded-uppercase-rejected",
+        "evidence_status": "REJECTED",
+        "bad_run_status": 1,
+        "bad_evidence": 0,
+        "bad_receipt": 0,
+    }
+    database._execute.return_value = cursor
+
+    assert (
+        CrawlRepository(database, "bounded-resume-contract").resumable_bounded_run_key(
+            10_000,
+            scheduled_job_run_id=None,
+        )
+        is None
+    )
+
+    select_query = database._execute.call_args_list[0].args[0]
+    assert "AS bad_run_status" in select_query
+    update_query, update_params = database._execute.call_args_list[-1].args
+    assert "SET evidence_status = 'rejected'" in update_query
+    assert "evidence_manifest_sha256 = NULL" in update_query
+    assert "evidence_dataset_sha256 = NULL" in update_query
+    assert "evidence_verified_at = NULL" in update_query
+    assert update_params == (19,)
+
+
+@pytest.mark.parametrize(
+    "raw_url",
+    (
+        "https://user:password@partsouq.com/en/catalog/genuine/unit?uid=10001",
+        "https://example.test/en/catalog/genuine/unit?uid=10001",
+        "https://partsouq.com/en/catalog/genuine/pick?uid=10001",
+        "https://partsouq.com/en/catalog/genuine/unit",
+    ),
+)
+def test_group_rejects_invalid_unit_url_before_db_or_http(monkeypatch, raw_url: str) -> None:
+    _bounded_config(monkeypatch)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.vehicles = mock.MagicMock()
+    instance.crawl = mock.MagicMock()
+    instance.crawl.is_group_fetched.return_value = False
+    instance._get = mock.MagicMock()
+    group = _group()
+    group["url"] = raw_url
+    try:
+        with pytest.raises(RuntimeError, match="invalid PartSouq catalog URL"):
+            instance.crawl_group("TOYOTA", 7, group)
+    finally:
+        instance.close()
+
+    instance.vehicles.upsert_category.assert_not_called()
+    instance._get.assert_not_called()
 
 
 @pytest.mark.skipif(
@@ -560,27 +908,6 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
             "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
             "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
         ).lastrowid
-        database.commit()
-        database._execute(
-            "UPDATE partsouq_http_artifacts SET sanitizer_version = %s, "
-            "verification_status = 'rejected', verified_at = NULL "
-            "WHERE crawl_run_id = %s AND verification_status = 'verified'",
-            ("partsouq-html-public-v1", first_run_id),
-        )
-        database.commit()
-        assert (
-            first.resumable_bounded_run_key(
-                10_000,
-                scheduled_job_run_id=retry_scheduled_job_run_id,
-            )
-            is None
-        )
-        database._execute(
-            "UPDATE partsouq_http_artifacts SET sanitizer_version = %s, "
-            "verification_status = 'verified', verified_at = UTC_TIMESTAMP(6) "
-            "WHERE crawl_run_id = %s",
-            (SANITIZER_VERSION, first_run_id),
-        )
         database.commit()
         assert first.resumable_bounded_run_key(
             10_000,
@@ -1351,6 +1678,374 @@ def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
         assert row["resolved_at"] is None
         assert row["resolution"] is None
         assert crawl.count_quarantined(second_run_key) == 1
+    finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
+)
+def test_mysql_crawl_model_releases_evidence_lock_before_vehicle_worker(
+    monkeypatch,
+) -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    _bounded_config(monkeypatch, target=10_000)
+    database = Database().connect()
+    instance: Crawler | None = None
+    try:
+        _clear_mysql_fixture(database)
+        run_id = database._execute(
+            "INSERT INTO crawl_runs ("
+            "run_key,started_at,status,dataset_kind,target_parts,evidence_status) "
+            "VALUES ('bounded-lock-regression',UTC_TIMESTAMP(),'running',"
+            "'bounded',10000,'collecting')"
+        ).lastrowid
+        assert run_id is not None
+        database.commit()
+
+        connection_ids: dict[str, int] = {}
+        instance = Crawler(mock.MagicMock(), database, workers=1)
+        instance.brands = mock.MagicMock()
+        instance.brands.upsert_model.return_value = 31
+        instance.crawl = CrawlRepository(database, "bounded-lock-regression")
+        instance._fetch = mock.MagicMock(return_value=("<html>pick</html>", object()))
+        vehicle = {
+            "name": "CAMRY",
+            "model_code": "AXVA70",
+            "prod_period": "01.2018 - 12.2020",
+            "production_from": "2018-01",
+            "production_to": "2020-12",
+            "vid": "SITE-VID-1",
+            "ssd": "VEHICLE-SSD",
+        }
+
+        def capture_pick_lock(*_args, **_kwargs) -> None:
+            row = database._execute("SELECT CONNECTION_ID() AS connection_id").fetchone()
+            assert row is not None
+            connection_ids["main"] = int(row["connection_id"])
+            assert database._execute(
+                "SELECT id FROM crawl_runs WHERE id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone() == {"id": run_id}
+
+        def capture_vehicle_lock(*_args) -> None:
+            database._execute("SET SESSION innodb_lock_wait_timeout=1")
+            row = database._execute("SELECT CONNECTION_ID() AS connection_id").fetchone()
+            assert row is not None
+            connection_ids["worker"] = int(row["connection_id"])
+            assert database._execute(
+                "SELECT id FROM crawl_runs WHERE id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone() == {"id": run_id}
+
+        instance._capture_http_evidence = mock.MagicMock(side_effect=capture_pick_lock)
+        instance.crawl_vehicle = mock.MagicMock(side_effect=capture_vehicle_lock)
+        with mock.patch(
+            "partsouq_catalog.crawler.parse_vehicles",
+            return_value=([vehicle], 0),
+        ):
+            result = instance.crawl_model(
+                "TOYOTA",
+                17,
+                {"name": "CAMRY", "ssd": "MODEL-SSD", "url": "/pick"},
+            )
+
+        assert result == (0, True)
+        assert connection_ids["main"] != connection_ids["worker"]
+        assert database._execute(
+            "SELECT status FROM crawl_state WHERE run_key='bounded-lock-regression' "
+            "AND scope='vehicle' AND scope_key=%s",
+            (instance._vehicle_key(31, vehicle),),
+        ).fetchone() == {"status": "done"}
+    finally:
+        if instance is not None:
+            instance.close()
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
+)
+@pytest.mark.parametrize(
+    ("receipt_url", "receipt_status"),
+    (
+        ("/en/catalog/genuine/unit?uid=10001", "done"),
+        ("HTTPS://PARTSOUQ.COM/en/catalog/genuine/unit?uid=10001", "done"),
+        (
+            "https://partsouq.com/en/catalog/genuine/unit?uid=10001&ssd=SECRET",
+            "done",
+        ),
+        ("https://partsouq.com/en/catalog/genuine/unit?uid=10001&token=SECRET", "done"),
+        ("https://partsouq.com/en/catalog/genuine/unit?", "done"),
+        ("https://partsouq.com/en/catalog/genuine/unit?uid=10001", "DONE"),
+        ("https://partsouq.com/en/catalog/genuine/unit?uid=10001", "done "),
+        ("https://partsouq.com/en/catalog/genuine/unit?uid=99999", "done"),
+    ),
+)
+def test_mysql_bounded_resume_durably_rejects_invalid_group_receipt(
+    receipt_url: str,
+    receipt_status: str,
+) -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        _clear_mysql_fixture(database)
+        assert database._execute(
+            "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns_list "
+            "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'groups_t' AND INDEX_NAME = 'idx_group_fetched_run_key'"
+        ).fetchone() == {"columns_list": "fetched_run_key"}
+        older_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        older = CrawlRepository(database, "bounded-valid-older")
+        older_run_id = older.start_run(
+            "bounded-valid-older",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=older_job_id,
+        )
+        older.finish_run(older_run_id, "interrupted", {"parts": 0}, "older valid run")
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'failed', exit_code = 125, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (older_job_id,),
+        )
+        first_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        crawl = CrawlRepository(database, "bounded-relative-receipt")
+        run_id = crawl.start_run(
+            "bounded-relative-receipt",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=first_job_id,
+        )
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        brand_id = brands.upsert_brand("TOYOTA", None)
+        model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-SSD", None)
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CAMRY",
+                "model_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "vid": "SITE-VID-1",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10001",
+            receipt_url,
+        )
+        crawl.mark_group_fetched(group_id, "bounded-relative-receipt", row_count=1)
+        database._execute(
+            "UPDATE groups_t SET fetched_status = %s WHERE id = %s",
+            (receipt_status, group_id),
+        )
+        crawl.finish_run(run_id, "interrupted", {"parts": 0}, "simulated old receipt")
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'failed', exit_code = 125, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (first_job_id,),
+        )
+        retry_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        database.commit()
+
+        assert (
+            crawl.resumable_bounded_run_key(
+                10_000,
+                scheduled_job_run_id=retry_job_id,
+            )
+            is None
+        )
+
+        database._execute(
+            "UPDATE groups_t SET url = %s, fetched_status = 'done' WHERE id = %s",
+            ("https://partsouq.com/en/catalog/genuine/unit?uid=10001", group_id),
+        )
+        database.commit()
+        assert (
+            crawl.resumable_bounded_run_key(
+                10_000,
+                scheduled_job_run_id=retry_job_id,
+            )
+            is None
+        )
+        assert database._execute(
+            "SELECT evidence_status FROM crawl_runs WHERE id = %s",
+            (run_id,),
+        ).fetchone() == {"evidence_status": "rejected"}
+    finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
+)
+def test_mysql_bounded_resume_durably_rejects_pending_artifact_without_fallback() -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        _clear_mysql_fixture(database)
+        older_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        older = CrawlRepository(database, "bounded-artifact-older")
+        older_run_id = older.start_run(
+            "bounded-artifact-older",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=older_job_id,
+        )
+        older.finish_run(older_run_id, "interrupted", {"parts": 0}, "older valid run")
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'failed', exit_code = 125, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (older_job_id,),
+        )
+
+        latest_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        latest = CrawlRepository(database, "bounded-artifact-latest")
+        latest_run_id = latest.start_run(
+            "bounded-artifact-latest",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=latest_job_id,
+        )
+        latest.finish_run(latest_run_id, "interrupted", {"parts": 0}, "pending evidence")
+        database._execute(
+            "UPDATE crawl_runs SET evidence_status = 'collecting', "
+            "evidence_manifest_sha256 = %s, evidence_dataset_sha256 = %s, "
+            "evidence_artifact_count = 1, evidence_record_count = 1, "
+            "evidence_original_bytes = 1, evidence_stored_bytes = 1, "
+            "evidence_verified_at = UTC_TIMESTAMP(6) WHERE id = %s",
+            ("1" * 64, "2" * 64, latest_run_id),
+        )
+        body_sha256 = "3" * 64
+        database._execute(
+            "INSERT INTO partsouq_response_bodies "
+            "(body_sha256, compression, body_blob, original_bytes, stored_bytes, "
+            "sanitizer_version) VALUES (%s, 'zlib', %s, 1, 1, %s)",
+            (body_sha256, b"x", SANITIZER_VERSION),
+        )
+        database._execute(
+            "INSERT INTO partsouq_http_artifacts ("
+            "crawl_run_id, scheduled_job_run_id, capture_kind, page_type, "
+            "public_source_url, source_url_sha256, raw_body_sha256, body_sha256, "
+            "sanitizer_version, http_status, content_type, challenge_detected, "
+            "fetched_at, elapsed_ms, attempt, parser_name, parser_version, "
+            "parser_context_json, parser_context_sha256, malformed_row_count, "
+            "skipped_record_count, parsed_record_count, parsed_records_sha256, "
+            "accepted_record_count, accepted_records_sha256, verification_status, "
+            "verified_at) VALUES ("
+            "%s, %s, 'live_http', 'genuine', "
+            "'https://partsouq.com/en/catalog/genuine', %s, %s, %s, %s, "
+            "200, 'text/html', 0, UTC_TIMESTAMP(6), 1, 1, 'parse_brands', "
+            "'partsouq-catalog-parser-v1', JSON_OBJECT(), %s, 0, 0, 1, %s, "
+            "0, %s, 'pending', NULL)",
+            (
+                latest_run_id,
+                latest_job_id,
+                "4" * 64,
+                "5" * 64,
+                body_sha256,
+                SANITIZER_VERSION,
+                "6" * 64,
+                "7" * 64,
+                "8" * 64,
+            ),
+        )
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'failed', exit_code = 125, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (latest_job_id,),
+        )
+        retry_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        database.commit()
+
+        assert (
+            latest.resumable_bounded_run_key(
+                10_000,
+                scheduled_job_run_id=retry_job_id,
+            )
+            is None
+        )
+        database.commit()
+        assert database._execute(
+            "SELECT evidence_status, evidence_manifest_sha256, evidence_dataset_sha256, "
+            "evidence_artifact_count, evidence_record_count, evidence_original_bytes, "
+            "evidence_stored_bytes, evidence_verified_at FROM crawl_runs WHERE id = %s",
+            (latest_run_id,),
+        ).fetchone() == {
+            "evidence_status": "rejected",
+            "evidence_manifest_sha256": None,
+            "evidence_dataset_sha256": None,
+            "evidence_artifact_count": 0,
+            "evidence_record_count": 0,
+            "evidence_original_bytes": 0,
+            "evidence_stored_bytes": 0,
+            "evidence_verified_at": None,
+        }
+
+        database._execute(
+            "UPDATE partsouq_http_artifacts SET verification_status = 'verified', "
+            "verified_at = UTC_TIMESTAMP(6) WHERE crawl_run_id = %s",
+            (latest_run_id,),
+        )
+        database.commit()
+        assert (
+            latest.resumable_bounded_run_key(
+                10_000,
+                scheduled_job_run_id=retry_job_id,
+            )
+            is None
+        )
+        assert database._execute(
+            "SELECT evidence_status FROM crawl_runs WHERE id IN (%s, %s) ORDER BY id",
+            (older_run_id, latest_run_id),
+        ).fetchall() == [
+            {"evidence_status": "missing"},
+            {"evidence_status": "rejected"},
+        ]
     finally:
         database.rollback()
         _clear_mysql_fixture(database)
