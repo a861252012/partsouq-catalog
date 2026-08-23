@@ -139,3 +139,24 @@
    run 1／2 stale running、VIN decode／mapping／fitment 0、catalog ledger 022。
 10. 更新完整交接文件與桌面摘要。接手第一步是修 migration 024 exact CHECK gate，不是啟動
     正式爬蟲。
+
+## 2026-08-23 13:45–14:05 最終交接再查證
+
+1. Git 基線更新為 `HEAD == origin/main == a46c3a9`；工作樹現有 18 個 modified、2 個
+   untracked，約 `+2106/-450`，全是尚未提交的 NHTSA schema/runtime/tests 整合稿。
+2. migration 024 原本的 MySQL 8.4 exact CHECK mismatch 已修正；legacy upgrade、重跑、
+   CHECK mutation與 running/NULL lease mutation 真 MySQL gate：`4 passed`。
+3. scheduler exact lineage／rollback 真 MySQL gate：`5 passed`。
+4. NHTSA exactly-one writer、expired takeover、舊 token失效、bulk/VIN atomic rollback 真
+   MySQL gate：`15 passed`。本輪合併重跑兩個 NHTSA integration files：`20 passed`。
+5. migration＋scheduler＋progress unit：`121 passed`；15 個異動 production source files 的
+   strict mypy 通過；Ruff check、`git diff --check` 通過。
+6. Ruff format 尚未全綠：`tests/crawler/integration/test_nhtsa_mysql_sync.py` 需要格式化。
+7. room-of-doubt review 找到尚未修正的 P1：atomic publish 後 child 非零退出會把 completed
+   scheduler row 改 failed；Bulk/API/VIN heartbeat enter／close／join 邊界；stale worker 中間
+   artifact mutation未完全綁 lease；長 finalize transaction 可能跨過 expiry。
+8. 因仍有 P1，本批 NHTSA diff 未 commit、未 push、未套主 DB，也未啟動正式排程。
+9. 唯讀重查主 DB：raw 10,000、distinct 3,823、bounded/published/current 皆 0、quarantine
+   2,260、VIN decode/mapping/fitment 皆 0、catalog ledger 022；NHTSA run 1/2 仍 running。
+10. MySQL、admin、station-admin healthy，queue-scheduler running；catalog/NHTSA LaunchAgent
+    未載入。完整現況與接手順序已更新到 `docs/handoff-2026-08-23.md`。
