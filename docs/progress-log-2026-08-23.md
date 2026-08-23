@@ -4,6 +4,8 @@
 
 | Commit | 內容 | Remote |
 |---|---|---|
+| `e687c4b` | diagnostic exact contract、fresh cleanup、真 MySQL 404 交易測試 | 已 push `origin/main` |
+| `949d91e` | 最終交接與進度文件 | 已 push |
 | `692076e` | bounded 競態、404／空解析 diagnostics、secret-safe HTTP 錯誤 | 已 push `origin/main` |
 | `e092b33` | NHTSA 長任務 heartbeat 與重複驗證 | 已 push |
 | `cba3685` | LaunchAgent 自動升級與排程回收順序 | 已 push |
@@ -11,8 +13,8 @@
 | `a999c9a` | evidence 版本與發布閘門 | 已 push |
 | `baeb235` | 搬移專案並強化本機排程環境 | 已 push |
 
-目前 `HEAD`、`origin/main` 都是
-`692076ea983ef6d10a0a2fd30ba08caed357af16`，工作樹乾淨。
+目前最新程式 commit 與 `origin/main` 是
+`e687c4b8bf8f467a17f46a7fd49e6d9c1c717715`；本文件更新會另建文件 commit。
 
 ## 2026-08-23 12:25–13:00
 
@@ -65,3 +67,18 @@
 
 詳細操作順序、成功條件與禁止事項見
 `docs/handoff-2026-08-23.md`。
+
+## 2026-08-23 13:00–13:05
+
+1. 完成 migration 023 runtime exact contract：欄位/default/charset、完整 index metadata、
+   同 DB foreign key、完整 CHECK clause 與 `ENFORCED=YES`。
+2. 修掉 hard-404 MySQL 測試預植 diagnostic 的假綠；改由實際 Crawler 第一次失敗後
+   查證 diagnostic，第二次成功重跑驗同一 id/upsert 單列。
+3. 補 weak same-token CHECK、`NOT ENFORCED`、prefix index、fresh CREATE、dirty retry
+   mutation tests。
+4. Ruff、strict mypy、針對性 migration／MySQL gate 全部 exit 0；獨立 re-review PASS。
+5. commit `e687c4b` 已 push `origin/main`。
+6. 再次唯讀盤點主 DB：raw parts 10,000；published/current 仍 0；NHTSA VIN/mapping/
+   fitment 仍 0；NHTSA run 1/2 仍 stale running。
+7. 更新最終交接文件，將下一步改為先完成 NHTSA lease／原子發布／stale recovery，
+   再套 migration 023 與重跑正式 PartSouq 10,000。
