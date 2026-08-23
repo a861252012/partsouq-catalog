@@ -396,3 +396,14 @@
 3. **NHTSA 解碼入庫 209 筆（驗收 >100 達標）**：含 sparse（Model/engine
    NULL）與 ErrorCode≠0（歐系檢查碼警告）案例；未解出者為 NHTSA 無申報
    的台灣專屬車，由 VNCS 自身欄位兜底。
+
+## 2026-08-24（工作階段5）bounded 語意的邊界與下一戰役範圍
+
+**重要發現**：run14 的 10,000 筆全部歸屬單一 vehicle（TOYOTA1000 KP30,
+vid='0',1969 古董車；DONE 統計 brands=1/models=1/vehicles=2）——bounded
+語意在首個模型即達標停止（log:「part row limit reached; stopping before
+next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋原子發布
+全鏈證明）；但 C1 VIN↔車款 mapping 與 fitment 的實際價值需要**全量 crawl
+戰役**（18 品牌 × 全模型，估數日禮節爬行）才有意義。此為下一階段範圍決策：
+(a) 直接啟動全量 crawl（LaunchAgent 已具備，改 interval/一次性觸發）
+(b) 先以現有 10k 完成 C1-C2-D2 工具鏈，全量資料到位後重跑。
