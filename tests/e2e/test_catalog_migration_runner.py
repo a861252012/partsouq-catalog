@@ -1097,6 +1097,159 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
         connection.close()
 
 
+def test_migration_check_rejects_http_diagnostic_schema_and_unique_index_drift(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    runner.check()
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
+            )
+        with pytest.raises(MigrationError, match="diagnostics schema contract mismatch"):
+            runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "MODIFY COLUMN content_type VARCHAR(128) NOT NULL"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "DROP INDEX uq_partsouq_diagnostic_group_reason, "
+                "ADD UNIQUE KEY uq_partsouq_diagnostic_group_reason "
+                "(group_id, crawl_run_id, reason)"
+            )
+        with pytest.raises(MigrationError, match="diagnostics schema contract mismatch"):
+            runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "ADD KEY fk_partsouq_diagnostic_group (group_id)"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "DROP INDEX uq_partsouq_diagnostic_group_reason, "
+                "ADD UNIQUE KEY uq_partsouq_diagnostic_group_reason "
+                "(crawl_run_id, group_id, reason)"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "DROP INDEX idx_partsouq_diagnostic_body, "
+                "ADD KEY idx_partsouq_diagnostic_body (body_sha256(8))"
+            )
+        with pytest.raises(MigrationError, match="diagnostics schema contract mismatch"):
+            runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "DROP INDEX idx_partsouq_diagnostic_body, "
+                "ADD KEY idx_partsouq_diagnostic_body (body_sha256)"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "DROP CHECK chk_partsouq_diagnostic_sanitizer, "
+                "ADD CONSTRAINT chk_partsouq_diagnostic_sanitizer "
+                "CHECK (sanitizer_version IS NOT NULL "
+                "OR 'partsouq-html-public-v2' = '')"
+            )
+        with pytest.raises(MigrationError, match="diagnostics schema contract mismatch"):
+            runner.check()
+    finally:
+        connection.close()
+
+
+def test_migration_023_creates_http_diagnostics_from_missing_table(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE partsouq_http_diagnostics")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=23")
+        assert runner.apply() == (23,)
+        runner.check()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS column_count FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='partsouq_http_diagnostics'"
+            )
+            assert cursor.fetchone() == {"column_count": 25}
+    finally:
+        connection.close()
+
+
+def test_migration_check_rejects_disabled_http_diagnostic_check(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "ALTER CHECK chk_partsouq_diagnostic_sanitizer NOT ENFORCED"
+            )
+        with pytest.raises(MigrationError, match="diagnostics schema contract mismatch"):
+            runner.check()
+    finally:
+        connection.close()
+
+
+def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
+            )
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=23")
+        with pytest.raises(MigrationError, match="migration:023 failed"):
+            runner.apply()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT state,attempt_count FROM catalog_schema_ledger WHERE version=23")
+            assert cursor.fetchone() == {"state": "failed", "attempt_count": 1}
+            cursor.execute(
+                "ALTER TABLE partsouq_http_diagnostics "
+                "MODIFY COLUMN content_type VARCHAR(128) NOT NULL"
+            )
+        assert runner.apply(retry_version=23) == (23,)
+        runner.check()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT state,attempt_count FROM catalog_schema_ledger WHERE version=23")
+            assert cursor.fetchone() == {"state": "applied", "attempt_count": 2}
+    finally:
+        connection.close()
+
+
 def test_migration_runner_operates_with_compose_application_user(
     migration_database: MigrationDatabase,
 ) -> None:

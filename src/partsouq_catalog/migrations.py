@@ -66,6 +66,96 @@ STATION_ADMIN_ASSET = (
     STATION_ADMIN_ASSET_HASHES[-1],
 )
 
+_HTTP_DIAGNOSTIC_COLUMNS = (
+    ("id", "bigint unsigned", "NO"),
+    ("crawl_run_id", "int", "NO"),
+    ("scheduled_job_run_id", "bigint unsigned", "NO"),
+    ("group_id", "int", "NO"),
+    ("reason", "varchar(32)", "NO"),
+    ("public_source_url", "varchar(1024)", "NO"),
+    ("source_url_sha256", "char(64)", "NO"),
+    ("raw_body_sha256", "char(64)", "NO"),
+    ("body_sha256", "char(64)", "NO"),
+    ("compression", "varchar(16)", "NO"),
+    ("body_blob", "mediumblob", "NO"),
+    ("original_bytes", "int unsigned", "NO"),
+    ("stored_bytes", "int unsigned", "NO"),
+    ("sanitizer_version", "varchar(64)", "NO"),
+    ("http_status", "smallint unsigned", "NO"),
+    ("content_type", "varchar(128)", "NO"),
+    ("fetched_at", "datetime(6)", "NO"),
+    ("elapsed_ms", "int unsigned", "NO"),
+    ("attempt", "smallint unsigned", "NO"),
+    ("parser_name", "varchar(128)", "NO"),
+    ("parser_version", "varchar(64)", "NO"),
+    ("parser_context_json", "json", "NO"),
+    ("parser_context_sha256", "char(64)", "NO"),
+    ("created_at", "datetime(6)", "NO"),
+    ("updated_at", "datetime(6)", "NO"),
+)
+_HTTP_DIAGNOSTIC_ASCII_COLUMNS = frozenset(
+    {
+        "reason",
+        "source_url_sha256",
+        "raw_body_sha256",
+        "body_sha256",
+        "compression",
+        "sanitizer_version",
+        "parser_version",
+        "parser_context_sha256",
+    }
+)
+_HTTP_DIAGNOSTIC_CHECK_CLAUSES = {
+    "chk_partsouq_diagnostic_context": (
+        "(json_valid(`parser_context_json`) and "
+        "(not(regexp_like(lower(cast(`parser_context_json` as char charset utf8mb4)),"
+        '_utf8mb4\\\'("ssd"[[:space:]]*:|ssd=|cf_clearance|phpsessid|authorization|'
+        "set-cookie)\\'))))"
+    ),
+    "chk_partsouq_diagnostic_hashes": (
+        "(regexp_like(`source_url_sha256`,_utf8mb4\\'^[0-9a-f]{64}$\\') and "
+        "regexp_like(`raw_body_sha256`,_utf8mb4\\'^[0-9a-f]{64}$\\') and "
+        "regexp_like(`body_sha256`,_utf8mb4\\'^[0-9a-f]{64}$\\') and "
+        "regexp_like(`parser_context_sha256`,_utf8mb4\\'^[0-9a-f]{64}$\\'))"
+    ),
+    "chk_partsouq_diagnostic_http": (
+        "((`content_type` <> _utf8mb4\\'\\') and (`elapsed_ms` >= 0) and (`attempt` > 0))"
+    ),
+    "chk_partsouq_diagnostic_parser": (
+        "((`parser_name` = _utf8mb4\\'parse_parts\\') and (`parser_version` <> _utf8mb4\\'\\'))"
+    ),
+    "chk_partsouq_diagnostic_public_url": (
+        "((`public_source_url` like "
+        "_utf8mb4\\'https://partsouq.com/en/catalog/genuine/unit?%\\') and "
+        "(not(regexp_like(lower(`public_source_url`),_utf8mb4\\'(^|[?&])ssd=\\'))) "
+        "and (not((`public_source_url` like _utf8mb4\\'%#%\\'))))"
+    ),
+    "chk_partsouq_diagnostic_reason": (
+        "(((cast(`reason` as char charset binary) = "
+        "cast(_utf8mb4\\'http_not_found\\' as char charset binary)) and "
+        "(`http_status` = 404)) or ((cast(`reason` as char charset binary) = "
+        "cast(_utf8mb4\\'empty_parse\\' as char charset binary)) and "
+        "(`http_status` = 200)))"
+    ),
+    "chk_partsouq_diagnostic_sanitizer": (
+        "(cast(`sanitizer_version` as char charset binary) = "
+        "cast(_utf8mb4\\'partsouq-html-public-v2\\' as char charset binary))"
+    ),
+    "chk_partsouq_diagnostic_storage": (
+        "((cast(`compression` as char charset binary) = "
+        "cast(_utf8mb4\\'zlib\\' as char charset binary)) and "
+        "(`original_bytes` > 0) and (`stored_bytes` > 0) and "
+        "(`stored_bytes` = length(`body_blob`)))"
+    ),
+}
+
+
+def _normalize_http_diagnostic_check_clause(clause: str) -> str:
+    normalized = clause.strip().lower()
+    normalized = re.sub(r"_(?:ascii|utf8mb4)(?=\\')", "", normalized)
+    return re.sub(r"\s+", " ", normalized)
+
+
 _DELIMITER_DIRECTIVE = re.compile(r"\s*DELIMITER\s+(\S+)\s*", re.IGNORECASE)
 _CREATE_PROCEDURE = re.compile(
     r"\bCREATE\s+PROCEDURE\s+`?([A-Za-z0-9_]+)`?",
@@ -418,6 +508,7 @@ class CatalogMigrationRunner:
                 raise MigrationError("catalog schema ledger does not exist")
             validate_ledger(_load_ledger(connection), changes, complete=True)
             _assert_no_owned_routines(connection, changes)
+            _assert_http_diagnostics_contract(connection)
         finally:
             connection.close()
 
@@ -491,6 +582,8 @@ class CatalogMigrationRunner:
                     if change.version == 5 and allow_v5_rebuild:
                         _execute(connection, "SET @PARTSOUQ_ALLOW_V5_VEHICLE_REBUILD = 1")
                     _execute_change(connection, change)
+                    if change.version == 23:
+                        _assert_http_diagnostics_contract(connection)
                     if change.version is not None:
                         _assert_no_owned_routines(connection, (change,))
                     _finish(connection, change)
@@ -503,6 +596,7 @@ class CatalogMigrationRunner:
 
             _assert_no_owned_routines(connection, changes)
             validate_ledger(_load_ledger(connection), changes, complete=True)
+            _assert_http_diagnostics_contract(connection)
             return tuple(applied)
         finally:
             if lock_name is not None:
@@ -728,6 +822,203 @@ def _column_exists(connection: MigrationConnection, table: str, column: str) -> 
         )
         row = cursor.fetchone()
     return bool(row and row["row_count"] == 1)
+
+
+def _assert_http_diagnostics_contract(connection: MigrationConnection) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT COLUMN_NAME AS column_name,COLUMN_TYPE AS column_type,"
+            "IS_NULLABLE AS is_nullable,COLUMN_DEFAULT AS column_default,EXTRA AS extra,"
+            "CHARACTER_SET_NAME AS character_set,COLLATION_NAME AS collation_name "
+            "FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='partsouq_http_diagnostics' "
+            "ORDER BY ORDINAL_POSITION"
+        )
+        column_rows = tuple(cursor.fetchall())
+        columns = tuple(
+            (
+                str(row["column_name"]),
+                str(row["column_type"]).lower(),
+                str(row["is_nullable"]),
+            )
+            for row in column_rows
+        )
+        cursor.execute(
+            "SELECT INDEX_NAME AS index_name,NON_UNIQUE AS non_unique,"
+            "SEQ_IN_INDEX AS sequence,COLUMN_NAME AS column_name,SUB_PART AS sub_part,"
+            "INDEX_TYPE AS index_type,IS_VISIBLE AS is_visible "
+            "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() "
+            "AND TABLE_NAME='partsouq_http_diagnostics' "
+            "ORDER BY BINARY INDEX_NAME,SEQ_IN_INDEX"
+        )
+        indexes = tuple(
+            (
+                str(row["index_name"]),
+                int(row["non_unique"]),
+                int(row["sequence"]),
+                str(row["column_name"]),
+                row["sub_part"],
+                str(row["index_type"]),
+                str(row["is_visible"]),
+            )
+            for row in cursor.fetchall()
+        )
+        cursor.execute(
+            "SELECT rc.CONSTRAINT_NAME AS constraint_name,kcu.COLUMN_NAME AS column_name,"
+            "kcu.REFERENCED_TABLE_NAME AS referenced_table,"
+            "kcu.REFERENCED_COLUMN_NAME AS referenced_column,"
+            "kcu.REFERENCED_TABLE_SCHEMA AS referenced_schema,"
+            "rc.UPDATE_RULE AS update_rule,rc.DELETE_RULE AS delete_rule "
+            "FROM information_schema.REFERENTIAL_CONSTRAINTS AS rc "
+            "JOIN information_schema.KEY_COLUMN_USAGE AS kcu "
+            "ON kcu.CONSTRAINT_SCHEMA=rc.CONSTRAINT_SCHEMA AND kcu.TABLE_NAME=rc.TABLE_NAME "
+            "AND kcu.CONSTRAINT_NAME=rc.CONSTRAINT_NAME "
+            "WHERE rc.CONSTRAINT_SCHEMA=DATABASE() "
+            "AND rc.TABLE_NAME='partsouq_http_diagnostics' "
+            "ORDER BY rc.CONSTRAINT_NAME,kcu.ORDINAL_POSITION"
+        )
+        foreign_keys = tuple(
+            (
+                str(row["constraint_name"]),
+                str(row["column_name"]),
+                str(row["referenced_table"]),
+                str(row["referenced_column"]),
+                str(row["referenced_schema"]),
+                str(row["update_rule"]),
+                str(row["delete_rule"]),
+            )
+            for row in cursor.fetchall()
+        )
+        cursor.execute(
+            "SELECT checks.CONSTRAINT_NAME AS constraint_name,"
+            "checks.CHECK_CLAUSE AS check_clause,constraints.ENFORCED AS enforced "
+            "FROM information_schema.CHECK_CONSTRAINTS AS checks "
+            "JOIN information_schema.TABLE_CONSTRAINTS AS constraints "
+            "ON constraints.CONSTRAINT_SCHEMA=checks.CONSTRAINT_SCHEMA "
+            "AND constraints.CONSTRAINT_NAME=checks.CONSTRAINT_NAME "
+            "WHERE checks.CONSTRAINT_SCHEMA=DATABASE() "
+            "AND constraints.TABLE_SCHEMA=DATABASE() "
+            "AND constraints.TABLE_NAME='partsouq_http_diagnostics' "
+            "AND constraints.CONSTRAINT_TYPE='CHECK' "
+            "AND checks.CONSTRAINT_NAME LIKE 'chk_partsouq_diagnostic_%' "
+            "ORDER BY checks.CONSTRAINT_NAME"
+        )
+        checks = {
+            str(row["constraint_name"]): (
+                _normalize_http_diagnostic_check_clause(str(row["check_clause"])),
+                str(row["enforced"]),
+            )
+            for row in cursor.fetchall()
+        }
+        cursor.execute("SELECT DATABASE() AS database_name")
+        database_row = cursor.fetchone()
+        if not database_row or not database_row["database_name"]:
+            raise MigrationError("partsouq_http_diagnostics database contract is unavailable")
+        database_name = str(database_row["database_name"])
+        cursor.execute(
+            "SELECT ENGINE AS engine,TABLE_COLLATION AS table_collation "
+            "FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() "
+            "AND TABLE_NAME='partsouq_http_diagnostics' AND TABLE_TYPE='BASE TABLE'"
+        )
+        table = cursor.fetchone()
+
+    default_contract = {
+        "id": (None, "auto_increment"),
+        "created_at": ("CURRENT_TIMESTAMP(6)", "DEFAULT_GENERATED"),
+        "updated_at": (
+            "CURRENT_TIMESTAMP(6)",
+            "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(6)",
+        ),
+    }
+    columns_valid = columns == _HTTP_DIAGNOSTIC_COLUMNS
+    for row in column_rows:
+        name = str(row["column_name"])
+        expected_default, expected_extra = default_contract.get(name, (None, ""))
+        columns_valid = columns_valid and (
+            row["column_default"] == expected_default and str(row["extra"]) == expected_extra
+        )
+        if name in _HTTP_DIAGNOSTIC_ASCII_COLUMNS:
+            columns_valid = columns_valid and (
+                row["character_set"] == "ascii" and row["collation_name"] == "ascii_bin"
+            )
+        elif str(row["column_type"]).lower().startswith(("char", "varchar")):
+            columns_valid = columns_valid and row["character_set"] == "utf8mb4"
+        else:
+            columns_valid = columns_valid and row["character_set"] is None
+
+    expected_checks = {
+        name: (_normalize_http_diagnostic_check_clause(clause), "YES")
+        for name, clause in _HTTP_DIAGNOSTIC_CHECK_CLAUSES.items()
+    }
+    checks_valid = checks == expected_checks
+    expected_indexes = (
+        ("PRIMARY", 0, 1, "id", None, "BTREE", "YES"),
+        ("fk_partsouq_diagnostic_group", 1, 1, "group_id", None, "BTREE", "YES"),
+        ("idx_partsouq_diagnostic_body", 1, 1, "body_sha256", None, "BTREE", "YES"),
+        ("idx_partsouq_diagnostic_run_reason", 1, 1, "crawl_run_id", None, "BTREE", "YES"),
+        ("idx_partsouq_diagnostic_run_reason", 1, 2, "reason", None, "BTREE", "YES"),
+        ("idx_partsouq_diagnostic_run_reason", 1, 3, "updated_at", None, "BTREE", "YES"),
+        (
+            "idx_partsouq_diagnostic_schedule",
+            1,
+            1,
+            "scheduled_job_run_id",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        ("uq_partsouq_diagnostic_group_reason", 0, 1, "crawl_run_id", None, "BTREE", "YES"),
+        ("uq_partsouq_diagnostic_group_reason", 0, 2, "group_id", None, "BTREE", "YES"),
+        ("uq_partsouq_diagnostic_group_reason", 0, 3, "reason", None, "BTREE", "YES"),
+    )
+    expected_foreign_keys = (
+        (
+            "fk_partsouq_diagnostic_group",
+            "group_id",
+            "groups_t",
+            "id",
+            database_name,
+            "NO ACTION",
+            "NO ACTION",
+        ),
+        (
+            "fk_partsouq_diagnostic_run",
+            "crawl_run_id",
+            "crawl_runs",
+            "id",
+            database_name,
+            "NO ACTION",
+            "NO ACTION",
+        ),
+        (
+            "fk_partsouq_diagnostic_schedule",
+            "scheduled_job_run_id",
+            "scheduled_job_runs",
+            "id",
+            database_name,
+            "NO ACTION",
+            "NO ACTION",
+        ),
+    )
+    failures: list[str] = []
+    if not columns_valid:
+        failures.append("columns")
+    if indexes != expected_indexes:
+        failures.append("indexes")
+    if foreign_keys != expected_foreign_keys:
+        failures.append("foreign_keys")
+    if not checks_valid:
+        failures.append("checks")
+    if (
+        not table
+        or table["engine"] != "InnoDB"
+        or not str(table["table_collation"]).startswith("utf8mb4_")
+    ):
+        failures.append("table")
+    if failures:
+        raise MigrationError(
+            "partsouq_http_diagnostics schema contract mismatch: " + ",".join(failures)
+        )
 
 
 def _claim(

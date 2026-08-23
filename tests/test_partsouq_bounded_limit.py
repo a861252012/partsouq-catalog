@@ -2572,7 +2572,296 @@ def test_mysql_http_diagnostic_upserts_inline_sanitized_body_without_formal_evid
         )
         assert b"FIRST-SECRET" not in restored
         assert b"SECOND-SECRET" not in restored
+
+        replacement_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        assert (
+            crawl.start_run(
+                "diagnostic-mysql-run",
+                fresh=True,
+                dataset_kind="bounded",
+                target_parts=10_000,
+                scheduled_job_run_id=replacement_job_id,
+            )
+            == run_id
+        )
+        database.commit()
+        assert database._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_http_diagnostics WHERE crawl_run_id=%s",
+            (run_id,),
+        ).fetchone() == {"row_count": 0}
     finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
+)
+def test_mysql_hard_404_terminal_writes_commit_or_rollback_together(monkeypatch) -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    instance: Crawler | None = None
+    try:
+        _clear_mysql_fixture(database)
+        scheduled_job_run_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        run_key = "hard-404-transaction"
+        crawl = CrawlRepository(database, run_key)
+        run_id = crawl.start_run(
+            run_key,
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=scheduled_job_run_id,
+        )
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        parts = PartRepository(database)
+        brand_id = brands.upsert_brand("TOYOTA", None)
+        model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-SSD", None)
+        vehicle_key = {
+            "name": "CAMRY",
+            "model_code": "AXVA70",
+            "prod_period": "01.2018 - 12.2020",
+            "production_from": "2018-01",
+            "production_to": "2020-12",
+            "engine": None,
+            "trim_name": None,
+            "vid": "SITE-VID-1",
+            "ssd": "VEHICLE-SSD",
+        }
+        vehicle_id = vehicles.upsert_vehicle(model_id, vehicle_key)
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        public_url = public_source_url(
+            "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&vid=SITE-VID-1&cid=1&uid=10001"
+        )
+        group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10001",
+            public_url,
+        )
+        part = _parts(1)[0]
+        assert parts.upsert_parts(group_id, [part], run_id) == 1
+        part_row = database._execute(
+            "SELECT id FROM parts WHERE group_id=%s AND seen_run_id=%s",
+            (group_id, run_id),
+        ).fetchone()
+        assert part_row is not None
+        part_id = int(part_row["id"])
+        parser_context = {
+            "group_key": {
+                "category": {
+                    "vehicle": {
+                        "brand": "TOYOTA",
+                        "model": "CAMRY",
+                        **{key: value for key, value in vehicle_key.items() if key != "ssd"},
+                    },
+                    "cid": "1",
+                    "category_name": "ENGINE/FUEL/TOOL",
+                },
+                "group_code": "1101",
+                "uid": "10001",
+            }
+        }
+        html = _parts_html(1)
+        sanitized = sanitize_parser_html(html)
+        records, malformed_rows, skipped_rows = replay_catalog_records(
+            sanitized.body,
+            parser_name="parse_parts",
+            parser_version=PARSER_CONTRACT_VERSION,
+            context=parser_context,
+        )
+        assert len(records) == 1
+        artifact_id = crawl.record_http_evidence(
+            run_id,
+            scheduled_job_run_id,
+            page_type="unit",
+            public_url=public_url,
+            raw_body_sha256=hashlib.sha256(html.encode()).hexdigest(),
+            status_code=200,
+            content_type="text/html",
+            fetched_at=datetime.now(UTC).replace(tzinfo=None),
+            elapsed_ms=1,
+            attempt=1,
+            sanitized_body=sanitized,
+            parser_name="parse_parts",
+            parser_version=PARSER_CONTRACT_VERSION,
+            parser_context=parser_context,
+            parsed_records=records,
+            replayed_records=records,
+            accepted_records=[(part_id, records[0])],
+            malformed_rows=malformed_rows,
+            skipped_record_count=skipped_rows,
+        )
+        database._execute(
+            "UPDATE crawl_runs SET evidence_status='verified', "
+            "evidence_manifest_sha256=%s, evidence_dataset_sha256=%s, "
+            "evidence_artifact_count=1, evidence_record_count=1, "
+            "evidence_original_bytes=%s, evidence_stored_bytes=%s, "
+            "evidence_verified_at=UTC_TIMESTAMP(6) WHERE id=%s",
+            ("a" * 64, "b" * 64, sanitized.original_bytes, sanitized.stored_bytes, run_id),
+        )
+        database.commit()
+
+        error_html = "<html><title>PartSouq - Error</title><p>Error 404</p></html>"
+        error_body = sanitize_parser_html(error_html)
+        original_run = database._execute(
+            "SELECT evidence_status,evidence_manifest_sha256,evidence_dataset_sha256,"
+            "evidence_artifact_count,evidence_record_count,evidence_original_bytes,"
+            "evidence_stored_bytes,evidence_verified_at FROM crawl_runs WHERE id=%s",
+            (run_id,),
+        ).fetchone()
+        original_group = database._execute(
+            "SELECT fetched_run_key,fetched_status,fetched_row_count FROM groups_t WHERE id=%s",
+            (group_id,),
+        ).fetchone()
+        _bounded_config(monkeypatch, target=10_000)
+        instance = Crawler(mock.MagicMock(), database, workers=1)
+        instance.run_id = run_id
+        instance.scheduled_job_run_id = scheduled_job_run_id
+        instance.crawl = crawl
+        instance.counts["parts"] = 1
+        group = {
+            "category_name": "ENGINE/FUEL/TOOL",
+            "cid": "1",
+            "group_code": "1101",
+            "group_name": "PARTIAL ENGINE ASSEMBLY",
+            "uid": "10001",
+            "url": public_url,
+        }
+        evidence_vehicle_key = parser_context["group_key"]["category"]["vehicle"]
+        original_mark_group_fetched = crawl.mark_group_fetched
+
+        def fail_after_receipt(*args, **kwargs) -> None:
+            original_mark_group_fetched(*args, **kwargs)
+            raise RuntimeError("injected receipt commit failure")
+
+        monkeypatch.setattr(crawl, "mark_group_fetched", fail_after_receipt)
+        instance._fetch = mock.MagicMock(
+            side_effect=NotFoundError(
+                "http 404",
+                _catalog_response(error_html, status_code=404, url=public_url),
+            )
+        )
+        with pytest.raises(RuntimeError, match="^injected receipt commit failure$"):
+            instance.crawl_group(
+                "TOYOTA",
+                vehicle_id,
+                group,
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+
+        assert database._execute(
+            "SELECT verification_status FROM partsouq_http_artifacts WHERE id=%s",
+            (artifact_id,),
+        ).fetchone() == {"verification_status": "verified"}
+        assert database._execute(
+            "SELECT seen_run_id FROM parts WHERE id=%s", (part_id,)
+        ).fetchone() == {"seen_run_id": run_id}
+        assert (
+            database._execute(
+                "SELECT fetched_run_key,fetched_status,fetched_row_count FROM groups_t WHERE id=%s",
+                (group_id,),
+            ).fetchone()
+            == original_group
+        )
+        assert (
+            database._execute(
+                "SELECT evidence_status,evidence_manifest_sha256,evidence_dataset_sha256,"
+                "evidence_artifact_count,evidence_record_count,evidence_original_bytes,"
+                "evidence_stored_bytes,evidence_verified_at FROM crawl_runs WHERE id=%s",
+                (run_id,),
+            ).fetchone()
+            == original_run
+        )
+        diagnostic = database._execute(
+            "SELECT id,public_source_url,body_sha256,compression,body_blob,"
+            "original_bytes,stored_bytes,http_status,attempt "
+            "FROM partsouq_http_diagnostics "
+            "WHERE crawl_run_id=%s AND group_id=%s AND reason='http_not_found'",
+            (run_id, group_id),
+        ).fetchone()
+        assert diagnostic is not None
+        diagnostic_id = int(diagnostic["id"])
+        assert diagnostic == {
+            "id": diagnostic_id,
+            "public_source_url": public_url,
+            "body_sha256": error_body.body_sha256,
+            "compression": "zlib",
+            "body_blob": error_body.compressed,
+            "original_bytes": error_body.original_bytes,
+            "stored_bytes": error_body.stored_bytes,
+            "http_status": 404,
+            "attempt": 1,
+        }
+
+        monkeypatch.setattr(crawl, "mark_group_fetched", original_mark_group_fetched)
+        instance._fetch = mock.MagicMock(
+            side_effect=NotFoundError(
+                "http 404",
+                _catalog_response(error_html, status_code=404, url=public_url),
+            )
+        )
+        assert (
+            instance.crawl_group(
+                "TOYOTA",
+                vehicle_id,
+                group,
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+            is False
+        )
+
+        assert database._execute(
+            "SELECT verification_status FROM partsouq_http_artifacts WHERE id=%s",
+            (artifact_id,),
+        ).fetchone() == {"verification_status": "superseded"}
+        assert database._execute(
+            "SELECT seen_run_id FROM parts WHERE id=%s", (part_id,)
+        ).fetchone() == {"seen_run_id": None}
+        assert database._execute(
+            "SELECT fetched_run_key,fetched_status,fetched_row_count FROM groups_t WHERE id=%s",
+            (group_id,),
+        ).fetchone() == {
+            "fetched_run_key": run_key,
+            "fetched_status": "not_found",
+            "fetched_row_count": 0,
+        }
+        final_run = database._execute(
+            "SELECT evidence_status,evidence_manifest_sha256,evidence_dataset_sha256,"
+            "evidence_artifact_count,evidence_record_count,evidence_original_bytes,"
+            "evidence_stored_bytes,evidence_verified_at FROM crawl_runs WHERE id=%s",
+            (run_id,),
+        ).fetchone()
+        assert final_run == {
+            "evidence_status": "collecting",
+            "evidence_manifest_sha256": None,
+            "evidence_dataset_sha256": None,
+            "evidence_artifact_count": 0,
+            "evidence_record_count": 0,
+            "evidence_original_bytes": 0,
+            "evidence_stored_bytes": 0,
+            "evidence_verified_at": None,
+        }
+        assert database._execute(
+            "SELECT id,COUNT(*) AS row_count FROM partsouq_http_diagnostics "
+            "WHERE crawl_run_id=%s AND group_id=%s AND reason='http_not_found' GROUP BY id",
+            (run_id, group_id),
+        ).fetchone() == {"id": diagnostic_id, "row_count": 1}
+    finally:
+        if instance is not None:
+            instance.close()
         database.rollback()
         _clear_mysql_fixture(database)
         database.close()

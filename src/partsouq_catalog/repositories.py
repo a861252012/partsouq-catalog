@@ -1111,8 +1111,12 @@ class CrawlRepository:
             )
         run_id = cast(int, cur.lastrowid)
         if fresh:
-            # --fresh 會重用同一 logical run id；舊 artifact 不能和新 HTTP
-            # body 混成一份 manifest。CAS body 保留供其他 run 去重。
+            # --fresh 會重用同一 logical run id；舊 artifact／diagnostic
+            # 不能混進新 HTTP attempt。CAS body 保留供其他 run 去重。
+            self.db._execute(
+                "DELETE FROM partsouq_http_diagnostics WHERE crawl_run_id = %s",
+                (run_id,),
+            )
             self.db._execute(
                 "DELETE FROM partsouq_http_artifacts WHERE crawl_run_id = %s",
                 (run_id,),
