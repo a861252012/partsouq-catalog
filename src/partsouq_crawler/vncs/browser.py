@@ -369,7 +369,9 @@ class VncsBrowserHarvester:
             return parse_grid_records([dict(row) for row in rows])
         # AJAX 換頁瞬間 DOM 列可能短暫為空：先等一格再取一次，避免把
         # 過渡狀態誤判成最終空頁。
-        await page.wait_for_timeout(500)
+        wait_for_timeout = getattr(page, "wait_for_timeout", None)
+        if wait_for_timeout is not None:
+            await wait_for_timeout(500)
         rows = await page.evaluate(_GRID_ROWS_SCRIPT)
         if rows:
             return parse_grid_records([dict(row) for row in rows])
