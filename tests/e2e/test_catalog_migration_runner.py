@@ -5,6 +5,7 @@ import re
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from unittest import mock
@@ -113,6 +114,97 @@ def _apply_schema(database: MigrationDatabase) -> None:
             )
     finally:
         connection.close()
+
+
+def _downgrade_nhtsa_024_schema(cursor: DictCursor) -> None:
+    cursor.execute(
+        "ALTER TABLE nhtsa_current_artifacts "
+        "DROP FOREIGN KEY fk_nhtsa_current_published_run, "
+        "DROP INDEX idx_nhtsa_current_published_run, "
+        "DROP COLUMN published_run_id"
+    )
+    cursor.execute(
+        "ALTER TABLE nhtsa_sync_runs "
+        "DROP CHECK chk_nhtsa_sync_status_lease, "
+        "DROP FOREIGN KEY fk_nhtsa_sync_scheduled_job, "
+        "DROP INDEX idx_nhtsa_sync_lease_expiry, "
+        "DROP INDEX uq_nhtsa_sync_scheduled_job, "
+        "DROP INDEX uq_nhtsa_sync_lease_slot, "
+        "DROP COLUMN scheduled_job_run_id, "
+        "DROP COLUMN lease_slot, "
+        "DROP COLUMN lease_token, "
+        "DROP COLUMN heartbeat_at, "
+        "DROP COLUMN lease_expires_at"
+    )
+    cursor.execute(
+        "ALTER TABLE scheduled_job_runs "
+        "DROP FOREIGN KEY fk_scheduled_job_parent, "
+        "DROP INDEX uq_scheduled_job_parent_stage, "
+        "DROP COLUMN parent_scheduled_job_run_id"
+    )
+    cursor.execute("DELETE FROM nhtsa_schema_migrations WHERE version=2")
+    cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=24")
+
+
+def _insert_stale_direct_nhtsa_tuple(
+    cursor: DictCursor,
+    *,
+    with_parent: bool,
+) -> tuple[int | None, int, int]:
+    parent_id: int | None = None
+    if with_parent:
+        cursor.execute(
+            "INSERT INTO scheduled_job_runs "
+            "(job_name,trigger_mode,status,started_at,output_text) "
+            "VALUES ('nhtsa','daemon','running',UTC_TIMESTAMP()-INTERVAL 10 MINUTE,"
+            "'original parent output')"
+        )
+        parent_id = int(cursor.lastrowid)
+    cursor.execute(
+        "INSERT INTO scheduled_job_runs "
+        "(parent_scheduled_job_run_id,job_name,trigger_mode,status,started_at,output_text) "
+        "VALUES (%s,'nhtsa-bulk','daemon','running',"
+        "UTC_TIMESTAMP()-INTERVAL 9 MINUTE,'original child output')",
+        (parent_id,),
+    )
+    child_id = int(cursor.lastrowid)
+    cursor.execute(
+        "INSERT INTO nhtsa_sync_runs "
+        "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+        "lease_slot,lease_token,started_at,updated_at,heartbeat_at,"
+        "lease_expires_at,error_message) VALUES ("
+        "%s,%s,'all','running',JSON_ARRAY(),'writer',%s,"
+        "UTC_TIMESTAMP(6)-INTERVAL 8 MINUTE,"
+        "UTC_TIMESTAMP(6)-INTERVAL 5 MINUTE,"
+        "UTC_TIMESTAMP(6)-INTERVAL 5 MINUTE,"
+        "UTC_TIMESTAMP(6)-INTERVAL 4 MINUTE,'original domain error')",
+        (child_id, f"stale-direct-{uuid.uuid4().hex}", "e" * 64),
+    )
+    return parent_id, child_id, int(cursor.lastrowid)
+
+
+def _nhtsa_recovery_snapshot(
+    cursor: DictCursor,
+    *,
+    run_id: int,
+    scheduled_ids: tuple[int, ...],
+) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+    cursor.execute(
+        "SELECT scheduled_job_run_id,status,started_at,updated_at,heartbeat_at,"
+        "lease_expires_at,ended_at,lease_slot,lease_token,error_message "
+        "FROM nhtsa_sync_runs WHERE id=%s",
+        (run_id,),
+    )
+    domain = cursor.fetchone()
+    assert domain is not None
+    placeholders = ",".join("%s" for _scheduled_id in scheduled_ids)
+    cursor.execute(
+        "SELECT id,parent_scheduled_job_run_id,job_name,trigger_mode,status,started_at,"
+        "finished_at,exit_code,output_text FROM scheduled_job_runs "
+        f"WHERE id IN ({placeholders}) ORDER BY id",
+        scheduled_ids,
+    )
+    return dict(domain), tuple(dict(row) for row in cursor.fetchall())
 
 
 def test_stale_repair_does_not_touch_near_match_rows(
@@ -283,9 +375,18 @@ def test_stale_repair_waits_for_other_writers_to_stop(
     try:
         with connection.cursor() as cursor:
             cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at) "
+                "VALUES ('nhtsa-bulk','manual','running',NOW(6))"
+            )
+            scheduled_job_run_id = cursor.lastrowid
+            cursor.execute(
                 "INSERT INTO nhtsa_sync_runs "
-                "(run_key,scope_name,status,source_keys_json,started_at,updated_at) "
-                "VALUES ('migration-running','all','running',JSON_ARRAY(),NOW(6),NOW(6))"
+                "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                "lease_slot,lease_token,started_at,updated_at,heartbeat_at,lease_expires_at) "
+                "VALUES (%s,'migration-running','all','running',JSON_ARRAY(),'writer',%s,"
+                "NOW(6),NOW(6),NOW(6),DATE_ADD(NOW(6),INTERVAL 5 MINUTE))",
+                (scheduled_job_run_id, "a" * 64),
             )
         with pytest.raises(MigrationError, match="running jobs exist in nhtsa_sync_runs"):
             runner.apply()
@@ -595,11 +696,13 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     near_name = "my_partsouqX013_backup"
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23)")
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24)"
+            )
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
 
-        assert runner.apply() == (18, 19, 20, 21, 22, 23)
+        assert runner.apply() == (18, 19, 20, 21, 22, 23, 24)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -626,7 +729,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
     connection = migration_database.connect()
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (22,23)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24)")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_verified_evidence")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_evidence_status")
             cursor.execute(
@@ -809,7 +912,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
                     (category_id, code, code, url, run_key),
                 )
 
-        assert runner.apply() == (22, 23)
+        assert runner.apply() == (22, 23, 24)
         runner.check()
         assert runner.apply() == ()
 
@@ -985,9 +1088,9 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "ALTER TABLE partsouq_http_artifacts DROP CHECK chk_partsouq_artifact_sanitizer"
             )
             cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24)")
 
-        assert runner.apply() == (20, 21, 22, 23)
+        assert runner.apply() == (20, 21, 22, 23, 24)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1049,7 +1152,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "verification_status='verified', verified_at=NOW(6) WHERE crawl_run_id=%s",
                 ("partsouq-html-public-v1", crawl_run_id),
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24)")
             cursor.execute(
                 "INSERT INTO catalog_schema_ledger "
                 "(change_key,kind,version,filename,sha256,state,attempt_count,started_at,"
@@ -1063,7 +1166,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
 
         with pytest.raises(MigrationError, match="retry that exact version"):
             runner.apply()
-        assert runner.apply(retry_version=20) == (20, 21, 22, 23)
+        assert runner.apply(retry_version=20) == (20, 21, 22, 23, 24)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1079,13 +1182,14 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             }
             cursor.execute(
                 "SELECT version,state,attempt_count FROM catalog_schema_ledger "
-                "WHERE version IN (20,21,22,23) ORDER BY version"
+                "WHERE version IN (20,21,22,23,24) ORDER BY version"
             )
             assert list(cursor.fetchall()) == [
                 {"version": 20, "state": "applied", "attempt_count": 2},
                 {"version": 21, "state": "applied", "attempt_count": 1},
                 {"version": 22, "state": "applied", "attempt_count": 1},
                 {"version": 23, "state": "applied", "attempt_count": 1},
+                {"version": 24, "state": "applied", "attempt_count": 1},
             ]
             cursor.execute(
                 "SELECT COUNT(*) AS row_count FROM information_schema.ROUTINES "
@@ -1181,8 +1285,8 @@ def test_migration_023_creates_http_diagnostics_from_missing_table(
     try:
         with connection.cursor() as cursor:
             cursor.execute("DROP TABLE partsouq_http_diagnostics")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=23")
-        assert runner.apply() == (23,)
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24)")
+        assert runner.apply() == (23, 24)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1231,7 +1335,7 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
             cursor.execute(
                 "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=23")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24)")
         with pytest.raises(MigrationError, match="migration:023 failed"):
             runner.apply()
         with connection.cursor() as cursor:
@@ -1241,11 +1345,953 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
                 "ALTER TABLE partsouq_http_diagnostics "
                 "MODIFY COLUMN content_type VARCHAR(128) NOT NULL"
             )
-        assert runner.apply(retry_version=23) == (23,)
+        assert runner.apply(retry_version=23) == (23, 24)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute("SELECT state,attempt_count FROM catalog_schema_ledger WHERE version=23")
             assert cursor.fetchone() == {"state": "applied", "attempt_count": 2}
+    finally:
+        connection.close()
+
+
+def test_migration_024_upgrades_legacy_nhtsa_schema_and_is_repeatable(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            _downgrade_nhtsa_024_schema(cursor)
+
+        assert runner.apply() == (24,)
+        runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=24")
+        assert runner.apply() == (24,)
+        runner.check()
+    finally:
+        connection.close()
+
+
+def test_migration_024_recovers_one_unique_cross_second_legacy_nhtsa_run(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    base = datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(minutes=10)
+    run_key = f"nhtsa-bulk-{base.strftime('%Y%m%dT%H%M%SZ')}"
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            _downgrade_nhtsa_024_schema(cursor)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed',%s,%s,125)",
+                (base + timedelta(seconds=1), base + timedelta(seconds=4)),
+            )
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(run_key,scope_name,status,source_keys_json,started_at,updated_at,error_message) "
+                "VALUES (%s,'all','running',JSON_ARRAY(),%s,%s,'original failure')",
+                (
+                    run_key,
+                    base + timedelta(seconds=2),
+                    base + timedelta(seconds=3),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24,)
+        runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,started_at,updated_at,ended_at,error_message,"
+                "scheduled_job_run_id FROM nhtsa_sync_runs WHERE id=%s",
+                (run_id,),
+            )
+            recovered = cursor.fetchone()
+        assert recovered is not None
+        assert recovered["status"] == "interrupted"
+        assert recovered["ended_at"] >= recovered["updated_at"] >= recovered["started_at"]
+        assert recovered["scheduled_job_run_id"] is None
+        assert "original failure" in str(recovered["error_message"])
+        assert "legacy-matched scheduler child" in str(recovered["error_message"])
+    finally:
+        connection.close()
+
+
+def test_migration_024_legacy_recovery_tolerates_child_second_precision(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    base = datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(minutes=10)
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            _downgrade_nhtsa_024_schema(cursor)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed',%s,%s,125)",
+                (base + timedelta(seconds=1), base + timedelta(seconds=4)),
+            )
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(run_key,scope_name,status,source_keys_json,started_at,updated_at) "
+                "VALUES (%s,'all','running',JSON_ARRAY(),%s,%s)",
+                (
+                    f"nhtsa-bulk-{base.strftime('%Y%m%dT%H%M%SZ')}",
+                    base + timedelta(seconds=2, microseconds=250_000),
+                    base + timedelta(seconds=4, microseconds=500_000),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24,)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM nhtsa_sync_runs WHERE id=%s", (run_id,))
+            assert cursor.fetchone() == {"status": "interrupted"}
+    finally:
+        connection.close()
+
+
+def test_post_024_recovery_tolerates_child_second_precision(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    base = datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(minutes=10)
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed',%s,%s,125)",
+                (base, base + timedelta(seconds=2)),
+            )
+            child_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                "lease_slot,lease_token,started_at,updated_at,heartbeat_at,lease_expires_at) "
+                "VALUES (%s,%s,'all','running',JSON_ARRAY(),'writer',%s,%s,%s,%s,%s)",
+                (
+                    child_id,
+                    f"stale-direct-precision-{uuid.uuid4().hex}",
+                    "d" * 64,
+                    base + timedelta(microseconds=250_000),
+                    base + timedelta(seconds=2, microseconds=500_000),
+                    base + timedelta(seconds=1, microseconds=250_000),
+                    base + timedelta(seconds=3),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == ()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM nhtsa_sync_runs WHERE id=%s", (run_id,))
+            assert cursor.fetchone() == {"status": "interrupted"}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "should_recover"),
+    ((5, True), (6, False)),
+)
+def test_migration_024_legacy_link_window_stops_after_five_seconds(
+    migration_database: MigrationDatabase,
+    offset_seconds: int,
+    should_recover: bool,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    base = datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(minutes=10)
+    marker_time = base + timedelta(seconds=offset_seconds)
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            _downgrade_nhtsa_024_schema(cursor)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed',%s,%s,125)",
+                (marker_time, base + timedelta(seconds=10)),
+            )
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(run_key,scope_name,status,source_keys_json,started_at,updated_at,error_message) "
+                "VALUES (%s,'all','running',JSON_ARRAY(),%s,%s,'boundary error')",
+                (
+                    f"nhtsa-bulk-{base.strftime('%Y%m%dT%H%M%SZ')}",
+                    marker_time,
+                    marker_time,
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+        if should_recover:
+            assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24,)
+        else:
+            with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
+                runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,ended_at,error_message FROM nhtsa_sync_runs WHERE id=%s",
+                (run_id,),
+            )
+            run = cursor.fetchone()
+            assert run is not None
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM catalog_schema_ledger WHERE version=24"
+            )
+            ledger = cursor.fetchone()
+        if should_recover:
+            assert run["status"] == "interrupted"
+            assert run["ended_at"] is not None
+            assert "boundary error" in str(run["error_message"])
+            assert ledger == {"row_count": 1}
+        else:
+            assert run == {
+                "status": "running",
+                "ended_at": None,
+                "error_message": "boundary error",
+            }
+            assert ledger == {"row_count": 0}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("ambiguity", ["two_children", "two_runs"])
+def test_migration_024_rejects_ambiguous_legacy_nhtsa_lineage(
+    migration_database: MigrationDatabase,
+    ambiguity: str,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    base = datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(minutes=10)
+    connection = migration_database.connect()
+    run_ids: list[int] = []
+    try:
+        with connection.cursor() as cursor:
+            _downgrade_nhtsa_024_schema(cursor)
+            child_starts = (
+                (base + timedelta(seconds=1), base + timedelta(seconds=2))
+                if ambiguity == "two_children"
+                else (base + timedelta(seconds=2),)
+            )
+            for offset, child_started in enumerate(child_starts, start=1):
+                cursor.execute(
+                    "INSERT INTO scheduled_job_runs "
+                    "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                    "VALUES ('nhtsa-bulk','daemon','failed',%s,%s,125)",
+                    (child_started, base + timedelta(seconds=4 + offset)),
+                )
+            run_bases = (
+                (base,) if ambiguity == "two_children" else (base, base + timedelta(seconds=1))
+            )
+            for run_base in run_bases:
+                cursor.execute(
+                    "INSERT INTO nhtsa_sync_runs "
+                    "(run_key,scope_name,status,source_keys_json,started_at,updated_at) "
+                    "VALUES (%s,'all','running',JSON_ARRAY(),%s,%s)",
+                    (
+                        f"nhtsa-bulk-{run_base.strftime('%Y%m%dT%H%M%SZ')}",
+                        base + timedelta(seconds=3),
+                        base + timedelta(seconds=3),
+                    ),
+                )
+                run_ids.append(int(cursor.lastrowid))
+
+        with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            placeholders = ",".join("%s" for _run_id in run_ids)
+            cursor.execute(
+                f"SELECT status FROM nhtsa_sync_runs WHERE id IN ({placeholders}) ORDER BY id",
+                tuple(run_ids),
+            )
+            assert [row["status"] for row in cursor.fetchall()] == ["running"] * len(run_ids)
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM catalog_schema_ledger WHERE version=24"
+            )
+            assert cursor.fetchone() == {"row_count": 0}
+    finally:
+        connection.close()
+
+
+def test_migration_024_does_not_recover_recent_legacy_nhtsa_run(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    base = datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(seconds=30)
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            _downgrade_nhtsa_024_schema(cursor)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed',%s,%s,125)",
+                (base + timedelta(seconds=1), base + timedelta(seconds=4)),
+            )
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(run_key,scope_name,status,source_keys_json,started_at,updated_at) "
+                "VALUES (%s,'all','running',JSON_ARRAY(),%s,%s)",
+                (
+                    f"nhtsa-bulk-{base.strftime('%Y%m%dT%H%M%SZ')}",
+                    base + timedelta(seconds=2),
+                    base + timedelta(seconds=3),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+        with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status,ended_at FROM nhtsa_sync_runs WHERE id=%s", (run_id,))
+            assert cursor.fetchone() == {"status": "running", "ended_at": None}
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM catalog_schema_ledger WHERE version=24"
+            )
+            assert cursor.fetchone() == {"row_count": 0}
+    finally:
+        connection.close()
+
+
+def test_post_024_stale_nhtsa_recovery_uses_direct_link_and_clears_lease(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed',"
+                "UTC_TIMESTAMP()-INTERVAL 5 MINUTE,"
+                "UTC_TIMESTAMP()-INTERVAL 90 SECOND,125)"
+            )
+            scheduled_job_run_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                "lease_slot,lease_token,started_at,updated_at,heartbeat_at,"
+                "lease_expires_at) VALUES ("
+                "%s,'direct-link-does-not-use-timestamp','all','running',JSON_ARRAY(),"
+                "'writer',%s,UTC_TIMESTAMP()-INTERVAL 5 MINUTE,"
+                "UTC_TIMESTAMP()-INTERVAL 3 MINUTE,"
+                "UTC_TIMESTAMP()-INTERVAL 3 MINUTE,"
+                "UTC_TIMESTAMP()-INTERVAL 2 MINUTE)",
+                (scheduled_job_run_id, "a" * 64),
+            )
+            run_id = int(cursor.lastrowid)
+
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == ()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,ended_at,lease_slot,lease_token,lease_expires_at,"
+                "scheduled_job_run_id,error_message FROM nhtsa_sync_runs WHERE id=%s",
+                (run_id,),
+            )
+            recovered = cursor.fetchone()
+        assert recovered is not None
+        assert recovered["status"] == "interrupted"
+        assert recovered["ended_at"] is not None
+        assert recovered["lease_slot"] is None
+        assert recovered["lease_token"] is None
+        assert recovered["lease_expires_at"] is None
+        assert recovered["scheduled_job_run_id"] == scheduled_job_run_id
+        assert "directly linked scheduler child" in recovered["error_message"]
+    finally:
+        connection.close()
+
+
+def test_post_024_stale_nhtsa_recovery_repairs_running_child_and_parent_atomically(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,output_text) "
+                "VALUES ('nhtsa','daemon','running',UTC_TIMESTAMP()-INTERVAL 10 MINUTE,"
+                "'parent output')"
+            )
+            parent_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(parent_scheduled_job_run_id,job_name,trigger_mode,status,started_at,output_text) "
+                "VALUES (%s,'nhtsa-bulk','daemon','running',"
+                "UTC_TIMESTAMP()-INTERVAL 9 MINUTE,'child output')",
+                (parent_id,),
+            )
+            child_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                "lease_slot,lease_token,started_at,updated_at,heartbeat_at,"
+                "lease_expires_at,error_message) VALUES ("
+                "%s,%s,'all','running',JSON_ARRAY(),'writer',%s,"
+                "UTC_TIMESTAMP(6)-INTERVAL 9 MINUTE,"
+                "UTC_TIMESTAMP(6)-INTERVAL 5 MINUTE,"
+                "UTC_TIMESTAMP(6)-INTERVAL 5 MINUTE,"
+                "UTC_TIMESTAMP(6)-INTERVAL 4 MINUTE,'original domain error')",
+                (child_id, f"parent-hard-kill-{uuid.uuid4().hex}", "c" * 64),
+            )
+            run_id = int(cursor.lastrowid)
+
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == ()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,started_at,updated_at,ended_at,lease_slot,lease_token,"
+                "lease_expires_at,error_message FROM nhtsa_sync_runs WHERE id=%s",
+                (run_id,),
+            )
+            domain = cursor.fetchone()
+            cursor.execute(
+                "SELECT id,status,finished_at,exit_code,output_text FROM scheduled_job_runs "
+                "WHERE id IN (%s,%s) ORDER BY id",
+                (parent_id, child_id),
+            )
+            scheduled = list(cursor.fetchall())
+        assert domain is not None
+        assert domain["status"] == "interrupted"
+        assert domain["ended_at"] >= domain["updated_at"] >= domain["started_at"]
+        assert domain["lease_slot"] is None
+        assert domain["lease_token"] is None
+        assert domain["lease_expires_at"] is None
+        assert "original domain error" in str(domain["error_message"])
+        assert [row["status"] for row in scheduled] == ["failed", "failed"]
+        assert [row["exit_code"] for row in scheduled] == [125, 125]
+        assert all(row["finished_at"] is not None for row in scheduled)
+        assert "composite parent interrupted" in str(scheduled[0]["output_text"])
+        assert "expired NHTSA lease recovered" in str(scheduled[1]["output_text"])
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("recent_marker", ["child", "parent"])
+def test_post_024_stale_nhtsa_recovery_rejects_recent_failed_marker(
+    migration_database: MigrationDatabase,
+    recent_marker: str,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            parent_id, child_id, run_id = _insert_stale_direct_nhtsa_tuple(
+                cursor,
+                with_parent=recent_marker == "parent",
+            )
+            marker_id = child_id if recent_marker == "child" else parent_id
+            assert marker_id is not None
+            cursor.execute(
+                "UPDATE scheduled_job_runs SET status='failed',"
+                "finished_at=UTC_TIMESTAMP()-INTERVAL 30 SECOND,exit_code=125 WHERE id=%s",
+                (marker_id,),
+            )
+            scheduled_ids = (child_id,) if parent_id is None else (parent_id, child_id)
+            before = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=scheduled_ids,
+            )
+
+        with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            after = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=scheduled_ids,
+            )
+        assert after == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("mutation", ["child_identity", "parent_link"])
+def test_post_024_stale_nhtsa_exact_recovery_rolls_back_after_candidate_mutation(
+    migration_database: MigrationDatabase,
+    mutation: str,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            parent_id, child_id, run_id = _insert_stale_direct_nhtsa_tuple(
+                cursor,
+                with_parent=True,
+            )
+            assert parent_id is not None
+        candidates = catalog_migrations._repairable_stale_nhtsa_runs(connection, 60)
+        assert [int(row["run_id"]) for row in candidates] == [run_id]
+
+        with connection.cursor() as cursor:
+            scheduled_ids = [parent_id, child_id]
+            if mutation == "child_identity":
+                cursor.execute(
+                    "UPDATE scheduled_job_runs SET job_name='nhtsa-vin' WHERE id=%s",
+                    (child_id,),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO scheduled_job_runs "
+                    "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                    "VALUES ('nhtsa','daemon','failed',"
+                    "UTC_TIMESTAMP()-INTERVAL 12 MINUTE,"
+                    "UTC_TIMESTAMP()-INTERVAL 11 MINUTE,125)"
+                )
+                alternate_parent_id = int(cursor.lastrowid)
+                scheduled_ids.append(alternate_parent_id)
+                cursor.execute(
+                    "UPDATE scheduled_job_runs SET parent_scheduled_job_run_id=%s WHERE id=%s",
+                    (alternate_parent_id, child_id),
+                )
+            exact_scheduled_ids = tuple(scheduled_ids)
+            domain_before, scheduled_before = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=exact_scheduled_ids,
+            )
+
+        with pytest.raises(MigrationError, match="scheduler marker changed during recovery"):
+            catalog_migrations._repair_stale_nhtsa_runs(connection, candidates)
+
+        with connection.cursor() as cursor:
+            domain_after, scheduled_after = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=exact_scheduled_ids,
+            )
+        assert domain_after == domain_before
+        assert scheduled_after == scheduled_before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("blocker", ["scheduler", "admin"])
+def test_post_024_stale_nhtsa_recovery_preflight_blocker_leaves_candidate_untouched(
+    migration_database: MigrationDatabase,
+    blocker: str,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    blocker_table = "scheduled_job_runs" if blocker == "scheduler" else "admin_crawl_requests"
+    try:
+        with connection.cursor() as cursor:
+            parent_id, child_id, run_id = _insert_stale_direct_nhtsa_tuple(
+                cursor,
+                with_parent=True,
+            )
+            assert parent_id is not None
+            if blocker == "scheduler":
+                cursor.execute(
+                    "INSERT INTO scheduled_job_runs "
+                    "(job_name,trigger_mode,status,started_at) "
+                    "VALUES ('unrelated','manual','running',"
+                    "UTC_TIMESTAMP()-INTERVAL 10 MINUTE)"
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO admin_crawl_requests "
+                    "(job_name,status,started_at) VALUES "
+                    "('unrelated','running',UTC_TIMESTAMP()-INTERVAL 10 MINUTE)"
+                )
+            blocker_id = int(cursor.lastrowid)
+            before = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=(parent_id, child_id),
+            )
+            cursor.execute(
+                "SELECT state,attempt_count,started_at,finished_at,error_text "
+                "FROM catalog_schema_ledger WHERE version=24"
+            )
+            ledger_before = cursor.fetchone()
+
+        with pytest.raises(MigrationError, match=f"running jobs exist in {blocker_table}"):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            after = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=(parent_id, child_id),
+            )
+            cursor.execute(
+                f"SELECT status FROM {blocker_table} WHERE id=%s",
+                (blocker_id,),
+            )
+            blocker_after = cursor.fetchone()
+            cursor.execute(
+                "SELECT state,attempt_count,started_at,finished_at,error_text "
+                "FROM catalog_schema_ledger WHERE version=24"
+            )
+            ledger_after = cursor.fetchone()
+        assert after == before
+        assert blocker_after == {"status": "running"}
+        assert ledger_after == ledger_before
+    finally:
+        connection.close()
+
+
+def test_post_024_stale_nhtsa_recovery_preserves_malformed_causal_times(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            _parent_id, child_id, run_id = _insert_stale_direct_nhtsa_tuple(
+                cursor,
+                with_parent=False,
+            )
+            cursor.execute(
+                "UPDATE nhtsa_sync_runs SET "
+                "started_at=UTC_TIMESTAMP(6)-INTERVAL 4 MINUTE,"
+                "updated_at=UTC_TIMESTAMP(6)-INTERVAL 5 MINUTE,"
+                "heartbeat_at=UTC_TIMESTAMP(6)-INTERVAL 5 MINUTE,"
+                "lease_expires_at=UTC_TIMESTAMP(6)-INTERVAL 3 MINUTE "
+                "WHERE id=%s",
+                (run_id,),
+            )
+            before = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=(child_id,),
+            )
+
+        with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            after = _nhtsa_recovery_snapshot(
+                cursor,
+                run_id=run_id,
+                scheduled_ids=(child_id,),
+            )
+        assert after == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "unsafe_state",
+    ["active_lease", "recent_heartbeat", "active_sibling", "wrong_trigger"],
+)
+def test_post_024_stale_nhtsa_recovery_rejects_active_or_ambiguous_lineage(
+    migration_database: MigrationDatabase,
+    unsafe_state: str,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at) "
+                "VALUES ('nhtsa','daemon','running',UTC_TIMESTAMP()-INTERVAL 10 MINUTE)"
+            )
+            parent_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(parent_scheduled_job_run_id,job_name,trigger_mode,status,started_at) "
+                "VALUES (%s,'nhtsa-bulk','daemon','running',"
+                "UTC_TIMESTAMP()-INTERVAL 9 MINUTE)",
+                (parent_id,),
+            )
+            child_id = int(cursor.lastrowid)
+            if unsafe_state == "wrong_trigger":
+                cursor.execute(
+                    "UPDATE scheduled_job_runs SET trigger_mode='manual' WHERE id=%s",
+                    (child_id,),
+                )
+            heartbeat_interval = "30 SECOND" if unsafe_state == "recent_heartbeat" else "5 MINUTE"
+            expiry_expression = (
+                "UTC_TIMESTAMP(6)+INTERVAL 5 MINUTE"
+                if unsafe_state == "active_lease"
+                else "UTC_TIMESTAMP(6)-INTERVAL 10 SECOND"
+                if unsafe_state == "recent_heartbeat"
+                else "UTC_TIMESTAMP(6)-INTERVAL 4 MINUTE"
+            )
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                "lease_slot,lease_token,started_at,updated_at,heartbeat_at,lease_expires_at) "
+                "VALUES (%s,%s,'all','running',JSON_ARRAY(),'writer',%s,"
+                "UTC_TIMESTAMP(6)-INTERVAL 9 MINUTE,"
+                f"UTC_TIMESTAMP(6)-INTERVAL {heartbeat_interval},"
+                f"UTC_TIMESTAMP(6)-INTERVAL {heartbeat_interval},{expiry_expression})",
+                (child_id, f"unsafe-{unsafe_state}-{uuid.uuid4().hex}", "d" * 64),
+            )
+            run_id = int(cursor.lastrowid)
+            sibling_id: int | None = None
+            if unsafe_state == "active_sibling":
+                cursor.execute(
+                    "INSERT INTO scheduled_job_runs "
+                    "(parent_scheduled_job_run_id,job_name,trigger_mode,status,started_at) "
+                    "VALUES (%s,'nhtsa-api','daemon','running',"
+                    "UTC_TIMESTAMP()-INTERVAL 8 MINUTE)",
+                    (parent_id,),
+                )
+                sibling_id = int(cursor.lastrowid)
+
+        with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,lease_slot,lease_token FROM nhtsa_sync_runs WHERE id=%s",
+                (run_id,),
+            )
+            assert cursor.fetchone() == {
+                "status": "running",
+                "lease_slot": "writer",
+                "lease_token": "d" * 64,
+            }
+            scheduled_ids = [parent_id, child_id]
+            if sibling_id is not None:
+                scheduled_ids.append(sibling_id)
+            placeholders = ",".join("%s" for _scheduled_id in scheduled_ids)
+            cursor.execute(
+                f"SELECT status FROM scheduled_job_runs WHERE id IN ({placeholders}) ORDER BY id",
+                tuple(scheduled_ids),
+            )
+            assert [row["status"] for row in cursor.fetchall()] == ["running"] * len(scheduled_ids)
+    finally:
+        connection.close()
+
+
+def test_post_024_stale_nhtsa_recovery_rejects_timestamp_match_without_direct_link(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','failed','2026-08-23 10:00:00',"
+                "'2026-08-23 10:01:00',125)"
+            )
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('nhtsa-bulk','daemon','completed','2026-08-23 09:59:00',"
+                "'2026-08-23 10:01:00',0)"
+            )
+            linked_completed_job_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO nhtsa_sync_runs "
+                "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                "lease_slot,lease_token,started_at,updated_at,heartbeat_at,"
+                "lease_expires_at) VALUES ("
+                "%s,'nhtsa-bulk-20260823T100000Z','all','running',JSON_ARRAY(),"
+                "'writer',%s,'2026-08-23 10:00:01','2026-08-23 10:00:01',"
+                "'2026-08-23 10:00:01','2026-08-23 10:01:01')",
+                (linked_completed_job_id, "b" * 64),
+            )
+            run_id = int(cursor.lastrowid)
+
+        with pytest.raises(
+            MigrationError,
+            match="running NHTSA jobs do not have one unique recoverable scheduler child each",
+        ):
+            runner.apply(recover_stale_nhtsa_daemon_seconds=60)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,lease_slot,lease_token,scheduled_job_run_id "
+                "FROM nhtsa_sync_runs WHERE id=%s",
+                (run_id,),
+            )
+            untouched = cursor.fetchone()
+        assert untouched == {
+            "status": "running",
+            "lease_slot": "writer",
+            "lease_token": "b" * 64,
+            "scheduled_job_run_id": linked_completed_job_id,
+        }
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("running_lease_requirement", "lease_expiry_comparison"),
+    (
+        (
+            "AND lease_slot IS NOT NULL AND BINARY lease_slot = BINARY 'writer'",
+            ">=",
+        ),
+        ("AND BINARY lease_slot = BINARY 'writer'", ">"),
+    ),
+)
+def test_migration_check_rejects_mutated_nhtsa_lease_check(
+    migration_database: MigrationDatabase,
+    running_lease_requirement: str,
+    lease_expiry_comparison: str,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE nhtsa_sync_runs DROP CHECK chk_nhtsa_sync_status_lease")
+            cursor.execute(
+                "ALTER TABLE nhtsa_sync_runs "
+                "ADD CONSTRAINT chk_nhtsa_sync_status_lease CHECK (("
+                "BINARY status = BINARY 'running' "
+                "AND scheduled_job_run_id IS NOT NULL "
+                f"{running_lease_requirement} "
+                "AND lease_token IS NOT NULL "
+                "AND lease_token REGEXP '^[0-9a-f]{64}$' "
+                "AND heartbeat_at IS NOT NULL "
+                "AND lease_expires_at IS NOT NULL "
+                f"AND lease_expires_at {lease_expiry_comparison} heartbeat_at "
+                "AND ended_at IS NULL) OR ("
+                "BINARY status IN ("
+                "BINARY 'completed', BINARY 'failed', BINARY 'interrupted') "
+                "AND lease_slot IS NULL AND lease_token IS NULL "
+                "AND lease_expires_at IS NULL AND ended_at IS NOT NULL))"
+            )
+        with pytest.raises(
+            MigrationError,
+            match="NHTSA run lease schema contract mismatch: checks",
+        ):
+            runner.check()
+    finally:
+        connection.close()
+
+
+def test_mysql_rejects_running_nhtsa_lease_without_slot(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at) "
+                "VALUES ('nhtsa-bulk','manual','running',UTC_TIMESTAMP(6))"
+            )
+            scheduled_job_run_id = cursor.lastrowid
+            with pytest.raises(
+                pymysql.MySQLError,
+                match="chk_nhtsa_sync_status_lease",
+            ):
+                cursor.execute(
+                    "INSERT INTO nhtsa_sync_runs "
+                    "(scheduled_job_run_id,run_key,scope_name,status,source_keys_json,"
+                    "lease_slot,lease_token,started_at,updated_at,heartbeat_at,"
+                    "lease_expires_at) VALUES ("
+                    "%s,'migration-null-lease-slot','all','running',JSON_ARRAY(),"
+                    "NULL,%s,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6),UTC_TIMESTAMP(6),"
+                    "DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 5 MINUTE))",
+                    (scheduled_job_run_id, "a" * 64),
+                )
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM nhtsa_sync_runs "
+                "WHERE run_key='migration-null-lease-slot'"
+            )
+            assert cursor.fetchone() == {"row_count": 0}
     finally:
         connection.close()
 
@@ -1338,7 +2384,13 @@ def test_migration_lock_defers_every_writer_before_running_marker(
         with pytest.raises(AdmissionLockBusy):
             scheduler._claim_request(request_id)
         with pytest.raises(AdmissionLockBusy):
-            nhtsa.start_run("nhtsa-lock-test", "all", ("fixture",))
+            nhtsa.start_run(
+                "nhtsa-lock-test",
+                "all",
+                ("fixture",),
+                scheduled_job_run_id=1,
+                expected_job_name="nhtsa-bulk",
+            )
         with pytest.raises(AdmissionLockBusy):
             crawler.run()
 

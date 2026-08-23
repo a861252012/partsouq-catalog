@@ -92,10 +92,7 @@ class NhtsaBulkClient:
                 sha256 = digest.hexdigest()
                 suffix = ".zip" if source.is_zip else Path(source.expected_member).suffix
                 final_path = target_dir / f"{sha256}{suffix}"
-                if final_path.exists():
-                    temp_path.unlink()
-                else:
-                    os.replace(temp_path, final_path)
+                os.replace(temp_path, final_path)
                 temp_path = None
                 return DownloadedArtifact(
                     http_status=200,

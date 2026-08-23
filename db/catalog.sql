@@ -339,6 +339,7 @@ CREATE TABLE IF NOT EXISTS crawl_state (
 -- catalog.sql 時必須已有此表，才能立即建立不可偽造的 direct FK。
 CREATE TABLE IF NOT EXISTS scheduled_job_runs (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  parent_scheduled_job_run_id BIGINT UNSIGNED NULL,
   job_name VARCHAR(32) NOT NULL,
   trigger_mode VARCHAR(16) NOT NULL DEFAULT 'manual',
   status VARCHAR(32) NOT NULL,
@@ -346,7 +347,10 @@ CREATE TABLE IF NOT EXISTS scheduled_job_runs (
   finished_at DATETIME NULL,
   exit_code INT NULL,
   output_text MEDIUMTEXT NULL,
-  KEY idx_scheduled_job_runs_name_started (job_name, started_at)
+  KEY idx_scheduled_job_runs_name_started (job_name, started_at),
+  UNIQUE KEY uq_scheduled_job_parent_stage (parent_scheduled_job_run_id, job_name),
+  CONSTRAINT fk_scheduled_job_parent FOREIGN KEY (parent_scheduled_job_run_id)
+    REFERENCES scheduled_job_runs(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 爬蟲運行記錄

@@ -45,18 +45,21 @@ def test_record_start_persists_trigger_mode(monkeypatch) -> None:
     monkeypatch.setattr(scheduler, "catalog_writer_admission", nullcontext)
 
     assert scheduler._record_start("catalog") == 77
-    assert cursor.execute.call_args.args[1] == ("catalog", "manual")
+    assert cursor.execute.call_args.args[1] == (None, "catalog", "manual")
+
+    assert scheduler._record_start("nhtsa-api", 76) == 77
+    assert cursor.execute.call_args.args[1] == (76, "nhtsa-api", "manual")
 
     scheduler._JOB_CONTEXT.trigger_mode = "daemon"
     try:
         assert scheduler._record_start("catalog") == 77
-        assert cursor.execute.call_args.args[1] == ("catalog", "daemon")
+        assert cursor.execute.call_args.args[1] == (None, "catalog", "daemon")
     finally:
         del scheduler._JOB_CONTEXT.trigger_mode
 
 
 def test_schema_migration_defers_scheduler_before_child_spawn(monkeypatch) -> None:
-    def migration_busy(_job: str) -> int:
+    def migration_busy(_job: str, _parent_run_id: int | None) -> int:
         raise scheduler.AdmissionLockBusy("migration")
 
     monkeypatch.setattr(scheduler, "_record_start", migration_busy)
@@ -67,7 +70,24 @@ def test_schema_migration_defers_scheduler_before_child_spawn(monkeypatch) -> No
     popen.assert_not_called()
 
 
-def test_api_progress_persists_actual_stage_completion_time(monkeypatch) -> None:
+def test_admission_release_failure_is_scheduler_db_error_before_child_spawn(
+    monkeypatch,
+) -> None:
+    def release_failed(_job: str, _parent_run_id: int | None) -> int:
+        raise RuntimeError("failed to release catalog writer admission lock")
+
+    monkeypatch.setattr(scheduler, "_record_start", release_failed)
+    popen = mock.MagicMock()
+    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+
+    assert (
+        scheduler._run("catalog", ["python", "-m", "crawler"])
+        == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    )
+    popen.assert_not_called()
+
+
+def test_api_progress_does_not_set_terminal_completion_time(monkeypatch) -> None:
     cursor = mock.MagicMock(rowcount=1)
     cursor.__enter__.return_value = cursor
     connection = mock.MagicMock()
@@ -77,11 +97,10 @@ def test_api_progress_persists_actual_stage_completion_time(monkeypatch) -> None
     scheduler._record_progress(78, scheduler.NHTSA_API_COMPLETED)
 
     statement, params = cursor.execute.call_args.args
-    assert "finished_at = CASE WHEN %s THEN UTC_TIMESTAMP()" in statement
+    assert "finished_at" not in statement
     assert params == (
         f"{scheduler.NHTSA_API_COMPLETED}\n",
         scheduler.MAX_OUTPUT_CHARS,
-        True,
         78,
     )
 
@@ -92,11 +111,12 @@ def test_record_finish_closes_matching_interrupted_catalog_run(monkeypatch) -> N
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+    cursor.fetchone.return_value = {"job_name": "catalog"}
 
     scheduler._record_finish(79, -2, "KeyboardInterrupt\n")
 
-    assert cursor.execute.call_count == 2
-    scheduled_call, crawl_call = cursor.execute.call_args_list
+    assert cursor.execute.call_count == 3
+    _select_call, scheduled_call, crawl_call = cursor.execute.call_args_list
     assert "UPDATE scheduled_job_runs" in scheduled_call.args[0]
     assert scheduled_call.args[1][-1] == 79
     assert "SET status = 'interrupted'" in crawl_call.args[0]
@@ -113,18 +133,163 @@ def test_record_finish_does_not_interrupt_crawl_for_normal_failure(monkeypatch) 
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+    cursor.fetchone.return_value = {"job_name": "catalog"}
 
     scheduler._record_finish(80, 1, "HTTP 403\n")
 
-    assert cursor.execute.call_count == 1
-    assert "UPDATE scheduled_job_runs" in cursor.execute.call_args.args[0]
+    assert cursor.execute.call_count == 2
+    assert "UPDATE scheduled_job_runs" in cursor.execute.call_args_list[1].args[0]
     connection.commit.assert_called_once_with()
+
+
+def test_record_finish_requires_completed_linked_nhtsa_domain_run(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.side_effect = [
+        {"job_name": "nhtsa-api"},
+        {
+            "id": 900,
+            "status": "running",
+            "ended_at": None,
+            "lease_slot": "writer",
+            "lease_token": "token",
+            "lease_expires_at": "future",
+        },
+        {"status": "running", "finished_at": None, "exit_code": None},
+    ]
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    assert scheduler._record_finish(82, 0, "child exited 0\n") == 1
+
+    domain_check = cursor.execute.call_args_list[1]
+    assert "scheduled_job_run_id = %s" in domain_check.args[0]
+    assert domain_check.args[0].endswith("FOR UPDATE")
+    child_lock = cursor.execute.call_args_list[2]
+    assert "FROM scheduled_job_runs" in child_lock.args[0]
+    assert child_lock.args[0].endswith("FOR UPDATE")
+    domain_update = cursor.execute.call_args_list[3]
+    assert "UPDATE nhtsa_sync_runs SET status = 'interrupted'" in domain_update.args[0]
+    assert domain_update.args[1] == (82,)
+    scheduled_update = cursor.execute.call_args_list[4]
+    assert scheduled_update.args[1][0] == 1
+    assert "without an exact atomic completed tuple" in scheduled_update.args[1][1]
+    connection.commit.assert_called_once_with()
+
+
+def test_record_finish_accepts_completed_linked_nhtsa_domain_run(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.side_effect = [
+        {"job_name": "nhtsa-api"},
+        {
+            "id": 901,
+            "status": "completed",
+            "ended_at": "finished",
+            "lease_slot": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+        },
+        {"status": "completed", "finished_at": "finished", "exit_code": 0},
+    ]
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    assert scheduler._record_finish(84, 0, "child exited 0\n") == 0
+
+    scheduled_update = cursor.execute.call_args_list[3]
+    assert "SET output_text" in scheduled_update.args[0]
+    assert scheduled_update.args[1] == (
+        "child exited 0\n",
+        scheduler.MAX_OUTPUT_CHARS,
+        84,
+    )
+
+
+@pytest.mark.parametrize("observed_return_code", [9, -9])
+def test_record_finish_preserves_atomic_nhtsa_completion_after_process_failure(
+    monkeypatch,
+    observed_return_code: int,
+) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.side_effect = [
+        {"job_name": "nhtsa-api"},
+        {
+            "id": 902,
+            "status": "completed",
+            "ended_at": "finished",
+            "lease_slot": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+        },
+        {"status": "completed", "finished_at": "finished", "exit_code": 0},
+    ]
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    assert (
+        scheduler._record_finish(
+            85,
+            observed_return_code,
+            "child process failed\n",
+        )
+        == 0
+    )
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert not any("status = 'interrupted'" in statement for statement in statements)
+    scheduled_update = cursor.execute.call_args_list[3]
+    assert "SET output_text" in scheduled_update.args[0]
+    assert scheduled_update.args[1][2] == 85
+    assert f"process exit {observed_return_code} was observed" in scheduled_update.args[1][0]
+    assert "completed state preserved" in scheduled_update.args[1][0]
+    connection.commit.assert_called_once_with()
+
+
+def test_record_finish_interrupts_only_exact_linked_nhtsa_domain_run(monkeypatch) -> None:
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.side_effect = [
+        {"job_name": "nhtsa-bulk"},
+        {
+            "id": 903,
+            "status": "running",
+            "ended_at": None,
+            "lease_slot": "writer",
+            "lease_token": "token",
+            "lease_expires_at": "later",
+        },
+        {"status": "running", "finished_at": None, "exit_code": None},
+    ]
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    assert scheduler._record_finish(83, 1, "child failed\n") == 1
+
+    domain_update = cursor.execute.call_args_list[3]
+    assert "UPDATE nhtsa_sync_runs" in domain_update.args[0]
+    assert "scheduled_job_run_id = %s" in domain_update.args[0]
+    assert "run_key" not in domain_update.args[0]
+    assert "lease_slot = NULL" in domain_update.args[0]
+    assert domain_update.args[1] == (83,)
+    scheduled_update = cursor.execute.call_args_list[4]
+    assert scheduled_update.args[1][0] == 1
 
 
 def test_record_finish_rolls_back_if_interrupted_crawl_update_fails(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
-    cursor.execute.side_effect = [None, scheduler.pymysql.OperationalError("update failed")]
+    cursor.fetchone.return_value = {"job_name": "catalog"}
+    cursor.execute.side_effect = [
+        None,
+        None,
+        scheduler.pymysql.OperationalError("update failed"),
+    ]
     connection = mock.MagicMock()
     connection.cursor.return_value = cursor
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
@@ -138,7 +303,7 @@ def test_record_finish_rolls_back_if_interrupted_crawl_update_fails(monkeypatch)
 
 def test_run_records_scheduler_id_in_child_environment(monkeypatch) -> None:
     finished: list[tuple[int, int, str]] = []
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 42)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 42)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -157,12 +322,34 @@ def test_run_records_scheduler_id_in_child_environment(monkeypatch) -> None:
     assert finished == [(42, 0, "42\n")]
 
 
+def test_run_returns_effective_success_after_observed_nhtsa_child_failure(
+    monkeypatch,
+) -> None:
+    observed: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 86)
+
+    def record_finish(run_id: int, code: int, output: str, *_success: object) -> int:
+        observed.append((run_id, code, output))
+        return 0
+
+    monkeypatch.setattr(scheduler, "_record_finish", record_finish)
+
+    assert (
+        scheduler._run(
+            "nhtsa-api",
+            [sys.executable, "-c", "import sys; print('committed'); sys.exit(9)"],
+        )
+        == 0
+    )
+    assert observed == [(86, 9, "committed\n")]
+
+
 def test_run_streams_output_and_only_records_bounded_redacted_tail(monkeypatch, capsys) -> None:
     vin = "1M8GDM9AXKP042788"
     prefix = "first-line\n"
 
     finished: list[tuple[int, int, str]] = []
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 43)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 43)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -190,7 +377,7 @@ def test_run_streams_output_and_only_records_bounded_redacted_tail(monkeypatch, 
 def test_run_masks_vin_split_across_pipe_reads(monkeypatch) -> None:
     vin = "1M8GDM9AXKP042788"
     finished: list[tuple[int, int, str]] = []
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 54)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 54)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -213,7 +400,7 @@ def test_launchd_run_records_child_output_without_writing_unbounded_stdout(
 ) -> None:
     finished: list[tuple[int, int, str]] = []
     monkeypatch.setenv("LAUNCHD_JOB", "1")
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 49)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 49)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -243,7 +430,7 @@ def test_run_terminates_silent_process_after_stall_timeout(monkeypatch) -> None:
     finished: list[tuple[int, int, str]] = []
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.2)
     monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 44)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 44)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -264,7 +451,7 @@ def test_run_terminates_silent_process_after_stall_timeout(monkeypatch) -> None:
 
 def test_run_does_not_stall_while_child_keeps_reporting_progress(monkeypatch) -> None:
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 45)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 45)
     monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
 
     script = "import time\nfor i in range(5):\n print(i, flush=True)\n time.sleep(0.05)\n"
@@ -274,7 +461,7 @@ def test_run_does_not_stall_while_child_keeps_reporting_progress(monkeypatch) ->
 
 def test_run_does_not_stall_during_cookie_backoff_heartbeats(monkeypatch) -> None:
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 2.0)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 48)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 48)
     monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
     script = (
         "print('child-started', flush=True)\n"
@@ -295,7 +482,7 @@ def test_run_does_not_stall_during_cookie_backoff_heartbeats(monkeypatch) -> Non
 def test_run_counts_flushed_bytes_without_newlines_as_progress(monkeypatch) -> None:
     finished: list[tuple[int, int, str]] = []
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 0.25)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 51)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 51)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -316,7 +503,7 @@ def test_run_kills_descendant_that_keeps_stdout_open_after_wrapper_exits(monkeyp
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
     monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.2)
     monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 46)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 46)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -371,7 +558,7 @@ def test_run_allows_kill_timer_to_finish_owned_process_group(monkeypatch) -> Non
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
     monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.02)
     monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 55)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 55)
     monkeypatch.setattr(scheduler, "_record_finish", lambda *_args, **_kwargs: None)
 
     try:
@@ -392,7 +579,7 @@ def test_run_does_not_wait_for_escaped_descendant_holding_stdout(tmp_path, monke
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
     monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.15)
     monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 52)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 52)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -427,7 +614,7 @@ def test_run_kills_child_that_closes_stdout_but_remains_alive(monkeypatch) -> No
     monkeypatch.setattr(scheduler, "CHILD_STALL_TIMEOUT_SECONDS", 5.0)
     monkeypatch.setattr(scheduler, "CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", 0.2)
     monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 50)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 50)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -459,7 +646,7 @@ def test_run_observes_shutdown_while_child_stdout_is_blocked(monkeypatch) -> Non
     monkeypatch.setattr(scheduler, "CHILD_TERMINATE_GRACE_SECONDS", 0.1)
     monkeypatch.setattr(scheduler, "_SHUTDOWN_EVENT", stop_event)
     monkeypatch.setattr(scheduler, "_terminate_child", terminate_child)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 47)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 47)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -531,7 +718,7 @@ def test_stdout_read_error_terminates_child_and_closes_pipe(monkeypatch) -> None
     monkeypatch.setattr(scheduler, "os", FailingReadOS())
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
     monkeypatch.setattr(scheduler, "_terminate_child", terminate_child)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 53)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 53)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
@@ -1089,7 +1276,7 @@ def test_catalog_recovery_rejects_recent_remote_running_row(monkeypatch) -> None
     connection.commit.assert_not_called()
 
 
-def test_nhtsa_recovery_closes_scheduler_owned_domain_run(monkeypatch) -> None:
+def test_nhtsa_recovery_closes_only_expired_linked_domain_run(monkeypatch) -> None:
     cursor = mock.MagicMock(rowcount=0)
     cursor.__enter__.return_value = cursor
     cursor.fetchone.return_value = None
@@ -1105,8 +1292,18 @@ def test_nhtsa_recovery_closes_scheduler_owned_domain_run(monkeypatch) -> None:
         statement for statement in statements if "UPDATE nhtsa_sync_runs" in statement
     )
     assert "status = 'interrupted'" in domain_recovery
-    assert "run_key REGEXP" in domain_recovery
-    assert "updated_at < UTC_TIMESTAMP(6)" in domain_recovery
+    assert "runs.scheduled_job_run_id" in domain_recovery
+    assert "child.id = runs.scheduled_job_run_id" in domain_recovery
+    assert "runs.lease_expires_at < UTC_TIMESTAMP(6)" in domain_recovery
+    assert "run_key" not in domain_recovery
+    parent_recovery = next(
+        statement for statement in statements if "SET parent.status = 'failed'" in statement
+    )
+    assert "LEFT JOIN scheduled_job_runs AS active_child" in parent_recovery
+    assert "active_child.id IS NULL" in parent_recovery
+    assert "NOT EXISTS" not in parent_recovery
+    assert not any("REGEXP" in statement for statement in statements)
+    assert not any("job_name LIKE" in statement for statement in statements)
     connection.commit.assert_called_once_with()
 
 
@@ -1121,21 +1318,122 @@ def test_nhtsa_recovery_rejects_recent_remote_running_row(monkeypatch) -> None:
     with pytest.raises(scheduler.ActiveDaemonRun, match="recent nhtsa daemon"):
         scheduler._recover_interrupted_job_runs("nhtsa")
 
-    assert len(cursor.execute.call_args_list) == 1
-    active_query, params = cursor.execute.call_args.args
-    assert "job_name LIKE 'nhtsa%%'" in active_query
+    assert len(cursor.execute.call_args_list) == 2
+    completion_query = cursor.execute.call_args_list[0].args[0]
+    assert "current_bulk.published_run_id = bulk_run.id" in completion_query
+    assert "current_api.published_run_id = api_run.id" in completion_query
+    active_query, params = cursor.execute.call_args_list[1].args
+    assert "job_name IN ('nhtsa', 'nhtsa-bulk', 'nhtsa-api', 'nhtsa-vin')" in active_query
+    assert "own_run.lease_expires_at >= UTC_TIMESTAMP(6)" in active_query
+    assert "active_child.parent_scheduled_job_run_id = jobs.id" in active_query
     assert params == (scheduler.RECOVERY_MIN_AGE_SECONDS,)
     connection.rollback.assert_called_once_with()
     connection.commit.assert_not_called()
 
 
-def test_nhtsa_api_commit_is_reconciled_without_repeating_stages(monkeypatch) -> None:
+def test_nhtsa_recovery_filters_daemon_only_on_every_update(monkeypatch) -> None:
+    cursor = mock.MagicMock(rowcount=0)
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    assert scheduler._recover_interrupted_job_runs("nhtsa") is False
+
+    update_statements = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if call.args[0].lstrip().upper().startswith("UPDATE")
+    ]
+    assert update_statements, "expected NHTSA recovery to issue UPDATE statements"
+    for statement in update_statements:
+        # 合法觸發來源只有 daemon 與 queue；manual/direct 一律不得被恢復觸碰。
+        assert "trigger_mode IN ('daemon', 'queue')" in statement or (
+            "trigger_mode = 'daemon'" in statement
+        ), "manual rows must not be touched by NHTSA recovery: " + statement
+
+
+def test_nhtsa_recovery_covers_queue_triggered_children(monkeypatch) -> None:
+    """Queue（後台 admin_crawl_requests）派發的 NHTSA child 也必須納入
+    expired-lease／stale-child 恢復，否則中斷的 queue run 永遠卡在 running。"""
+    cursor = mock.MagicMock(rowcount=0)
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    scheduler._recover_interrupted_job_runs("nhtsa")
+
+    child_updates = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if call.args[0].lstrip().upper().startswith("UPDATE")
+        and "'nhtsa-bulk', 'nhtsa-api', 'nhtsa-vin'" in call.args[0]
+    ]
+    assert len(child_updates) >= 3
+    for statement in child_updates:
+        assert "trigger_mode IN ('daemon', 'queue')" in statement, statement
+
+
+def test_dispatch_locked_maps_release_lock_runtime_error_to_db_exit_code(
+    monkeypatch, capsys
+) -> None:
+    lock_file = mock.MagicMock()
+    lock_file.fileno.return_value = 7
+    monkeypatch.setattr(scheduler, "_try_lock", lambda _prefix, _job: lock_file)
+
+    def recover(_job: str) -> bool:
+        raise RuntimeError("failed to release catalog writer admission lock")
+
+    monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", recover)
+    monkeypatch.setattr(scheduler, "dispatch", lambda *args, **kwargs: 0)
+
+    assert scheduler.dispatch_locked("nhtsa", "all") == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err
+    assert "failed to release catalog writer admission lock" in err
+
+
+def test_run_daemon_migration_runtime_error_is_non_site(monkeypatch, capsys) -> None:
+    daemon_lock = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "_wait_for_daemon_lock", lambda _job, _stop_event: daemon_lock)
+    job_lock = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "_try_lock", lambda _prefix, _job: job_lock)
+
+    def fake_getenv(name: str, default: object = None) -> object:
+        if name == "PARTSOUQ_APPLY_MIGRATIONS_ON_START":
+            return "1"
+        return default
+
+    monkeypatch.setattr(scheduler.os, "getenv", fake_getenv)
+
+    runner = mock.MagicMock()
+    runner.apply.side_effect = RuntimeError("migration runner adapter lost schema lock")
+    monkeypatch.setattr(scheduler, "CatalogMigrationRunner", lambda: runner)
+    monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", lambda _job: None)
+
+    stop_event = FakeStopEvent()
+    stop_event.stopped = True
+    assert (
+        scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event)
+        == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    )
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err
+    assert "migration runner adapter lost schema lock" in err
+
+
+def test_nhtsa_publish_is_reconciled_only_from_complete_lineage(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
     cursor.fetchone.return_value = None
 
     def execute(statement: str, _params=None) -> None:
-        cursor.rowcount = 1 if "output_text LIKE" in statement else 0
+        cursor.rowcount = (
+            1 if statement.startswith("UPDATE scheduled_job_runs AS parent JOIN") else 0
+        )
 
     cursor.execute.side_effect = execute
     connection = mock.MagicMock()
@@ -1143,12 +1441,35 @@ def test_nhtsa_api_commit_is_reconciled_without_repeating_stages(monkeypatch) ->
     monkeypatch.setattr(scheduler, "_connect", lambda: connection)
 
     assert scheduler._recover_interrupted_job_runs("nhtsa") is True
-    reconciliation = next(
-        call for call in cursor.execute.call_args_list if "output_text LIKE" in call.args[0]
-    )
-    assert reconciliation.args[1][-1] == f"%{scheduler.NHTSA_API_COMPLETED}%"
-    assert "finished_at = COALESCE(finished_at, started_at)" in reconciliation.args[0]
+    reconciliation = cursor.execute.call_args_list[0]
+    query = reconciliation.args[0]
+    assert "bulk_child.parent_scheduled_job_run_id = parent.id" in query
+    assert "api_child.parent_scheduled_job_run_id = parent.id" in query
+    assert "bulk_run.scheduled_job_run_id = bulk_child.id" in query
+    assert "api_run.scheduled_job_run_id = api_child.id" in query
+    assert "current_bulk.published_run_id = bulk_run.id" in query
+    assert "current_api.published_run_id = api_run.id" in query
+    assert "output_text LIKE" not in query
+    assert "bulk_child.finished_at IS NOT NULL" in query
+    assert "api_child.finished_at IS NOT NULL" in query
+    assert "parent.finished_at = GREATEST" in query
     connection.commit.assert_called_once_with()
+
+
+def test_nhtsa_progress_marker_alone_cannot_reconcile_parent(monkeypatch) -> None:
+    cursor = mock.MagicMock(rowcount=0)
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = None
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+
+    assert scheduler._recover_interrupted_job_runs("nhtsa") is False
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert all(scheduler.NHTSA_BULK_COMPLETED not in statement for statement in statements)
+    assert all(scheduler.NHTSA_API_COMPLETED not in statement for statement in statements)
+    assert all("output_text LIKE" not in statement for statement in statements)
 
 
 def test_daemon_retries_with_bounded_exponential_backoff(monkeypatch) -> None:
@@ -1392,8 +1713,19 @@ def test_catalog_sample_exit_waits_without_immediate_retry(monkeypatch) -> None:
 def test_catalog_sample_exit_is_not_recorded_as_scheduler_success(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def run(job_name: str, command: list[str], success_codes=(0,)) -> int:
-        captured.update(job=job_name, command=command, success_codes=success_codes)
+    def run(
+        job_name: str,
+        command: list[str],
+        success_codes=(0,),
+        *,
+        parent_scheduled_job_run_id: int | None = None,
+    ) -> int:
+        captured.update(
+            job=job_name,
+            command=command,
+            success_codes=success_codes,
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
+        )
         return 3
 
     monkeypatch.setattr(scheduler, "_run", run)
@@ -1402,6 +1734,32 @@ def test_catalog_sample_exit_is_not_recorded_as_scheduler_success(monkeypatch) -
     assert scheduler.dispatch("catalog", "all") == 3
     assert captured["job"] == "catalog"
     assert captured["success_codes"] == (0,)
+    assert captured["parent_scheduled_job_run_id"] is None
+
+
+def test_dispatch_forwards_parent_to_nhtsa_child_run(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def run(
+        job_name: str,
+        command: list[str],
+        success_codes=(0,),
+        *,
+        parent_scheduled_job_run_id: int | None = None,
+    ) -> int:
+        captured.update(
+            job=job_name,
+            command=command,
+            success_codes=success_codes,
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
+        )
+        return 0
+
+    monkeypatch.setattr(scheduler, "_run", run)
+
+    assert scheduler.dispatch("nhtsa-api", "all", parent_scheduled_job_run_id=501) == 0
+    assert captured["job"] == "nhtsa-api"
+    assert captured["parent_scheduled_job_run_id"] == 501
 
 
 def test_successful_daemon_waits_full_interval_before_next_cycle(monkeypatch) -> None:
@@ -1651,52 +2009,8 @@ def test_ambiguous_finish_failure_rechecks_cadence_before_retrying_work(
     dispatch.assert_called_once_with("catalog", "all")
 
 
-def test_nhtsa_retry_stage_only_uses_latest_failed_daemon_parent(monkeypatch) -> None:
-    cursor = mock.MagicMock()
-    cursor.__enter__.return_value = cursor
-    cursor.fetchone.return_value = {
-        "status": "failed",
-        "output_text": f"{scheduler.NHTSA_BULK_COMPLETED}\n",
-    }
-    connection = mock.MagicMock()
-    connection.cursor.return_value = cursor
-    monkeypatch.setattr(scheduler, "_dict_connect", lambda: connection)
-    scheduler._JOB_CONTEXT.trigger_mode = "daemon"
-    try:
-        assert scheduler._nhtsa_bulk_completed_for_retry() is True
-        cursor.fetchone.return_value["status"] = "completed"
-        assert scheduler._nhtsa_bulk_completed_for_retry() is False
-    finally:
-        del scheduler._JOB_CONTEXT.trigger_mode
-    query = cursor.execute.call_args.args[0]
-    assert "started_at >= UTC_TIMESTAMP() - INTERVAL 1 DAY" in query
-    assert "ORDER BY started_at DESC" in query
-
-
-def test_nhtsa_retry_does_not_resume_an_expired_bulk_stage(monkeypatch) -> None:
-    cursor = mock.MagicMock()
-    cursor.__enter__.return_value = cursor
-    cursor.fetchone.return_value = None
-    connection = mock.MagicMock()
-    connection.cursor.return_value = cursor
-    monkeypatch.setattr(scheduler, "_dict_connect", lambda: connection)
-    scheduler._JOB_CONTEXT.trigger_mode = "daemon"
-    try:
-        assert scheduler._nhtsa_bulk_completed_for_retry() is False
-    finally:
-        del scheduler._JOB_CONTEXT.trigger_mode
-    assert "INTERVAL 1 DAY" in cursor.execute.call_args.args[0]
-
-
-def test_nhtsa_retry_resumes_api_without_repeating_bulk(monkeypatch) -> None:
-    retry_stage = iter((False, True))
-    monkeypatch.setattr(
-        scheduler,
-        "_nhtsa_bulk_completed_for_retry",
-        lambda: next(retry_stage),
-    )
-    run_ids = iter((81, 82))
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: next(run_ids))
+def test_nhtsa_composite_always_runs_fresh_linked_children(monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 81)
     progress: list[tuple[int, str]] = []
     monkeypatch.setattr(
         scheduler,
@@ -1710,26 +2024,30 @@ def test_nhtsa_retry_resumes_api_without_repeating_bulk(monkeypatch) -> None:
         lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
     calls: list[str] = []
-    results = iter((0, 1, 0))
+    parents: list[tuple[str, int | None]] = []
 
-    def dispatch(job: str, _scope: str) -> int:
+    def dispatch(
+        job: str,
+        _scope: str,
+        *,
+        parent_scheduled_job_run_id: int | None = None,
+    ) -> int:
         calls.append(job)
-        return next(results)
+        parents.append((job, parent_scheduled_job_run_id))
+        return 0
 
     monkeypatch.setattr(scheduler, "dispatch", dispatch)
 
-    assert scheduler._run_nhtsa("all") == 1
     assert scheduler._run_nhtsa("all") == 0
 
-    assert calls == ["nhtsa-bulk", "nhtsa-api", "nhtsa-api"]
+    assert calls == ["nhtsa-bulk", "nhtsa-api"]
+    assert parents == [("nhtsa-bulk", 81), ("nhtsa-api", 81)]
     assert progress == [
         (81, scheduler.NHTSA_BULK_COMPLETED),
-        (82, scheduler.NHTSA_BULK_COMPLETED),
-        (82, scheduler.NHTSA_API_COMPLETED),
+        (81, scheduler.NHTSA_API_COMPLETED),
     ]
     assert scheduler.NHTSA_BULK_COMPLETED in finished[0][2]
-    assert scheduler.NHTSA_API_COMPLETED not in finished[0][2]
-    assert scheduler.NHTSA_API_COMPLETED in finished[1][2]
+    assert scheduler.NHTSA_API_COMPLETED in finished[0][2]
 
 
 def test_nhtsa_composite_rejects_incompatible_scope(monkeypatch) -> None:
@@ -1740,9 +2058,56 @@ def test_nhtsa_composite_rejects_incompatible_scope(monkeypatch) -> None:
     record_start.assert_not_called()
 
 
+def test_nhtsa_parent_start_db_failure_is_non_site(monkeypatch) -> None:
+    def record_start(_job: str, _parent: int | None = None) -> int:
+        raise scheduler.pymysql.OperationalError("temporary start failure")
+
+    monkeypatch.setattr(scheduler, "_record_start", record_start)
+    dispatch = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "dispatch", dispatch)
+
+    assert scheduler._run_nhtsa("all") == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    dispatch.assert_not_called()
+
+
+def test_nhtsa_parent_admission_release_failure_is_non_site(monkeypatch) -> None:
+    def record_start(_job: str, _parent: int | None = None) -> int:
+        raise RuntimeError("failed to release catalog writer admission lock")
+
+    monkeypatch.setattr(scheduler, "_record_start", record_start)
+    dispatch = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "dispatch", dispatch)
+
+    assert scheduler._run_nhtsa("all") == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    dispatch.assert_not_called()
+
+
+def test_nhtsa_bulk_success_survives_progress_write_failure(monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 82)
+
+    def record_progress(_run_id: int, marker: str) -> None:
+        if marker == scheduler.NHTSA_BULK_COMPLETED:
+            raise scheduler.pymysql.OperationalError("temporary progress failure")
+
+    monkeypatch.setattr(scheduler, "_record_progress", record_progress)
+    finished: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(
+        scheduler,
+        "_record_finish",
+        lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
+    )
+    dispatch = mock.MagicMock(return_value=0)
+    monkeypatch.setattr(scheduler, "dispatch", dispatch)
+
+    assert scheduler._run_nhtsa("all") == 0
+    assert [call.args[0] for call in dispatch.call_args_list] == ["nhtsa-bulk", "nhtsa-api"]
+    assert finished[0][0:2] == (82, 0)
+    assert scheduler.NHTSA_BULK_COMPLETED in finished[0][2]
+    assert scheduler.NHTSA_API_COMPLETED in finished[0][2]
+
+
 def test_nhtsa_api_success_survives_progress_write_failure(monkeypatch) -> None:
-    monkeypatch.setattr(scheduler, "_nhtsa_bulk_completed_for_retry", lambda: False)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 83)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 83)
 
     def record_progress(_run_id: int, marker: str) -> None:
         if marker == scheduler.NHTSA_API_COMPLETED:
@@ -1755,18 +2120,31 @@ def test_nhtsa_api_success_survives_progress_write_failure(monkeypatch) -> None:
         "_record_finish",
         lambda run_id, code, output, *_success: finished.append((run_id, code, output)),
     )
-    monkeypatch.setattr(scheduler, "dispatch", lambda _job, _scope: 0)
+    monkeypatch.setattr(scheduler, "dispatch", lambda _job, _scope, **_kwargs: 0)
 
     assert scheduler._run_nhtsa("all") == 0
     assert finished[0][0:2] == (83, 0)
     assert scheduler.NHTSA_API_COMPLETED in finished[0][2]
 
 
+def test_nhtsa_parent_finish_db_failure_is_non_site(monkeypatch) -> None:
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 84)
+    monkeypatch.setattr(scheduler, "_record_progress", lambda _run_id, _marker: None)
+    monkeypatch.setattr(scheduler, "dispatch", lambda _job, _scope, **_kwargs: 0)
+
+    def record_finish(_run_id: int, _code: int, _output: str) -> int:
+        raise RuntimeError("temporary finish failure")
+
+    monkeypatch.setattr(scheduler, "_record_finish", record_finish)
+
+    assert scheduler._run_nhtsa("all") == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+
+
 def test_shutdown_before_spawn_records_interrupted_without_starting_child(monkeypatch) -> None:
     stop_event = scheduler.threading.Event()
     stop_event.set()
     monkeypatch.setattr(scheduler, "_SHUTDOWN_EVENT", stop_event)
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job: 61)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 61)
     popen = mock.MagicMock()
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
     finished: list[tuple[int, int, str]] = []
@@ -1779,6 +2157,26 @@ def test_shutdown_before_spawn_records_interrupted_without_starting_child(monkey
     assert scheduler._run("catalog", ["python", "-m", "crawler"]) == 125
     popen.assert_not_called()
     assert finished[0][:2] == (61, scheduler.INTERRUPTED_EXIT_CODE)
+
+
+def test_shutdown_before_spawn_finish_db_failure_is_non_site(monkeypatch) -> None:
+    stop_event = scheduler.threading.Event()
+    stop_event.set()
+    monkeypatch.setattr(scheduler, "_SHUTDOWN_EVENT", stop_event)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job, _parent=None: 62)
+    popen = mock.MagicMock()
+    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+
+    def record_finish(_run_id: int, _code: int, _output: str, *_success: object) -> int:
+        raise RuntimeError("temporary interrupted finish failure")
+
+    monkeypatch.setattr(scheduler, "_record_finish", record_finish)
+
+    assert (
+        scheduler._run("catalog", ["python", "-m", "crawler"])
+        == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    )
+    popen.assert_not_called()
 
 
 def test_child_receives_sigint_without_inheriting_blocked_mask() -> None:
@@ -2080,6 +2478,7 @@ def test_catalog_auto_migration_runs_under_daemon_and_job_locks_before_ready(
     try_lock.assert_called_once_with("scheduler-job", "catalog")
     runner.apply.assert_called_once_with(
         recover_stale_catalog_daemon_seconds=scheduler.RECOVERY_MIN_AGE_SECONDS,
+        recover_stale_nhtsa_daemon_seconds=scheduler.RECOVERY_MIN_AGE_SECONDS,
     )
     runner.check.assert_called_once_with()
     recover.assert_called_once_with("catalog")

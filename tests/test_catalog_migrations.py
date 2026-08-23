@@ -19,6 +19,8 @@ from partsouq_catalog.migrations import (
     CatalogMigrationRunner,
     MigrationError,
     SchemaChange,
+    _normalize_nhtsa_check_clause,
+    _repairable_stale_nhtsa_runs,
     load_schema_changes,
     split_mysql_script,
     validate_ledger,
@@ -40,9 +42,77 @@ def test_admission_release_query_failure_closes_owner_connection() -> None:
     connection.close.assert_called_once_with()
 
 
+def test_repairable_stale_nhtsa_runs_rejects_child_started_after_parent_finished(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_table_exists(_connection: object, _table: str) -> bool:
+        return True
+
+    def fake_column_exists(_connection: object, table: str, column: str) -> bool:
+        return table in {"nhtsa_sync_runs", "scheduled_job_runs"} and column in {
+            "trigger_mode",
+            "started_at",
+            "finished_at",
+            "exit_code",
+            "run_key",
+            "updated_at",
+            "scheduled_job_run_id",
+            "lease_slot",
+            "lease_token",
+            "heartbeat_at",
+            "lease_expires_at",
+            "parent_scheduled_job_run_id",
+        }
+
+    monkeypatch.setattr("partsouq_catalog.migrations._table_exists", fake_table_exists)
+    monkeypatch.setattr("partsouq_catalog.migrations._column_exists", fake_column_exists)
+
+    connection = mock.MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+
+    def fake_fetchall() -> list[dict[str, object]]:
+        return [{"id": 1, "run_key": "nhtsa-bulk-20260101T000000Z"}]
+
+    cursor.fetchall.side_effect = fake_fetchall
+
+    def capture(statement: str, params: object = None) -> None:
+        if (
+            "JOIN scheduled_job_runs AS jobs" in statement
+            and "WHERE BINARY runs.status=BINARY 'running'" in statement
+        ):
+            captured["statement"] = statement
+            captured["params"] = params
+        return None
+
+    cursor.execute.side_effect = capture
+
+    with pytest.raises(KeyError):
+        _repairable_stale_nhtsa_runs(connection, 900)
+    assert "statement" in captured
+    statement = str(captured["statement"])
+    assert "jobs.started_at<=parent.finished_at" in statement or (
+        "jobs.started_at <= parent.finished_at" in statement
+    ), "failed parent recovery must reject children started after parent finished"
+
+
 def test_migration_lock_timeout_cannot_wait_forever() -> None:
     with pytest.raises(ValueError, match="non-negative"):
         CatalogMigrationRunner(lock_timeout_seconds=-1)
+
+
+@pytest.mark.parametrize("charset", ("ascii", "latin1", "utf8mb4"))
+def test_nhtsa_check_normalizer_accepts_expected_literal_charsets(charset: str) -> None:
+    clause = f"cast(_{charset}\\'writer\\' as char charset binary)"
+
+    assert _normalize_nhtsa_check_clause(clause) == "binary 'writer'"
+
+
+def test_nhtsa_check_normalizer_does_not_accept_unlisted_literal_charset() -> None:
+    clause = "cast(_binary\\'writer\\' as char charset binary)"
+
+    assert _normalize_nhtsa_check_clause(clause) == "binary _binary'writer'"
 
 
 def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
@@ -77,8 +147,9 @@ def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
         10,
         10,
         10,
+        10,
     ]
-    assert sum(len(change.statements) for change in migrations if change.active) == 563
+    assert sum(len(change.statements) for change in migrations if change.active) == 573
     assert changes[-1].key == STATION_ADMIN_ASSET[0]
     assert changes[-1].statements
 

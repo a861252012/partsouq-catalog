@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -321,6 +322,7 @@ async def _dispatch_nhtsa(args: argparse.Namespace) -> int:
                     run_key=args.run_id,
                     scope_name=args.scope,
                     sources=sources,
+                    scheduled_job_run_id=_scheduled_job_run_id(),
                 )
             _print_json(report)
             return 0 if report["status"] == "completed" else 1
@@ -329,6 +331,7 @@ async def _dispatch_nhtsa(args: argparse.Namespace) -> int:
                 report = await NhtsaApiSyncService(repository, config).run(
                     run_key=args.run_id,
                     scope_name=args.scope,
+                    scheduled_job_run_id=_scheduled_job_run_id(),
                 )
             _print_json(report)
             return 0 if report["status"] == "completed" else 1
@@ -338,6 +341,7 @@ async def _dispatch_nhtsa(args: argparse.Namespace) -> int:
                     report = await NhtsaApiSyncService(repository, config).decode_vin(
                         run_key=args.run_id,
                         vin=args.vin,
+                        scheduled_job_run_id=_scheduled_job_run_id(),
                     )
             except ValueError as error:
                 _print_json(
@@ -352,6 +356,13 @@ async def _dispatch_nhtsa(args: argparse.Namespace) -> int:
         return 75
     finally:
         repository.close()
+
+
+def _scheduled_job_run_id() -> int:
+    value = os.getenv("SCHEDULED_JOB_RUN_ID", "")
+    if not value.isdigit() or int(value) <= 0:
+        raise ValueError("NHTSA commands require a positive SCHEDULED_JOB_RUN_ID")
+    return int(value)
 
 
 async def _probe(repository: Repository, args: argparse.Namespace) -> int:

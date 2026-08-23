@@ -126,15 +126,19 @@ def _audit_catalog_evidence(
         database.close()
 
 
-def _record_start(job_name: str) -> int:
+def _record_start(job_name: str, parent_scheduled_job_run_id: int | None = None) -> int:
     connection = _connect()
     try:
         with catalog_writer_admission(connection), connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO scheduled_job_runs "
-                "(job_name, trigger_mode, status, started_at) "
-                "VALUES (%s, %s, 'running', UTC_TIMESTAMP())",
-                (job_name, getattr(_JOB_CONTEXT, "trigger_mode", "manual")),
+                "(parent_scheduled_job_run_id, job_name, trigger_mode, status, started_at) "
+                "VALUES (%s, %s, %s, 'running', UTC_TIMESTAMP())",
+                (
+                    parent_scheduled_job_run_id,
+                    job_name,
+                    getattr(_JOB_CONTEXT, "trigger_mode", "manual"),
+                ),
             )
             return int(cursor.lastrowid)
     finally:
@@ -143,23 +147,97 @@ def _record_start(job_name: str) -> int:
 
 def _record_finish(
     run_id: int, return_code: int, output: str, success_codes: tuple[int, ...] = (0,)
-) -> None:
+) -> int:
     connection = _connect()
     try:
         connection.begin()
         with connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE scheduled_job_runs "
-                "SET status = %s, finished_at = UTC_TIMESTAMP(), exit_code = %s, output_text = %s "
-                "WHERE id = %s",
-                (
-                    "completed" if return_code in success_codes else "failed",
-                    return_code,
-                    output[-MAX_OUTPUT_CHARS:],
-                    run_id,
-                ),
+                "SELECT job_name FROM scheduled_job_runs WHERE id = %s",
+                (run_id,),
             )
-            if return_code == INTERRUPTED_EXIT_CODE or return_code < 0:
+            scheduled_run = cursor.fetchone()
+            if scheduled_run is None:
+                raise RuntimeError(f"scheduled job run {run_id} does not exist")
+            job_name = str(scheduled_run["job_name"])
+            effective_return_code = return_code
+            effective_output = output
+            if job_name in {"nhtsa-bulk", "nhtsa-api", "nhtsa-vin"}:
+                cursor.execute(
+                    "SELECT id, status, ended_at, lease_slot, lease_token, lease_expires_at "
+                    "FROM nhtsa_sync_runs WHERE scheduled_job_run_id = %s FOR UPDATE",
+                    (run_id,),
+                )
+                domain_run = cursor.fetchone()
+                cursor.execute(
+                    "SELECT status, finished_at, exit_code FROM scheduled_job_runs "
+                    "WHERE id = %s FOR UPDATE",
+                    (run_id,),
+                )
+                child_state = cursor.fetchone()
+                if child_state is None:
+                    raise RuntimeError(f"scheduled job run {run_id} disappeared")
+                exact_atomic_completion = (
+                    child_state["status"] == "completed"
+                    and child_state["finished_at"] is not None
+                    and child_state["exit_code"] == 0
+                    and domain_run is not None
+                    and domain_run["status"] == "completed"
+                    and domain_run["ended_at"] is not None
+                    and domain_run["lease_slot"] is None
+                    and domain_run["lease_token"] is None
+                    and domain_run["lease_expires_at"] is None
+                )
+                if exact_atomic_completion:
+                    effective_return_code = 0
+                    if return_code != 0:
+                        effective_output += (
+                            f"\nNHTSA child process exit {return_code} was observed after "
+                            "exact atomic completion; completed state preserved\n"
+                        )
+                    cursor.execute(
+                        "UPDATE scheduled_job_runs SET output_text = "
+                        "RIGHT(CONCAT(COALESCE(output_text, ''), %s), %s) WHERE id = %s",
+                        (effective_output, MAX_OUTPUT_CHARS, run_id),
+                    )
+                else:
+                    if return_code in success_codes:
+                        effective_return_code = 1
+                        effective_output += (
+                            "\nNHTSA child exited successfully without an exact atomic "
+                            "completed tuple\n"
+                        )
+                    cursor.execute(
+                        "UPDATE nhtsa_sync_runs SET status = 'interrupted', "
+                        "updated_at = UTC_TIMESTAMP(6), ended_at = UTC_TIMESTAMP(6), "
+                        "lease_slot = NULL, lease_token = NULL, lease_expires_at = NULL, "
+                        "error_message = 'linked scheduler child failed' "
+                        "WHERE scheduled_job_run_id = %s AND status = 'running'",
+                        (run_id,),
+                    )
+                    cursor.execute(
+                        "UPDATE scheduled_job_runs "
+                        "SET status = 'failed', finished_at = UTC_TIMESTAMP(), "
+                        "exit_code = %s, output_text = %s WHERE id = %s",
+                        (
+                            effective_return_code,
+                            effective_output[-MAX_OUTPUT_CHARS:],
+                            run_id,
+                        ),
+                    )
+            else:
+                cursor.execute(
+                    "UPDATE scheduled_job_runs "
+                    "SET status = %s, finished_at = UTC_TIMESTAMP(), exit_code = %s, "
+                    "output_text = %s WHERE id = %s",
+                    (
+                        "completed" if effective_return_code in success_codes else "failed",
+                        effective_return_code,
+                        effective_output[-MAX_OUTPUT_CHARS:],
+                        run_id,
+                    ),
+                )
+            if effective_return_code == INTERRUPTED_EXIT_CODE or effective_return_code < 0:
                 cursor.execute(
                     "UPDATE crawl_runs SET status = 'interrupted', "
                     "finished_at = COALESCE(finished_at, UTC_TIMESTAMP()) "
@@ -167,6 +245,7 @@ def _record_finish(
                     (run_id,),
                 )
         connection.commit()
+        return effective_return_code
     except Exception:
         connection.rollback()
         raise
@@ -180,10 +259,9 @@ def _record_progress(run_id: int, marker: str) -> None:
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE scheduled_job_runs SET output_text = "
-                "RIGHT(CONCAT(COALESCE(output_text, ''), %s), %s), "
-                "finished_at = CASE WHEN %s THEN UTC_TIMESTAMP() ELSE finished_at END "
+                "RIGHT(CONCAT(COALESCE(output_text, ''), %s), %s) "
                 "WHERE id = %s AND status = 'running'",
-                (f"{marker}\n", MAX_OUTPUT_CHARS, marker == NHTSA_API_COMPLETED, run_id),
+                (f"{marker}\n", MAX_OUTPUT_CHARS, run_id),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"scheduled job run {run_id} is not running")
@@ -304,13 +382,19 @@ def _shutdown_requested() -> bool:
     return _SHUTDOWN_EVENT is not None and _SHUTDOWN_EVENT.is_set()
 
 
-def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,)) -> int:
+def _run(
+    job_name: str,
+    command: list[str],
+    success_codes: tuple[int, ...] = (0,),
+    *,
+    parent_scheduled_job_run_id: int | None = None,
+) -> int:
     try:
-        run_id = _record_start(job_name)
+        run_id = _record_start(job_name, parent_scheduled_job_run_id)
     except AdmissionLockBusy:
         print(f"{job_name} 遇到 schema migration；保留工作並稍後重試", file=sys.stderr)
         return LOCK_BUSY_EXIT_CODE
-    except pymysql.MySQLError as error:
+    except (pymysql.MySQLError, RuntimeError) as error:
         print(f"無法記錄 {job_name} 排程：{error}", file=sys.stderr)
         return SCHEDULER_DB_ERROR_EXIT_CODE
 
@@ -323,7 +407,11 @@ def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,
         )
     if _shutdown_requested():
         output = f"{job_name} 尚未啟動，scheduler 已收到停止訊號\n"
-        _record_finish(run_id, INTERRUPTED_EXIT_CODE, output)
+        try:
+            _record_finish(run_id, INTERRUPTED_EXIT_CODE, output)
+        except (pymysql.MySQLError, RuntimeError) as error:
+            print(f"無法完成 {job_name} 的排程紀錄：{error}", file=sys.stderr)
+            return SCHEDULER_DB_ERROR_EXIT_CODE
         return INTERRUPTED_EXIT_CODE
 
     vin = command[4].strip().upper() if job_name == "nhtsa-vin" and len(command) > 4 else None
@@ -513,8 +601,10 @@ def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,
     if output and not output_was_streamed and emit_stdout:
         print(output, end="" if output.endswith("\n") else "\n")
     try:
-        _record_finish(run_id, return_code, output, success_codes)
-    except pymysql.MySQLError as error:
+        recorded_return_code = _record_finish(run_id, return_code, output, success_codes)
+        if recorded_return_code is not None:
+            return_code = recorded_return_code
+    except (pymysql.MySQLError, RuntimeError) as error:
         print(f"無法完成 {job_name} 的排程紀錄：{error}", file=sys.stderr)
         return SCHEDULER_DB_ERROR_EXIT_CODE
     # 只有呼叫端明確列出的成功碼會轉成 0；正式 catalog 只接受 0。
@@ -625,9 +715,62 @@ def _recover_interrupted_job_runs(job: str) -> bool:
 
             if family == "nhtsa":
                 cursor.execute(
-                    "SELECT id FROM scheduled_job_runs WHERE status = 'running' "
-                    "AND trigger_mode = 'daemon' AND job_name LIKE 'nhtsa%%' "
-                    "AND started_at >= UTC_TIMESTAMP() - INTERVAL %s SECOND LIMIT 1",
+                    "UPDATE scheduled_job_runs AS parent "
+                    "JOIN scheduled_job_runs AS bulk_child "
+                    "ON bulk_child.parent_scheduled_job_run_id = parent.id "
+                    "AND bulk_child.job_name = 'nhtsa-bulk' "
+                    "AND bulk_child.status = 'completed' AND bulk_child.finished_at IS NOT NULL "
+                    "AND bulk_child.exit_code = 0 "
+                    "JOIN nhtsa_sync_runs AS bulk_run "
+                    "ON bulk_run.scheduled_job_run_id = bulk_child.id "
+                    "AND bulk_run.status = 'completed' AND bulk_run.ended_at IS NOT NULL "
+                    "AND bulk_run.lease_slot IS NULL AND bulk_run.lease_token IS NULL "
+                    "AND bulk_run.lease_expires_at IS NULL "
+                    "JOIN scheduled_job_runs AS api_child "
+                    "ON api_child.parent_scheduled_job_run_id = parent.id "
+                    "AND api_child.job_name = 'nhtsa-api' "
+                    "AND api_child.status = 'completed' AND api_child.finished_at IS NOT NULL "
+                    "AND api_child.exit_code = 0 "
+                    "JOIN nhtsa_sync_runs AS api_run "
+                    "ON api_run.scheduled_job_run_id = api_child.id "
+                    "AND api_run.status = 'completed' AND api_run.ended_at IS NOT NULL "
+                    "AND api_run.lease_slot IS NULL AND api_run.lease_token IS NULL "
+                    "AND api_run.lease_expires_at IS NULL "
+                    "SET parent.status = 'completed', "
+                    "parent.finished_at = GREATEST(bulk_child.finished_at, api_child.finished_at), "
+                    "parent.exit_code = 0, parent.output_text = "
+                    "RIGHT(CONCAT(COALESCE(parent.output_text, ''), %s), %s) "
+                    "WHERE parent.job_name = 'nhtsa' "
+                    "AND parent.trigger_mode = 'daemon' "
+                    "AND (parent.status = 'running' OR (parent.status = 'failed' "
+                    "AND parent.exit_code IS NOT NULL AND parent.exit_code <> 0)) "
+                    "AND EXISTS (SELECT 1 FROM nhtsa_current_artifacts AS current_bulk "
+                    "WHERE current_bulk.published_run_id = bulk_run.id) "
+                    "AND EXISTS (SELECT 1 FROM nhtsa_current_artifacts AS current_api "
+                    "WHERE current_api.published_run_id = api_run.id)",
+                    (
+                        "\nNHTSA bulk and API publishes reconciled from exact lineage\n",
+                        MAX_OUTPUT_CHARS,
+                    ),
+                )
+                recovered_complete = cursor.rowcount > 0
+                cursor.execute(
+                    "SELECT jobs.id FROM scheduled_job_runs AS jobs "
+                    "LEFT JOIN nhtsa_sync_runs AS own_run "
+                    "ON own_run.scheduled_job_run_id = jobs.id "
+                    "WHERE jobs.status = 'running' "
+                    "AND jobs.trigger_mode IN ('daemon', 'queue') "
+                    "AND jobs.job_name IN ('nhtsa', 'nhtsa-bulk', 'nhtsa-api', 'nhtsa-vin') "
+                    "AND (jobs.started_at >= UTC_TIMESTAMP() - INTERVAL %s SECOND "
+                    "OR (own_run.status = 'running' "
+                    "AND own_run.lease_expires_at >= UTC_TIMESTAMP(6)) "
+                    "OR EXISTS (SELECT 1 FROM scheduled_job_runs AS active_child "
+                    "JOIN nhtsa_sync_runs AS active_run "
+                    "ON active_run.scheduled_job_run_id = active_child.id "
+                    "WHERE active_child.parent_scheduled_job_run_id = jobs.id "
+                    "AND active_child.status = 'running' "
+                    "AND active_run.status = 'running' "
+                    "AND active_run.lease_expires_at >= UTC_TIMESTAMP(6))) LIMIT 1",
                     (RECOVERY_MIN_AGE_SECONDS,),
                 )
             else:
@@ -642,41 +785,72 @@ def _recover_interrupted_job_runs(job: str) -> bool:
 
             if family == "nhtsa":
                 cursor.execute(
-                    "UPDATE scheduled_job_runs SET status = 'completed', "
-                    "finished_at = COALESCE(finished_at, started_at), exit_code = 0, "
-                    "output_text = RIGHT(CONCAT(COALESCE(output_text, ''), %s), %s) "
-                    "WHERE status = 'running' AND job_name = 'nhtsa' "
-                    "AND trigger_mode = 'daemon' "
-                    "AND started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND "
-                    "AND output_text LIKE %s",
-                    (
-                        "\nNHTSA API completed before scheduler interruption; "
-                        "completion reconciled automatically\n",
-                        MAX_OUTPUT_CHARS,
-                        RECOVERY_MIN_AGE_SECONDS,
-                        f"%{NHTSA_API_COMPLETED}%",
-                    ),
-                )
-                recovered_complete = cursor.rowcount > 0
-                cursor.execute(
-                    "UPDATE nhtsa_sync_runs SET status = 'interrupted', "
-                    "updated_at = UTC_TIMESTAMP(6), ended_at = UTC_TIMESTAMP(6), "
-                    "error_message = 'scheduler interrupted; recovered automatically' "
-                    "WHERE status = 'running' AND run_key REGEXP "
-                    "'^nhtsa-(bulk|api|vin)-[0-9]{8}T[0-9]{6}Z$' "
-                    "AND updated_at < UTC_TIMESTAMP(6) - INTERVAL %s SECOND",
+                    "UPDATE nhtsa_sync_runs AS runs "
+                    "JOIN scheduled_job_runs AS child "
+                    "ON child.id = runs.scheduled_job_run_id "
+                    "SET runs.status = 'interrupted', runs.updated_at = UTC_TIMESTAMP(6), "
+                    "runs.ended_at = UTC_TIMESTAMP(6), runs.lease_slot = NULL, "
+                    "runs.lease_token = NULL, runs.lease_expires_at = NULL, "
+                    "runs.error_message = 'scheduler recovered expired linked lease' "
+                    "WHERE runs.status = 'running' "
+                    "AND runs.lease_expires_at < UTC_TIMESTAMP(6) "
+                    "AND child.status = 'running' "
+                    "AND child.trigger_mode IN ('daemon', 'queue') "
+                    "AND child.job_name IN ('nhtsa-bulk', 'nhtsa-api', 'nhtsa-vin') "
+                    "AND child.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
                     (RECOVERY_MIN_AGE_SECONDS,),
                 )
                 cursor.execute(
-                    "UPDATE scheduled_job_runs SET status = 'failed', "
-                    "finished_at = UTC_TIMESTAMP(), exit_code = %s, "
-                    "output_text = RIGHT(CONCAT(COALESCE(output_text, ''), %s), %s) "
-                    "WHERE status = 'running' AND job_name LIKE 'nhtsa%%' "
-                    "AND trigger_mode = 'daemon' "
-                    "AND started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                    "UPDATE scheduled_job_runs AS child "
+                    "JOIN nhtsa_sync_runs AS runs "
+                    "ON runs.scheduled_job_run_id = child.id "
+                    "SET child.status = 'failed', child.finished_at = UTC_TIMESTAMP(), "
+                    "child.exit_code = %s, child.output_text = "
+                    "RIGHT(CONCAT(COALESCE(child.output_text, ''), %s), %s) "
+                    "WHERE child.status = 'running' AND runs.status = 'interrupted' "
+                    "AND child.trigger_mode IN ('daemon', 'queue') "
+                    "AND child.job_name IN ('nhtsa-bulk', 'nhtsa-api', 'nhtsa-vin') "
+                    "AND child.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
                     (
                         INTERRUPTED_EXIT_CODE,
-                        "\nprevious scheduler interrupted; recovered automatically\n",
+                        "\nexpired linked NHTSA lease recovered automatically\n",
+                        MAX_OUTPUT_CHARS,
+                        RECOVERY_MIN_AGE_SECONDS,
+                    ),
+                )
+                cursor.execute(
+                    "UPDATE scheduled_job_runs AS child "
+                    "LEFT JOIN nhtsa_sync_runs AS runs "
+                    "ON runs.scheduled_job_run_id = child.id "
+                    "SET child.status = 'failed', child.finished_at = UTC_TIMESTAMP(), "
+                    "child.exit_code = %s, child.output_text = "
+                    "RIGHT(CONCAT(COALESCE(child.output_text, ''), %s), %s) "
+                    "WHERE child.status = 'running' AND runs.id IS NULL "
+                    "AND child.trigger_mode IN ('daemon', 'queue') "
+                    "AND child.job_name IN ('nhtsa-bulk', 'nhtsa-api', 'nhtsa-vin') "
+                    "AND child.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                    (
+                        INTERRUPTED_EXIT_CODE,
+                        "\nstale NHTSA child stopped before domain lease claim\n",
+                        MAX_OUTPUT_CHARS,
+                        RECOVERY_MIN_AGE_SECONDS,
+                    ),
+                )
+                cursor.execute(
+                    "UPDATE scheduled_job_runs AS parent "
+                    "LEFT JOIN scheduled_job_runs AS active_child "
+                    "ON active_child.parent_scheduled_job_run_id = parent.id "
+                    "AND active_child.status = 'running' "
+                    "SET parent.status = 'failed', parent.finished_at = UTC_TIMESTAMP(), "
+                    "parent.exit_code = %s, parent.output_text = "
+                    "RIGHT(CONCAT(COALESCE(parent.output_text, ''), %s), %s) "
+                    "WHERE parent.status = 'running' AND parent.job_name = 'nhtsa' "
+                    "AND parent.trigger_mode = 'daemon' "
+                    "AND parent.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND "
+                    "AND active_child.id IS NULL",
+                    (
+                        INTERRUPTED_EXIT_CODE,
+                        "\nprevious NHTSA composite interrupted; recovered automatically\n",
                         MAX_OUTPUT_CHARS,
                         RECOVERY_MIN_AGE_SECONDS,
                     ),
@@ -737,8 +911,8 @@ def dispatch_locked(job: str, scope: str) -> int:
         except AdmissionLockBusy:
             print(f"{job} 遇到 schema migration；保留工作並稍後重試", file=sys.stderr)
             return LOCK_BUSY_EXIT_CODE
-        except pymysql.MySQLError as error:
-            print(f"無法回收 {job} 的中斷排程：{error}", file=sys.stderr)
+        except (pymysql.MySQLError, RuntimeError) as error:
+            print(f"無法回收 {job} 的中斷排程：{type(error).__name__}: {error}", file=sys.stderr)
             return SCHEDULER_DB_ERROR_EXIT_CODE
         if (
             recovered_complete
@@ -886,6 +1060,7 @@ def run_daemon(
                 runner = CatalogMigrationRunner()
                 runner.apply(
                     recover_stale_catalog_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
+                    recover_stale_nhtsa_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
                 )
                 runner.check()
                 _recover_interrupted_job_runs(job)
@@ -894,8 +1069,9 @@ def run_daemon(
                 ActiveDaemonRun,
                 AdmissionLockBusy,
                 pymysql.MySQLError,
+                RuntimeError,
             ) as error:
-                print(f"catalog 啟動升級失敗：{error}", file=sys.stderr)
+                print(f"catalog 啟動升級失敗：{type(error).__name__}: {error}", file=sys.stderr)
                 return SCHEDULER_DB_ERROR_EXIT_CODE
             finally:
                 job_lock.close()
@@ -1071,64 +1247,42 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGINT, stop)
 
 
-def _nhtsa_bulk_completed_for_retry() -> bool:
-    if getattr(_JOB_CONTEXT, "trigger_mode", "manual") != "daemon":
-        return False
-    connection = _dict_connect()
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT status, output_text FROM scheduled_job_runs "
-                "WHERE job_name = 'nhtsa' AND trigger_mode = 'daemon' "
-                "AND started_at >= UTC_TIMESTAMP() - INTERVAL 1 DAY "
-                "ORDER BY started_at DESC, id DESC LIMIT 1"
-            )
-            row = cursor.fetchone()
-    finally:
-        connection.close()
-    return bool(
-        row
-        and row.get("status") == "failed"
-        and NHTSA_BULK_COMPLETED in str(row.get("output_text") or "")
-        and NHTSA_API_COMPLETED not in str(row.get("output_text") or "")
-    )
-
-
 def _run_nhtsa(scope: str) -> int:
     if scope != "all":
         print("nhtsa composite 只支援 scope=all；個別 scope 請使用子工作", file=sys.stderr)
         return 2
     try:
-        resume_api = _nhtsa_bulk_completed_for_retry()
-    except pymysql.MySQLError as error:
-        print(f"無法讀取 nhtsa stage：{error}", file=sys.stderr)
-        return 1
-    try:
-        parent_run_id = _record_start("nhtsa")
+        parent_run_id = _record_start("nhtsa", None)
     except AdmissionLockBusy:
         print("nhtsa 遇到 schema migration；保留工作並稍後重試", file=sys.stderr)
         return LOCK_BUSY_EXIT_CODE
-    except pymysql.MySQLError as error:
+    except (pymysql.MySQLError, RuntimeError) as error:
         print(f"無法記錄 nhtsa 排程：{error}", file=sys.stderr)
-        return 1
+        return SCHEDULER_DB_ERROR_EXIT_CODE
 
     completed_stages: list[str] = []
-    bulk_result = 0 if resume_api else dispatch("nhtsa-bulk", scope)
+    bulk_result = dispatch(
+        "nhtsa-bulk",
+        scope,
+        parent_scheduled_job_run_id=parent_run_id,
+    )
     if bulk_result == 0:
         completed_stages.append(NHTSA_BULK_COMPLETED)
         try:
             _record_progress(parent_run_id, NHTSA_BULK_COMPLETED)
         except (pymysql.MySQLError, RuntimeError) as error:
             print(f"無法記錄 nhtsa bulk stage：{error}", file=sys.stderr)
-            return_code = 1
-        else:
-            return_code = dispatch("nhtsa-api", scope)
-            if return_code == 0:
-                completed_stages.append(NHTSA_API_COMPLETED)
-                try:
-                    _record_progress(parent_run_id, NHTSA_API_COMPLETED)
-                except (pymysql.MySQLError, RuntimeError) as error:
-                    print(f"無法記錄 nhtsa API stage：{error}", file=sys.stderr)
+        return_code = dispatch(
+            "nhtsa-api",
+            scope,
+            parent_scheduled_job_run_id=parent_run_id,
+        )
+        if return_code == 0:
+            completed_stages.append(NHTSA_API_COMPLETED)
+            try:
+                _record_progress(parent_run_id, NHTSA_API_COMPLETED)
+            except (pymysql.MySQLError, RuntimeError) as error:
+                print(f"無法記錄 nhtsa API stage：{error}", file=sys.stderr)
     else:
         return_code = bulk_result
     output = (
@@ -1136,10 +1290,12 @@ def _run_nhtsa(scope: str) -> int:
         + f"nhtsa composite finished with exit code {return_code}; see child job rows\n"
     )
     try:
-        _record_finish(parent_run_id, return_code, output)
-    except pymysql.MySQLError as error:
+        recorded_return_code = _record_finish(parent_run_id, return_code, output)
+        if recorded_return_code is not None:
+            return_code = recorded_return_code
+    except (pymysql.MySQLError, RuntimeError) as error:
         print(f"無法完成 nhtsa 的排程紀錄：{error}", file=sys.stderr)
-        return 1
+        return SCHEDULER_DB_ERROR_EXIT_CODE
     return return_code
 
 
@@ -1167,7 +1323,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def dispatch(job: str, scope: str) -> int:
+def dispatch(
+    job: str,
+    scope: str,
+    *,
+    parent_scheduled_job_run_id: int | None = None,
+) -> int:
     if job == "pending":
         try:
             _requeue_interrupted_requests()
@@ -1226,6 +1387,7 @@ def dispatch(job: str, scope: str) -> int:
         return _run(
             "catalog",
             [sys.executable, "-m", "partsouq_catalog.run_crawl", "--workers", workers],
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
         )
 
     if job == "nhtsa-bulk":
@@ -1241,6 +1403,7 @@ def dispatch(job: str, scope: str) -> int:
                 "--run-id",
                 _nhtsa_run_id("bulk"),
             ],
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
         )
 
     if job == "nhtsa-api":
@@ -1256,6 +1419,7 @@ def dispatch(job: str, scope: str) -> int:
                 "--run-id",
                 _nhtsa_run_id("api"),
             ],
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
         )
 
     if job == "nhtsa-vin":
@@ -1270,6 +1434,7 @@ def dispatch(job: str, scope: str) -> int:
                 "--run-id",
                 _nhtsa_run_id("vin"),
             ],
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
         )
 
     return _run_nhtsa(scope)

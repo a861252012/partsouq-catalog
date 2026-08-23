@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from partsouq_crawler.nhtsa.api import NhtsaApiParser, normalize_vin
+from partsouq_crawler.nhtsa.api import NhtsaApiParser, normalize_vin, vin_source_key
 from partsouq_crawler.nhtsa.api_client import NhtsaApiClient
 from partsouq_crawler.nhtsa.config import NhtsaConfig
 from partsouq_crawler.nhtsa.datasets import CSSI_SOURCES, VPIC_FIXED_SOURCES, ApiSource
-from partsouq_crawler.nhtsa.models import ApiDocument
-from partsouq_crawler.nhtsa.repository import NhtsaMySQLRepository
+from partsouq_crawler.nhtsa.models import (
+    ApiDocument,
+    NhtsaRunLease,
+    read_verified_stored_artifact,
+    verified_stored_artifact_path,
+)
+from partsouq_crawler.nhtsa.progress import lease_heartbeat
+from partsouq_crawler.nhtsa.repository import NhtsaLeaseLostError, NhtsaMySQLRepository
 from partsouq_crawler.nhtsa.service import BATCH_SIZE, NhtsaRecordWriter
 
 API_PARSER_NAME = "nhtsa_official_api_json"
@@ -44,7 +49,13 @@ class NhtsaApiSyncService:
         self.writer = NhtsaRecordWriter(repository)
         self.request_count = 0
 
-    async def run(self, *, run_key: str, scope_name: str) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        run_key: str,
+        scope_name: str,
+        scheduled_job_run_id: int,
+    ) -> dict[str, Any]:
         if scope_name not in {"all", "vpic", "cssi"}:
             raise ValueError(f"unsupported NHTSA API scope: {scope_name}")
         source_groups = []
@@ -52,7 +63,13 @@ class NhtsaApiSyncService:
             source_groups.append("vpic")
         if scope_name in {"all", "cssi"}:
             source_groups.append("cssi")
-        run_id = self.repository.start_run(run_key, f"api-{scope_name}", source_groups)
+        lease = self.repository.start_run(
+            run_key,
+            f"api-{scope_name}",
+            source_groups,
+            scheduled_job_run_id=scheduled_job_run_id,
+            expected_job_name="nhtsa-api",
+        )
         downloaded = 0
         reused = 0
         source_rows = 0
@@ -62,102 +79,107 @@ class NhtsaApiSyncService:
         replace_datasets: list[str] = []
         active_artifact_id: int | None = None
         try:
-            async with NhtsaApiClient(self.config) as client:
-                if scope_name in {"all", "vpic"}:
-                    variables: ApiDocument | None = None
-                    for source in VPIC_FIXED_SOURCES:
-                        imported = await self._sync_source(client, source)
-                        active_artifact_id = imported.artifact_id
-                        downloaded += int(imported.downloaded)
-                        reused += int(not imported.downloaded)
-                        source_rows += imported.document.count
-                        new_versions += imported.new_versions
-                        rejected_rows += len(imported.document.rejections)
-                        publishable.append((source.dataset_name, source.key, imported.artifact_id))
-                        active_artifact_id = None
-                        if source.dataset_name == "vpic_variables":
-                            variables = imported.document
-
-                    for page in range(1, MAX_MANUFACTURER_PAGES + 1):
-                        source = ApiSource(
-                            key=f"vpic_manufacturers_page_{page:03d}",
-                            dataset_name="vpic_manufacturers",
-                            url=(
-                                "https://vpic.nhtsa.dot.gov/api/vehicles/"
-                                f"GetAllManufacturers?format=json&page={page}"
-                            ),
-                        )
-                        imported = await self._sync_source(client, source)
-                        downloaded += int(imported.downloaded)
-                        reused += int(not imported.downloaded)
-                        source_rows += imported.document.count
-                        new_versions += imported.new_versions
-                        rejected_rows += len(imported.document.rejections)
-                        if imported.document.count:
+            with lease_heartbeat(self.config, lease) as check_lease:
+                async with NhtsaApiClient(self.config) as client:
+                    if scope_name in {"all", "vpic"}:
+                        variables: ApiDocument | None = None
+                        for source in VPIC_FIXED_SOURCES:
+                            imported = await self._sync_source(client, source, lease)
+                            active_artifact_id = imported.artifact_id
+                            downloaded += int(imported.downloaded)
+                            reused += int(not imported.downloaded)
+                            source_rows += imported.document.count
+                            new_versions += imported.new_versions
+                            rejected_rows += len(imported.document.rejections)
                             publishable.append(
                                 (source.dataset_name, source.key, imported.artifact_id)
                             )
-                        if imported.document.count < MANUFACTURER_PAGE_SIZE:
-                            break
-                    else:
-                        raise ValueError("vPIC manufacturer pagination exceeded safety limit")
+                            active_artifact_id = None
+                            if source.dataset_name == "vpic_variables":
+                                variables = imported.document
 
-                    if variables is None:
-                        raise ValueError("vPIC variable list was not collected")
-                    variable_ids = sorted(
-                        {
-                            int(record.external_id)
-                            for record in variables.records
-                            if record.external_id and record.external_id.isdigit()
-                        }
-                    )
-                    for variable_id in variable_ids:
-                        source = ApiSource(
-                            key=f"vpic_variable_{variable_id}_values",
-                            dataset_name="vpic_variable_values",
-                            url=(
-                                "https://vpic.nhtsa.dot.gov/api/vehicles/"
-                                f"GetVehicleVariableValuesList/{variable_id}?format=json"
-                            ),
-                            context=(("Variable_ID", str(variable_id)),),
+                        for page in range(1, MAX_MANUFACTURER_PAGES + 1):
+                            source = ApiSource(
+                                key=f"vpic_manufacturers_page_{page:03d}",
+                                dataset_name="vpic_manufacturers",
+                                url=(
+                                    "https://vpic.nhtsa.dot.gov/api/vehicles/"
+                                    f"GetAllManufacturers?format=json&page={page}"
+                                ),
+                            )
+                            imported = await self._sync_source(client, source, lease)
+                            downloaded += int(imported.downloaded)
+                            reused += int(not imported.downloaded)
+                            source_rows += imported.document.count
+                            new_versions += imported.new_versions
+                            rejected_rows += len(imported.document.rejections)
+                            if imported.document.count:
+                                publishable.append(
+                                    (source.dataset_name, source.key, imported.artifact_id)
+                                )
+                            if imported.document.count < MANUFACTURER_PAGE_SIZE:
+                                break
+                        else:
+                            raise ValueError("vPIC manufacturer pagination exceeded safety limit")
+
+                        if variables is None:
+                            raise ValueError("vPIC variable list was not collected")
+                        variable_ids = sorted(
+                            {
+                                int(record.external_id)
+                                for record in variables.records
+                                if record.external_id and record.external_id.isdigit()
+                            }
                         )
-                        imported = await self._sync_source(client, source)
-                        downloaded += int(imported.downloaded)
-                        reused += int(not imported.downloaded)
-                        source_rows += imported.document.count
-                        new_versions += imported.new_versions
-                        rejected_rows += len(imported.document.rejections)
-                        publishable.append((source.dataset_name, source.key, imported.artifact_id))
-                    replace_datasets.extend(
-                        (
-                            "vpic_makes",
-                            "vpic_models",
-                            "vpic_manufacturers",
-                            "vpic_variables",
-                            "vpic_variable_values",
+                        for variable_id in variable_ids:
+                            source = ApiSource(
+                                key=f"vpic_variable_{variable_id}_values",
+                                dataset_name="vpic_variable_values",
+                                url=(
+                                    "https://vpic.nhtsa.dot.gov/api/vehicles/"
+                                    f"GetVehicleVariableValuesList/{variable_id}?format=json"
+                                ),
+                                context=(("Variable_ID", str(variable_id)),),
+                            )
+                            imported = await self._sync_source(client, source, lease)
+                            downloaded += int(imported.downloaded)
+                            reused += int(not imported.downloaded)
+                            source_rows += imported.document.count
+                            new_versions += imported.new_versions
+                            rejected_rows += len(imported.document.rejections)
+                            publishable.append(
+                                (source.dataset_name, source.key, imported.artifact_id)
+                            )
+                        replace_datasets.extend(
+                            (
+                                "vpic_makes",
+                                "vpic_models",
+                                "vpic_manufacturers",
+                                "vpic_variables",
+                                "vpic_variable_values",
+                            )
                         )
-                    )
 
-                if scope_name in {"all", "cssi"}:
-                    for source in CSSI_SOURCES:
-                        imported = await self._sync_source(client, source)
-                        downloaded += int(imported.downloaded)
-                        reused += int(not imported.downloaded)
-                        source_rows += imported.document.count
-                        new_versions += imported.new_versions
-                        rejected_rows += len(imported.document.rejections)
-                        publishable.append((source.dataset_name, source.key, imported.artifact_id))
-                    replace_datasets.append("cssi_stations")
+                    if scope_name in {"all", "cssi"}:
+                        for source in CSSI_SOURCES:
+                            imported = await self._sync_source(client, source, lease)
+                            downloaded += int(imported.downloaded)
+                            reused += int(not imported.downloaded)
+                            source_rows += imported.document.count
+                            new_versions += imported.new_versions
+                            rejected_rows += len(imported.document.rejections)
+                            publishable.append(
+                                (source.dataset_name, source.key, imported.artifact_id)
+                            )
+                        replace_datasets.append("cssi_stations")
 
-            if rejected_rows:
-                raise ValueError(f"NHTSA API sync rejected {rejected_rows} records")
-            self.repository.publish_artifacts(
+                if rejected_rows:
+                    raise ValueError(f"NHTSA API sync rejected {rejected_rows} records")
+                check_lease()
+            self.repository.complete_run_and_publish_artifacts(
+                lease,
                 publishable,
                 replace_datasets=replace_datasets,
-            )
-            self.repository.finish_run(
-                run_id,
-                status="completed",
                 downloaded=downloaded,
                 reused=reused,
                 source_rows=source_rows,
@@ -165,7 +187,7 @@ class NhtsaApiSyncService:
                 rejected_rows=rejected_rows,
             )
             return {
-                "run_id": run_id,
+                "run_id": lease.id,
                 "run_key": run_key,
                 "scope": scope_name,
                 "status": "completed",
@@ -178,32 +200,54 @@ class NhtsaApiSyncService:
                 "published_sources": len(publishable),
             }
         except asyncio.CancelledError:
-            self.repository.finish_run(
-                run_id,
-                status="interrupted",
-                downloaded=downloaded,
-                reused=reused,
-                source_rows=source_rows,
-                new_versions=new_versions,
-                rejected_rows=rejected_rows,
-                error_message="sync interrupted",
-            )
+            try:
+                self.repository.finish_run(
+                    lease,
+                    status="interrupted",
+                    downloaded=downloaded,
+                    reused=reused,
+                    source_rows=source_rows,
+                    new_versions=new_versions,
+                    rejected_rows=rejected_rows,
+                    error_message="sync interrupted",
+                )
+            except Exception as finish_error:
+                print(
+                    f"nhtsa api cancellation cleanup failed: {finish_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             raise
         except Exception as error:
-            if active_artifact_id is not None:
-                self.repository.quarantine_artifact(active_artifact_id, str(error))
-            self.repository.finish_run(
-                run_id,
-                status="failed",
-                downloaded=downloaded,
-                reused=reused,
-                source_rows=source_rows,
-                new_versions=new_versions,
-                rejected_rows=rejected_rows,
-                error_message=f"{type(error).__name__}: {error}",
-            )
+            if active_artifact_id is not None and not isinstance(error, NhtsaLeaseLostError):
+                try:
+                    self.repository.quarantine_artifact(lease, active_artifact_id, str(error))
+                except Exception as quarantine_error:
+                    print(
+                        f"nhtsa api quarantine cleanup failed: {quarantine_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if not isinstance(error, NhtsaLeaseLostError):
+                try:
+                    self.repository.finish_run(
+                        lease,
+                        status="failed",
+                        downloaded=downloaded,
+                        reused=reused,
+                        source_rows=source_rows,
+                        new_versions=new_versions,
+                        rejected_rows=rejected_rows,
+                        error_message=f"{type(error).__name__}: {error}",
+                    )
+                except Exception as finish_error:
+                    print(
+                        f"nhtsa api terminal cleanup failed: {finish_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             return {
-                "run_id": run_id,
+                "run_id": lease.id,
                 "run_key": run_key,
                 "scope": scope_name,
                 "status": "failed",
@@ -218,17 +262,29 @@ class NhtsaApiSyncService:
                 "published_sources": 0,
             }
 
-    async def decode_vin(self, *, run_key: str, vin: str) -> dict[str, Any]:
+    async def decode_vin(
+        self,
+        *,
+        run_key: str,
+        vin: str,
+        scheduled_job_run_id: int,
+    ) -> dict[str, Any]:
         normalized_vin = normalize_vin(vin)
         source = ApiSource(
-            key=f"vpic_vin_sha256_{hashlib.sha256(normalized_vin.encode()).hexdigest()}",
+            key=vin_source_key(normalized_vin),
             dataset_name="vpic_vin_decodes",
             url=(
                 "https://vpic.nhtsa.dot.gov/api/vehicles/"
                 f"DecodeVinValues/{normalized_vin}?format=json"
             ),
         )
-        run_id = self.repository.start_run(run_key, "api-vin", (source.key,))
+        lease = self.repository.start_run(
+            run_key,
+            "api-vin",
+            (source.key,),
+            scheduled_job_run_id=scheduled_job_run_id,
+            expected_job_name="nhtsa-vin",
+        )
         downloaded = 0
         reused = 0
         source_rows = 0
@@ -236,36 +292,35 @@ class NhtsaApiSyncService:
         rejected_rows = 0
         artifact_id: int | None = None
         try:
-            async with NhtsaApiClient(self.config) as client:
-                imported = await self._sync_source(client, source)
-            artifact_id = imported.artifact_id
-            document = imported.document
-            downloaded = int(imported.downloaded)
-            reused = int(not imported.downloaded)
-            source_rows = document.count
-            new_versions = imported.new_versions
-            rejected_rows = len(document.rejections)
-            if document.count != 1 or len(document.records) != 1 or document.rejections:
-                raise ValueError(
-                    "NHTSA VIN decode must return exactly one valid result; "
-                    f"count={document.count}, records={len(document.records)}, "
-                    f"rejections={len(document.rejections)}"
-                )
-            record = document.records[0]
-            payload = json.loads(record.payload_json)
-            if (
-                not isinstance(payload, dict)
-                or str(payload.get("VIN") or "").upper() != normalized_vin
-            ):
-                raise ValueError("NHTSA VIN decode response does not match the requested VIN")
-            vehicle = self.repository.publish_vin_decode(
+            with lease_heartbeat(self.config, lease) as check_lease:
+                async with NhtsaApiClient(self.config) as client:
+                    imported = await self._sync_source(client, source, lease)
+                artifact_id = imported.artifact_id
+                document = imported.document
+                downloaded = int(imported.downloaded)
+                reused = int(not imported.downloaded)
+                source_rows = document.count
+                new_versions = imported.new_versions
+                rejected_rows = len(document.rejections)
+                if document.count != 1 or len(document.records) != 1 or document.rejections:
+                    raise ValueError(
+                        "NHTSA VIN decode must return exactly one valid result; "
+                        f"count={document.count}, records={len(document.records)}, "
+                        f"rejections={len(document.rejections)}"
+                    )
+                record = document.records[0]
+                payload = json.loads(record.payload_json)
+                if (
+                    not isinstance(payload, dict)
+                    or str(payload.get("VIN") or "").upper() != normalized_vin
+                ):
+                    raise ValueError("NHTSA VIN decode response does not match the requested VIN")
+                check_lease()
+            vehicle = self.repository.complete_run_and_publish_vin_decode(
+                lease,
                 imported.artifact_id,
-                source.key,
+                normalized_vin,
                 payload,
-            )
-            self.repository.finish_run(
-                run_id,
-                status="completed",
                 downloaded=downloaded,
                 reused=reused,
                 source_rows=source_rows,
@@ -273,7 +328,7 @@ class NhtsaApiSyncService:
                 rejected_rows=rejected_rows,
             )
             return {
-                "run_id": run_id,
+                "run_id": lease.id,
                 "run_key": run_key,
                 "scope": "vin",
                 "status": "completed",
@@ -286,36 +341,59 @@ class NhtsaApiSyncService:
                 "vehicle": vehicle,
             }
         except asyncio.CancelledError:
-            self.repository.finish_run(
-                run_id,
-                status="interrupted",
-                downloaded=downloaded,
-                reused=reused,
-                source_rows=source_rows,
-                new_versions=new_versions,
-                rejected_rows=rejected_rows,
-                error_message="VIN decode interrupted",
-            )
+            try:
+                self.repository.finish_run(
+                    lease,
+                    status="interrupted",
+                    downloaded=downloaded,
+                    reused=reused,
+                    source_rows=source_rows,
+                    new_versions=new_versions,
+                    rejected_rows=rejected_rows,
+                    error_message="VIN decode interrupted",
+                )
+            except Exception as finish_error:
+                print(
+                    f"nhtsa VIN cancellation cleanup failed: {finish_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             raise
         except Exception as error:
-            if artifact_id is not None:
-                self.repository.quarantine_artifact(
-                    artifact_id,
-                    str(error),
-                    only_if_unpublished=True,
-                )
-            self.repository.finish_run(
-                run_id,
-                status="failed",
-                downloaded=downloaded,
-                reused=reused,
-                source_rows=source_rows,
-                new_versions=new_versions,
-                rejected_rows=rejected_rows,
-                error_message=f"{type(error).__name__}: {error}",
-            )
+            if artifact_id is not None and not isinstance(error, NhtsaLeaseLostError):
+                try:
+                    self.repository.quarantine_artifact(
+                        lease,
+                        artifact_id,
+                        str(error),
+                        only_if_unpublished=True,
+                    )
+                except Exception as quarantine_error:
+                    print(
+                        f"nhtsa VIN quarantine cleanup failed: {quarantine_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if not isinstance(error, NhtsaLeaseLostError):
+                try:
+                    self.repository.finish_run(
+                        lease,
+                        status="failed",
+                        downloaded=downloaded,
+                        reused=reused,
+                        source_rows=source_rows,
+                        new_versions=new_versions,
+                        rejected_rows=rejected_rows,
+                        error_message=f"{type(error).__name__}: {error}",
+                    )
+                except Exception as finish_error:
+                    print(
+                        f"nhtsa VIN terminal cleanup failed: {finish_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             return {
-                "run_id": run_id,
+                "run_id": lease.id,
                 "run_key": run_key,
                 "scope": "vin",
                 "status": "failed",
@@ -333,16 +411,34 @@ class NhtsaApiSyncService:
         self,
         client: NhtsaApiClient,
         source: ApiSource,
+        lease: NhtsaRunLease,
     ) -> ApiSourceImport:
         self.request_count += 1
         if self.request_count > API_REQUEST_BUDGET:
             raise ValueError(f"NHTSA API request budget exceeded ({API_REQUEST_BUDGET})")
         current = self.repository.current_artifact(source.dataset_name, source.key)
-        download, body = await client.fetch(source, current_artifact=current)
+        current_path = await asyncio.to_thread(
+            verified_stored_artifact_path,
+            current,
+            parser_name=API_PARSER_NAME,
+            parser_version=API_PARSER_VERSION,
+        )
+        conditional_current = current if current_path is not None else None
+        download, body = await client.fetch(source, current_artifact=conditional_current)
         if download.reused_artifact_id is not None:
-            if current is None:
-                raise ValueError("reused API response has no current artifact")
-            body = await asyncio.to_thread(Path(str(current["stored_path"])).read_bytes)
+            refreshed = self.repository.current_artifact(source.dataset_name, source.key)
+            body = await asyncio.to_thread(
+                read_verified_stored_artifact,
+                refreshed,
+                parser_name=API_PARSER_NAME,
+                parser_version=API_PARSER_VERSION,
+            )
+            if (
+                refreshed is None
+                or body is None
+                or int(str(refreshed["id"])) != download.reused_artifact_id
+            ):
+                raise ValueError(f"{source.key} current API artifact failed 304 revalidation")
             document = self.parser.parse(body, source)
             return ApiSourceImport(download.reused_artifact_id, document, False, 0)
         if download.sha256 is None or download.path is None or body is None:
@@ -354,6 +450,11 @@ class NhtsaApiSyncService:
             API_PARSER_VERSION,
         )
         if existing and existing["status"] == "imported":
+            self.repository.refresh_artifact_storage(
+                lease,
+                int(str(existing["id"])),
+                download,
+            )
             document = self.parser.parse(body, source)
             return ApiSourceImport(int(str(existing["id"])), document, False, 0)
         if existing and existing["status"] == "quarantined":
@@ -361,6 +462,7 @@ class NhtsaApiSyncService:
                 f"{source.key} API content is quarantined: {existing['error_message']}"
             )
         artifact_id = self.repository.create_artifact(
+            lease,
             dataset_name=source.dataset_name,
             source_key=source.key,
             source_url=source.url,
@@ -382,21 +484,23 @@ class NhtsaApiSyncService:
                     f"API schema drift for {source.key}: "
                     f"{current_schema} -> {document.member.schema_sha256}"
                 )
-            self.repository.store_member(artifact_id, document.member)
-            self.repository.reset_artifact_import(artifact_id)
+            self.repository.store_member(lease, artifact_id, document.member)
+            self.repository.reset_artifact_import(lease, artifact_id)
             new_versions = 0
             duplicate_rejections = 0
             records = list(document.records)
             for index in range(0, len(records), BATCH_SIZE):
                 added, rejected = self.writer.insert(
+                    lease,
                     artifact_id,
                     records[index : index + BATCH_SIZE],
                 )
                 new_versions += added
                 duplicate_rejections += rejected
-            self.repository.insert_rejections(artifact_id, document.rejections)
+            self.repository.insert_rejections(lease, artifact_id, document.rejections)
             total_rejections = duplicate_rejections + len(document.rejections)
             self.repository.complete_artifact(
+                lease,
                 artifact_id,
                 source_rows=document.count,
                 new_versions=new_versions,
@@ -406,5 +510,12 @@ class NhtsaApiSyncService:
                 raise ValueError(f"{source.key} rejected {total_rejections} API records")
             return ApiSourceImport(artifact_id, document, True, new_versions)
         except Exception as error:
-            self.repository.quarantine_artifact(artifact_id, str(error))
+            try:
+                self.repository.quarantine_artifact(lease, artifact_id, str(error))
+            except Exception as quarantine_error:
+                print(
+                    f"nhtsa API source quarantine cleanup failed: {quarantine_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             raise

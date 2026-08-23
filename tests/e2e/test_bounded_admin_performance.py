@@ -1078,7 +1078,12 @@ def test_data_admin_health_fails_closed_when_schema_object_is_missing(
     connection = performance_database.connect(autocommit=True)
     try:
         with connection.cursor() as cursor:
+            # nhtsa_sync_runs 被 nhtsa_current_artifacts 的 published_run FK
+            # 引用；health() 的 fail-closed 語意只需要「物件不存在」，
+            # 因此這裡合法地暫時關閉 FK 檢查再 DROP。
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
             cursor.execute(f"DROP {object_type} {object_name}")
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
     finally:
         connection.close()
 

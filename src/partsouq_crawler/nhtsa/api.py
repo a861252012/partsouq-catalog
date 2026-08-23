@@ -37,6 +37,11 @@ def normalize_vin(value: str) -> str:
     return vin
 
 
+def vin_source_key(value: str) -> str:
+    vin = normalize_vin(value)
+    return f"vpic_vin_sha256_{hashlib.sha256(vin.encode()).hexdigest()}"
+
+
 class NhtsaApiPolicy:
     def validate(self, url: str) -> None:
         parsed = urlsplit(url)

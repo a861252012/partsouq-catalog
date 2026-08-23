@@ -9,6 +9,7 @@ from partsouq_crawler.nhtsa.api import (
     NhtsaApiPolicy,
     NhtsaApiPolicyError,
     normalize_vin,
+    vin_source_key,
 )
 from partsouq_crawler.nhtsa.datasets import ApiSource
 
@@ -42,6 +43,12 @@ def test_normalize_vin_requires_full_valid_alphabet() -> None:
     for invalid in (VIN[:-1], f"{VIN[:-1]}I", f"{VIN[:-1]}Q"):
         with pytest.raises(ValueError, match="VIN 必須是 17 碼"):
             normalize_vin(invalid)
+
+
+def test_vin_source_key_is_the_hash_of_the_normalized_vin() -> None:
+    assert vin_source_key(f" {VIN.lower()} ") == (
+        "vpic_vin_sha256_ede95f1201f438e841f7bab89e079c35bdda827ea9d32a4dec959442c08c9a7b"
+    )
 
 
 def test_api_parser_normalizes_vin_vehicle_fields() -> None:

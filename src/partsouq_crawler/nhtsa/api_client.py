@@ -96,18 +96,17 @@ class NhtsaApiClient:
         target_dir = self.config.raw_dir / source.dataset_name
         target_dir.mkdir(parents=True, exist_ok=True)
         final_path = target_dir / f"{sha256}.json"
-        if not final_path.exists():
-            descriptor, name = tempfile.mkstemp(prefix=".nhtsa-api-", dir=target_dir)
-            os.close(descriptor)
-            temp_path = Path(name)
-            try:
-                async with aiofiles.open(temp_path, "wb") as output:
-                    await output.write(body)
-                    await output.flush()
-                os.replace(temp_path, final_path)
-            finally:
-                with suppress(FileNotFoundError):
-                    await asyncio.to_thread(os.unlink, temp_path)
+        descriptor, name = tempfile.mkstemp(prefix=".nhtsa-api-", dir=target_dir)
+        os.close(descriptor)
+        temp_path = Path(name)
+        try:
+            async with aiofiles.open(temp_path, "wb") as output:
+                await output.write(body)
+                await output.flush()
+            os.replace(temp_path, final_path)
+        finally:
+            with suppress(FileNotFoundError):
+                await asyncio.to_thread(os.unlink, temp_path)
         return (
             DownloadedArtifact(
                 http_status=200,

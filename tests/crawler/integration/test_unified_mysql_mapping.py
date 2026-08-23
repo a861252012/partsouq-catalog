@@ -19,7 +19,7 @@ from partsouq_catalog.repositories import (
     PartRepository,
     VehicleRepository,
 )
-from partsouq_crawler.nhtsa.api import NhtsaApiParser
+from partsouq_crawler.nhtsa.api import NhtsaApiParser, vin_source_key
 from partsouq_crawler.nhtsa.config import NhtsaConfig
 from partsouq_crawler.nhtsa.datasets import ApiSource
 from partsouq_crawler.nhtsa.models import DownloadedArtifact
@@ -55,6 +55,7 @@ def _config(tmp_path: Path) -> NhtsaConfig:
 
 
 def _clear_shared_database(repository: NhtsaMySQLRepository) -> None:
+    repository.clear_for_tests()
     with repository.transaction() as connection, connection.cursor() as cursor:
         for table in (
             "admin_vehicle_mappings",
@@ -72,7 +73,6 @@ def _clear_shared_database(repository: NhtsaMySQLRepository) -> None:
             "brands",
         ):
             cursor.execute(f"DELETE FROM {table}")
-    repository.clear_for_tests()
 
 
 def _vehicle_html() -> str:
@@ -118,7 +118,7 @@ def _publish_fixture_vin(
     tmp_path: Path,
 ) -> None:
     source = ApiSource(
-        key=f"vpic_vin_{VIN}",
+        key=vin_source_key(VIN),
         dataset_name="vpic_vin_decodes",
         url=f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{VIN}?format=json",
     )
@@ -142,7 +142,23 @@ def _publish_fixture_vin(
     sha256 = hashlib.sha256(body).hexdigest()
     raw_path = tmp_path / f"{sha256}.json"
     raw_path.write_bytes(body)
+    with repository.transaction() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO scheduled_job_runs(job_name, trigger_mode, status, started_at)
+            VALUES ('nhtsa-vin', 'daemon', 'running', UTC_TIMESTAMP())
+            """
+        )
+        scheduled_job_run_id = int(cursor.lastrowid)
+    lease = repository.start_run(
+        "mapping-vin-fixture",
+        "api-vin",
+        (source.key,),
+        scheduled_job_run_id=scheduled_job_run_id,
+        expected_job_name="nhtsa-vin",
+    )
     artifact_id = repository.create_artifact(
+        lease,
         dataset_name=source.dataset_name,
         source_key=source.key,
         source_url=source.url,
@@ -156,16 +172,27 @@ def _publish_fixture_vin(
         parser_name="test_vin_fixture",
         parser_version="1",
     )
-    repository.store_member(artifact_id, document.member)
-    repository.reset_artifact_import(artifact_id)
-    new_versions = repository.insert_records(artifact_id, document.records)
+    repository.store_member(lease, artifact_id, document.member)
+    repository.reset_artifact_import(lease, artifact_id)
+    new_versions = repository.insert_records(lease, artifact_id, document.records)
     repository.complete_artifact(
+        lease,
         artifact_id,
         source_rows=1,
         new_versions=new_versions,
         rejected_rows=0,
     )
-    repository.publish_vin_decode(artifact_id, source.key, payload)
+    repository.complete_run_and_publish_vin_decode(
+        lease,
+        artifact_id,
+        VIN,
+        payload,
+        downloaded=1,
+        reused=0,
+        source_rows=1,
+        new_versions=new_versions,
+        rejected_rows=0,
+    )
 
 
 def test_part_and_vin_are_mapped_through_shared_mysql_and_admin_api(

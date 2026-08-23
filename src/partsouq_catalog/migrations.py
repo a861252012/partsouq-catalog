@@ -23,6 +23,7 @@ type ChangeKind = Literal["migration", "asset"]
 LEDGER_TABLE = "catalog_schema_ledger"
 SUPERSEDED_VERSIONS = (13, 14)
 STALE_SCHEDULER_EXIT_CODE = 125
+LEGACY_NHTSA_LINK_WINDOW_SECONDS = 5
 
 # Published migrations are immutable. Hashes cover the exact file bytes.
 # fmt: off
@@ -50,6 +51,7 @@ CATALOG_MANIFEST = (
     (21, "021_exact_artifact_sanitizer_contract.sql", "46a974719bde384e9853660181b658cadbdbe4559cb4bae4e4597a8bf3332873"),
     (22, "022_group_receipt_run_key_index.sql", "41303ad2d06bbe682655bb276893893aa4f2a3d5f817bc34275b406920cd47fd"),
     (23, "023_partsouq_http_diagnostics.sql", "83951039e522c3bdf9caf887bd46ebf65594649f4ac57b4810a35a140da08918"),
+    (24, "024_nhtsa_run_leases.sql", "7faeb30a4aa83a1aca8c768bf3a3170d0bed5783fa9aa53c2d207419dcc17182"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(
@@ -153,6 +155,18 @@ _HTTP_DIAGNOSTIC_CHECK_CLAUSES = {
 def _normalize_http_diagnostic_check_clause(clause: str) -> str:
     normalized = clause.strip().lower()
     normalized = re.sub(r"_(?:ascii|utf8mb4)(?=\\')", "", normalized)
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _normalize_nhtsa_check_clause(clause: str) -> str:
+    normalized = clause.strip().lower().replace("`", "")
+    normalized = normalized.replace("\\'", "'")
+    normalized = re.sub(r"_(?:ascii|latin1|utf8mb4)(?=')", "", normalized)
+    normalized = re.sub(
+        r"cast\(([^()]+) as char charset binary\)",
+        r"binary \1",
+        normalized,
+    )
     return re.sub(r"\s+", " ", normalized)
 
 
@@ -509,6 +523,7 @@ class CatalogMigrationRunner:
             validate_ledger(_load_ledger(connection), changes, complete=True)
             _assert_no_owned_routines(connection, changes)
             _assert_http_diagnostics_contract(connection)
+            _assert_nhtsa_run_lease_contract(connection)
         finally:
             connection.close()
 
@@ -519,12 +534,18 @@ class CatalogMigrationRunner:
         allow_v5_rebuild: bool = False,
         retry_station_asset: bool = False,
         recover_stale_catalog_daemon_seconds: int | None = None,
+        recover_stale_nhtsa_daemon_seconds: int | None = None,
     ) -> tuple[int, ...]:
         if (
             recover_stale_catalog_daemon_seconds is not None
             and recover_stale_catalog_daemon_seconds <= 0
         ):
             raise ValueError("stale catalog daemon age must be positive")
+        if (
+            recover_stale_nhtsa_daemon_seconds is not None
+            and recover_stale_nhtsa_daemon_seconds <= 0
+        ):
+            raise ValueError("stale NHTSA daemon age must be positive")
         changes = load_schema_changes(self._migrations_dir, self._station_schema_path)
         connection = self._connection_factory()
         lock_name: str | None = None
@@ -553,12 +574,33 @@ class CatalogMigrationRunner:
                     connection,
                     recover_stale_catalog_daemon_seconds,
                 )
+            repairable_nhtsa_runs: tuple[Mapping[str, object], ...] = ()
+            if recover_stale_nhtsa_daemon_seconds is not None:
+                repairable_nhtsa_runs = _repairable_stale_nhtsa_runs(
+                    connection,
+                    recover_stale_nhtsa_daemon_seconds,
+                )
+            repairable_nhtsa_scheduled_job_ids: list[int] = []
+            for row in repairable_nhtsa_runs:
+                if row["job_status"] == "running":
+                    repairable_nhtsa_scheduled_job_ids.append(int(str(row["scheduled_job_run_id"])))
+                if row.get("parent_job_status") == "running":
+                    repairable_nhtsa_scheduled_job_ids.append(
+                        int(str(row["parent_scheduled_job_run_id"]))
+                    )
             _assert_no_running_jobs(
                 connection,
                 allow_repairable_catalog=True,
                 repairable_scheduled_job_id=repairable_scheduler_id,
+                repairable_nhtsa_run_ids=tuple(
+                    int(str(row["run_id"])) for row in repairable_nhtsa_runs
+                ),
+                repairable_nhtsa_scheduled_job_ids=tuple(
+                    dict.fromkeys(repairable_nhtsa_scheduled_job_ids)
+                ),
             )
             _repair_stale_catalog_runs(connection, repairable_scheduler_id)
+            _repair_stale_nhtsa_runs(connection, repairable_nhtsa_runs)
             _assert_no_running_jobs(connection)
             if not _table_exists(connection, LEDGER_TABLE):
                 _create_ledger(connection)
@@ -584,6 +626,8 @@ class CatalogMigrationRunner:
                     _execute_change(connection, change)
                     if change.version == 23:
                         _assert_http_diagnostics_contract(connection)
+                    if change.version == 24:
+                        _assert_nhtsa_run_lease_contract(connection)
                     if change.version is not None:
                         _assert_no_owned_routines(connection, (change,))
                     _finish(connection, change)
@@ -597,6 +641,7 @@ class CatalogMigrationRunner:
             _assert_no_owned_routines(connection, changes)
             validate_ledger(_load_ledger(connection), changes, complete=True)
             _assert_http_diagnostics_contract(connection)
+            _assert_nhtsa_run_lease_contract(connection)
             return tuple(applied)
         finally:
             if lock_name is not None:
@@ -668,6 +713,8 @@ def _assert_no_running_jobs(
     *,
     allow_repairable_catalog: bool = False,
     repairable_scheduled_job_id: int | None = None,
+    repairable_nhtsa_run_ids: Sequence[int] = (),
+    repairable_nhtsa_scheduled_job_ids: Sequence[int] = (),
 ) -> None:
     for table in (
         "crawl_runs",
@@ -684,11 +731,31 @@ def _assert_no_running_jobs(
             and _column_exists(connection, "crawl_runs", "scheduled_job_run_id")
         )
         with connection.cursor() as cursor:
-            if table == "scheduled_job_runs" and repairable_scheduled_job_id is not None:
+            if table == "scheduled_job_runs" and (
+                repairable_scheduled_job_id is not None or repairable_nhtsa_scheduled_job_ids
+            ):
+                repairable_job_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            ()
+                            if repairable_scheduled_job_id is None
+                            else (repairable_scheduled_job_id,)
+                        )
+                        + tuple(repairable_nhtsa_scheduled_job_ids)
+                    )
+                )
+                placeholders = ",".join("%s" for _job_id in repairable_job_ids)
                 cursor.execute(
                     "SELECT COUNT(*) AS row_count FROM scheduled_job_runs "
-                    "WHERE status='running' AND id<>%s",
-                    (repairable_scheduled_job_id,),
+                    f"WHERE status='running' AND id NOT IN ({placeholders})",
+                    repairable_job_ids,
+                )
+            elif table == "nhtsa_sync_runs" and repairable_nhtsa_run_ids:
+                placeholders = ",".join("%s" for _run_id in repairable_nhtsa_run_ids)
+                cursor.execute(
+                    "SELECT COUNT(*) AS row_count FROM nhtsa_sync_runs "
+                    f"WHERE status='running' AND id NOT IN ({placeholders})",
+                    tuple(repairable_nhtsa_run_ids),
                 )
             elif repairable_catalog:
                 repairable_running_scheduler = ""
@@ -807,6 +874,378 @@ def _repair_stale_catalog_runs(
                 "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
                 "AND jobs.exit_code <> 0"
             )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _repairable_stale_nhtsa_runs(
+    connection: MigrationConnection,
+    minimum_age_seconds: int,
+) -> tuple[Mapping[str, object], ...]:
+    required_columns = (
+        ("scheduled_job_runs", "trigger_mode"),
+        ("scheduled_job_runs", "started_at"),
+        ("scheduled_job_runs", "finished_at"),
+        ("scheduled_job_runs", "exit_code"),
+        ("nhtsa_sync_runs", "run_key"),
+        ("nhtsa_sync_runs", "started_at"),
+        ("nhtsa_sync_runs", "updated_at"),
+    )
+    if (
+        not _table_exists(connection, "nhtsa_sync_runs")
+        or not _table_exists(connection, "scheduled_job_runs")
+        or any(not _column_exists(connection, table, column) for table, column in required_columns)
+    ):
+        return ()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT id,run_key,started_at,updated_at FROM nhtsa_sync_runs "
+            "WHERE BINARY status=BINARY 'running' ORDER BY id"
+        )
+        running = tuple(cursor.fetchall())
+        if not running:
+            return ()
+        direct_link = _column_exists(connection, "nhtsa_sync_runs", "scheduled_job_run_id")
+        lease_columns = all(
+            _column_exists(connection, "nhtsa_sync_runs", column)
+            for column in ("lease_slot", "lease_token", "heartbeat_at", "lease_expires_at")
+        )
+        if direct_link:
+            if not lease_columns:
+                raise MigrationError(
+                    "direct NHTSA scheduler links require the complete lease schema"
+                )
+            if not _column_exists(
+                connection,
+                "scheduled_job_runs",
+                "parent_scheduled_job_run_id",
+            ):
+                raise MigrationError(
+                    "direct NHTSA scheduler links require the parent lineage schema"
+                )
+            cursor.execute(
+                "SELECT runs.id AS run_id,runs.run_key AS run_key,"
+                "runs.started_at AS run_started_at,runs.updated_at AS run_updated_at,"
+                "runs.error_message AS run_error_message,runs.lease_slot AS lease_slot,"
+                "runs.lease_token AS lease_token,runs.heartbeat_at AS heartbeat_at,"
+                "runs.lease_expires_at AS lease_expires_at,"
+                "jobs.id AS scheduled_job_run_id,jobs.finished_at AS job_finished_at,"
+                "jobs.started_at AS job_started_at,jobs.exit_code AS job_exit_code,"
+                "jobs.job_name AS job_name,jobs.trigger_mode AS job_trigger_mode,"
+                "jobs.status AS job_status,"
+                "jobs.parent_scheduled_job_run_id AS parent_scheduled_job_run_id,"
+                "parent.job_name AS parent_job_name,"
+                "parent.trigger_mode AS parent_trigger_mode,"
+                "parent.status AS parent_job_status,"
+                "parent.started_at AS parent_job_started_at,"
+                "parent.finished_at AS parent_job_finished_at,"
+                "parent.exit_code AS parent_job_exit_code,"
+                "'direct' AS link_mode "
+                "FROM nhtsa_sync_runs AS runs JOIN scheduled_job_runs AS jobs "
+                "ON jobs.id=runs.scheduled_job_run_id "
+                "LEFT JOIN scheduled_job_runs AS parent "
+                "ON parent.id=jobs.parent_scheduled_job_run_id "
+                "WHERE BINARY runs.status=BINARY 'running' "
+                "AND BINARY jobs.job_name IN ("
+                "BINARY 'nhtsa-bulk',BINARY 'nhtsa-api',BINARY 'nhtsa-vin') "
+                "AND BINARY jobs.trigger_mode IN (BINARY 'daemon',BINARY 'queue') "
+                "AND BINARY runs.lease_slot=BINARY 'writer' "
+                "AND runs.lease_token REGEXP '^[0-9a-f]{64}$' "
+                "AND runs.heartbeat_at IS NOT NULL "
+                "AND runs.lease_expires_at>runs.heartbeat_at "
+                "AND runs.lease_expires_at<UTC_TIMESTAMP(6) "
+                "AND runs.started_at<UTC_TIMESTAMP(6)-INTERVAL %s SECOND "
+                "AND runs.updated_at<UTC_TIMESTAMP(6)-INTERVAL %s SECOND "
+                "AND runs.heartbeat_at<UTC_TIMESTAMP(6)-INTERVAL %s SECOND "
+                "AND jobs.started_at<=runs.started_at "
+                "AND runs.started_at<=runs.heartbeat_at "
+                "AND runs.heartbeat_at<=runs.updated_at "
+                "AND runs.updated_at<runs.lease_expires_at "
+                "AND ((BINARY jobs.status=BINARY 'failed' "
+                "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
+                "AND jobs.exit_code<>0 "
+                "AND jobs.finished_at<UTC_TIMESTAMP()-INTERVAL %s SECOND "
+                "AND runs.updated_at<TIMESTAMPADD(SECOND,1,jobs.finished_at)) OR ("
+                "BINARY jobs.status=BINARY 'running' "
+                "AND jobs.finished_at IS NULL AND jobs.exit_code IS NULL "
+                "AND jobs.started_at<UTC_TIMESTAMP()-INTERVAL %s SECOND)) "
+                "AND (jobs.parent_scheduled_job_run_id IS NULL OR ("
+                "parent.id IS NOT NULL AND BINARY parent.job_name=BINARY 'nhtsa' "
+                "AND BINARY parent.trigger_mode IN (BINARY 'daemon',BINARY 'queue') "
+                "AND parent.started_at<=jobs.started_at "
+                "AND ((BINARY parent.status=BINARY 'failed' "
+                "AND parent.finished_at IS NOT NULL AND parent.exit_code IS NOT NULL "
+                "AND parent.exit_code<>0 "
+                "AND jobs.started_at<=parent.finished_at "
+                "AND parent.finished_at<UTC_TIMESTAMP()-INTERVAL %s SECOND) OR ("
+                "BINARY parent.status=BINARY 'running' "
+                "AND parent.finished_at IS NULL AND parent.exit_code IS NULL "
+                "AND parent.started_at<UTC_TIMESTAMP()-INTERVAL %s SECOND)) "
+                "AND NOT EXISTS (SELECT 1 FROM scheduled_job_runs AS sibling "
+                "WHERE sibling.parent_scheduled_job_run_id=parent.id "
+                "AND sibling.id<>jobs.id AND BINARY sibling.status=BINARY 'running'))) "
+                "ORDER BY runs.id,jobs.id",
+                (
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                ),
+            )
+        else:
+            cursor.execute(
+                "SELECT runs.id AS run_id,runs.run_key AS run_key,"
+                "runs.started_at AS run_started_at,runs.updated_at AS run_updated_at,"
+                "runs.error_message AS run_error_message,NULL AS lease_slot,"
+                "NULL AS lease_token,NULL AS heartbeat_at,NULL AS lease_expires_at,"
+                "jobs.id AS scheduled_job_run_id,jobs.finished_at AS job_finished_at,"
+                "jobs.started_at AS job_started_at,jobs.exit_code AS job_exit_code,"
+                "jobs.job_name AS job_name,jobs.trigger_mode AS job_trigger_mode,"
+                "jobs.status AS job_status,"
+                "NULL AS parent_scheduled_job_run_id,NULL AS parent_job_name,"
+                "NULL AS parent_trigger_mode,NULL AS parent_job_status,"
+                "NULL AS parent_job_started_at,NULL AS parent_job_finished_at,"
+                "NULL AS parent_job_exit_code,"
+                "'legacy' AS link_mode "
+                "FROM nhtsa_sync_runs AS runs JOIN scheduled_job_runs AS jobs "
+                "ON BINARY jobs.job_name=BINARY CONCAT('nhtsa-',"
+                "SUBSTRING_INDEX(SUBSTRING(runs.run_key,7),'-',1)) "
+                "AND jobs.started_at>=STR_TO_DATE("
+                "RIGHT(runs.run_key,16),'%%Y%%m%%dT%%H%%i%%sZ') "
+                "AND jobs.started_at<=TIMESTAMPADD(SECOND,%s,STR_TO_DATE("
+                "RIGHT(runs.run_key,16),'%%Y%%m%%dT%%H%%i%%sZ')) "
+                "WHERE BINARY runs.status=BINARY 'running' "
+                "AND BINARY runs.run_key REGEXP BINARY "
+                "'^nhtsa-(bulk|api|vin)-[0-9]{8}T[0-9]{6}Z$' "
+                "AND BINARY jobs.status=BINARY 'failed' "
+                "AND BINARY jobs.trigger_mode IN (BINARY 'daemon',BINARY 'queue') "
+                "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
+                "AND jobs.exit_code<>0 "
+                "AND runs.started_at>=jobs.started_at "
+                "AND runs.started_at<=TIMESTAMPADD(SECOND,%s,STR_TO_DATE("
+                "RIGHT(runs.run_key,16),'%%Y%%m%%dT%%H%%i%%sZ')) "
+                "AND runs.started_at<=runs.updated_at "
+                "AND runs.updated_at<TIMESTAMPADD(SECOND,1,jobs.finished_at) "
+                "AND jobs.finished_at<UTC_TIMESTAMP(6)-INTERVAL %s SECOND "
+                "AND runs.updated_at<UTC_TIMESTAMP(6)-INTERVAL %s SECOND "
+                "ORDER BY runs.id,jobs.id",
+                (
+                    LEGACY_NHTSA_LINK_WINDOW_SECONDS,
+                    LEGACY_NHTSA_LINK_WINDOW_SECONDS,
+                    minimum_age_seconds,
+                    minimum_age_seconds,
+                ),
+            )
+        candidates = tuple(cursor.fetchall())
+    running_ids = {int(row["id"]) for row in running}
+    run_counts: dict[int, int] = {}
+    job_counts: dict[int, int] = {}
+    parent_counts: dict[int, int] = {}
+    for row in candidates:
+        run_id = int(row["run_id"])
+        job_id = int(row["scheduled_job_run_id"])
+        run_counts[run_id] = run_counts.get(run_id, 0) + 1
+        job_counts[job_id] = job_counts.get(job_id, 0) + 1
+        parent_id = row.get("parent_scheduled_job_run_id")
+        if parent_id is not None:
+            parsed_parent_id = int(parent_id)
+            parent_counts[parsed_parent_id] = parent_counts.get(parsed_parent_id, 0) + 1
+    if (
+        {int(row["run_id"]) for row in candidates} != running_ids
+        or any(count != 1 for count in run_counts.values())
+        or any(count != 1 for count in job_counts.values())
+        or any(count != 1 for count in parent_counts.values())
+    ):
+        raise MigrationError(
+            "running NHTSA jobs do not have one unique recoverable scheduler child each"
+        )
+    return candidates
+
+
+def _repair_stale_nhtsa_runs(
+    connection: MigrationConnection,
+    candidates: Sequence[Mapping[str, object]],
+) -> None:
+    if not candidates:
+        return
+    connection.begin()
+    try:
+        with connection.cursor() as cursor:
+            direct_link = _column_exists(
+                connection,
+                "nhtsa_sync_runs",
+                "scheduled_job_run_id",
+            )
+            lease_columns = tuple(
+                column
+                for column in ("lease_slot", "lease_token", "lease_expires_at")
+                if _column_exists(connection, "nhtsa_sync_runs", column)
+            )
+            lease_assignments = "".join(f",{column}=NULL" for column in lease_columns)
+            for row in candidates:
+                cursor.execute(
+                    "SELECT status,run_key,started_at,updated_at,error_message"
+                    + (
+                        ",scheduled_job_run_id,lease_slot,lease_token,heartbeat_at,"
+                        "lease_expires_at,(lease_expires_at<UTC_TIMESTAMP(6)) AS lease_expired"
+                        if direct_link
+                        else ""
+                    )
+                    + " FROM nhtsa_sync_runs WHERE id=%s FOR UPDATE",
+                    (row["run_id"],),
+                )
+                locked_run = cursor.fetchone()
+                if (
+                    locked_run is None
+                    or locked_run["status"] != "running"
+                    or locked_run["run_key"] != row["run_key"]
+                    or locked_run["started_at"] != row["run_started_at"]
+                    or locked_run["updated_at"] != row["run_updated_at"]
+                    or (
+                        direct_link
+                        and (
+                            locked_run["scheduled_job_run_id"] != row["scheduled_job_run_id"]
+                            or locked_run["lease_slot"] != row["lease_slot"]
+                            or locked_run["lease_token"] != row["lease_token"]
+                            or locked_run["heartbeat_at"] != row["heartbeat_at"]
+                            or locked_run["lease_expires_at"] != row["lease_expires_at"]
+                            or int(locked_run["lease_expired"]) != 1
+                        )
+                    )
+                ):
+                    raise MigrationError("stale NHTSA run changed during exact recovery")
+
+                cursor.execute(
+                    "SELECT job_name,trigger_mode,"
+                    + (
+                        "parent_scheduled_job_run_id,"
+                        if direct_link
+                        else "NULL AS parent_scheduled_job_run_id,"
+                    )
+                    + "status,started_at,finished_at,exit_code "
+                    "FROM scheduled_job_runs WHERE id=%s FOR UPDATE",
+                    (row["scheduled_job_run_id"],),
+                )
+                locked_job = cursor.fetchone()
+                if (
+                    locked_job is None
+                    or locked_job["job_name"] != row["job_name"]
+                    or locked_job["trigger_mode"] != row["job_trigger_mode"]
+                    or locked_job["parent_scheduled_job_run_id"]
+                    != row["parent_scheduled_job_run_id"]
+                    or locked_job["status"] != row["job_status"]
+                    or locked_job["started_at"] != row["job_started_at"]
+                    or locked_job["finished_at"] != row["job_finished_at"]
+                    or locked_job["exit_code"] != row["job_exit_code"]
+                ):
+                    raise MigrationError("stale NHTSA scheduler marker changed during recovery")
+                if row["job_status"] == "running":
+                    cursor.execute(
+                        "UPDATE scheduled_job_runs SET status='failed',"
+                        "finished_at=UTC_TIMESTAMP(),exit_code=%s,output_text="
+                        "RIGHT(CONCAT(COALESCE(output_text,''),%s),60000) "
+                        "WHERE id=%s AND BINARY status=BINARY 'running' "
+                        "AND BINARY job_name=BINARY %s "
+                        "AND BINARY trigger_mode=BINARY %s "
+                        "AND parent_scheduled_job_run_id<=>%s "
+                        "AND started_at=%s AND finished_at IS NULL AND exit_code IS NULL",
+                        (
+                            STALE_SCHEDULER_EXIT_CODE,
+                            "\nmigration preflight: expired NHTSA lease recovered\n",
+                            row["scheduled_job_run_id"],
+                            row["job_name"],
+                            row["job_trigger_mode"],
+                            row["parent_scheduled_job_run_id"],
+                            row["job_started_at"],
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise MigrationError("stale NHTSA scheduler marker changed during recovery")
+
+                link_predicate = ""
+                link_parameters: tuple[object, ...] = ()
+                if direct_link:
+                    link_predicate = " AND scheduled_job_run_id=%s"
+                    link_parameters = (row["scheduled_job_run_id"],)
+                link_description = (
+                    "directly linked" if row.get("link_mode") == "direct" else "legacy-matched"
+                )
+                cursor.execute(
+                    "UPDATE nhtsa_sync_runs SET status='interrupted',"
+                    "updated_at=GREATEST(updated_at,UTC_TIMESTAMP(6)),"
+                    "ended_at=GREATEST(updated_at,UTC_TIMESTAMP(6)),"
+                    "error_message=CONCAT_WS('\\n',NULLIF(error_message,''),%s)"
+                    f"{lease_assignments} "
+                    "WHERE id=%s AND BINARY status=BINARY 'running' "
+                    "AND BINARY run_key=BINARY %s AND started_at=%s AND updated_at=%s"
+                    f"{link_predicate}",
+                    (
+                        f"migration preflight: {link_description} scheduler child "
+                        f"{int(str(row['scheduled_job_run_id']))} "
+                        f"{'expired' if row['job_status'] == 'running' else 'failed'}; "
+                        "stale run interrupted",
+                        int(str(row["run_id"])),
+                        row["run_key"],
+                        row["run_started_at"],
+                        row["run_updated_at"],
+                    )
+                    + link_parameters,
+                )
+                if cursor.rowcount != 1:
+                    raise MigrationError("stale NHTSA run changed during exact recovery")
+
+                parent_id = row.get("parent_scheduled_job_run_id")
+                if parent_id is None:
+                    continue
+                cursor.execute(
+                    "SELECT job_name,trigger_mode,status,started_at,finished_at,exit_code "
+                    "FROM scheduled_job_runs WHERE id=%s FOR UPDATE",
+                    (parent_id,),
+                )
+                locked_parent = cursor.fetchone()
+                if (
+                    locked_parent is None
+                    or locked_parent["job_name"] != row["parent_job_name"]
+                    or locked_parent["trigger_mode"] != row["parent_trigger_mode"]
+                    or locked_parent["status"] != row["parent_job_status"]
+                    or locked_parent["started_at"] != row["parent_job_started_at"]
+                    or locked_parent["finished_at"] != row["parent_job_finished_at"]
+                    or locked_parent["exit_code"] != row["parent_job_exit_code"]
+                ):
+                    raise MigrationError("stale NHTSA parent marker changed during recovery")
+                if row["parent_job_status"] != "running":
+                    continue
+                cursor.execute(
+                    "SELECT id FROM scheduled_job_runs "
+                    "WHERE parent_scheduled_job_run_id=%s "
+                    "AND BINARY status=BINARY 'running' FOR UPDATE",
+                    (parent_id,),
+                )
+                if cursor.fetchone() is not None:
+                    raise MigrationError("stale NHTSA parent still has an active child")
+                cursor.execute(
+                    "UPDATE scheduled_job_runs SET status='failed',"
+                    "finished_at=UTC_TIMESTAMP(),exit_code=%s,output_text="
+                    "RIGHT(CONCAT(COALESCE(output_text,''),%s),60000) "
+                    "WHERE id=%s AND BINARY job_name=BINARY 'nhtsa' "
+                    "AND BINARY trigger_mode=BINARY 'daemon' "
+                    "AND BINARY status=BINARY 'running' AND started_at=%s "
+                    "AND finished_at IS NULL AND exit_code IS NULL",
+                    (
+                        STALE_SCHEDULER_EXIT_CODE,
+                        "\nmigration preflight: expired NHTSA child recovered; "
+                        "composite parent interrupted\n",
+                        parent_id,
+                        row["parent_job_started_at"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise MigrationError("stale NHTSA parent marker changed during recovery")
         connection.commit()
     except Exception:
         connection.rollback()
@@ -1019,6 +1458,344 @@ def _assert_http_diagnostics_contract(connection: MigrationConnection) -> None:
         raise MigrationError(
             "partsouq_http_diagnostics schema contract mismatch: " + ",".join(failures)
         )
+
+
+def _assert_nhtsa_run_lease_contract(connection: MigrationConnection) -> None:
+    required_tables = (
+        "scheduled_job_runs",
+        "nhtsa_sync_runs",
+        "nhtsa_current_artifacts",
+        "nhtsa_schema_migrations",
+    )
+    if any(not _table_exists(connection, table) for table in required_tables):
+        raise MigrationError("NHTSA run lease schema contract is unavailable")
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT TABLE_NAME AS table_name,COLUMN_NAME AS column_name,"
+            "COLUMN_TYPE AS column_type,IS_NULLABLE AS is_nullable,"
+            "COLUMN_DEFAULT AS column_default,EXTRA AS extra,"
+            "CHARACTER_SET_NAME AS character_set,COLLATION_NAME AS collation_name "
+            "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND ("
+            "(TABLE_NAME='scheduled_job_runs' AND COLUMN_NAME='parent_scheduled_job_run_id') OR "
+            "(TABLE_NAME='nhtsa_sync_runs' AND COLUMN_NAME IN ("
+            "'scheduled_job_run_id','lease_slot','lease_token','heartbeat_at',"
+            "'lease_expires_at')) OR "
+            "(TABLE_NAME='nhtsa_current_artifacts' AND COLUMN_NAME='published_run_id')) "
+            "ORDER BY BINARY TABLE_NAME,ORDINAL_POSITION"
+        )
+        columns = {
+            (str(row["table_name"]), str(row["column_name"])): (
+                str(row["column_type"]).lower(),
+                str(row["is_nullable"]),
+                row["column_default"],
+                str(row["extra"]),
+                row["character_set"],
+                row["collation_name"],
+            )
+            for row in cursor.fetchall()
+        }
+        cursor.execute(
+            "SELECT TABLE_NAME AS table_name,INDEX_NAME AS index_name,"
+            "NON_UNIQUE AS non_unique,SEQ_IN_INDEX AS sequence,"
+            "COLUMN_NAME AS column_name,SUB_PART AS sub_part,INDEX_TYPE AS index_type,"
+            "IS_VISIBLE AS is_visible FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND ("
+            "(TABLE_NAME='scheduled_job_runs' AND INDEX_NAME='uq_scheduled_job_parent_stage') OR "
+            "(TABLE_NAME='nhtsa_sync_runs' AND INDEX_NAME IN ("
+            "'idx_nhtsa_sync_lease_expiry','uq_nhtsa_sync_scheduled_job',"
+            "'uq_nhtsa_sync_lease_slot')) OR "
+            "(TABLE_NAME='nhtsa_current_artifacts' "
+            "AND INDEX_NAME='idx_nhtsa_current_published_run')) "
+            "ORDER BY BINARY TABLE_NAME,BINARY INDEX_NAME,SEQ_IN_INDEX"
+        )
+        indexes = tuple(
+            (
+                str(row["table_name"]),
+                str(row["index_name"]),
+                int(row["non_unique"]),
+                int(row["sequence"]),
+                str(row["column_name"]),
+                row["sub_part"],
+                str(row["index_type"]),
+                str(row["is_visible"]),
+            )
+            for row in cursor.fetchall()
+        )
+        cursor.execute("SELECT DATABASE() AS database_name")
+        database_row = cursor.fetchone()
+        database_name = str(database_row["database_name"]) if database_row else ""
+        cursor.execute(
+            "SELECT rc.TABLE_NAME AS table_name,rc.CONSTRAINT_NAME AS constraint_name,"
+            "kcu.COLUMN_NAME AS column_name,kcu.REFERENCED_TABLE_NAME AS referenced_table,"
+            "kcu.REFERENCED_COLUMN_NAME AS referenced_column,"
+            "kcu.REFERENCED_TABLE_SCHEMA AS referenced_schema,"
+            "rc.UPDATE_RULE AS update_rule,rc.DELETE_RULE AS delete_rule "
+            "FROM information_schema.REFERENTIAL_CONSTRAINTS AS rc "
+            "JOIN information_schema.KEY_COLUMN_USAGE AS kcu "
+            "ON kcu.CONSTRAINT_SCHEMA=rc.CONSTRAINT_SCHEMA "
+            "AND kcu.TABLE_NAME=rc.TABLE_NAME AND kcu.CONSTRAINT_NAME=rc.CONSTRAINT_NAME "
+            "WHERE rc.CONSTRAINT_SCHEMA=DATABASE() AND rc.CONSTRAINT_NAME IN ("
+            "'fk_scheduled_job_parent','fk_nhtsa_sync_scheduled_job',"
+            "'fk_nhtsa_current_published_run') "
+            "ORDER BY BINARY rc.TABLE_NAME,BINARY rc.CONSTRAINT_NAME,kcu.ORDINAL_POSITION"
+        )
+        foreign_keys = tuple(
+            (
+                str(row["table_name"]),
+                str(row["constraint_name"]),
+                str(row["column_name"]),
+                str(row["referenced_table"]),
+                str(row["referenced_column"]),
+                str(row["referenced_schema"]),
+                str(row["update_rule"]),
+                str(row["delete_rule"]),
+            )
+            for row in cursor.fetchall()
+        )
+        cursor.execute(
+            "SELECT constraints.TABLE_NAME AS table_name,"
+            "checks.CONSTRAINT_NAME AS constraint_name,"
+            "checks.CHECK_CLAUSE AS check_clause,constraints.ENFORCED AS enforced "
+            "FROM information_schema.CHECK_CONSTRAINTS AS checks "
+            "JOIN information_schema.TABLE_CONSTRAINTS AS constraints "
+            "ON constraints.CONSTRAINT_SCHEMA=checks.CONSTRAINT_SCHEMA "
+            "AND constraints.CONSTRAINT_NAME=checks.CONSTRAINT_NAME "
+            "WHERE checks.CONSTRAINT_SCHEMA=DATABASE() "
+            "AND constraints.TABLE_SCHEMA=DATABASE() AND ("
+            "(constraints.TABLE_NAME='scheduled_job_runs' "
+            "AND checks.CONSTRAINT_NAME='chk_scheduled_job_not_own_parent') OR "
+            "(constraints.TABLE_NAME='nhtsa_sync_runs' "
+            "AND checks.CONSTRAINT_NAME='chk_nhtsa_sync_status_lease')) "
+            "ORDER BY BINARY constraints.TABLE_NAME,BINARY checks.CONSTRAINT_NAME"
+        )
+        checks = {
+            (str(row["table_name"]), str(row["constraint_name"])): (
+                _normalize_nhtsa_check_clause(str(row["check_clause"])),
+                str(row["enforced"]),
+            )
+            for row in cursor.fetchall()
+        }
+        cursor.execute(
+            "SELECT TABLE_NAME AS table_name,ENGINE AS engine,TABLE_COLLATION AS table_collation "
+            "FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() "
+            "AND TABLE_NAME IN ('scheduled_job_runs','nhtsa_sync_runs',"
+            "'nhtsa_current_artifacts') ORDER BY BINARY TABLE_NAME"
+        )
+        tables = {
+            str(row["table_name"]): (
+                str(row["engine"]),
+                str(row["table_collation"]),
+            )
+            for row in cursor.fetchall()
+        }
+        cursor.execute("SELECT COUNT(*) AS row_count FROM nhtsa_schema_migrations WHERE version=2")
+        version_row = cursor.fetchone()
+
+    expected_columns = {
+        ("scheduled_job_runs", "parent_scheduled_job_run_id"): (
+            "bigint unsigned",
+            "YES",
+            None,
+            "",
+            None,
+            None,
+        ),
+        ("nhtsa_sync_runs", "scheduled_job_run_id"): (
+            "bigint unsigned",
+            "YES",
+            None,
+            "",
+            None,
+            None,
+        ),
+        ("nhtsa_sync_runs", "lease_slot"): (
+            "varchar(16)",
+            "YES",
+            None,
+            "",
+            "ascii",
+            "ascii_bin",
+        ),
+        ("nhtsa_sync_runs", "lease_token"): (
+            "char(64)",
+            "YES",
+            None,
+            "",
+            "ascii",
+            "ascii_bin",
+        ),
+        ("nhtsa_sync_runs", "heartbeat_at"): (
+            "datetime(6)",
+            "YES",
+            None,
+            "",
+            None,
+            None,
+        ),
+        ("nhtsa_sync_runs", "lease_expires_at"): (
+            "datetime(6)",
+            "YES",
+            None,
+            "",
+            None,
+            None,
+        ),
+        ("nhtsa_current_artifacts", "published_run_id"): (
+            "bigint unsigned",
+            "NO",
+            None,
+            "",
+            None,
+            None,
+        ),
+    }
+    expected_indexes = (
+        (
+            "nhtsa_current_artifacts",
+            "idx_nhtsa_current_published_run",
+            1,
+            1,
+            "published_run_id",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "nhtsa_sync_runs",
+            "idx_nhtsa_sync_lease_expiry",
+            1,
+            1,
+            "status",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "nhtsa_sync_runs",
+            "idx_nhtsa_sync_lease_expiry",
+            1,
+            2,
+            "lease_expires_at",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "nhtsa_sync_runs",
+            "idx_nhtsa_sync_lease_expiry",
+            1,
+            3,
+            "id",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "nhtsa_sync_runs",
+            "uq_nhtsa_sync_lease_slot",
+            0,
+            1,
+            "lease_slot",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "nhtsa_sync_runs",
+            "uq_nhtsa_sync_scheduled_job",
+            0,
+            1,
+            "scheduled_job_run_id",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "scheduled_job_runs",
+            "uq_scheduled_job_parent_stage",
+            0,
+            1,
+            "parent_scheduled_job_run_id",
+            None,
+            "BTREE",
+            "YES",
+        ),
+        (
+            "scheduled_job_runs",
+            "uq_scheduled_job_parent_stage",
+            0,
+            2,
+            "job_name",
+            None,
+            "BTREE",
+            "YES",
+        ),
+    )
+    expected_foreign_keys = (
+        (
+            "nhtsa_current_artifacts",
+            "fk_nhtsa_current_published_run",
+            "published_run_id",
+            "nhtsa_sync_runs",
+            "id",
+            database_name,
+            "NO ACTION",
+            "NO ACTION",
+        ),
+        (
+            "nhtsa_sync_runs",
+            "fk_nhtsa_sync_scheduled_job",
+            "scheduled_job_run_id",
+            "scheduled_job_runs",
+            "id",
+            database_name,
+            "NO ACTION",
+            "NO ACTION",
+        ),
+        (
+            "scheduled_job_runs",
+            "fk_scheduled_job_parent",
+            "parent_scheduled_job_run_id",
+            "scheduled_job_runs",
+            "id",
+            database_name,
+            "NO ACTION",
+            "NO ACTION",
+        ),
+    )
+    lease_check = (
+        "(((binary status = binary 'running') and "
+        "(scheduled_job_run_id is not null) and (lease_slot is not null) and "
+        "(binary lease_slot = binary 'writer') and (lease_token is not null) and "
+        "regexp_like(lease_token,'^[0-9a-f]{64}$') and "
+        "(heartbeat_at is not null) and (lease_expires_at is not null) and "
+        "(lease_expires_at > heartbeat_at) and (ended_at is null)) or "
+        "((binary status in (binary 'completed',binary 'failed',"
+        "binary 'interrupted')) and (lease_slot is null) and "
+        "(lease_token is null) and (lease_expires_at is null) and "
+        "(ended_at is not null)))"
+    )
+    expected_checks = {
+        ("nhtsa_sync_runs", "chk_nhtsa_sync_status_lease"): (lease_check, "YES"),
+    }
+    failures: list[str] = []
+    if columns != expected_columns:
+        failures.append("columns")
+    if indexes != expected_indexes:
+        failures.append("indexes")
+    if foreign_keys != expected_foreign_keys:
+        failures.append("foreign_keys")
+    if checks != expected_checks:
+        failures.append("checks")
+    if set(tables) != set(required_tables[:3]) or any(
+        engine != "InnoDB" or not collation.startswith("utf8mb4_")
+        for engine, collation in tables.values()
+    ):
+        failures.append("tables")
+    if not version_row or int(version_row["row_count"]) != 1:
+        failures.append("nhtsa_schema_version")
+    if failures:
+        raise MigrationError("NHTSA run lease schema contract mismatch: " + ",".join(failures))
 
 
 def _claim(

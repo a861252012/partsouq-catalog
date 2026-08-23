@@ -5,12 +5,17 @@ CREATE TABLE IF NOT EXISTS nhtsa_schema_migrations (
 
 CREATE TABLE IF NOT EXISTS nhtsa_sync_runs (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    scheduled_job_run_id BIGINT UNSIGNED NULL,
     run_key VARCHAR(191) NOT NULL,
     scope_name VARCHAR(64) NOT NULL,
     status VARCHAR(32) NOT NULL,
     source_keys_json JSON NOT NULL,
+    lease_slot VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    lease_token CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
     started_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
+    heartbeat_at DATETIME(6) NULL,
+    lease_expires_at DATETIME(6) NULL,
     ended_at DATETIME(6) NULL,
     artifacts_downloaded INT UNSIGNED NOT NULL DEFAULT 0,
     artifacts_reused INT UNSIGNED NOT NULL DEFAULT 0,
@@ -18,7 +23,34 @@ CREATE TABLE IF NOT EXISTS nhtsa_sync_runs (
     new_versions BIGINT UNSIGNED NOT NULL DEFAULT 0,
     rejected_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,
     error_message TEXT NULL,
-    INDEX idx_nhtsa_sync_runs_key (run_key, id)
+    INDEX idx_nhtsa_sync_runs_key (run_key, id),
+    INDEX idx_nhtsa_sync_lease_expiry (status, lease_expires_at, id),
+    UNIQUE KEY uq_nhtsa_sync_scheduled_job (scheduled_job_run_id),
+    UNIQUE KEY uq_nhtsa_sync_lease_slot (lease_slot),
+    CONSTRAINT fk_nhtsa_sync_scheduled_job
+        FOREIGN KEY (scheduled_job_run_id) REFERENCES scheduled_job_runs(id),
+    CONSTRAINT chk_nhtsa_sync_status_lease CHECK (
+        (
+            BINARY status = BINARY 'running'
+            AND scheduled_job_run_id IS NOT NULL
+            AND lease_slot IS NOT NULL
+            AND BINARY lease_slot = BINARY 'writer'
+            AND lease_token IS NOT NULL
+            AND lease_token REGEXP '^[0-9a-f]{64}$'
+            AND heartbeat_at IS NOT NULL
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > heartbeat_at
+            AND ended_at IS NULL
+        ) OR (
+            BINARY status IN (
+                BINARY 'completed', BINARY 'failed', BINARY 'interrupted'
+            )
+            AND lease_slot IS NULL
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL
+            AND ended_at IS NOT NULL
+        )
+    )
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS nhtsa_source_artifacts (
@@ -143,10 +175,14 @@ CREATE TABLE IF NOT EXISTS nhtsa_current_artifacts (
     dataset_name VARCHAR(64) NOT NULL,
     source_key VARCHAR(128) NOT NULL,
     artifact_id BIGINT UNSIGNED NOT NULL,
+    published_run_id BIGINT UNSIGNED NOT NULL,
     published_at DATETIME(6) NOT NULL,
     PRIMARY KEY (dataset_name, source_key),
+    INDEX idx_nhtsa_current_published_run (published_run_id),
     CONSTRAINT fk_nhtsa_current_artifact
-        FOREIGN KEY (artifact_id) REFERENCES nhtsa_source_artifacts(id)
+        FOREIGN KEY (artifact_id) REFERENCES nhtsa_source_artifacts(id),
+    CONSTRAINT fk_nhtsa_current_published_run
+        FOREIGN KEY (published_run_id) REFERENCES nhtsa_sync_runs(id)
 ) ENGINE=InnoDB;
 
 CREATE OR REPLACE VIEW nhtsa_current_records AS
@@ -180,4 +216,4 @@ JOIN nhtsa_record_versions AS v
  AND v.record_sha256 = r.record_sha256;
 
 INSERT IGNORE INTO nhtsa_schema_migrations(version, applied_at)
-VALUES (1, UTC_TIMESTAMP(6));
+VALUES (1, UTC_TIMESTAMP(6)), (2, UTC_TIMESTAMP(6));

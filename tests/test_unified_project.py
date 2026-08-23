@@ -2075,11 +2075,17 @@ def test_vehicle_candidates_exclude_unmapped_legacy_snapshots(
 
 def test_scheduler_runs_nhtsa_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, list[str]]] = []
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job_name: 8)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job_name, _parent=None: 8)
     monkeypatch.setattr(scheduler, "_record_progress", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_record_finish", lambda *_args: None)
 
-    def fake_run(job_name: str, command: list[str]) -> int:
+    def fake_run(
+        job_name: str,
+        command: list[str],
+        *,
+        parent_scheduled_job_run_id: int | None = None,
+    ) -> int:
+        assert parent_scheduled_job_run_id == 8
         calls.append((job_name, command))
         return 0
 
@@ -2116,7 +2122,7 @@ def test_scheduler_consumes_pending_admin_request(
         "_finish_request",
         lambda request_id, return_code: completed.append((request_id, return_code)),
     )
-    monkeypatch.setattr(scheduler, "_run", lambda _job_name, _command: 0)
+    monkeypatch.setattr(scheduler, "_run", lambda _job_name, _command, **_kwargs: 0)
 
     assert scheduler.dispatch("pending", "all") == 0
     assert completed == [(7, 0)]
@@ -2127,7 +2133,7 @@ def test_scheduler_decodes_one_supplied_vin(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(
         scheduler,
         "_run",
-        lambda job_name, command: calls.append((job_name, command)) or 0,
+        lambda job_name, command, **_kwargs: calls.append((job_name, command)) or 0,
     )
 
     assert scheduler.dispatch("nhtsa-vin", "ZZZTEST00X0000001") == 0
@@ -2139,7 +2145,7 @@ def test_scheduler_redacts_vin_from_persisted_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saved: list[str] = []
-    monkeypatch.setattr(scheduler, "_record_start", lambda _job_name: 7)
+    monkeypatch.setattr(scheduler, "_record_start", lambda _job_name, _parent=None: 7)
     monkeypatch.setattr(
         scheduler,
         "_record_finish",
