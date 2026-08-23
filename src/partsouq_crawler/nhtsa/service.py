@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sys
 from collections.abc import Sequence
 from typing import Any
 
@@ -10,7 +11,7 @@ import pymysql
 from partsouq_crawler.nhtsa.client import NhtsaBulkClient
 from partsouq_crawler.nhtsa.config import NhtsaConfig
 from partsouq_crawler.nhtsa.datasets import DATASET_SPECS, BulkSource
-from partsouq_crawler.nhtsa.models import ParsedRecord, RejectedRow
+from partsouq_crawler.nhtsa.models import ArtifactMember, ParsedRecord, RejectedRow
 from partsouq_crawler.nhtsa.parser import BulkArtifactParser
 from partsouq_crawler.nhtsa.repository import (
     BULK_PARSER_NAME,
@@ -53,6 +54,11 @@ class NhtsaBulkSyncService:
             async with NhtsaBulkClient(self.config) as client:
                 for source in sources:
                     spec = DATASET_SPECS[source.dataset_name]
+                    print(
+                        f"nhtsa bulk {source.key}: checking source",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     current = self.repository.current_artifact(source.dataset_name, source.key)
                     download = await client.download(source, current_artifact=current)
                     if download.reused_artifact_id is not None:
@@ -61,6 +67,11 @@ class NhtsaBulkSyncService:
                         publishable.append((source.dataset_name, source.key, artifact_id))
                         if current:
                             source_rows += int(str(current["source_rows"]))
+                        print(
+                            f"nhtsa bulk {source.key}: reused current artifact",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         continue
 
                     if download.sha256 is None or download.path is None:
@@ -76,6 +87,11 @@ class NhtsaBulkSyncService:
                         artifact_id = int(str(existing["id"]))
                         source_rows += int(str(existing["source_rows"]))
                         publishable.append((source.dataset_name, source.key, artifact_id))
+                        print(
+                            f"nhtsa bulk {source.key}: reused imported artifact",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         continue
                     if existing and existing["status"] == "quarantined":
                         raise ValueError(
@@ -103,7 +119,7 @@ class NhtsaBulkSyncService:
                     self.repository.store_member(artifact_id, member)
                     self.repository.reset_artifact_import(artifact_id)
                     artifact_source_rows, artifact_new_versions, artifact_rejected = (
-                        self._import_artifact(artifact_id, download.path, source)
+                        self._import_artifact(artifact_id, download.path, source, member)
                     )
                     self.repository.complete_artifact(
                         artifact_id,
@@ -189,9 +205,9 @@ class NhtsaBulkSyncService:
         artifact_id: int,
         path: Any,
         source: BulkSource,
+        member: ArtifactMember,
     ) -> tuple[int, int, int]:
         spec = DATASET_SPECS[source.dataset_name]
-        member = self.parser.inspect(path, source, spec)
         records: list[ParsedRecord] = []
         rejections: list[RejectedRow] = []
         source_rows = 0
@@ -212,10 +228,20 @@ class NhtsaBulkSyncService:
                 new_versions += added
                 rejected_rows += rejected
                 records.clear()
+                print(
+                    f"nhtsa bulk {source.key}: processed {source_rows} rows",
+                    file=sys.stderr,
+                    flush=True,
+                )
         if records:
             added, rejected = self.writer.insert(artifact_id, records)
             new_versions += added
             rejected_rows += rejected
+            print(
+                f"nhtsa bulk {source.key}: processed {source_rows} rows",
+                file=sys.stderr,
+                flush=True,
+            )
         if rejections:
             self.repository.insert_rejections(artifact_id, rejections)
             rejected_rows += len(rejections)

@@ -317,6 +317,10 @@ def _run(job_name: str, command: list[str], success_codes: tuple[int, ...] = (0,
     child_environment = os.environ.copy()
     child_environment.pop("LAUNCHD_JOB", None)
     child_environment["SCHEDULED_JOB_RUN_ID"] = str(run_id)
+    if job_name in {"nhtsa", "nhtsa-bulk", "nhtsa-api", "nhtsa-vin"}:
+        child_environment["NHTSA_HEARTBEAT_INTERVAL_SECONDS"] = str(
+            max(0.01, min(60.0, CHILD_STALL_TIMEOUT_SECONDS / 3))
+        )
     if _shutdown_requested():
         output = f"{job_name} 尚未啟動，scheduler 已收到停止訊號\n"
         _record_finish(run_id, INTERRUPTED_EXIT_CODE, output)

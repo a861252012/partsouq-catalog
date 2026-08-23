@@ -5,6 +5,8 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 from partsouq_crawler.nhtsa.datasets import (
     BULK_SOURCES,
     CSSI_SOURCES,
@@ -13,7 +15,7 @@ from partsouq_crawler.nhtsa.datasets import (
     BulkSource,
 )
 from partsouq_crawler.nhtsa.models import ParsedRecord, RejectedRow
-from partsouq_crawler.nhtsa.parser import BulkArtifactParser, normalize_header
+from partsouq_crawler.nhtsa.parser import BulkArtifactParser, NhtsaFormatError, normalize_header
 
 
 def _recall_row(record_id: str = "81717") -> list[str]:
@@ -67,6 +69,26 @@ def test_recall_zip_inspection_and_record_provenance(tmp_path: Path) -> None:
     assert record.model_year == 2010
     assert record.source_line == 1
     assert json.loads(record.payload_json)["MFR_COMP_PTNO"] == "R41-LABEL"
+
+
+def test_crc_is_checked_before_import(tmp_path: Path) -> None:
+    source = BulkSource(
+        key="crc_recalls",
+        dataset_name="recalls",
+        url="https://example.test/recalls.zip",
+        expected_member="recalls.txt",
+    )
+    path = tmp_path / "recalls.zip"
+    _write_zip(path, source.expected_member, [_recall_row()])
+    archive = bytearray(path.read_bytes())
+    central_header = archive.index(b"PK\x01\x02")
+    archive[central_header + 16] ^= 0xFF
+    path.write_bytes(archive)
+
+    parser = BulkArtifactParser()
+    spec = DATASET_SPECS["recalls"]
+    with pytest.raises(NhtsaFormatError, match="ZIP CRC failed"):
+        parser.inspect(path, source, spec)
 
 
 def test_recall_wrong_field_count_is_rejected(tmp_path: Path) -> None:

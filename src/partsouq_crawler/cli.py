@@ -23,6 +23,7 @@ from partsouq_crawler.logging import CrawlLogger
 from partsouq_crawler.nhtsa.api_service import NhtsaApiSyncService
 from partsouq_crawler.nhtsa.config import NhtsaConfig
 from partsouq_crawler.nhtsa.datasets import BULK_SOURCES_BY_SCOPE
+from partsouq_crawler.nhtsa.progress import scheduler_heartbeat
 from partsouq_crawler.nhtsa.repository import NhtsaMySQLRepository
 from partsouq_crawler.nhtsa.service import NhtsaBulkSyncService
 from partsouq_crawler.parsers.base import CatalogParser, ParseError
@@ -315,26 +316,29 @@ async def _dispatch_nhtsa(args: argparse.Namespace) -> int:
             return 0
         if args.command == "nhtsa-sync-bulk":
             sources = BULK_SOURCES_BY_SCOPE[args.scope]
-            report = await NhtsaBulkSyncService(repository, config).run(
-                run_key=args.run_id,
-                scope_name=args.scope,
-                sources=sources,
-            )
+            with scheduler_heartbeat("bulk"):
+                report = await NhtsaBulkSyncService(repository, config).run(
+                    run_key=args.run_id,
+                    scope_name=args.scope,
+                    sources=sources,
+                )
             _print_json(report)
             return 0 if report["status"] == "completed" else 1
         if args.command == "nhtsa-sync-api":
-            report = await NhtsaApiSyncService(repository, config).run(
-                run_key=args.run_id,
-                scope_name=args.scope,
-            )
+            with scheduler_heartbeat("api"):
+                report = await NhtsaApiSyncService(repository, config).run(
+                    run_key=args.run_id,
+                    scope_name=args.scope,
+                )
             _print_json(report)
             return 0 if report["status"] == "completed" else 1
         if args.command == "nhtsa-decode-vin":
             try:
-                report = await NhtsaApiSyncService(repository, config).decode_vin(
-                    run_key=args.run_id,
-                    vin=args.vin,
-                )
+                with scheduler_heartbeat("vin"):
+                    report = await NhtsaApiSyncService(repository, config).decode_vin(
+                        run_key=args.run_id,
+                        vin=args.vin,
+                    )
             except ValueError as error:
                 _print_json(
                     {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
