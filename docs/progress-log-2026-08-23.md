@@ -4,6 +4,7 @@
 
 | Commit | 內容 | Remote |
 |---|---|---|
+| `b7711d4` | 完成最終交接與現況查證紀錄 | 已 push `origin/main` |
 | `f80483e` | 更新最終交接與正式資料缺口 | 已 push `origin/main` |
 | `e687c4b` | diagnostic exact contract、fresh cleanup、真 MySQL 404 交易測試 | 已 push `origin/main` |
 | `949d91e` | 最終交接與進度文件 | 已 push |
@@ -99,3 +100,19 @@
 7. Docker MySQL、admin、station-admin healthy，queue-scheduler running；兩個 health endpoint
    均實際回 OK。catalog／NHTSA LaunchAgent 未載入。
 8. 沒有執行完整 E2E、沒有套 migration、沒有啟動正式爬蟲，也沒有更動主 DB。
+
+## 2026-08-23 13:20–13:31 最終交付再查證
+
+1. 確認交接文件 commit `b7711d4` 已推到 `origin/main`，branch 沒有 ahead／behind。
+2. 重新檢查工作樹：除未追蹤 migration 024 外，已有 4 個 fresh schema 檔案被修改；
+   這 5 個檔案都尚未 commit／push。
+3. 這批未提交變更只有 NHTSA lease／scheduler link／current provenance 的 schema 草稿；
+   migration manifest、runner exact contract、runtime lease／CAS、原子發布與測試仍未完成。
+4. migration 024 仍會被主 DB 兩筆 stale `running` NHTSA run 擋住，不能直接套用；
+   fresh schema 與既有 runtime 也尚未相容，不能單獨提交 schema。
+5. 再次唯讀查證主 DB：raw parts 10,000、distinct part numbers 3,823、bounded／published／
+   current 皆 0、quarantine 2,260、VIN decode／mapping／fitment 皆 0、catalog ledger 到 022。
+6. NHTSA run 1／2 仍為 `running`；source artifacts 仍為 6 筆（5 imported、1 importing），
+   current artifact 0。沒有修改或刪除任何主 DB 資料。
+7. Docker MySQL、admin、station-admin 仍 healthy，queue-scheduler 仍 running；
+   catalog／NHTSA LaunchAgent 未載入。
