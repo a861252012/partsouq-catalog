@@ -356,3 +356,27 @@
    partsouq_catalog_test，ledger=24）；純 unit `801 passed / 207 skipped`；
    skip 契約更新為 **263 = 207 env-gated + 56 macOS-gated**（ci.yml +
    test_ci_contract 同步）；ruff/format/mypy/git diff --check 全綠。
+
+## 2026-08-23（接手工作階段3）正式管線實跑與三個實戰修復
+
+1. **B2/B3 上線**：LaunchAgent release 建立並 bootstrap；正式 bounded run
+   自動啟動（run7 起）。
+2. **毒組根因確診**：`[Toyota group=7507] parsed 0 parts` 反覆重現
+   （run7/8/9/10，位元組級一致）。取出 partsouq_http_diagnostics 的
+   body_blob 驗屍：HTTP 200、車輛表完整（TOYOTA1000 KP30-,1969-78 RHD），
+   零件表殼（Number|Name|Code）渲染正常但**站方零資料列**——合法空組，
+   非版型變更、非反爬。修復：parsers 新增 `has_empty_parts_table()`；
+   crawler 對此情境 receipt done/0；evidence 契約允許 unit 頁 0 筆結果
+   （replay 一致性照驗）。真頁 HTML 作為 regression fixture。
+3. **解碼契約放寬（對齊使用者決策「缺欄位留空」）**：Make+ModelYear 必要，
+   Model/engine/displacement/trim 缺席存 NULL（migration 026 + schema 三處
+   同步）；ErrorCode≠0 不再整筆拒絕（歐系 VIN 檢查碼警告 code=1 但資料
+   可用），code/text 留存於 error_code/error_text/payload_json。
+   實證：42+ 筆入庫，含 sparse 與 code=1 案例。失敗者為 NHTSA 完全無
+   申報的台灣專屬車（由 VNCS 自身 make/model/cc 兜底，設計內）。
+4. **運維教訓**：admin_crawl_requests 完成時會遮罩 VIN（隱私設計）——
+   重試須從源頭表 tw_vncs_vehicles 重新取 VIN，不可重用舊列；
+   queue-scheduler/admin 容器映像必須隨碼重建，否則對新 ledger crash-loop。
+5. **VNCS 全量**：汽油車 686 頁全量入庫成功；柴油首輪因連續高頻請求後
+   站方降級而 fail-closed（診斷掃描 939 頁 0 壞列證明資料本身乾淨），
+   改 2s/頁節流重跑中。
