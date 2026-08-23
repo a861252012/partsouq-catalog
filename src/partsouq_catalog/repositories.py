@@ -1333,7 +1333,11 @@ class CrawlRepository:
             raise ValueError("PartSouq evidence page/parser contract mismatch")
         if malformed_rows != 0:
             raise ValueError("malformed parser rows cannot become verified evidence")
-        if not parsed_records:
+        # 合法空組（unit 頁零件表殼存在但站方零資料列，實證 TOYOTA1000
+        # KP30 BODY STRIPE）是預期狀態：unit 頁允許 0 筆 parser 結果，
+        # 且下方 replay 比對會驗證「原始解析與重放皆為空」的一致性。
+        # 非 unit 頁的空結果仍視為版型異常。
+        if not parsed_records and page_type != "unit":
             raise ValueError("PartSouq evidence cannot contain an empty parser result")
         quarantine_record_count = sum(
             record.record_type == "quarantine_part" for record in parsed_records
