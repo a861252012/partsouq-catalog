@@ -428,6 +428,7 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
   source_url_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   raw_body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   body_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  sanitizer_version VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   http_status SMALLINT UNSIGNED NOT NULL,
   content_type VARCHAR(128) NOT NULL,
   challenge_detected TINYINT(1) NOT NULL DEFAULT 0,
@@ -493,6 +494,11 @@ CREATE TABLE IF NOT EXISTS partsouq_http_artifacts (
   ),
   CONSTRAINT chk_partsouq_artifact_http CHECK (
     content_type <> '' AND elapsed_ms >= 0 AND attempt > 0
+  ),
+  CONSTRAINT chk_partsouq_artifact_sanitizer CHECK (sanitizer_version <> ''),
+  CONSTRAINT chk_partsouq_artifact_verified_sanitizer CHECK (
+    verification_status <> 'verified'
+    OR BINARY sanitizer_version = BINARY 'partsouq-html-public-v2'
   ),
   CONSTRAINT chk_partsouq_artifact_counts CHECK (
     parsed_record_count > 0

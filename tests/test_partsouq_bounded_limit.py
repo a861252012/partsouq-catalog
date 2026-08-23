@@ -14,6 +14,7 @@ from partsouq_catalog.crawler import Crawler, SampleLimitReached
 from partsouq_catalog.db import Database
 from partsouq_catalog.evidence import (
     PARSER_CONTRACT_VERSION,
+    SANITIZER_VERSION,
     RecordEvidence,
     public_source_url,
     replay_catalog_records,
@@ -438,7 +439,8 @@ def test_scheduled_bounded_resume_requires_a_finished_failed_prior_attempt() -> 
     assert "previous_job.finished_at IS NOT NULL" in query
     assert "previous_job.exit_code IS NOT NULL" in query
     assert "previous_job.exit_code <> 0" in query
-    assert params == (10_000, 77)
+    assert "BINARY artifact.sanitizer_version <> BINARY %s" in query
+    assert params == (10_000, 77, SANITIZER_VERSION)
 
 
 @pytest.mark.skipif(
@@ -559,6 +561,27 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
             "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
         ).lastrowid
         database.commit()
+        database._execute(
+            "UPDATE partsouq_http_artifacts SET sanitizer_version = %s, "
+            "verification_status = 'rejected', verified_at = NULL "
+            "WHERE crawl_run_id = %s AND verification_status = 'verified'",
+            ("partsouq-html-public-v1", first_run_id),
+        )
+        database.commit()
+        assert (
+            first.resumable_bounded_run_key(
+                10_000,
+                scheduled_job_run_id=retry_scheduled_job_run_id,
+            )
+            is None
+        )
+        database._execute(
+            "UPDATE partsouq_http_artifacts SET sanitizer_version = %s, "
+            "verification_status = 'verified', verified_at = UTC_TIMESTAMP(6) "
+            "WHERE crawl_run_id = %s",
+            (SANITIZER_VERSION, first_run_id),
+        )
+        database.commit()
         assert first.resumable_bounded_run_key(
             10_000,
             scheduled_job_run_id=retry_scheduled_job_run_id,
@@ -671,13 +694,15 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
         database._executemany(
             "INSERT INTO partsouq_http_artifacts("
             "crawl_run_id, scheduled_job_run_id, capture_kind, page_type, public_source_url, "
-            "source_url_sha256, raw_body_sha256, body_sha256, http_status, content_type, "
+            "source_url_sha256, raw_body_sha256, body_sha256, sanitizer_version, "
+            "http_status, content_type, "
             "challenge_detected, fetched_at, elapsed_ms, attempt, parser_name, parser_version, "
             "parser_context_json, parser_context_sha256, malformed_row_count, "
             "skipped_record_count, parsed_record_count, parsed_records_sha256, "
             "accepted_record_count, accepted_records_sha256, verification_status, verified_at"
             ") SELECT %s, %s, capture_kind, page_type, public_source_url, source_url_sha256, "
-            "%s, body_sha256, http_status, content_type, challenge_detected, fetched_at, "
+            "%s, body_sha256, sanitizer_version, http_status, content_type, "
+            "challenge_detected, fetched_at, "
             "elapsed_ms, attempt, parser_name, parser_version, parser_context_json, "
             "parser_context_sha256, malformed_row_count, skipped_record_count, "
             "parsed_record_count, parsed_records_sha256, accepted_record_count, "

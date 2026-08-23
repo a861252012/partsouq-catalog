@@ -22,6 +22,7 @@ from typing import cast
 from .config import CRAWL
 from .db import Database, Row
 from .evidence import (
+    SANITIZER_VERSION,
     RecordEvidence,
     SanitizedBody,
     assert_no_secret_material,
@@ -1146,8 +1147,11 @@ class CrawlRepository:
                 "SELECT run_key FROM crawl_runs WHERE dataset_kind = 'bounded' "
                 "AND target_parts = %s AND status IN ('running', 'error', 'interrupted') "
                 "AND scheduled_job_run_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM partsouq_http_artifacts AS artifact "
+                "WHERE artifact.crawl_run_id = crawl_runs.id "
+                "AND BINARY artifact.sanitizer_version <> BINARY %s) "
                 "ORDER BY started_at DESC, id DESC LIMIT 1",
-                (target_parts,),
+                (target_parts, SANITIZER_VERSION),
             ).fetchone()
         else:
             row = self.db._execute(
@@ -1164,8 +1168,11 @@ class CrawlRepository:
                 "AND (previous_job.id = current_job.id OR ("
                 "previous_job.status = 'failed' AND previous_job.finished_at IS NOT NULL "
                 "AND previous_job.exit_code IS NOT NULL AND previous_job.exit_code <> 0)) "
+                "AND NOT EXISTS (SELECT 1 FROM partsouq_http_artifacts AS artifact "
+                "WHERE artifact.crawl_run_id = cr.id "
+                "AND BINARY artifact.sanitizer_version <> BINARY %s) "
                 "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1",
-                (target_parts, scheduled_job_run_id),
+                (target_parts, scheduled_job_run_id, SANITIZER_VERSION),
             ).fetchone()
         return str(row["run_key"]) if row and row.get("run_key") else None
 
@@ -1279,6 +1286,8 @@ class CrawlRepository:
             raise ValueError(
                 "sanitized PartSouq evidence body exceeds or violates its size contract"
             )
+        if sanitized_body.sanitizer_version != SANITIZER_VERSION:
+            raise ValueError("unsupported PartSouq evidence sanitizer version")
         restored = restore_sanitized_body(
             "zlib",
             sanitized_body.compressed,
@@ -1335,16 +1344,18 @@ class CrawlRepository:
             "INSERT INTO partsouq_http_artifacts ("
             "crawl_run_id, scheduled_job_run_id, capture_kind, page_type, "
             "public_source_url, source_url_sha256, raw_body_sha256, body_sha256, "
+            "sanitizer_version, "
             "http_status, content_type, challenge_detected, fetched_at, elapsed_ms, attempt, "
             "parser_name, parser_version, parser_context_json, parser_context_sha256, "
             "malformed_row_count, skipped_record_count, "
             "parsed_record_count, parsed_records_sha256, accepted_record_count, "
             "accepted_records_sha256, verification_status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, "
             "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending') AS new "
             "ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), "
             "capture_kind = new.capture_kind, page_type = new.page_type, "
-            "public_source_url = new.public_source_url, http_status = new.http_status, "
+            "public_source_url = new.public_source_url, "
+            "sanitizer_version = new.sanitizer_version, http_status = new.http_status, "
             "content_type = new.content_type, challenge_detected = new.challenge_detected, "
             "fetched_at = new.fetched_at, elapsed_ms = new.elapsed_ms, attempt = new.attempt, "
             "malformed_row_count = new.malformed_row_count, "
@@ -1363,6 +1374,7 @@ class CrawlRepository:
                 source_url_sha256,
                 raw_body_sha256,
                 sanitized_body.body_sha256,
+                sanitized_body.sanitizer_version,
                 status_code,
                 content_type[:128],
                 fetched_at,
@@ -1593,7 +1605,8 @@ class CrawlRepository:
             self.db._execute(
                 "SELECT artifact.id, artifact.scheduled_job_run_id, artifact.capture_kind, "
                 "artifact.page_type, artifact.public_source_url, artifact.source_url_sha256, "
-                "artifact.raw_body_sha256, artifact.body_sha256, artifact.http_status, "
+                "artifact.raw_body_sha256, artifact.body_sha256, artifact.sanitizer_version, "
+                "artifact.http_status, "
                 "artifact.content_type, artifact.challenge_detected, artifact.fetched_at, "
                 "artifact.elapsed_ms, artifact.attempt, artifact.parser_name, "
                 "artifact.parser_version, artifact.parser_context_json, "
@@ -1825,6 +1838,7 @@ class CrawlRepository:
                 or _db_int(artifact.get("http_status") or 0) != 200
                 or not str(artifact.get("content_type") or "").lower().startswith("text/html")
                 or bool(_db_int(artifact.get("challenge_detected") or 0))
+                or artifact.get("sanitizer_version") != SANITIZER_VERSION
                 or _db_int(artifact.get("malformed_row_count") or 0) != 0
                 or artifact.get("verified_at") is None
                 or (artifact.get("page_type"), artifact.get("parser_name"))
@@ -1955,7 +1969,7 @@ class CrawlRepository:
                     "source_url_sha256": artifact["source_url_sha256"],
                     "raw_body_sha256": artifact["raw_body_sha256"],
                     "body_sha256": body_sha256,
-                    "sanitizer_version": body["sanitizer_version"],
+                    "sanitizer_version": artifact["sanitizer_version"],
                     "http_status": artifact["http_status"],
                     "content_type": artifact["content_type"],
                     "fetched_at": fetched_at.isoformat(timespec="microseconds"),

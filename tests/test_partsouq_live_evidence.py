@@ -16,6 +16,7 @@ from partsouq_catalog.crawler import Crawler
 from partsouq_catalog.evidence import (
     PARSER_CONTRACT_VERSION,
     REDACTED_VALUE,
+    SANITIZER_VERSION,
     CatalogHttpResponse,
     assert_no_secret_material,
     brand_natural_key,
@@ -30,8 +31,9 @@ from partsouq_catalog.evidence import (
     replay_catalog_records,
     restore_sanitized_body,
     sanitize_parser_html,
+    vehicle_record_evidence,
 )
-from partsouq_catalog.parsers import parse_parts
+from partsouq_catalog.parsers import parse_parts, parse_vehicles
 from partsouq_catalog.repositories import CrawlRepository
 
 
@@ -198,6 +200,7 @@ def _repository_verification_fixture():
             "source_url_sha256": hashlib.sha256(public_url.encode()).hexdigest(),
             "raw_body_sha256": "a" * 64,
             "body_sha256": body.body_sha256,
+            "sanitizer_version": body.sanitizer_version,
             "http_status": 200,
             "content_type": "text/html; charset=utf-8",
             "challenge_detected": 0,
@@ -405,6 +408,85 @@ def test_sanitized_replay_does_not_leak_secret_url_fragments_or_attributes() -> 
     assert "DATA-SSD-SECRET" not in sanitized
     assert "EVENT-SECRET" not in sanitized
     assert "INPUT-SECRET" not in sanitized
+
+
+def test_sanitized_replay_redacts_secret_from_open_graph_url() -> None:
+    html = (
+        '<meta property="og:url" content="https://partsouq.com/en/catalog/genuine/pick?'
+        'c=Toyota&amp;model=1000&amp;ssd=OPEN-GRAPH-SECRET">'
+    )
+
+    sanitized = sanitize_parser_html(html).body.decode("utf-8")
+
+    assert "OPEN-GRAPH-SECRET" not in sanitized
+    assert "og:url" not in sanitized
+
+
+def test_sanitized_replay_preserves_distinct_vehicle_candidate_identities() -> None:
+    html = """
+    <table>
+      <tr><th class="n_name">Name</th><th class="__model">Model</th></tr>
+      <tr>
+        <td><a href="/en/catalog/genuine/vehicle?c=Toyota&amp;ssd=SECRET-A&amp;vid=1">A</a></td>
+        <td>MODEL-A</td>
+      </tr>
+      <tr>
+        <td><a href="/en/catalog/genuine/vehicle?c=Toyota&amp;ssd=SECRET-B&amp;vid=1">B</a></td>
+        <td>MODEL-B</td>
+      </tr>
+    </table>
+    """
+    live, live_malformed = parse_vehicles(html, "Toyota", diagnostics=True)
+
+    sanitized = sanitize_parser_html(html)
+    replayed, replay_malformed, replay_skipped = replay_catalog_records(
+        sanitized.body,
+        parser_name="parse_vehicles",
+        parser_version=PARSER_CONTRACT_VERSION,
+        context={"brand": "Toyota", "model": "1000"},
+    )
+
+    assert (live_malformed, replay_malformed, replay_skipped) == (0, 0, 0)
+    assert replayed == vehicle_record_evidence("Toyota", "1000", live)
+    assert b"SECRET-A" not in sanitized.body
+    assert b"SECRET-B" not in sanitized.body
+    assert REDACTED_VALUE.encode() in sanitized.body
+    assert b"__PARTSOUQ_REDACTED_2__" in sanitized.body
+
+
+def test_sanitized_replay_preserves_blank_and_missing_ssd_diagnostics() -> None:
+    html = """
+    <table>
+      <tr><th class="n_name">Name</th><th class="__model">Model</th></tr>
+      <tr>
+        <td><a href="/en/catalog/genuine/vehicle?c=Toyota&amp;ssd=&amp;vid=1">A</a></td>
+        <td>MODEL-A</td>
+      </tr>
+      <tr>
+        <td><a href="/en/catalog/genuine/vehicle?c=Toyota&amp;vid=1">B</a></td>
+        <td>MODEL-B</td>
+      </tr>
+      <tr>
+        <td><a href="/en/catalog/genuine/vehicle?c=Toyota&amp;ssd=SECRET-C&amp;vid=2">C</a></td>
+        <td>MODEL-C</td>
+      </tr>
+    </table>
+    """
+    live, live_malformed = parse_vehicles(html, "Toyota", diagnostics=True)
+
+    sanitized = sanitize_parser_html(html)
+    replayed, replay_malformed, replay_skipped = replay_catalog_records(
+        sanitized.body,
+        parser_name="parse_vehicles",
+        parser_version=PARSER_CONTRACT_VERSION,
+        context={"brand": "Toyota", "model": "1000"},
+    )
+
+    assert (live_malformed, replay_malformed, replay_skipped) == (1, 1, 0)
+    assert replayed == vehicle_record_evidence("Toyota", "1000", live)
+    assert b"SECRET-C" not in sanitized.body
+    assert REDACTED_VALUE.encode() in sanitized.body
+    assert b"__PARTSOUQ_REDACTED_2__" not in sanitized.body
 
 
 def test_sanitizer_fails_closed_on_unstructured_ssd_text() -> None:
@@ -679,6 +761,22 @@ def test_repository_rejects_sanitized_body_hash_mutation_before_database_write()
     database._executemany.assert_not_called()
 
 
+def test_repository_rejects_unsupported_sanitizer_before_database_write() -> None:
+    database = mock.MagicMock()
+    repository = CrawlRepository(database, "evidence-test")
+    body = sanitize_parser_html(_unit_html())
+
+    with pytest.raises(ValueError, match="unsupported PartSouq evidence sanitizer version"):
+        _record_evidence(
+            repository,
+            public_url="https://partsouq.com/en/catalog/genuine/unit?uid=1",
+            sanitized_body=replace(body, sanitizer_version="partsouq-html-public-v1"),
+        )
+
+    database._execute.assert_not_called()
+    database._executemany.assert_not_called()
+
+
 def test_repository_rejects_parser_replay_mutation_before_database_write() -> None:
     database = mock.MagicMock()
     repository = CrawlRepository(database, "evidence-test")
@@ -804,6 +902,19 @@ def test_repository_verifier_detects_coherent_cas_body_replacement() -> None:
         ),
         pytest.raises(RuntimeError, match="parser evidence mismatch"),
     ):
+        fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+        )
+
+
+def test_repository_verifier_rejects_mixed_sanitizer_version() -> None:
+    fixture = _repository_verification_fixture()
+    fixture["artifacts"][0]["sanitizer_version"] = "partsouq-html-public-v1"
+
+    with pytest.raises(RuntimeError, match="is not verified live HTTP"):
         fixture["repository"]._calculate_run_evidence(
             17,
             23,
@@ -1040,6 +1151,15 @@ def test_evidence_schema_supports_exact_root_url_and_mutation_identity() -> None
         assert "scheduled_job_run_id" in identity
         assert "body_sha256" in identity
         assert "parser_context_sha256" in identity
+
+    migration = (
+        Path(__file__).parents[1] / "migrations/catalog/020_artifact_sanitizer_version.sql"
+    ).read_text()
+    catalog = (Path(__file__).parents[1] / "db/catalog.sql").read_text()
+    for schema in (migration, catalog):
+        assert "sanitizer_version VARCHAR(64) NOT NULL" in schema
+        assert "chk_partsouq_artifact_sanitizer" in schema
+    assert SANITIZER_VERSION in migration
 
 
 def test_formal_bounded_view_requires_verified_live_evidence_and_exact_coverage() -> None:

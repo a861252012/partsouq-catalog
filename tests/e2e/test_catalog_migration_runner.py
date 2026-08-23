@@ -528,11 +528,11 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     near_name = "my_partsouqX013_backup"
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21)")
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
 
-        assert runner.apply() == (18, 19)
+        assert runner.apply() == (18, 19, 20, 21)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -543,6 +543,184 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
                 (exact_name, near_name),
             )
             assert [row["ROUTINE_NAME"] for row in cursor.fetchall()] == [near_name]
+    finally:
+        connection.close()
+
+
+def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts "
+                "DROP CHECK chk_partsouq_artifact_verified_sanitizer"
+            )
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name, trigger_mode, status, started_at, finished_at, exit_code) "
+                "VALUES ('catalog', 'daemon', 'failed', NOW(6), NOW(6), 125)"
+            )
+            scheduled_job_run_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO crawl_runs "
+                "(run_key, started_at, finished_at, status, dataset_kind, target_parts, "
+                "scheduled_job_run_id, evidence_status) "
+                "VALUES ('legacy-v1-evidence', NOW(6), NOW(6), 'interrupted', "
+                "'bounded', 10000, %s, 'collecting')",
+                (scheduled_job_run_id,),
+            )
+            crawl_run_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO partsouq_response_bodies "
+                "(body_sha256, compression, body_blob, original_bytes, stored_bytes, "
+                "sanitizer_version) VALUES (%s, 'zlib', %s, 1, 1, %s)",
+                ("a" * 64, b"x", "partsouq-html-public-v1"),
+            )
+            cursor.execute(
+                "INSERT INTO partsouq_http_artifacts "
+                "(crawl_run_id, scheduled_job_run_id, capture_kind, page_type, "
+                "public_source_url, source_url_sha256, raw_body_sha256, body_sha256, "
+                "sanitizer_version, http_status, content_type, challenge_detected, "
+                "fetched_at, elapsed_ms, attempt, parser_name, parser_version, "
+                "parser_context_json, parser_context_sha256, malformed_row_count, "
+                "skipped_record_count, parsed_record_count, parsed_records_sha256, "
+                "accepted_record_count, accepted_records_sha256, verification_status, "
+                "verified_at) VALUES "
+                "(%s, %s, 'live_http', 'genuine', "
+                "'https://partsouq.com/en/catalog/genuine', %s, %s, %s, %s, "
+                "200, 'text/html', 0, NOW(6), 1, 1, 'parse_brands', "
+                "'partsouq-catalog-parser-v1', JSON_OBJECT(), %s, 0, 0, 1, %s, "
+                "0, %s, 'verified', NOW(6))",
+                (
+                    crawl_run_id,
+                    scheduled_job_run_id,
+                    "b" * 64,
+                    "c" * 64,
+                    "a" * 64,
+                    "partsouq-html-public-v1",
+                    "d" * 64,
+                    "e" * 64,
+                    "f" * 64,
+                ),
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts DROP CHECK chk_partsouq_artifact_sanitizer"
+            )
+            cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21)")
+
+        assert runner.apply() == (20, 21)
+        runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT sanitizer_version, verification_status, verified_at "
+                "FROM partsouq_http_artifacts WHERE crawl_run_id = %s",
+                (crawl_run_id,),
+            )
+            artifact = cursor.fetchone()
+            assert artifact == {
+                "sanitizer_version": "partsouq-html-public-v1",
+                "verification_status": "rejected",
+                "verified_at": None,
+            }
+            cursor.execute(
+                "SELECT CHARACTER_SET_NAME, COLLATION_NAME, IS_NULLABLE "
+                "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME='partsouq_http_artifacts' "
+                "AND COLUMN_NAME='sanitizer_version'"
+            )
+            assert cursor.fetchone() == {
+                "CHARACTER_SET_NAME": "ascii",
+                "COLLATION_NAME": "ascii_bin",
+                "IS_NULLABLE": "NO",
+            }
+            cursor.execute(
+                "SELECT evidence_status FROM crawl_runs WHERE id = %s",
+                (crawl_run_id,),
+            )
+            assert cursor.fetchone() == {"evidence_status": "rejected"}
+            cursor.execute(
+                "UPDATE partsouq_http_artifacts SET sanitizer_version=%s, "
+                "verification_status='verified', verified_at=NOW(6) WHERE crawl_run_id=%s",
+                ("partsouq-html-public-v2", crawl_run_id),
+            )
+            for incompatible_version in (
+                "PARTSOUQ-HTML-PUBLIC-V2",
+                "partsouq-html-public-v2 ",
+            ):
+                with pytest.raises(pymysql.MySQLError) as error:
+                    cursor.execute(
+                        "UPDATE partsouq_http_artifacts SET sanitizer_version=%s "
+                        "WHERE crawl_run_id=%s",
+                        (incompatible_version, crawl_run_id),
+                    )
+                assert error.value.args[0] == 3819
+
+            _, filename, sha256 = next(item for item in CATALOG_MANIFEST if item[0] == 20)
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts "
+                "DROP CHECK chk_partsouq_artifact_verified_sanitizer"
+            )
+            cursor.execute(
+                "ALTER TABLE partsouq_http_artifacts MODIFY COLUMN "
+                "sanitizer_version VARCHAR(64) NULL AFTER body_sha256"
+            )
+            cursor.execute(
+                "UPDATE partsouq_http_artifacts SET sanitizer_version=%s, "
+                "verification_status='verified', verified_at=NOW(6) WHERE crawl_run_id=%s",
+                ("partsouq-html-public-v1", crawl_run_id),
+            )
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21)")
+            cursor.execute(
+                "INSERT INTO catalog_schema_ledger "
+                "(change_key,kind,version,filename,sha256,state,attempt_count,started_at,"
+                "finished_at,error_text) VALUES "
+                "('migration:020','migration',20,%s,%s,'failed',1,NOW(6),NOW(6),'injected')",
+                (filename, sha256),
+            )
+            cursor.execute(
+                "CREATE PROCEDURE upgrade_partsouq_020_artifact_sanitizer_version() SELECT 1"
+            )
+
+        with pytest.raises(MigrationError, match="retry that exact version"):
+            runner.apply()
+        assert runner.apply(retry_version=20) == (20, 21)
+        runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT sanitizer_version,verification_status,verified_at "
+                "FROM partsouq_http_artifacts WHERE crawl_run_id=%s",
+                (crawl_run_id,),
+            )
+            assert cursor.fetchone() == {
+                "sanitizer_version": "partsouq-html-public-v1",
+                "verification_status": "rejected",
+                "verified_at": None,
+            }
+            cursor.execute(
+                "SELECT version,state,attempt_count FROM catalog_schema_ledger "
+                "WHERE version IN (20,21) ORDER BY version"
+            )
+            assert list(cursor.fetchall()) == [
+                {"version": 20, "state": "applied", "attempt_count": 2},
+                {"version": 21, "state": "applied", "attempt_count": 1},
+            ]
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA=DATABASE() "
+                "AND ROUTINE_NAME='upgrade_partsouq_020_artifact_sanitizer_version'"
+            )
+            assert cursor.fetchone() == {"row_count": 0}
     finally:
         connection.close()
 

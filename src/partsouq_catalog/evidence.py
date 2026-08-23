@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup, Comment, Tag
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
-SANITIZER_VERSION = "partsouq-html-public-v1"
+SANITIZER_VERSION = "partsouq-html-public-v2"
 PARSER_CONTRACT_VERSION = "partsouq-catalog-parser-v1"
 DEFAULT_EVIDENCE_MAX_BODY_BYTES = 8 * 1024 * 1024
 REDACTED_VALUE = "__PARTSOUQ_REDACTED__"
@@ -43,7 +43,9 @@ SECRET_FIELD_NAMES = frozenset(
 )
 SECRET_TEXT_PATTERNS = (
     re.compile(
-        r"\bssd\s*=\s*(?!__PARTSOUQ_REDACTED__(?:[&\s\"'<>]|$))[^&#\s\"'<>]+",
+        r"\bssd\s*=\s*(?!__PARTSOUQ_REDACTED(?:_(?:[2-9]|[1-9][0-9]+))?__"
+        r"(?:[&\s\"'<>]|$))"
+        r"[^&#\s\"'<>]+",
         re.I,
     ),
     re.compile(r"\b(?:cf_clearance|phpsessid|set-cookie|authorization)\b", re.I),
@@ -431,11 +433,10 @@ def public_source_url(url: str) -> str:
 def sanitize_parser_html(html: str) -> SanitizedBody:
     """Create deterministic, token-free HTML that the parser can replay.
 
-    Scripts, comments, cookie-setting meta tags, and secret hidden inputs are
-    outside every catalog parser's input contract and are removed.  Catalog URL
-    attributes retain their structure but replace the ephemeral ``ssd`` value
-    with a fixed sentinel so context-sensitive parsers can be replayed with the
-    same sentinel.
+    Scripts, comments, meta tags, and secret hidden inputs are outside every
+    catalog parser's input contract and are removed. Catalog URL attributes
+    retain their structure but replace each distinct ephemeral ``ssd`` value
+    with a document-local sentinel so parser candidate identities remain stable.
     """
 
     soup = BeautifulSoup(html, "lxml")
@@ -444,8 +445,8 @@ def sanitize_parser_html(html: str) -> SanitizedBody:
     for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
         comment.extract()
     for meta in soup.find_all("meta"):
-        if str(meta.get("http-equiv") or "").strip().lower() == "set-cookie":
-            meta.decompose()
+        meta.decompose()
+    ssd_aliases: dict[str, str] = {}
     for element in soup.find_all(True):
         tag: Tag = element
         if tag.name == "input" and _is_secret_field(str(tag.get("name") or "")):
@@ -454,7 +455,7 @@ def sanitize_parser_html(html: str) -> SanitizedBody:
         for attribute in ("href", "src", "action"):
             raw = tag.get(attribute)
             if isinstance(raw, str):
-                tag[attribute] = _sanitize_url_value(raw)
+                tag[attribute] = _sanitize_url_value(raw, ssd_aliases)
         for attribute in list(tag.attrs):
             lowered = attribute.lower()
             if (
@@ -663,14 +664,21 @@ def _public_record(record: Mapping[str, object]) -> dict[str, JsonValue]:
     return public
 
 
-def _sanitize_url_value(value: str) -> str:
+def _sanitize_url_value(value: str, ssd_aliases: dict[str, str]) -> str:
     parts = urlsplit(value)
     query = []
     for key, item in parse_qsl(parts.query, keep_blank_values=True):
         lowered = key.lower()
         if lowered not in PARSER_QUERY_KEYS:
             continue
-        query.append((key, REDACTED_VALUE if lowered == "ssd" else item))
+        if lowered == "ssd" and item:
+            redacted = ssd_aliases.get(item)
+            if redacted is None:
+                index = len(ssd_aliases) + 1
+                redacted = REDACTED_VALUE if index == 1 else f"__PARTSOUQ_REDACTED_{index}__"
+                ssd_aliases[item] = redacted
+            item = redacted
+        query.append((key, item))
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
