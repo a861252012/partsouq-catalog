@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -187,3 +188,12 @@ def test_config_from_env_reads_overrides(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.rate_limit_seconds == 2.0
     assert config.request_timeout_seconds == 30.0
     assert config.public_dict()["rate_limit_seconds"] == 2.0
+
+
+def test_config_rejects_missing_tls_ca_bundle(tmp_path) -> None:
+    with pytest.raises(ValueError, match="TLS CA bundle"):
+        VncsConfig.from_env(tls_ca_bundle=str(tmp_path / "missing.pem"))
+
+    # 預設錨定 repo 內 TWCA 中繼憑證，必須存在且可解析。
+    config = VncsConfig.from_env()
+    assert Path(config.tls_ca_bundle).is_file()

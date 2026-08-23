@@ -6,14 +6,17 @@ DecodeVinValues；非 17 碼的引擎號碼保留但不參與唯一約束。
 
 from __future__ import annotations
 
+from .browser import KIND_OPTION_VALUES, VncsBrowserError, VncsBrowserHarvester
 from .client import VncsClient, VncsClientError
 from .config import VncsConfig
 from .models import ParsedRecord, VncsRunHandle
 from .parser import (
+    GRID_RESULT_HEADERS,
     RESULT_HEADERS,
     VncsParserError,
     assert_form_contract,
     is_vin_code,
+    parse_grid_records,
     parse_hidden_fields,
     parse_vehicle_name,
     parse_vehicles,
@@ -22,9 +25,13 @@ from .repository import VncsMySQLRepository
 from .service import MALFORMED_RATIO_LIMIT, VncsSyncService
 
 __all__ = [
+    "GRID_RESULT_HEADERS",
+    "KIND_OPTION_VALUES",
     "MALFORMED_RATIO_LIMIT",
     "RESULT_HEADERS",
     "ParsedRecord",
+    "VncsBrowserError",
+    "VncsBrowserHarvester",
     "VncsClient",
     "VncsClientError",
     "VncsConfig",
@@ -34,6 +41,7 @@ __all__ = [
     "VncsSyncService",
     "assert_form_contract",
     "is_vin_code",
+    "parse_grid_records",
     "parse_hidden_fields",
     "parse_vehicle_name",
     "parse_vehicles",

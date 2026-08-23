@@ -15,6 +15,24 @@ RESULT_HEADERS = (
     "核准日期",
     "查核碼",
 )
+# 「使用中機動車輛噪音查詢」格線（Infragistics wdgMain）的實際欄位順序，
+# 2026-08-23 於真站驗證。瀏覽器路線以 DOM 列提取後交給 parse_grid_records。
+GRID_RESULT_HEADERS = (
+    "車輛種類",
+    "車型名稱",
+    "車型年份",
+    "受測轉速(rpm)",
+    "使用中原地噪音管制值",
+    "車型組代號",
+    "車身碼或引擎碼",
+    "噪音測值原地dB(A)",
+    "噪音測值加速dB(A)",
+    "最大馬力轉速(rpm)",
+    "核准日期",
+    "查核碼",
+    "期別",
+    "原地檢測模式",
+)
 # 官方頁面同時提供汽油車/柴油車/機車；本模組依政策只抓前兩類。
 VEHICLE_KINDS_QUERIED = ("汽油車", "柴油車")
 ALLOWED_VEHICLE_KINDS = frozenset(VEHICLE_KINDS_QUERIED)
@@ -297,6 +315,73 @@ def parse_vehicles(html_bytes: bytes) -> tuple[list[dict[str, object]], int]:
                 }
             )
     return records, malformed
+
+
+def parse_grid_records(rows: list[dict[str, str]]) -> tuple[list[dict[str, object]], int]:
+    """把瀏覽器 DOM 提取的格線列（欄位名 → 值）轉成結構化 records。
+
+    wdgMain 的車型名稱在顯示層被伺服器截斷（…），完整名稱放在 span title；
+    由 browser.py 的 JS 先以 title 覆寫再回傳，本函式只做純映射與驗證。
+    回傳 ``(records, malformed_rows)``，語意與 parse_vehicles 相同：
+    政策外車輛種類略過、缺必要欄位計 malformed、找不到必要欄位即 raise。
+    """
+    if not rows:
+        return [], 0
+    required = ("車輛種類", "車型名稱", "車型年份", "車型組代號", "車身碼或引擎碼")
+    sample: dict[str, str] = rows[0]
+    missing = [name for name in required if name not in sample]
+    if missing:
+        raise VncsParserError(f"VNCS grid rows are missing expected columns: {missing}")
+    records: list[dict[str, object]] = []
+    malformed = 0
+    for row in rows:
+        kind = _normalize_cell(row.get("車輛種類", ""))
+        if kind not in ALLOWED_VEHICLE_KINDS:
+            continue
+        name = _normalize_cell(row.get("車型名稱", ""))
+        year = _normalize_cell(row.get("車型年份", ""))
+        code = _normalize_cell(row.get("車身碼或引擎碼", ""))
+        legacy_row = {
+            "車輛種類": kind,
+            "車型名稱": name,
+            "車型年份": year,
+            "車身碼或引擎碼": code,
+        }
+        if _row_is_malformed(legacy_row):
+            malformed += 1
+            continue
+        name_parts = parse_vehicle_name(name)
+        records.append(
+            {
+                "vehicle_kind": kind,
+                "make": str(name_parts["brand"]),
+                "model_name": name,
+                **name_parts,
+                "model_year": int(year),
+                "model_group_code": _normalize_cell(row.get("車型組代號", "")),
+                "body_or_engine_code": code.upper(),
+                "is_vin": is_vin_code(code.upper()),
+                "period": _optional_grid_cell(row.get("期別")),
+                "approval_date": _optional_grid_cell(row.get("核准日期")),
+                "check_code": _optional_grid_cell(row.get("查核碼")),
+                "tested_rpm": _optional_grid_cell(row.get("受測轉速(rpm)")),
+                "noise_limit": _optional_grid_cell(row.get("使用中原地噪音管制值")),
+                "stationary_noise_db": _optional_grid_cell(row.get("噪音測值原地dB(A)")),
+                "acceleration_noise_db": _optional_grid_cell(row.get("噪音測值加速dB(A)")),
+                "max_power_rpm": _optional_grid_cell(row.get("最大馬力轉速(rpm)")),
+                "detection_mode": _optional_grid_cell(row.get("原地檢測模式")),
+            }
+        )
+    return records, malformed
+
+
+def _normalize_cell(value: str) -> str:
+    return _WHITESPACE_RE.sub(" ", value).strip()
+
+
+def _optional_grid_cell(value: str | None) -> str | None:
+    text = _normalize_cell(value or "")
+    return text or None
 
 
 def _row_is_malformed(row: dict[str, str]) -> bool:

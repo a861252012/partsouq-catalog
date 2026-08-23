@@ -4,7 +4,6 @@ import asyncio
 import ssl
 
 import aiohttp
-import certifi
 
 from partsouq_crawler.crawl.rate_limit import HostRateLimiter
 from partsouq_crawler.vncs.config import VncsConfig
@@ -36,7 +35,9 @@ class VncsClient:
         self.session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> VncsClient:
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        # 信任庫錨定 repo 內的 TWCA 政府 CA（見 config.DEFAULT_TLS_CA_BUNDLE
+        # 註解）；仍為 CERT_REQUIRED，不做任何 insecure 降級。
+        ssl_context = ssl.create_default_context(cafile=self.config.tls_ca_bundle)
         timeout = aiohttp.ClientTimeout(total=self.config.request_timeout_seconds)
         self.session = aiohttp.ClientSession(
             timeout=timeout,

@@ -7,6 +7,7 @@ from partsouq_crawler.vncs.parser import (
     VncsParserError,
     assert_form_contract,
     is_vin_code,
+    parse_grid_records,
     parse_hidden_fields,
     parse_vehicle_name,
     parse_vehicles,
@@ -460,3 +461,89 @@ def test_parse_vehicle_name_keeps_unknown_brand_information() -> None:
 
     assert parsed["brand"] == "ACME"
     assert parsed["model_raw"] == "ROADSTER"
+
+
+# ---------------------------------------------------------------------------
+# 使用中噪音格線（wdgMain）DOM 列 → records 的映射（瀏覽器路線）
+# ---------------------------------------------------------------------------
+
+
+def _grid_row(**overrides: str) -> dict[str, str]:
+    row = {
+        "車輛種類": "汽油車",
+        "車型名稱": "KIA SPORTAGE PE A1 2WD 1598c.c. A8 5D",
+        "車型年份": "2027",
+        "受測轉速(rpm)": "3750",
+        "使用中原地噪音管制值": "93",
+        "車型組代號": "C7G124-A02",
+        "車身碼或引擎碼": VIN,
+        "噪音測值原地dB(A)": "73",
+        "噪音測值加速dB(A)": "68",
+        "最大馬力轉速(rpm)": "5500",
+        "核准日期": "2026/04/14",
+        "查核碼": "",
+        "期別": "六期",
+        "原地檢測模式": "",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_parse_grid_records_maps_in_use_noise_columns() -> None:
+    records, malformed = parse_grid_records([_grid_row()])
+
+    assert malformed == 0
+    assert len(records) == 1
+    record = records[0]
+    assert record["vehicle_kind"] == "汽油車"
+    assert record["make"] == "KIA"
+    assert record["model_raw"] == "SPORTAGE PE A1 2WD A8"
+    assert record["model_year"] == 2027
+    assert record["model_group_code"] == "C7G124-A02"
+    assert record["body_or_engine_code"] == VIN
+    assert record["is_vin"] is True
+    assert record["period"] == "六期"
+    assert record["approval_date"] == "2026/04/14"
+    assert record["check_code"] is None
+    assert record["tested_rpm"] == "3750"
+    assert record["noise_limit"] == "93"
+    assert record["stationary_noise_db"] == "73"
+    assert record["acceleration_noise_db"] == "68"
+    assert record["max_power_rpm"] == "5500"
+    assert record["detection_mode"] is None
+
+
+def test_parse_grid_records_flags_engine_codes_and_skips_motorcycles() -> None:
+    rows = [
+        _grid_row(車身碼或引擎碼="R1152PH00142", 查核碼="R1152PH00142"),
+        _grid_row(車輛種類="機車", 車型名稱="KYMCO MANY 110", 車身碼或引擎碼="LC0TCKS10X0000001"),
+    ]
+
+    records, malformed = parse_grid_records(rows)
+
+    assert malformed == 0
+    assert len(records) == 1
+    assert records[0]["is_vin"] is False
+    assert records[0]["check_code"] == "R1152PH00142"
+
+
+def test_parse_grid_records_counts_malformed_rows() -> None:
+    rows = [
+        _grid_row(),
+        _grid_row(車型名稱=""),
+        _grid_row(車型年份="20X7"),
+    ]
+
+    records, malformed = parse_grid_records(rows)
+
+    assert malformed == 2
+    assert len(records) == 1
+
+
+def test_parse_grid_records_rejects_unexpected_column_set() -> None:
+    with pytest.raises(VncsParserError, match="missing expected columns"):
+        parse_grid_records([{"車輛種類": "汽油車"}])
+
+
+def test_parse_grid_records_accepts_empty_page() -> None:
+    assert parse_grid_records([]) == ([], 0)
