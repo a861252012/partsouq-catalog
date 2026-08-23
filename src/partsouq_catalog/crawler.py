@@ -57,6 +57,7 @@ from .http_client import NotFoundError, SessionManager
 from .parsers import (
     ParsedRecord,
     _soup,
+    has_empty_parts_table,
     parse_brand_index,
     parse_category_links,
     parse_groups,
@@ -1500,6 +1501,32 @@ class Crawler:
                     live_records=source_part_records,
                     malformed_rows=malformed,
                     skipped_record_count=skipped_nameless,
+                )
+            self.db.commit()
+            if fetched is not None:
+                fetched[map_key] = 0
+            return False
+        # 合法空組：站方渲染了完整零件表殼（Number|Name|Code 表頭）但
+        # 沒有任何資料列（實例：TOYOTA1000 KP30 的 BODY STRIPE unit，
+        # 三輪 run 位元組級重現）。HTTP 200 且 0 malformed —— 這是站方
+        # 的合法「此組無零件」，receipt done/0，不得讓整輪 run 失敗。
+        if not parts and not malformed and has_empty_parts_table(html):
+            log.info(
+                "[%s group=%s] parts table present but empty; site lists no "
+                "parts for this unit — receipted as done/0",
+                brand,
+                group.get("group_code"),
+            )
+            self.crawl.mark_group_fetched(group_id, run_key, status="done", row_count=0)
+            if unit_response is not None and source_group_key is not None:
+                self._capture_http_evidence(
+                    unit_response,
+                    page_type="unit",
+                    parser_name="parse_parts",
+                    parser_context={"group_key": source_group_key},
+                    live_records=[],
+                    malformed_rows=0,
+                    skipped_record_count=0,
                 )
             self.db.commit()
             if fetched is not None:

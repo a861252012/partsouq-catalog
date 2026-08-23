@@ -1,6 +1,6 @@
 import pytest
 
-from partsouq_catalog.parsers import parse_parts
+from partsouq_catalog.parsers import has_empty_parts_table, parse_parts
 
 
 def _unit_table(headers: list[str], values: list[str]) -> str:
@@ -107,3 +107,36 @@ def test_parse_legacy_six_column_range_header(range_header: str) -> None:
 )
 def test_parse_header_shape_mismatch_is_malformed(headers: list[str], values: list[str]) -> None:
     assert parse_parts(_unit_table(headers, values)) == ([], 1)
+
+
+def test_parse_empty_parts_table_shell_is_legitimate_empty() -> None:
+    """實測案例（2026-08-23，TOYOTA1000 KP30 BODY STRIPE unit，uid=4128）：
+    站方渲染完整零件表殼（Number|Name|Code 表頭）但零資料列 —— HTTP 200、
+    版型正常，屬合法「此組無零件」。parse_parts 回空且 0 malformed；
+    has_empty_parts_table 讓 crawler receipt done/0 而非誤判版型變更。"""
+    html = (
+        "<table><tr><td>Brand</td><td>Name</td><td>Model</td>"
+        "<td>Options</td><td>Prod Period</td></tr>"
+        "<tr><td>TOYOTA</td><td>TOYOTA1000 KP3#</td><td>KP30-</td>"
+        "<td>Driver's Position: RIGHT-HAND DR</td>"
+        "<td>04.1969 - 02.1978</td></tr></table>"
+        '<table class="glow pop-vin"><thead><tr>'
+        "<th>Number</th><th>Name</th><th>Code</th>"
+        "</tr></thead></table>"
+    )
+
+    parts, malformed = parse_parts(html)
+
+    assert parts == []
+    assert malformed == 0
+    assert has_empty_parts_table(html) is True
+
+
+def test_has_empty_parts_table_is_false_for_populated_or_missing_tables() -> None:
+    populated = _unit_table(
+        ["Number", "Name", "Code"],
+        ["SYN60006", "SYNTHETIC LEVER", "C60"],
+    )
+    assert has_empty_parts_table(populated) is False
+    # 完全沒有零件表（反爬變體、空白頁）→ False，交由 guard 拒絕。
+    assert has_empty_parts_table("<html><body>challenge page</body></html>") is False

@@ -694,6 +694,29 @@ def parse_groups(
 # ----------------------------------------------------------------- unit
 
 
+def has_empty_parts_table(html: str, soup: Any | None = None) -> bool:
+    """unit 頁存在「零件表殼」但完全沒有資料列。
+
+    站方對部分車型（例如古董車 TOYOTA1000 KP30 的 BODY STRIPE unit）
+    會渲染完整的零件表骨架（`Number|Name|Code` 表頭）卻不列任何零件
+    列 —— HTTP 200、頁面版型正常，這是合法的「此組無零件」，不是版型
+    變更。呼叫端應將該組 receipt 為 done/0 列，而不是讓整輪 run 失敗。
+
+    判定：存在某張 table，其第一列為表頭且前兩格恰為 Number／Name，
+    而該 table 除表頭外沒有任何列。完全沒有零件表的頁面（反爬變體、
+    空白 200）回 False，交由既有 guard 拒絕。
+    """
+    soup = soup if soup is not None else _soup(html)
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        header_cells = [cell.get_text(strip=True) for cell in rows[0].find_all(["td", "th"])]
+        if len(header_cells) >= 3 and header_cells[0] == "Number" and header_cells[1] == "Name":
+            return len(rows) == 1
+    return False
+
+
 @overload
 def parse_parts(
     html: str,
