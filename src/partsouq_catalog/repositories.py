@@ -1182,6 +1182,8 @@ class CrawlRepository:
 
         新 daemon attempt 只能接手已明確失敗且有結束碼的舊 attempt；
         artifact 保留原 scheduler id，最終 evidence 會逐 attempt 驗證時間窗。
+        已耗盡配額卻仍有 scope error 的 run 無法再取得爬取額度，必須拒絕並
+        由 scheduler 建立新的 logical run，避免 remaining=0 的永久重試。
         """
         if scheduled_job_run_id is None:
             row = self.db._execute(
@@ -1195,6 +1197,12 @@ class CrawlRepository:
                 "BINARY artifact.verification_status = BINARY 'verified' OR "
                 "BINARY artifact.verification_status = BINARY 'superseded'))) "
                 "AS bad_evidence, "
+                "((SELECT COUNT(*) FROM parts AS quota_part "
+                "WHERE quota_part.seen_run_id = candidate.id) >= candidate.target_parts "
+                "AND EXISTS (SELECT 1 FROM crawl_state AS failed_scope "
+                "WHERE failed_scope.run_key = candidate.run_key "
+                "AND BINARY failed_scope.status = BINARY 'error')) "
+                "AS exhausted_with_failures, "
                 "EXISTS (SELECT 1 FROM groups_t AS receipt_group "
                 "WHERE receipt_group.fetched_run_key = candidate.run_key "
                 "AND (receipt_group.fetched_status IS NULL OR NOT ("
@@ -1203,7 +1211,7 @@ class CrawlRepository:
                 "OR NULLIF(TRIM(receipt_group.url), '') IS NULL OR NOT ("
                 f"{_canonical_unit_url_sql('receipt_group.url', 'receipt_group.uid')}))) "
                 "AS bad_receipt "
-                "FROM (SELECT id, run_key, evidence_status FROM crawl_runs "
+                "FROM (SELECT id, run_key, evidence_status, target_parts FROM crawl_runs "
                 "WHERE dataset_kind = 'bounded' "
                 "AND target_parts = %s AND status IN ('running', 'error', 'interrupted') "
                 "AND scheduled_job_run_id IS NULL "
@@ -1222,6 +1230,12 @@ class CrawlRepository:
                 "BINARY artifact.verification_status = BINARY 'verified' OR "
                 "BINARY artifact.verification_status = BINARY 'superseded'))) "
                 "AS bad_evidence, "
+                "((SELECT COUNT(*) FROM parts AS quota_part "
+                "WHERE quota_part.seen_run_id = candidate.id) >= candidate.target_parts "
+                "AND EXISTS (SELECT 1 FROM crawl_state AS failed_scope "
+                "WHERE failed_scope.run_key = candidate.run_key "
+                "AND BINARY failed_scope.status = BINARY 'error')) "
+                "AS exhausted_with_failures, "
                 "EXISTS (SELECT 1 FROM groups_t AS receipt_group "
                 "WHERE receipt_group.fetched_run_key = candidate.run_key "
                 "AND (receipt_group.fetched_status IS NULL OR NOT ("
@@ -1230,7 +1244,7 @@ class CrawlRepository:
                 "OR NULLIF(TRIM(receipt_group.url), '') IS NULL OR NOT ("
                 f"{_canonical_unit_url_sql('receipt_group.url', 'receipt_group.uid')}))) "
                 "AS bad_receipt "
-                "FROM (SELECT cr.id, cr.run_key, cr.evidence_status "
+                "FROM (SELECT cr.id, cr.run_key, cr.evidence_status, cr.target_parts "
                 "FROM scheduled_job_runs AS current_job "
                 "JOIN crawl_runs AS cr ON cr.dataset_kind = 'bounded' "
                 "AND cr.target_parts = %s "
@@ -1253,6 +1267,7 @@ class CrawlRepository:
             _db_int(row.get("bad_run_status") or 0) != 0
             or _db_int(row.get("bad_evidence") or 0) != 0
             or _db_int(row.get("bad_receipt") or 0) != 0
+            or _db_int(row.get("exhausted_with_failures") or 0) != 0
         )
         if incompatible:
             self.db._execute(

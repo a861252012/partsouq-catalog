@@ -1708,32 +1708,31 @@ class Crawler:
         )
         if self.evidence_mode and self.scheduled_job_run_id is None:
             raise ValueError("formal 10000-part bounded run requires the daemon scheduler")
-        if bounded_mode and self.scheduled_job_run_id and CRAWL["bounded_run_key"]:
-            raise ValueError("PSQ_BOUNDED_RUN_KEY cannot be set for a scheduled bounded run")
+        # explicit key 一律禁止（scheduled 與 direct 皆同）：resume 一律由
+        # resumable_bounded_run_key 依相容性檢查挑選；操作者不得繞過
+        # exhausted_with_failures／evidence／receipt gate 重開特定 run。
+        if bounded_mode and CRAWL["bounded_run_key"]:
+            raise ValueError("PSQ_BOUNDED_RUN_KEY cannot be set for a bounded run")
         # Direct CLI 沒有 scheduler marker；先取得與 migration 相同的短鎖，
         # 並在 running crawl marker 與 fresh reset 一起 commit 後立即釋放。
         # 取得前不能查任何業務表，避免 metadata lock 反向等待。
         with catalog_writer_admission(self.db._thread_conn()):
             if bounded_mode:
-                run_key = str(CRAWL["bounded_run_key"])
-                if not run_key:
-                    resumable_run_key = self.crawl.resumable_bounded_run_key(
-                        self.part_limit,
-                        scheduled_job_run_id=self.scheduled_job_run_id,
-                    )
-                    # 不相容的最新 run 會在 resolver 內標成 rejected。
-                    # 先獨立提交，避免後續新 marker 建立失敗時把拒絕狀態
-                    # 一併 rollback，舊 run 又在下一輪被重新考慮。
-                    self.db.commit()
-                    run_key = resumable_run_key or ""
+                resumable_run_key = self.crawl.resumable_bounded_run_key(
+                    self.part_limit,
+                    scheduled_job_run_id=self.scheduled_job_run_id,
+                )
+                # 不相容的最新 run 會在 resolver 內標成 rejected。
+                # 先獨立提交，避免後續新 marker 建立失敗時把拒絕狀態
+                # 一併 rollback，舊 run 又在下一輪被重新考慮。
+                self.db.commit()
+                run_key = resumable_run_key or ""
                 if not run_key:
                     run_key = (
                         f"bounded-{self.part_limit}-"
                         f"{'s' if self.scheduled_job_run_id else 'd'}"
                         f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
                     )
-                if len(run_key) > 32:
-                    raise ValueError("PSQ_BOUNDED_RUN_KEY must be at most 32 characters")
             elif sample_mode:
                 run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f")
             elif partial:

@@ -993,7 +993,26 @@ def test_scheduled_bounded_run_rejects_operator_supplied_run_key(monkeypatch) ->
     try:
         with pytest.raises(
             ValueError,
-            match="PSQ_BOUNDED_RUN_KEY cannot be set for a scheduled bounded run",
+            match="PSQ_BOUNDED_RUN_KEY cannot be set for a bounded run",
+        ):
+            instance.run()
+    finally:
+        instance.close()
+
+    instance.crawl.start_run.assert_not_called()
+
+
+def test_direct_bounded_run_rejects_operator_supplied_run_key(monkeypatch) -> None:
+    """Direct bounded 也禁止 explicit key：否則會繞過 resolver 的
+    exhausted_with_failures／evidence gate 重開已耗盡且有錯誤的 run。"""
+    _bounded_config(monkeypatch, target=10)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 0)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.crawl = mock.MagicMock()
+    try:
+        with pytest.raises(
+            ValueError,
+            match="PSQ_BOUNDED_RUN_KEY cannot be set for a bounded run",
         ):
             instance.run()
     finally:
@@ -1053,6 +1072,11 @@ def test_scheduled_bounded_resume_requires_a_finished_failed_prior_attempt() -> 
     assert "BINARY artifact.sanitizer_version <> BINARY %s" in query
     assert "BINARY artifact.verification_status = BINARY 'verified'" in query
     assert "BINARY artifact.verification_status = BINARY 'superseded'" in query
+    assert "quota_part.seen_run_id = candidate.id" in query
+    assert ">= candidate.target_parts" in query
+    assert "failed_scope.run_key = candidate.run_key" in query
+    assert "BINARY failed_scope.status = BINARY 'error'" in query
+    assert "AS exhausted_with_failures" in query
     assert "ORDER BY cr.started_at DESC, cr.id DESC LIMIT 1) AS candidate" in query
     assert "receipt_group.fetched_run_key = candidate.run_key" in query
     assert "receipt_group.fetched_status" in query
@@ -1072,6 +1096,11 @@ def test_scheduled_bounded_resume_requires_a_finished_failed_prior_attempt() -> 
     assert "ORDER BY started_at DESC, id DESC LIMIT 1) AS candidate" in query
     assert "BINARY artifact.verification_status = BINARY 'verified'" in query
     assert "BINARY artifact.verification_status = BINARY 'superseded'" in query
+    assert "quota_part.seen_run_id = candidate.id" in query
+    assert ">= candidate.target_parts" in query
+    assert "failed_scope.run_key = candidate.run_key" in query
+    assert "BINARY failed_scope.status = BINARY 'error'" in query
+    assert "AS exhausted_with_failures" in query
     assert "receipt_group.fetched_run_key = candidate.run_key" in query
     assert "receipt_group.fetched_status" in query
     assert "REGEXP_LIKE(receipt_group.url" in query
@@ -1101,6 +1130,63 @@ def test_incompatible_bounded_resume_is_durably_rejected() -> None:
     update_query, update_params = database._execute.call_args_list[-1].args
     assert "SET evidence_status = 'rejected'" in update_query
     assert update_params == (17,)
+
+
+def test_exhausted_bounded_resume_with_failures_is_durably_rejected() -> None:
+    database = mock.MagicMock()
+    cursor = mock.MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 18,
+        "run_key": "bounded-exhausted-with-error",
+        "evidence_status": "collecting",
+        "bad_run_status": 0,
+        "bad_evidence": 0,
+        "bad_receipt": 0,
+        "exhausted_with_failures": 1,
+    }
+    database._execute.return_value = cursor
+
+    assert (
+        CrawlRepository(database, "bounded-resume-contract").resumable_bounded_run_key(
+            10_000,
+            scheduled_job_run_id=77,
+        )
+        is None
+    )
+
+    queries = [call.args[0] for call in database._execute.call_args_list]
+    assert all("DELETE " not in query for query in queries)
+    update_query, update_params = database._execute.call_args_list[-1].args
+    assert "SET evidence_status = 'rejected'" in update_query
+    assert update_params == (18,)
+
+
+@pytest.mark.parametrize("scenario", ("under_target_with_error", "exact_target_without_error"))
+def test_compatible_bounded_resume_remains_resumable(scenario: str) -> None:
+    database = mock.MagicMock()
+    cursor = mock.MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 20,
+        "run_key": f"bounded-{scenario}",
+        "evidence_status": "collecting",
+        "bad_run_status": 0,
+        "bad_evidence": 0,
+        "bad_receipt": 0,
+        "exhausted_with_failures": 0,
+    }
+    database._execute.return_value = cursor
+
+    assert (
+        CrawlRepository(
+            database,
+            "bounded-resume-contract",
+        ).resumable_bounded_run_key(
+            10_000,
+            scheduled_job_run_id=77,
+        )
+        == f"bounded-{scenario}"
+    )
+    assert database._execute.call_count == 1
 
 
 def test_non_exact_rejected_resume_is_normalized_and_clears_stale_seals() -> None:
@@ -2271,6 +2357,185 @@ def test_mysql_bounded_resume_durably_rejects_invalid_group_receipt(
             "SELECT evidence_status FROM crawl_runs WHERE id = %s",
             (run_id,),
         ).fetchone() == {"evidence_status": "rejected"}
+    finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests",
+)
+@pytest.mark.parametrize(
+    ("membership_count", "has_error", "expected_resume"),
+    (
+        (10, True, False),
+        (8, True, True),
+        (10, False, True),
+    ),
+)
+def test_mysql_bounded_resume_retires_only_exhausted_failed_run(
+    membership_count: int,
+    has_error: bool,
+    expected_resume: bool,
+) -> None:
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        _clear_mysql_fixture(database)
+        failed_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        run_key = f"bounded-exhausted-{membership_count}-{int(has_error)}"
+        crawl = CrawlRepository(database, run_key)
+        run_id = crawl.start_run(
+            run_key,
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10,
+            scheduled_job_run_id=failed_job_id,
+        )
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        parts = PartRepository(database)
+        brand_id = brands.upsert_brand("TOYOTA", None)
+        model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-BOUNDED", None)
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CAMRY",
+                "model_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "vid": "SITE-VID-BOUNDED",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        completed_group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "COMPLETED ENGINE ASSEMBLY",
+            "10001",
+            "https://partsouq.com/en/catalog/genuine/unit?uid=10001",
+        )
+        partial_group_id = vehicles.upsert_group(
+            category_id,
+            "1102",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10002",
+            "https://partsouq.com/en/catalog/genuine/unit?uid=10002",
+        )
+        completed_count = membership_count - 2
+        parts.upsert_parts(completed_group_id, _parts(completed_count), run_id)
+        crawl.mark_group_fetched(
+            completed_group_id,
+            run_key,
+            row_count=completed_count,
+        )
+        parts.upsert_parts(
+            partial_group_id,
+            _parts(2),
+            run_id,
+            complete_group=False,
+        )
+        if has_error:
+            crawl.mark_error("vehicle", f"v5:{'a' * 64}", "simulated retryable error")
+
+        body_sha256 = hashlib.sha256(run_key.encode()).hexdigest()
+        database._execute(
+            "INSERT INTO partsouq_response_bodies "
+            "(body_sha256, compression, body_blob, original_bytes, stored_bytes, "
+            "sanitizer_version) VALUES (%s, 'zlib', %s, 1, 1, %s)",
+            (body_sha256, b"x", SANITIZER_VERSION),
+        )
+        database._execute(
+            "INSERT INTO partsouq_http_artifacts ("
+            "crawl_run_id, scheduled_job_run_id, capture_kind, page_type, "
+            "public_source_url, source_url_sha256, raw_body_sha256, body_sha256, "
+            "sanitizer_version, http_status, content_type, challenge_detected, "
+            "fetched_at, elapsed_ms, attempt, parser_name, parser_version, "
+            "parser_context_json, parser_context_sha256, malformed_row_count, "
+            "skipped_record_count, parsed_record_count, parsed_records_sha256, "
+            "accepted_record_count, accepted_records_sha256, verification_status, "
+            "verified_at) VALUES ("
+            "%s, %s, 'live_http', 'unit', %s, %s, %s, %s, %s, "
+            "200, 'text/html', 0, UTC_TIMESTAMP(6), 1, 1, 'parse_parts', "
+            "'partsouq-catalog-parser-v1', JSON_OBJECT(), %s, 0, 0, 1, %s, "
+            "0, %s, 'superseded', UTC_TIMESTAMP(6))",
+            (
+                run_id,
+                failed_job_id,
+                "https://partsouq.com/en/catalog/genuine/unit?uid=10002",
+                "1" * 64,
+                "2" * 64,
+                body_sha256,
+                SANITIZER_VERSION,
+                "3" * 64,
+                "4" * 64,
+                "5" * 64,
+            ),
+        )
+        crawl.finish_run(
+            run_id,
+            "error" if has_error else "interrupted",
+            {"parts": membership_count},
+            "simulated bounded stop" if has_error else None,
+        )
+        database._execute(
+            "UPDATE scheduled_job_runs SET status = 'failed', exit_code = 1, "
+            "finished_at = UTC_TIMESTAMP() WHERE id = %s",
+            (failed_job_id,),
+        )
+        retry_job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        database.commit()
+
+        resumed_key = crawl.resumable_bounded_run_key(
+            10,
+            scheduled_job_run_id=retry_job_id,
+        )
+        if expected_resume:
+            assert resumed_key == run_key
+            assert database._execute(
+                "SELECT evidence_status FROM crawl_runs WHERE id = %s",
+                (run_id,),
+            ).fetchone() == {"evidence_status": "missing"}
+            return
+
+        assert resumed_key is None
+        database.commit()
+        assert database._execute(
+            "SELECT evidence_status FROM crawl_runs WHERE id = %s",
+            (run_id,),
+        ).fetchone() == {"evidence_status": "rejected"}
+        assert crawl.count_run_parts(run_id) == 10
+        assert database._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts WHERE crawl_run_id = %s",
+            (run_id,),
+        ).fetchone() == {"row_count": 1}
+        assert database._execute(
+            "SELECT COUNT(*) AS row_count FROM partsouq_response_bodies WHERE body_sha256 = %s",
+            (body_sha256,),
+        ).fetchone() == {"row_count": 1}
+
+        new_run_id = crawl.start_run(
+            "bounded-clean-retry",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10,
+            scheduled_job_run_id=retry_job_id,
+        )
+        assert new_run_id != run_id
+        assert crawl.count_run_parts(new_run_id) == 0
+        assert crawl.count_run_parts(run_id) == 10
     finally:
         database.rollback()
         _clear_mysql_fixture(database)
