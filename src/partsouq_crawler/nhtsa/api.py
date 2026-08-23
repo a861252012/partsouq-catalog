@@ -17,6 +17,11 @@ from partsouq_crawler.nhtsa.models import (
 VPIC_PATHS = (
     re.compile(r"/api/vehicles/GetAllMakes"),
     re.compile(r"/api/vehicles/GetModelsForMakeId/0"),
+    re.compile(r"/api/vehicles/GetModelsForMakeId/[1-9][0-9]*"),
+    re.compile(
+        r"/api/vehicles/GetModelsForMakeYear"
+        r"/make/[A-Za-z0-9%]+/modelyear/[0-9]{4}"
+    ),
     re.compile(r"/api/vehicles/GetAllManufacturers"),
     re.compile(r"/api/vehicles/GetVehicleVariableList"),
     re.compile(r"/api/vehicles/GetVehicleVariableValuesList/[0-9]+"),

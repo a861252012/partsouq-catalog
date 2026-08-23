@@ -20,11 +20,13 @@ from partsouq_crawler.nhtsa.api import NhtsaApiParser, NhtsaApiPolicy, vin_sourc
 from partsouq_crawler.nhtsa.api_client import NhtsaApiClient
 from partsouq_crawler.nhtsa.api_service import (
     API_PARSER_VERSION,
+    ApiSourceImport,
     NhtsaApiSyncService,
 )
 from partsouq_crawler.nhtsa.config import NhtsaConfig
 from partsouq_crawler.nhtsa.datasets import RECALL_FIELDS, ApiSource, BulkSource
 from partsouq_crawler.nhtsa.models import (
+    ApiDocument,
     ArtifactMember,
     DownloadedArtifact,
     NhtsaRunLease,
@@ -292,6 +294,45 @@ def _stage_vin_artifact(
         rejected_rows=0,
     )
     return artifact_id
+
+
+def _stage_api_document(
+    repository: NhtsaMySQLRepository,
+    lease: NhtsaRunLease,
+    tmp_path: Path,
+    source: ApiSource,
+    body: bytes,
+) -> tuple[int, ApiDocument, int]:
+    document = NhtsaApiParser().parse(body, source)
+    sha256 = hashlib.sha256(body).hexdigest()
+    raw_path = tmp_path / f"{sha256}-{source.key}.json"
+    raw_path.write_bytes(body)
+    artifact_id = repository.create_artifact(
+        lease,
+        dataset_name=source.dataset_name,
+        source_key=source.key,
+        source_url=source.url,
+        download=DownloadedArtifact(
+            http_status=200,
+            response_headers={"content-type": "application/json"},
+            path=raw_path,
+            sha256=sha256,
+            byte_count=len(body),
+        ),
+        parser_name="api-scope-test",
+        parser_version="1",
+    )
+    repository.store_member(lease, artifact_id, document.member)
+    repository.reset_artifact_import(lease, artifact_id)
+    new_versions = repository.insert_records(lease, artifact_id, document.records)
+    repository.complete_artifact(
+        lease,
+        artifact_id,
+        source_rows=document.count,
+        new_versions=new_versions,
+        rejected_rows=0,
+    )
+    return artifact_id, document, new_versions
 
 
 def _fail_completed_finalization(
@@ -710,6 +751,214 @@ def test_api_304_revalidates_raw_before_publication(
             finally:
                 repository.clear_for_tests()
                 repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_api_vpic_scope_expands_models_for_every_make(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    makes_body = json.dumps(
+        {
+            "Count": 3,
+            "Message": "Results returned successfully",
+            "Results": [
+                {"Make_ID": 955, "Make_Name": "TESLA"},
+                {"Make_ID": 460, "Make_Name": "BMW"},
+                {"Make_ID": 240, "Make_Name": "TOYOTA"},
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    empty_body = json.dumps(
+        {"Count": 0, "Message": "Results returned successfully", "Results": []},
+        separators=(",", ":"),
+    ).encode()
+
+    async def scenario() -> None:
+        calls: list[ApiSource] = []
+
+        class NoFetchNhtsaApiClient:
+            def __init__(self, _config: NhtsaConfig) -> None:
+                pass
+
+            async def __aenter__(self) -> NoFetchNhtsaApiClient:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                pass
+
+            async def fetch(
+                self,
+                _source: object,
+                *,
+                current_artifact: dict[str, object] | None,
+            ) -> tuple[DownloadedArtifact, bytes]:
+                del current_artifact
+                raise AssertionError("dynamic expansion must go through _sync_source only")
+
+        async def fake_sync_source(
+            service: NhtsaApiSyncService,
+            client: NoFetchNhtsaApiClient,
+            source: ApiSource,
+            lease: NhtsaRunLease,
+        ) -> ApiSourceImport:
+            del service, client
+            calls.append(source)
+            body = makes_body if source.dataset_name == "vpic_makes" else empty_body
+            artifact_id, document, new_versions = _stage_api_document(
+                repository,
+                lease,
+                tmp_path,
+                source,
+                body,
+            )
+            return ApiSourceImport(artifact_id, document, True, new_versions)
+
+        monkeypatch.setattr(NhtsaApiSyncService, "_sync_source", fake_sync_source)
+        monkeypatch.setattr(
+            "partsouq_crawler.nhtsa.api_service.NhtsaApiClient",
+            NoFetchNhtsaApiClient,
+        )
+        config = replace(_config(tmp_path), api_delay_seconds=0)
+        repository = NhtsaMySQLRepository.create(config)
+        try:
+            repository.clear_for_tests()
+            report = await NhtsaApiSyncService(repository, config).run(
+                run_key="vpic-models-expansion",
+                scope_name="vpic",
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-api"),
+            )
+
+            assert report["status"] == "completed"
+            assert [source.key for source in calls] == [
+                "vpic_all_makes",
+                "vpic_variables",
+                "vpic_models_for_make_955",
+                "vpic_models_for_make_460",
+                "vpic_models_for_make_240",
+                "vpic_manufacturers_page_001",
+            ]
+            assert [
+                (source.key, source.url, dict(source.context))
+                for source in calls
+                if source.dataset_name == "vpic_models"
+            ] == [
+                (
+                    "vpic_models_for_make_955",
+                    "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/955?format=json",
+                    {"Make_ID": "955", "Make_Name": "TESLA"},
+                ),
+                (
+                    "vpic_models_for_make_460",
+                    "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/460?format=json",
+                    {"Make_ID": "460", "Make_Name": "BMW"},
+                ),
+                (
+                    "vpic_models_for_make_240",
+                    "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/240?format=json",
+                    {"Make_ID": "240", "Make_Name": "TOYOTA"},
+                ),
+            ]
+            assert report["published_sources"] == 5
+            assert report["source_rows"] == 3
+            with repository.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT source_key FROM nhtsa_current_artifacts
+                    WHERE dataset_name = 'vpic_models' ORDER BY source_key
+                    """
+                )
+                assert [row["source_key"] for row in cursor] == [
+                    "vpic_models_for_make_240",
+                    "vpic_models_for_make_460",
+                    "vpic_models_for_make_955",
+                ]
+        finally:
+            repository.clear_for_tests()
+            repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_api_request_budget_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    body = _api_body()
+    sha256 = hashlib.sha256(body).hexdigest()
+    raw_path = tmp_path / f"{sha256}.json"
+    raw_path.write_bytes(body)
+
+    async def scenario() -> None:
+        sources = tuple(
+            ApiSource(
+                f"cssi_state_{state}",
+                "cssi_stations",
+                f"https://api.nhtsa.gov/CSSIStation/state/{state}?format=json",
+            )
+            for state in ("IL", "NV", "CO")
+        )
+
+        class FetchNhtsaApiClient:
+            def __init__(self, _config: NhtsaConfig) -> None:
+                pass
+
+            async def __aenter__(self) -> FetchNhtsaApiClient:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                pass
+
+            async def fetch(
+                self,
+                _source: object,
+                *,
+                current_artifact: dict[str, object] | None,
+            ) -> tuple[DownloadedArtifact, bytes]:
+                del current_artifact
+                return (
+                    DownloadedArtifact(
+                        http_status=200,
+                        response_headers={
+                            "content-type": "application/json",
+                            "content-length": str(len(body)),
+                        },
+                        path=raw_path,
+                        sha256=sha256,
+                        byte_count=len(body),
+                    ),
+                    body,
+                )
+
+        monkeypatch.setattr(
+            "partsouq_crawler.nhtsa.api_service.NhtsaApiClient",
+            FetchNhtsaApiClient,
+        )
+        monkeypatch.setattr("partsouq_crawler.nhtsa.api_service.CSSI_SOURCES", sources)
+        monkeypatch.setattr("partsouq_crawler.nhtsa.api_service.API_REQUEST_BUDGET", 2)
+        config = replace(_config(tmp_path), api_delay_seconds=0)
+        repository = NhtsaMySQLRepository.create(config)
+        try:
+            repository.clear_for_tests()
+            report = await NhtsaApiSyncService(repository, config).run(
+                run_key="budget-fail-closed",
+                scope_name="cssi",
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-api"),
+            )
+
+            assert report["status"] == "failed"
+            assert "request budget exceeded" in str(report["error"])
+            assert report["api_requests"] == 3
+            with repository.connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) AS row_count FROM nhtsa_current_artifacts")
+                assert cursor.fetchone()["row_count"] == 0
+                cursor.execute(
+                    "SELECT status FROM nhtsa_sync_runs WHERE id = %s",
+                    (report["run_id"],),
+                )
+                assert cursor.fetchone()["status"] == "failed"
+        finally:
+            repository.clear_for_tests()
+            repository.close()
 
     asyncio.run(scenario())
 

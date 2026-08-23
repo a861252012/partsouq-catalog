@@ -22,9 +22,13 @@ from partsouq_crawler.nhtsa.service import BATCH_SIZE, NhtsaRecordWriter
 
 API_PARSER_NAME = "nhtsa_official_api_json"
 API_PARSER_VERSION = "3"
-API_REQUEST_BUDGET = 500
+# Fail-closed ceiling: 2 fixed vPIC sources + up to MAX_MANUFACTURER_PAGES
+# manufacturer pages + ~150 vehicle-variable value lists + 12,340 per-make
+# GetModelsForMakeId expansions (~13k total); anything beyond aborts the run.
+API_REQUEST_BUDGET = 15000
 MANUFACTURER_PAGE_SIZE = 100
 MAX_MANUFACTURER_PAGES = 500
+MODEL_EXPANSION_LOG_BATCH = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +87,7 @@ class NhtsaApiSyncService:
                 async with NhtsaApiClient(self.config) as client:
                     if scope_name in {"all", "vpic"}:
                         variables: ApiDocument | None = None
+                        makes: ApiDocument | None = None
                         for source in VPIC_FIXED_SOURCES:
                             imported = await self._sync_source(client, source, lease)
                             active_artifact_id = imported.artifact_id
@@ -97,6 +102,50 @@ class NhtsaApiSyncService:
                             active_artifact_id = None
                             if source.dataset_name == "vpic_variables":
                                 variables = imported.document
+                            elif source.dataset_name == "vpic_makes":
+                                makes = imported.document
+
+                        # GetModelsForMakeYear 全量展開刻意不做：12,340 makes x ~46 年
+                        # ≈ 567k requests，超出 request budget 兩個數量級。allowlist 與
+                        # vpic_model_years spec 僅為抽樣決策保留（少數代表 make x 單一年份）。
+                        if makes is None:
+                            raise ValueError("vPIC make list was not collected")
+                        total_makes = len(makes.records)
+                        for offset, make_record in enumerate(makes.records, start=1):
+                            make_id = make_record.external_id
+                            if make_id is None or not make_id.isdigit():
+                                raise ValueError(
+                                    "vPIC make record has no usable Make_ID: "
+                                    f"{make_record.natural_key_text}"
+                                )
+                            source = ApiSource(
+                                key=f"vpic_models_for_make_{make_id}",
+                                dataset_name="vpic_models",
+                                url=(
+                                    "https://vpic.nhtsa.dot.gov/api/vehicles/"
+                                    f"GetModelsForMakeId/{make_id}?format=json"
+                                ),
+                                context=(
+                                    ("Make_ID", make_id),
+                                    ("Make_Name", make_record.make_name or ""),
+                                ),
+                            )
+                            imported = await self._sync_source(client, source, lease)
+                            downloaded += int(imported.downloaded)
+                            reused += int(not imported.downloaded)
+                            source_rows += imported.document.count
+                            new_versions += imported.new_versions
+                            rejected_rows += len(imported.document.rejections)
+                            publishable.append(
+                                (source.dataset_name, source.key, imported.artifact_id)
+                            )
+                            if offset % MODEL_EXPANSION_LOG_BATCH == 0:
+                                print(
+                                    f"nhtsa api vpic models expansion: "
+                                    f"{offset}/{total_makes} makes synced",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
 
                         for page in range(1, MAX_MANUFACTURER_PAGES + 1):
                             source = ApiSource(

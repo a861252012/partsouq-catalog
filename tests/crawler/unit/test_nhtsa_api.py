@@ -12,6 +12,7 @@ from partsouq_crawler.nhtsa.api import (
     vin_source_key,
 )
 from partsouq_crawler.nhtsa.datasets import ApiSource
+from partsouq_crawler.nhtsa.models import ParsedRecord
 
 VIN = "ZZZTEST00X0000001"
 
@@ -36,6 +37,139 @@ def test_api_policy_allows_collections_and_one_full_vin_decode() -> None:
     for url in forbidden:
         with pytest.raises(NhtsaApiPolicyError):
             policy.validate(url)
+
+
+def test_api_policy_allows_per_make_models_and_rejects_malformed_paths() -> None:
+    policy = NhtsaApiPolicy()
+    policy.validate("https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/460?format=json")
+    policy.validate("https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/0?format=json")
+    policy.validate(
+        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeYear/make/Tesla/modelyear/2021"
+        "?format=json"
+    )
+    policy.validate(
+        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeYear/make/AM%20General"
+        "/modelyear/2011?format=json"
+    )
+
+    forbidden = (
+        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/-1?format=json",
+        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/abc?format=json",
+        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/0460?format=json",
+        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/460?format=json&page=2",
+        (
+            "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/460"
+            "/../DecodeVinValues/" + VIN + "?format=json"
+        ),
+        (
+            "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeYear/make/Tesla"
+            "/modelyear/20?format=json"
+        ),
+        (
+            "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeYear/make/Tesla"
+            "/modelyear/2021/extra?format=json"
+        ),
+        (
+            "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeYear/make/Tesla!"
+            "/modelyear/2021?format=json"
+        ),
+    )
+    for url in forbidden:
+        with pytest.raises(NhtsaApiPolicyError):
+            policy.validate(url)
+
+
+def test_context_merge_happens_before_required_fields_validation() -> None:
+    source = ApiSource(
+        key="vpic_variable_5_values",
+        dataset_name="vpic_variable_values",
+        url=("https://vpic.nhtsa.dot.gov/api/vehicles/GetVehicleVariableValuesList/5?format=json"),
+        context=(("Variable_ID", "5"),),
+    )
+    body = json.dumps(
+        {
+            "Count": 1,
+            "Message": "Results returned successfully",
+            "Results": [{"ElementName": "Body Class", "Id": 1, "Name": "Convertible"}],
+        }
+    ).encode()
+
+    document = NhtsaApiParser().parse(body, source)
+
+    assert document.rejections == ()
+    assert len(document.records) == 1
+    assert document.records[0].natural_key_text == "5\x1f1"
+
+
+def test_vpic_models_natural_key_pairs_make_and_model() -> None:
+    parser = NhtsaApiParser()
+
+    def record_for_make(make_id: str, make_name: str, model_id: int) -> ParsedRecord:
+        source = ApiSource(
+            key=f"vpic_models_for_make_{make_id}",
+            dataset_name="vpic_models",
+            url=(
+                f"https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/{make_id}?format=json"
+            ),
+            context=(("Make_ID", make_id), ("Make_Name", make_name)),
+        )
+        body = json.dumps(
+            {
+                "Count": 1,
+                "Message": "Results returned successfully",
+                "Results": [
+                    {
+                        "Make_ID": int(make_id),
+                        "Make_Name": make_name,
+                        "Model_ID": model_id,
+                        "Model_Name": "Model 3",
+                    }
+                ],
+            }
+        ).encode()
+        document = parser.parse(body, source)
+        assert document.rejections == ()
+        return document.records[0]
+
+    tesla = record_for_make("955", "TESLA", 17102)
+    overseas = record_for_make("9995", "TESLA (OVERSEAS)", 17102)
+
+    assert tesla.external_id == "17102"
+    assert tesla.make_name == "TESLA"
+    assert tesla.model_name == "Model 3"
+    assert tesla.natural_key_text == "955\x1f17102"
+    assert overseas.natural_key_text == "9995\x1f17102"
+    assert tesla.natural_key_sha256 != overseas.natural_key_sha256
+
+
+def test_vpic_model_years_injects_year_from_context_into_payload() -> None:
+    source = ApiSource(
+        key="vpic_model_years_tesla_2021",
+        dataset_name="vpic_model_years",
+        url=(
+            "https://vpic.nhtsa.dot.gov/api/vehicles/"
+            "GetModelsForMakeYear/make/Tesla/modelyear/2021?format=json"
+        ),
+        context=(("Model_Year", "2021"),),
+    )
+    body = json.dumps(
+        {
+            "Count": 1,
+            "Message": "Results returned successfully",
+            "Results": [
+                {"Make_ID": 955, "Make_Name": "TESLA", "Model_ID": 17102, "Model_Name": "Model 3"}
+            ],
+        }
+    ).encode()
+
+    document = NhtsaApiParser().parse(body, source)
+
+    assert document.rejections == ()
+    record = document.records[0]
+    assert record.external_id == "17102"
+    assert record.make_name == "TESLA"
+    assert record.model_name == "Model 3"
+    assert json.loads(record.payload_json)["Model_Year"] == "2021"
 
 
 def test_normalize_vin_requires_full_valid_alphabet() -> None:

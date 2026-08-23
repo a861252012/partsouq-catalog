@@ -267,7 +267,20 @@ DATASET_SPECS = {
         delimiter=",",
         has_header=False,
         field_names=(),
-        required_fields=("Make_ID", "Model_ID", "Model_Name"),
+        required_fields=("Make_ID", "Make_Name", "Model_ID", "Model_Name"),
+        identity_fields=("Make_ID", "Model_ID"),
+        external_id_field="Model_ID",
+        make_field="Make_Name",
+        model_field="Model_Name",
+    ),
+    # GetModelsForMakeYear 回應僅 4 欄、不含 Model_Year；年份由 ApiSource.context
+    # 注入 payload（見 api.py parse() 的 payload.update(dict(source.context))）。
+    "vpic_model_years": DatasetSpec(
+        name="vpic_model_years",
+        delimiter=",",
+        has_header=False,
+        field_names=(),
+        required_fields=("Make_ID", "Make_Name", "Model_ID", "Model_Name"),
         identity_fields=("Model_ID",),
         external_id_field="Model_ID",
         make_field="Make_Name",
@@ -437,15 +450,13 @@ BULK_SOURCES_BY_SCOPE = {
 }
 
 VPIC_FIXED_SOURCES = (
+    # vpic_models 不再有寫死 GetModelsForMakeId/0 的固定來源：改由
+    # api_service.run() 在取得 GetAllMakes 文件後，對每個 Make_ID 動態建立
+    # vpic_models_for_make_<id> 來源展開 GetModelsForMakeId/<id>。
     ApiSource(
         "vpic_all_makes",
         "vpic_makes",
         "https://vpic.nhtsa.dot.gov/api/vehicles/GetAllMakes?format=json",
-    ),
-    ApiSource(
-        "vpic_all_models",
-        "vpic_models",
-        "https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeId/0?format=json",
     ),
     ApiSource(
         "vpic_variables",
