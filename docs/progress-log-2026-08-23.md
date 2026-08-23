@@ -116,3 +116,26 @@
    current artifact 0。沒有修改或刪除任何主 DB 資料。
 7. Docker MySQL、admin、station-admin 仍 healthy，queue-scheduler 仍 running；
    catalog／NHTSA LaunchAgent 未載入。
+
+## 2026-08-23 13:31–13:45 NHTSA lease 整合與最終交接
+
+1. 兩個實作 agent 完成未提交的 NHTSA runtime lease 與 scheduler lineage 整合稿，停在安全
+   落盤點；沒有 commit／push，也沒有碰主 DB。
+2. Runtime 已加入單 writer lease、token／expiry CAS、獨立 DB heartbeat，以及 bulk／API／VIN
+   current publish、domain completed、scheduler completed 的原子交易。
+3. Scheduler 已加入 parent→bulk／API child 直接 link；child 成功核對 exact domain run，失敗只
+   中斷 exact linked run；移除 regex、LIKE 與 output marker authority。
+4. migration 024 已進 manifest，fresh schema、runner exact contract 與 legacy stale recovery
+   都有草稿；目前 migration hash 與 manifest 一致。
+5. 聚焦 Python tests exit 0；scheduler 單檔 92 passed；NHTSA 相關 123 passed、14 MySQL gate
+   skipped。Ruff check、strict mypy 8 個 source files、`git diff --check` 通過。
+6. 真 MySQL fresh migration E2E 仍失敗：`migration:024 failed`，原因是
+   `NHTSA run lease schema contract mismatch: checks`。這是目前第一個 blocker。
+7. Ruff format check 仍指出 `src/partsouq_catalog/migrations.py` 3 處格式差異；完整 E2E、
+   MySQL race／atomic rollback、獨立 adversarial review 尚未執行。
+8. Git 基線仍為 `HEAD == origin/main == 3944312`。工作樹有 16 個 modified、1 個 untracked，
+   共 `+1703/-435`；未提交整合稿不得直接套主 DB。
+9. 再次唯讀查證主 DB：raw parts 10,000、published/current 0、quarantine 2,260、NHTSA
+   run 1／2 stale running、VIN decode／mapping／fitment 0、catalog ledger 022。
+10. 更新完整交接文件與桌面摘要。接手第一步是修 migration 024 exact CHECK gate，不是啟動
+    正式爬蟲。
