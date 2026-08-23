@@ -282,3 +282,32 @@
     皆未載入。未碰主DB、未啟動Chromium／正式爬蟲、未使用付費服務。
 11. Git仍為`HEAD == origin/main == d0b328a`，ahead／behind 0／0。工作樹25 tracked modified、
     2 untracked，tracked diff約`+5796/-645`；不得整批提交。
+
+## 2026-08-23 15:46–16:04 VIN邊界實作與最終adversarial收旂
+
+1. 統一 `vin_source_key()`，並在同一發布交易核對 lease、normalized VIN SHA-256
+   source key、artifact、唯一record、natural key、record SHA與canonical payload。
+2. API `replace_datasets`改成必須完全等於lease scope；bulk source keys也必須精確相符。
+   空API snapshot可清掉自己scope，不會刪除無關current pointer。
+3. Finalization新增imported／verified／imported_at、rejections、record rows與source_rows
+   對帳；read-only SELECT已建立明確transaction boundary，不再讀舊snapshot。
+4. 這批最新scoped gate：unit `32 passed`、NHTSA真MySQL `44 passed`、shared mapping真
+   MySQL `1 passed`；Ruff／format／3個production modules strict mypy通過；測後 `_test`
+   DB相關計數均為0。沒有寫主DB、沒有啟動瀏覽器。
+5. 主代理另外修正shutdown-before-spawn `_record_finish()` DB／RuntimeError分類，以及
+   migration DATETIME(0)／DATETIME(6)同秒邊界；聚焦回歸及migration真MySQL測試已通過。
+6. 最終獨立adversarial review確認仍有2個P1：
+   - recovery沒限制daemon，會改寫manual parent／child；terminal tuple與時間因果也不完整。
+   - admission lock release的`RuntimeError`在`dispatch_locked()`／啟動migration路徑仍可往外穿透。
+7. 同一review保留3個P2：finalization scheduler child CAS不完整、raw artifact
+   check-to-publish filesystem競態，migration仍接受parent先finish、child後start的不可能時序。
+8. deterministic Event lease barrier與完整vPIC／variable values／CSSI orchestration真MySQL
+   regression仍未補；新增測試後CI skip契約尚未由最終staged snapshot重算。
+9. 16:04、本次文件更新前實際查證`HEAD == origin/main == 585ae9e`；工作樹27
+   tracked modified、2 untracked，
+   tracked diff為`+6831/-709`。沒有stage、commit或push任何程式。
+10. 主DB重查仍為：raw／distinct 10,000／3,823；bounded／published／current
+    0／0／0；quarantine 2,260／2,260；VIN decode／mapping／fitment 0／0／0；ledger 022。
+    PartSouq run 5仍error，NHTSA run 1／2仍running。
+11. MySQL、admin、station-admin healthy，queue-scheduler running；catalog／NHTSA LaunchAgent的
+    `launchctl print`均exit 113。沒有正式crawl、hosted CI、production deploy或付費服務。
