@@ -374,7 +374,9 @@ def test_macos_catalog_scheduler_stages_a_tcc_safe_locked_runtime() -> None:
     assert "export PSQ_BOUNDED_PARTS=10000" in launcher
     assert '[[ "${PARTSOUQ_DB_NAME:-}" != "partsouq_catalog" ]]' in launcher
     assert "READY_MARKER=" in launcher
-    assert '"$PROJECT_ROOT/.venv/bin/partsouq-catalog-migrate" check' in launcher
+    assert '"PARTSOUQ_APPLY_MIGRATIONS_ON_START=1"' in launcher
+    assert "--recover-only" not in launcher
+    assert 'partsouq-catalog-migrate" apply' not in launcher
     assert launcher.index('cmp -s "$RUNTIME_CHECK"') < launcher.index('source "$RUNTIME_CONFIG"')
     assert launcher.index('source "$RUNTIME_CONFIG"') < launcher.index(
         'export CLOAKBROWSER_BINARY_PATH="$EXPECTED_CLOAK_BINARY"'
@@ -481,20 +483,11 @@ def test_macos_staged_runner_survives_source_removal_and_filters_environment(
         text=True,
     )
     assert restart.returncode == 0, restart.stderr
-    assert execution_log.read_text(encoding="utf-8").splitlines() == [
-        "partsouq-catalog-migrate",
-        "partsouq-scheduler",
-        "partsouq-catalog-migrate",
-        "partsouq-scheduler",
-    ]
+    expected_executions = ["partsouq-scheduler"]
+    assert execution_log.read_text(encoding="utf-8").splitlines() == expected_executions * 2
     assert not (project / "logs").exists()
     runtime_log = home / "Library/Application Support/partsouq-catalog/logs/runtime/crawl.log"
-    assert runtime_log.read_text(encoding="utf-8").splitlines() == [
-        "partsouq-catalog-migrate",
-        "partsouq-scheduler",
-        "partsouq-catalog-migrate",
-        "partsouq-scheduler",
-    ]
+    assert runtime_log.read_text(encoding="utf-8").splitlines() == expected_executions * 2
     ready_marker = (
         home
         / "Library/Application Support/partsouq-catalog/scheduler"
@@ -919,12 +912,8 @@ def test_macos_catalog_install_is_tcc_safe_repeatable_and_source_independent(
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert execution_log.read_text(encoding="utf-8").splitlines() == [
-        "partsouq-catalog-migrate",
-        "partsouq-scheduler",
-        "partsouq-catalog-migrate",
-        "partsouq-scheduler",
-    ]
+    expected_executions = ["partsouq-scheduler"]
+    assert execution_log.read_text(encoding="utf-8").splitlines() == expected_executions * 2
 
 
 @MACOS_LAUNCH_AGENT_ONLY

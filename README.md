@@ -75,9 +75,12 @@ docker compose up -d --build admin station-admin
 MySQL 第一次初始化時會依序載入 `db/catalog.sql`、`db/nhtsa.sql`、
 `db/admin.sql` 與 `db/station_admin.sql`。接著必須執行一次明確的
 `schema-migrate`，建立 migration ledger、驗證固定 checksum，並安全重播可重複
-執行的 migration。後台與三個 scheduler 每次啟動前只會執行 read-only 的
-migration ledger／checksum gate；
-不會自行套 DDL。現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，
+執行的 migration。Compose 後台與三個 container scheduler 每次啟動前只會執行
+read-only 的 migration ledger／checksum gate，不會自行套 DDL。host catalog
+LaunchAgent 是例外：catalog daemon 會持續持有本機 daemon lock，並在寫入 ready
+marker 前由 migration runner 依序驗證既有 ledger、回收可證明屬於本機舊程序的
+逾時 marker、套用尚未執行的版本，最後才啟動正式爬蟲。
+現有 volume 不會自動重跑初始化 SQL；開發環境若要重建資料庫，
 先確認無需保留資料後再使用 `docker compose down -v`。
 Compose 只把各服務需要的變數傳入 container：root 密碼只給 MySQL，8000 token
 只給 admin，8086 的 session／登入密碼只給 station-admin。三個 scheduler、兩套後台、
@@ -268,6 +271,10 @@ headed Chromium 必須從 macOS Aqua session 啟動；LaunchAgent 除了
 repository，因此不需要替 LaunchAgent 手動授予 Full Disk Access。runner 仍會
 拒絕未帶 marker、SSH、CI 與 Codex sandbox 直接執行，避免 AppKit 以 `SIGABRT`
 結束 Chromium 並跳出「未預期的結束」提示。
+正式 runner 只支援此本機 LaunchAgent 作為 catalog daemon owner；Compose catalog
+scheduler 不得同時啟動。它會同時持有 daemon/job flock，並在 migration checksum
+與既有 ledger 完整通過後，才回收唯一一筆逾時的 daemon marker。近期、複數、無法
+唯一連結的 marker，或任何 NHTSA／後台 writer 都會 fail closed，不會被誤改。
 
 ```bash
 # 建立 hash-locked release、render／lint 並安裝 plist，不啟動爬蟲：

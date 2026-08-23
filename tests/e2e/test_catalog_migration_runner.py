@@ -462,6 +462,72 @@ def test_fresh_schema_replay_is_repeatable_and_fail_closed(
         connection.close()
 
 
+def test_apply_recovers_one_stale_catalog_daemon_after_ledger_validation(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    job_id, run_id = _insert_running_daemon(migration_database, "safe-auto-recovery")
+
+    assert runner.apply(recover_stale_catalog_daemon_seconds=900) == ()
+    runner.check()
+
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,exit_code,finished_at FROM scheduled_job_runs WHERE id=%s",
+                (job_id,),
+            )
+            job = cursor.fetchone()
+            assert job and job["status"] == "failed"
+            assert job["exit_code"] == catalog_migrations.STALE_SCHEDULER_EXIT_CODE
+            assert job["finished_at"] is not None
+            cursor.execute("SELECT status,finished_at FROM crawl_runs WHERE id=%s", (run_id,))
+            run = cursor.fetchone()
+            assert run and run["status"] == "interrupted"
+            assert run["finished_at"] is not None
+    finally:
+        connection.close()
+
+
+def test_stale_catalog_daemon_is_unchanged_when_ledger_checksum_drifts(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    job_id, run_id = _insert_running_daemon(migration_database, "checksum-drift")
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE catalog_schema_ledger SET sha256=%s WHERE change_key='migration:001'",
+                ("0" * 64,),
+            )
+        with pytest.raises(MigrationError, match="checksum drift"):
+            runner.apply(recover_stale_catalog_daemon_seconds=900)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,exit_code,finished_at FROM scheduled_job_runs WHERE id=%s", (job_id,)
+            )
+            job = cursor.fetchone()
+            assert job and job["status"] == "running"
+            assert job["exit_code"] is None and job["finished_at"] is None
+            cursor.execute("SELECT status,finished_at FROM crawl_runs WHERE id=%s", (run_id,))
+            run = cursor.fetchone()
+            assert run and run["status"] == "running" and run["finished_at"] is None
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("version", (13, 14))
 @pytest.mark.parametrize("state", ("applying", "failed"))
 def test_superseded_dirty_retry_replays_final_index_contract(
@@ -1240,6 +1306,30 @@ def _insert_linked_run(
             run_id = cursor.lastrowid
             assert run_id is not None
             return run_id
+    finally:
+        connection.close()
+
+
+def _insert_running_daemon(database: MigrationDatabase, suffix: str) -> tuple[int, int]:
+    connection = database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs "
+                "(job_name,trigger_mode,status,started_at,finished_at,exit_code,output_text) "
+                "VALUES ('catalog','daemon','running','2026-01-01 00:00:00',NULL,NULL,'fixture')"
+            )
+            job_id = cursor.lastrowid
+            assert job_id is not None
+            cursor.execute(
+                "INSERT INTO crawl_runs "
+                "(run_key,started_at,status,dataset_kind,target_parts,scheduled_job_run_id) "
+                "VALUES (%s,'2026-01-01 00:00:00','running','bounded',10000,%s)",
+                (f"migration-{suffix}", job_id),
+            )
+            run_id = cursor.lastrowid
+            assert run_id is not None
+            return int(job_id), int(run_id)
     finally:
         connection.close()
 

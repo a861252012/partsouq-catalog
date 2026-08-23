@@ -237,6 +237,7 @@ RUNTIME_ENV=(
   "SHELL=${SHELL:-/bin/zsh}"
   "PARTSOUQ_LAUNCHD_JOB=1"
   "LAUNCHD_JOB=1"
+  "PARTSOUQ_APPLY_MIGRATIONS_ON_START=1"
   "PYTHONDONTWRITEBYTECODE=1"
   "PARTSOUQ_HOME=$PARTSOUQ_HOME"
   "PARTSOUQ_DB_HOST=${PARTSOUQ_DB_HOST:-127.0.0.1}"
@@ -279,10 +280,6 @@ if [[ ! -x "$PROJECT_ROOT/.venv/bin/partsouq-scheduler" ]]; then
   print -u2 "missing staged scheduler: $PROJECT_ROOT/.venv/bin/partsouq-scheduler"
   exit 2
 fi
-if [[ ! -x "$PROJECT_ROOT/.venv/bin/partsouq-catalog-migrate" ]]; then
-  print -u2 "missing staged migration checker: $PROJECT_ROOT/.venv/bin/partsouq-catalog-migrate"
-  exit 2
-fi
 if [[ ! -x "$PSQ_CLOAK_PYTHON" ]]; then
   print -u2 "missing staged CloakBrowser Python: $PSQ_CLOAK_PYTHON"
   exit 2
@@ -303,8 +300,6 @@ if ! /usr/bin/env -i \
   print -u2 "staged CloakBrowser package is unavailable"
   exit 2
 fi
-
-/usr/bin/env -i "${RUNTIME_ENV[@]}" "$PROJECT_ROOT/.venv/bin/partsouq-catalog-migrate" check
 
 exec /usr/bin/env -i "${RUNTIME_ENV[@]}" "$PROJECT_ROOT/.venv/bin/partsouq-scheduler" \
   --job catalog \

@@ -22,6 +22,7 @@ type ChangeKind = Literal["migration", "asset"]
 
 LEDGER_TABLE = "catalog_schema_ledger"
 SUPERSEDED_VERSIONS = (13, 14)
+STALE_SCHEDULER_EXIT_CODE = 125
 
 # Published migrations are immutable. Hashes cover the exact file bytes.
 # fmt: off
@@ -425,7 +426,13 @@ class CatalogMigrationRunner:
         retry_version: int | None = None,
         allow_v5_rebuild: bool = False,
         retry_station_asset: bool = False,
+        recover_stale_catalog_daemon_seconds: int | None = None,
     ) -> tuple[int, ...]:
+        if (
+            recover_stale_catalog_daemon_seconds is not None
+            and recover_stale_catalog_daemon_seconds <= 0
+        ):
+            raise ValueError("stale catalog daemon age must be positive")
         changes = load_schema_changes(self._migrations_dir, self._station_schema_path)
         connection = self._connection_factory()
         lock_name: str | None = None
@@ -448,8 +455,18 @@ class CatalogMigrationRunner:
                     raise MigrationError("cannot retry without an existing schema ledger")
                 records = {}
 
-            _assert_no_running_jobs(connection, allow_repairable_catalog=True)
-            _repair_stale_catalog_runs(connection)
+            repairable_scheduler_id = None
+            if recover_stale_catalog_daemon_seconds is not None:
+                repairable_scheduler_id = _repairable_stale_catalog_daemon_id(
+                    connection,
+                    recover_stale_catalog_daemon_seconds,
+                )
+            _assert_no_running_jobs(
+                connection,
+                allow_repairable_catalog=True,
+                repairable_scheduled_job_id=repairable_scheduler_id,
+            )
+            _repair_stale_catalog_runs(connection, repairable_scheduler_id)
             _assert_no_running_jobs(connection)
             if not _table_exists(connection, LEDGER_TABLE):
                 _create_ledger(connection)
@@ -552,7 +569,10 @@ def _load_ledger(connection: MigrationConnection) -> list[Mapping[str, object]]:
 
 
 def _assert_no_running_jobs(
-    connection: MigrationConnection, *, allow_repairable_catalog: bool = False
+    connection: MigrationConnection,
+    *,
+    allow_repairable_catalog: bool = False,
+    repairable_scheduled_job_id: int | None = None,
 ) -> None:
     for table in (
         "crawl_runs",
@@ -569,16 +589,30 @@ def _assert_no_running_jobs(
             and _column_exists(connection, "crawl_runs", "scheduled_job_run_id")
         )
         with connection.cursor() as cursor:
-            if repairable_catalog:
+            if table == "scheduled_job_runs" and repairable_scheduled_job_id is not None:
+                cursor.execute(
+                    "SELECT COUNT(*) AS row_count FROM scheduled_job_runs "
+                    "WHERE status='running' AND id<>%s",
+                    (repairable_scheduled_job_id,),
+                )
+            elif repairable_catalog:
+                repairable_running_scheduler = ""
+                parameters: tuple[object, ...] = ()
+                if repairable_scheduled_job_id is not None:
+                    repairable_running_scheduler = " OR (jobs.id=%s AND jobs.status='running')"
+                    parameters = (repairable_scheduled_job_id,)
                 cursor.execute(
                     "SELECT COUNT(*) AS row_count FROM crawl_runs AS runs "
                     "LEFT JOIN scheduled_job_runs AS jobs "
                     "ON jobs.id=runs.scheduled_job_run_id WHERE runs.status='running' "
                     "AND NOT (runs.scheduled_job_run_id IS NOT NULL AND jobs.id IS NOT NULL "
-                    "AND jobs.job_name='catalog' AND jobs.status='failed' "
+                    "AND jobs.job_name='catalog' AND ((jobs.status='failed' "
                     "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
-                    "AND jobs.exit_code <> 0 AND (SELECT COUNT(*) FROM crawl_runs AS linked "
-                    "WHERE linked.scheduled_job_run_id=jobs.id)=1)"
+                    "AND jobs.exit_code <> 0)"
+                    f"{repairable_running_scheduler}) "
+                    "AND (SELECT COUNT(*) FROM crawl_runs AS linked "
+                    "WHERE linked.scheduled_job_run_id=jobs.id)=1)",
+                    parameters,
                 )
             else:
                 cursor.execute(
@@ -589,30 +623,99 @@ def _assert_no_running_jobs(
             raise MigrationError(f"running jobs exist in {table}; stop writers before migration")
 
 
-def _repair_stale_catalog_runs(connection: MigrationConnection) -> None:
+def _repairable_stale_catalog_daemon_id(
+    connection: MigrationConnection,
+    minimum_age_seconds: int,
+) -> int | None:
+    required_columns = (
+        ("scheduled_job_runs", "trigger_mode"),
+        ("scheduled_job_runs", "started_at"),
+        ("crawl_runs", "scheduled_job_run_id"),
+    )
+    if (
+        not _table_exists(connection, "crawl_runs")
+        or not _table_exists(connection, "scheduled_job_runs")
+        or any(not _column_exists(connection, table, column) for table, column in required_columns)
+    ):
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT jobs.id, "
+            "(BINARY jobs.job_name=BINARY 'catalog' "
+            "AND BINARY jobs.trigger_mode=BINARY 'daemon' "
+            "AND jobs.started_at < UTC_TIMESTAMP() - INTERVAL %s SECOND) "
+            "AS stale_catalog_daemon, "
+            "COUNT(runs.id) AS linked_runs, "
+            "COALESCE(SUM(CASE WHEN runs.id IS NOT NULL "
+            "AND BINARY runs.status NOT IN (BINARY 'running', BINARY 'bounded_success') "
+            "THEN 1 ELSE 0 END),0) AS incompatible_runs "
+            "FROM scheduled_job_runs AS jobs "
+            "LEFT JOIN crawl_runs AS runs ON runs.scheduled_job_run_id=jobs.id "
+            "WHERE BINARY jobs.status=BINARY 'running' "
+            "GROUP BY jobs.id,jobs.job_name,jobs.trigger_mode,jobs.started_at "
+            "ORDER BY jobs.id LIMIT 2",
+            (minimum_age_seconds,),
+        )
+        rows = list(cursor.fetchall())
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    if (
+        int(row["stale_catalog_daemon"]) != 1
+        or int(row["linked_runs"]) > 1
+        or int(row["incompatible_runs"]) != 0
+    ):
+        return None
+    return int(row["id"])
+
+
+def _repair_stale_catalog_runs(
+    connection: MigrationConnection,
+    scheduled_job_run_id: int | None = None,
+) -> None:
     if (
         not _table_exists(connection, "crawl_runs")
         or not _table_exists(connection, "scheduled_job_runs")
         or not _column_exists(connection, "crawl_runs", "scheduled_job_run_id")
     ):
         return
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "UPDATE crawl_runs AS runs "
-            "JOIN scheduled_job_runs AS jobs ON jobs.id=runs.scheduled_job_run_id "
-            "JOIN (SELECT scheduled_job_run_id FROM crawl_runs "
-            "WHERE scheduled_job_run_id IS NOT NULL GROUP BY scheduled_job_run_id "
-            "HAVING COUNT(*)=1) AS unique_links "
-            "ON unique_links.scheduled_job_run_id=jobs.id "
-            "SET runs.status='interrupted',"
-            "runs.finished_at=COALESCE(runs.finished_at,jobs.finished_at),"
-            "runs.error_msg=CONCAT_WS('\\n',NULLIF(runs.error_msg,''),"
-            "'migration preflight: linked catalog scheduler failed; stale run interrupted') "
-            "WHERE runs.status='running' AND runs.scheduled_job_run_id IS NOT NULL "
-            "AND jobs.job_name='catalog' AND jobs.status='failed' "
-            "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
-            "AND jobs.exit_code <> 0"
-        )
+    connection.begin()
+    try:
+        with connection.cursor() as cursor:
+            if scheduled_job_run_id is not None:
+                cursor.execute(
+                    "UPDATE scheduled_job_runs SET status='failed',finished_at=UTC_TIMESTAMP(),"
+                    "exit_code=%s,output_text=RIGHT(CONCAT(COALESCE(output_text,''),%s),60000) "
+                    "WHERE id=%s AND status='running'",
+                    (
+                        STALE_SCHEDULER_EXIT_CODE,
+                        "\nformal host daemon owns the local locks; stale scheduler recovered "
+                        "before migration\n",
+                        scheduled_job_run_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise MigrationError("stale catalog scheduler marker changed during recovery")
+            cursor.execute(
+                "UPDATE crawl_runs AS runs "
+                "JOIN scheduled_job_runs AS jobs ON jobs.id=runs.scheduled_job_run_id "
+                "JOIN (SELECT scheduled_job_run_id FROM crawl_runs "
+                "WHERE scheduled_job_run_id IS NOT NULL GROUP BY scheduled_job_run_id "
+                "HAVING COUNT(*)=1) AS unique_links "
+                "ON unique_links.scheduled_job_run_id=jobs.id "
+                "SET runs.status='interrupted',"
+                "runs.finished_at=COALESCE(runs.finished_at,jobs.finished_at),"
+                "runs.error_msg=CONCAT_WS('\\n',NULLIF(runs.error_msg,''),"
+                "'migration preflight: linked catalog scheduler failed; stale run interrupted') "
+                "WHERE runs.status='running' AND runs.scheduled_job_run_id IS NOT NULL "
+                "AND jobs.job_name='catalog' AND jobs.status='failed' "
+                "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
+                "AND jobs.exit_code <> 0"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def _column_exists(connection: MigrationConnection, table: str, column: str) -> bool:

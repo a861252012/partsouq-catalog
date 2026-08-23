@@ -2052,3 +2052,80 @@ def test_daemon_rejects_non_positive_cli_seconds(option, value, monkeypatch) -> 
     )
 
     assert scheduler.main() == 2
+
+
+def test_catalog_auto_migration_runs_under_daemon_and_job_locks_before_ready(
+    monkeypatch,
+) -> None:
+    stop_event = FakeStopEvent()
+    stop_event.stopped = True
+    daemon_lock = mock.MagicMock()
+    job_lock = mock.MagicMock()
+    runner = mock.MagicMock()
+    ready = mock.MagicMock()
+    recover = mock.MagicMock(return_value=False)
+    monkeypatch.setenv("PARTSOUQ_APPLY_MIGRATIONS_ON_START", "1")
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        mock.MagicMock(return_value=daemon_lock),
+    )
+    try_lock = mock.MagicMock(return_value=job_lock)
+    monkeypatch.setattr(scheduler, "_try_lock", try_lock)
+    monkeypatch.setattr(scheduler, "CatalogMigrationRunner", mock.MagicMock(return_value=runner))
+    monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", recover)
+    monkeypatch.setattr(scheduler, "_write_daemon_ready_marker", ready)
+
+    assert scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event) == 0
+    try_lock.assert_called_once_with("scheduler-job", "catalog")
+    runner.apply.assert_called_once_with(
+        recover_stale_catalog_daemon_seconds=scheduler.RECOVERY_MIN_AGE_SECONDS,
+    )
+    runner.check.assert_called_once_with()
+    recover.assert_called_once_with("catalog")
+    ready.assert_called_once_with()
+    job_lock.close.assert_called_once_with()
+    daemon_lock.close.assert_called_once_with()
+
+
+def test_catalog_auto_migration_failure_stops_before_ready_or_dispatch(monkeypatch) -> None:
+    stop_event = FakeStopEvent()
+    daemon_lock = mock.MagicMock()
+    job_lock = mock.MagicMock()
+    runner = mock.MagicMock()
+    runner.apply.side_effect = scheduler.MigrationError("ledger checksum drift")
+    ready = mock.MagicMock()
+    dispatch = mock.MagicMock()
+    monkeypatch.setenv("PARTSOUQ_APPLY_MIGRATIONS_ON_START", "1")
+    monkeypatch.setattr(scheduler, "_wait_for_daemon_lock", lambda _job, _stop: daemon_lock)
+    monkeypatch.setattr(scheduler, "_try_lock", lambda _prefix, _job: job_lock)
+    monkeypatch.setattr(scheduler, "CatalogMigrationRunner", mock.MagicMock(return_value=runner))
+    monkeypatch.setattr(scheduler, "_write_daemon_ready_marker", ready)
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+
+    assert (
+        scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event)
+        == scheduler.SCHEDULER_DB_ERROR_EXIT_CODE
+    )
+    runner.check.assert_not_called()
+    ready.assert_not_called()
+    dispatch.assert_not_called()
+    job_lock.close.assert_called_once_with()
+    daemon_lock.close.assert_called_once_with()
+
+
+def test_catalog_auto_migration_refuses_when_job_lock_is_owned(monkeypatch) -> None:
+    stop_event = FakeStopEvent()
+    daemon_lock = mock.MagicMock()
+    runner = mock.MagicMock()
+    monkeypatch.setenv("PARTSOUQ_APPLY_MIGRATIONS_ON_START", "1")
+    monkeypatch.setattr(scheduler, "_wait_for_daemon_lock", lambda _job, _stop: daemon_lock)
+    monkeypatch.setattr(scheduler, "_try_lock", mock.MagicMock(return_value=None))
+    monkeypatch.setattr(scheduler, "CatalogMigrationRunner", runner)
+
+    assert (
+        scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event)
+        == scheduler.LOCK_BUSY_EXIT_CODE
+    )
+    runner.assert_not_called()
+    daemon_lock.close.assert_called_once_with()

@@ -27,6 +27,11 @@ from .admission import (
     release_catalog_writer_admission,
 )
 from .config import BASE_DIR, DB_CONFIG, LOG_DIR
+from .migrations import (
+    STALE_SCHEDULER_EXIT_CODE,
+    CatalogMigrationRunner,
+    MigrationError,
+)
 from .state_files import ensure_private_state_directory, open_private_state_file
 
 MAX_OUTPUT_CHARS = 60_000
@@ -37,7 +42,7 @@ CHILD_PIPE_DRAIN_TIMEOUT_SECONDS = float(
     os.getenv("SCHEDULER_CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", "5")
 )
 CHILD_STALL_EXIT_CODE = 124
-INTERRUPTED_EXIT_CODE = 125
+INTERRUPTED_EXIT_CODE = STALE_SCHEDULER_EXIT_CODE
 LOCK_BUSY_EXIT_CODE = 75
 # scheduler 自身的 DB 紀錄失敗（_record_start/_record_finish/_recover）：
 # 與子程序的站台失敗（exit=1）區分，daemon 的 MAX_CONSECUTIVE_FAILURES
@@ -867,15 +872,38 @@ def run_daemon(
         return 0
     previous_trigger_mode = getattr(_JOB_CONTEXT, "trigger_mode", None)
     _JOB_CONTEXT.trigger_mode = "daemon"
-    _write_daemon_ready_marker()
-    failures = 0
-    non_site_failures = 0
-    schedule_read_failures = 0
-    completion_check_failures = 0
-    wait_seconds = 0.0
-    needs_schedule_check = job != "pending"
-    announce_completion = False
     try:
+        if job == "catalog" and os.getenv("PARTSOUQ_APPLY_MIGRATIONS_ON_START") == "1":
+            job_lock = _try_lock("scheduler-job", job)
+            if job_lock is None:
+                print("catalog 工作仍由另一個程序持有；不可進行啟動升級", file=sys.stderr)
+                return LOCK_BUSY_EXIT_CODE
+            try:
+                runner = CatalogMigrationRunner()
+                runner.apply(
+                    recover_stale_catalog_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
+                )
+                runner.check()
+                _recover_interrupted_job_runs(job)
+            except (
+                MigrationError,
+                ActiveDaemonRun,
+                AdmissionLockBusy,
+                pymysql.MySQLError,
+            ) as error:
+                print(f"catalog 啟動升級失敗：{error}", file=sys.stderr)
+                return SCHEDULER_DB_ERROR_EXIT_CODE
+            finally:
+                job_lock.close()
+
+        _write_daemon_ready_marker()
+        failures = 0
+        non_site_failures = 0
+        schedule_read_failures = 0
+        completion_check_failures = 0
+        wait_seconds = 0.0
+        needs_schedule_check = job != "pending"
+        announce_completion = False
         while not stop_event.wait(wait_seconds):
             if needs_schedule_check:
                 try:
