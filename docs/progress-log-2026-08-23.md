@@ -160,3 +160,26 @@
    2,260、VIN decode/mapping/fitment 皆 0、catalog ledger 022；NHTSA run 1/2 仍 running。
 10. MySQL、admin、station-admin healthy，queue-scheduler running；catalog/NHTSA LaunchAgent
     未載入。完整現況與接手順序已更新到 `docs/handoff-2026-08-23.md`。
+
+## 2026-08-23 14:05–14:19 最終交接收斂
+
+1. 確認 Git 已推送基線為 `HEAD == origin/main == f634b68`，branch 沒有 ahead／behind。
+2. 工作樹目前有 20 個 modified、2 個 untracked，約 `+3420/-587`；包含 NHTSA
+   lease／atomic publish 與 PartSouq bounded resume 兩批未提交修正。
+3. NHTSA runtime 已補齊 intermediate artifact lease fence、heartbeat stop／bounded join、
+   cleanup error、lock 後 fresh DB timestamp 與跨 TTL finalize；scheduler 已修正 lock order 及
+   completed tuple authority。
+4. 實作 agent scoped gate：NHTSA progress 17 passed、crawler unit 130 passed、NHTSA 真
+   MySQL 19 passed、scheduler unit 95 passed、scheduler真 MySQL 9 passed，Ruff／mypy 通過。
+5. 主 agent以 `partsouq_catalog_test` 實跑 unified mapping，確認仍失敗：fixture 在取得 lease
+   前呼叫 `create_artifact()`，回 `TypeError: missing 1 required positional argument: 'lease'`。
+6. PartSouq run 5 的新根因已確認：membership 已達 10,000，但仍有 scope error；舊 resolver
+   會續用同 run，而 remaining=0，形成無法修復的永久重試。
+7. bounded resume 草稿已落在 `repositories.py` 與 `test_partsouq_bounded_limit.py`：達配額且
+   有 error 時拒絕舊 run、保留 raw/artifact/lineage，讓 scheduler 建新 logical run。
+8. 新增 bounded resume unit 聚焦測試 `4 passed`、Ruff check 通過；Ruff format仍失敗，真
+   MySQL 參數化測試尚未執行，尚未獨立 review，因此不得啟動正式 10,000。
+9. 唯讀重查主 DB：raw 10,000、distinct 3,823、bounded/published/current 皆 0、quarantine
+   2,260、VIN decode/mapping/fitment 皆 0、NHTSA artifacts 6/0、ledger 022。
+10. MySQL、admin、station-admin healthy，queue-scheduler running；catalog／NHTSA LaunchAgent
+    均未載入（`launchctl print` exit 113）。沒有寫主 DB、沒有啟動爬蟲、沒有跑完整 E2E。
