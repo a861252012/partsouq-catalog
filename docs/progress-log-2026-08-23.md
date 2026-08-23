@@ -205,3 +205,31 @@
    LaunchAgent 均未載入。沒有正式 crawl、沒有完整 E2E、沒有使用付費服務。
 10. 已依最新證據更新最終交接文件；下一位 agent 應先修上述小範圍 gate／P2，再拆成
     NHTSA 與 PartSouq 兩個獨立 commit，禁止整批直接提交。
+
+## 2026-08-23 14:39–15:00 最終交接收尾
+
+1. 修正 `tests/test_unified_project.py` 4 個舊 scheduler fake signature；精準重跑 `4 passed`。
+2. 修正 NHTSA 三個 review P2：exit-0／non-exact domain lease、bulk／API artifact identity、
+   parent child `finished_at` recovery，並補 unit與真 MySQL regression。
+3. 真 MySQL測試曾實際抓到 MySQL 8.4 self-update error 1093；stale parent recovery 改成
+   `LEFT JOIN` active child 後，NHTSA兩個 integration files重跑 `35 passed`。
+4. 完整無 DB／browser suite 最終為 `786 passed, 164 skipped, 0 failed`；JUnit 在
+   `/private/tmp/nhtsa-current-full-unit.xml`，tests=950、failures=0、errors=0、skips=164。
+5. 獨立 gate audit確認新增 4 個 MySQL cases 後，Ubuntu CI unit預期 skip 應為 220：本機
+   gated skips 164，加唯一 macOS-only marker展開 56。已將 workflow與 contract從 216改為
+   220；這是 marker模擬，尚未宣稱 Ubuntu hosted runner實跑。
+6. CI contract `7 passed`；CI YAML parse `yaml-ok`；17 個 scoped Python files的 Ruff check／
+   format通過；strict mypy先前已通過；`git diff --check`通過。
+7. `partsouq_catalog_test` 清理讀回：NHTSA sync runs、source artifacts、current artifacts、
+   scheduled NHTSA jobs均為 0。測試沒有寫主 DB。
+8. 唯讀重查主 DB：raw 10,000、distinct part numbers 3,823、bounded／published／current
+   仍為 0、quarantine 2,260、VIN decode／mapping／fitment均為 0、ledger仍到 022。
+9. PartSouq run 5仍是 error，evidence collecting、artifact／record count為 0；NHTSA run 1／2
+   仍是 running，source/current artifacts為 6／0。沒有人工改狀態或刪資料。
+10. MySQL、admin、station-admin仍 healthy，queue-scheduler running；catalog／NHTSA
+    LaunchAgent未載入。沒有正式 crawl、production deploy、hosted CI或付費服務。
+11. 工作樹程式現為 23 tracked modified、2 untracked，tracked diff約 `+4078/-607`；NHTSA
+    scoped gate雖綠，仍須完成整體 diff review後單獨 commit；PartSouq direct explicit bounded
+    key bypass仍是待修 P2。
+12. 依上述最新證據重寫 `docs/handoff-2026-08-23.md` 與桌面摘要；正式 10,000 publish、
+    授權 VIN decode／mapping／fitment及正式資料 real Chrome E2E仍未完成。
