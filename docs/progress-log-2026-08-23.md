@@ -183,3 +183,25 @@
    2,260、VIN decode/mapping/fitment 皆 0、NHTSA artifacts 6/0、ledger 022。
 10. MySQL、admin、station-admin healthy，queue-scheduler running；catalog／NHTSA LaunchAgent
     均未載入（`launchctl print` exit 113）。沒有寫主 DB、沒有啟動爬蟲、沒有跑完整 E2E。
+
+## 2026-08-23 14:19–14:39 最終交接校正
+
+1. 確認 Git 基線為 `HEAD == origin/main == 09f0daf`；程式 working tree 仍有 20 個 modified、
+   2 個 untracked，tracked diff 約 `+3943/-598`。沒有提交任何程式草稿。
+2. 唯讀重查主 DB：raw parts 10,000、distinct part numbers 3,823、bounded／published／current
+   皆 0、quarantine 2,260、VIN decode／mapping／fitment皆 0；crawl run 5 仍為 error。
+3. NHTSA run 1／2 仍為 running；source artifacts 6（5 imported、1 importing）、current 0；
+   catalog ledger 仍只到 022。主 DB沒有套 023／024，也沒有人工改狀態。
+4. unified MySQL mapping 的 lease fixture blocker 已修正，先前真 MySQL重跑為 `1 passed`。
+5. NHTSA runtime 最新 scoped gate：focused unit 23 passed、crawler unit 136 passed、真 MySQL
+   integration 22 passed；Ruff、format、strict mypy、`git diff --check` 通過。
+6. 主 agent精準重跑 `tests/test_unified_project.py` 4 個 scheduler案例，結果 `4 failed`；原因是
+   測試 fake 尚未接受新的 parent／`parent_scheduled_job_run_id` 介面。
+7. 獨立 review 另確認 3 個 NHTSA P2：exit 0 但非 exact tuple 時 linked domain lease 未立即
+   中斷；bulk／API artifact identity gate 不完整；parent recovery 未要求 child `finished_at`。
+8. PartSouq bounded resume 已有 unit 6 passed、真 MySQL 3 passed、單檔 bounded suite exit 0、
+   Ruff／mypy／diff clean；獨立 review 仍找到 direct explicit bounded key bypass 這 1 個 P2。
+9. Docker MySQL／admin／station-admin仍 healthy，queue-scheduler running；catalog／NHTSA
+   LaunchAgent 均未載入。沒有正式 crawl、沒有完整 E2E、沒有使用付費服務。
+10. 已依最新證據更新最終交接文件；下一位 agent 應先修上述小範圍 gate／P2，再拆成
+    NHTSA 與 PartSouq 兩個獨立 commit，禁止整批直接提交。
