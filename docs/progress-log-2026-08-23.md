@@ -273,7 +273,8 @@
    scoped結果`107 passed`，真MySQL`2 passed`；尚未做主代理整合review。
 6. 尚未實作：VIN payload／artifact／source key exact binding、`replace_datasets` lease scope限制、
    deterministic lease barrier與完整API orchestration regression。
-7. PartSouq direct bounded explicit `PSQ_BOUNDED_RUN_KEY` bypass仍未修。
+7. PartSouq direct bounded explicit `PSQ_BOUNDED_RUN_KEY` bypass：已修——一律禁止 explicit
+   key（scheduled/direct 同規則），補 direct regression；scoped unit 全綠後待真 MySQL 重跑。
 8. 15:46唯讀重查主DB：raw／distinct為10,000／3,823；bounded／published／current為0／0／0；
    quarantine total／unresolved為2,260／2,260；VIN decode／mapping／fitment為0／0／0；ledger到022。
 9. crawl run5仍是error、target／parts_ok為10,000／10,000、evidence collecting且artifact／record
@@ -311,3 +312,47 @@
     PartSouq run 5仍error，NHTSA run 1／2仍running。
 11. MySQL、admin、station-admin healthy，queue-scheduler running；catalog／NHTSA LaunchAgent的
     `launchctl print`均exit 113。沒有正式crawl、hosted CI、production deploy或付費服務。
+
+## 2026-08-23 16:04之後 vPIC實測修訂與A1/B1收尾（接手工作階段1）
+
+1. **live API 實測**：`GetWMIs` 端點已被 NHTSA 移除（帶/不帶 page 皆回
+   "No HTTP resource was found"）；`GetAllMakes` 單請求 12,340 筆不分頁；
+   `GetModelsForMakeId/<id>` 正常；`GetModelsForMakeYear` 回應僅4欄、無
+   `Model_Year`；`DecodeWMI/{wmi}` 可用但無法枚舉；VNCS `VNCSEXLRPT.aspx`
+   存活，控制項實名 `dlFtrMOBTYPE`/`dlFtrPERIOD`/`dlFtrTESTTYPE`。
+2. **文件修訂**：`docs/implementation-plan-2026-08-23.md` 重寫為 v2——移除
+   GetWMIs 子計畫、修正 request budget 數學（567k≠3000-4000）、
+   `vpic_model_years.required_fields` 移除 `Model_Year`（改 context 注入）、
+   「三項決策」更正為四項、VNCS 唯一鍵改為 VIN 條件唯一（generated column）。
+3. **B-1 修正**：`crawler.py` bounded run 一律禁止 `PSQ_BOUNDED_RUN_KEY`
+   （scheduled/direct 同規則）；新增 direct regression test。舊錯誤訊息字串
+   全 repo 無殘留。`handoff-2026-08-23.md`「尚未修正」段同步標記已修。
+4. **Skip 契約更正**：unit job 期望值 217 → **262**（=206 env-gated + 56
+   macOS-gated；與 e2e job 的 56 交叉驗證）。本地 junit 實測 206 筆 skip
+   全數在允許清單內。217 初稿值的推導無法重現，判定為過時套件狀態下誤算。
+5. **品質關卡（本機 macOS / Python 3.14.5）**：ruff check ✓、ruff format ✓
+   （152 files）、mypy --strict ✓（95 files）、unit suite **800 passed /
+   206 skipped**、skip 契約 206 ✓、`test_ci_contract.py` 7 passed。
+6. 待辦：真 MySQL 測試（NHTSA_TEST_MYSQL=1 等）→ 分批 commit/push。
+
+## 2026-08-23（接手工作階段2）queue 觸發鏈修正與真MySQL全綠
+
+1. **發現 P1 級生產缺陷（未提交工作內）**：admin API 允許 `nhtsa-bulk/api/vin`
+   請求，由 scheduler pending 路徑以 `_JOB_CONTEXT.trigger_mode='queue'` 派發；
+   但工作樹新增的 `_assert_active_lease`、NHTSA child 恢復查詢與 migration
+   `_repairable_stale_nhtsa_runs` 全部只認 `'daemon'` → 所有 queue 觸發的
+   NHTSA run 無法 finalize、中斷後永遠卡 running。
+2. **修正不變量**：NHTSA 合法觸發來源 = {daemon, queue}；manual/direct 一律
+   拒絕。改動：repository lineage 斷言、scheduler 三個 child 恢復 UPDATE、
+   active 偵測 query、migrations 兩處 repairable filter。parent/catalog/
+   daemon-cadence 維持 daemon-only（語意正確，不變）。
+3. **測試修正**：integration fixtures 的 'manual' 改為 'daemon'（模擬主要
+   生產路徑）；manual 負向案例保留並補齊合法 lease 欄位（舊寫法違反新 CHECK
+   約束）；`test_successful_child_with_exact_completed_domain_is_completed`
+   參數化覆蓋 daemon+queue；修復 concurrent writer 測試的 scope/job 錯配；
+   bounded_admin_performance 的 DROP TABLE 加 FOREIGN_KEY_CHECKS 暫關
+   （新 FK fk_nhtsa_current_published_run 所需）。
+4. **驗證**：真 MySQL 全套 `999 passed / 9 skipped / 0 failed`（7m06s，
+   partsouq_catalog_test，ledger=24）；純 unit `801 passed / 207 skipped`；
+   skip 契約更新為 **263 = 207 env-gated + 56 macOS-gated**（ci.yml +
+   test_ci_contract 同步）；ruff/format/mypy/git diff --check 全綠。
