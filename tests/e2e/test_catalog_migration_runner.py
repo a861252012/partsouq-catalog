@@ -143,7 +143,7 @@ def _downgrade_nhtsa_024_schema(cursor: DictCursor) -> None:
         "DROP COLUMN parent_scheduled_job_run_id"
     )
     cursor.execute("DELETE FROM nhtsa_schema_migrations WHERE version=2")
-    cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=24")
+    cursor.execute("DELETE FROM catalog_schema_ledger WHERE version >= 24")
 
 
 def _insert_stale_direct_nhtsa_tuple(
@@ -697,12 +697,12 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24,25)"
             )
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
 
-        assert runner.apply() == (18, 19, 20, 21, 22, 23, 24)
+        assert runner.apply() == (18, 19, 20, 21, 22, 23, 24, 25)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -729,7 +729,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
     connection = migration_database.connect()
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24,25)")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_verified_evidence")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_evidence_status")
             cursor.execute(
@@ -912,7 +912,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
                     (category_id, code, code, url, run_key),
                 )
 
-        assert runner.apply() == (22, 23, 24)
+        assert runner.apply() == (22, 23, 24, 25)
         runner.check()
         assert runner.apply() == ()
 
@@ -1088,9 +1088,9 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "ALTER TABLE partsouq_http_artifacts DROP CHECK chk_partsouq_artifact_sanitizer"
             )
             cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25)")
 
-        assert runner.apply() == (20, 21, 22, 23, 24)
+        assert runner.apply() == (20, 21, 22, 23, 24, 25)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1152,7 +1152,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 "verification_status='verified', verified_at=NOW(6) WHERE crawl_run_id=%s",
                 ("partsouq-html-public-v1", crawl_run_id),
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25)")
             cursor.execute(
                 "INSERT INTO catalog_schema_ledger "
                 "(change_key,kind,version,filename,sha256,state,attempt_count,started_at,"
@@ -1166,7 +1166,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
 
         with pytest.raises(MigrationError, match="retry that exact version"):
             runner.apply()
-        assert runner.apply(retry_version=20) == (20, 21, 22, 23, 24)
+        assert runner.apply(retry_version=20) == (20, 21, 22, 23, 24, 25)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1285,8 +1285,8 @@ def test_migration_023_creates_http_diagnostics_from_missing_table(
     try:
         with connection.cursor() as cursor:
             cursor.execute("DROP TABLE partsouq_http_diagnostics")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24)")
-        assert runner.apply() == (23, 24)
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25)")
+        assert runner.apply() == (23, 24, 25)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1335,7 +1335,7 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
             cursor.execute(
                 "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25)")
         with pytest.raises(MigrationError, match="migration:023 failed"):
             runner.apply()
         with connection.cursor() as cursor:
@@ -1345,7 +1345,7 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
                 "ALTER TABLE partsouq_http_diagnostics "
                 "MODIFY COLUMN content_type VARCHAR(128) NOT NULL"
             )
-        assert runner.apply(retry_version=23) == (23, 24)
+        assert runner.apply(retry_version=23) == (23, 24, 25)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute("SELECT state,attempt_count FROM catalog_schema_ledger WHERE version=23")
@@ -1368,12 +1368,12 @@ def test_migration_024_upgrades_legacy_nhtsa_schema_and_is_repeatable(
         with connection.cursor() as cursor:
             _downgrade_nhtsa_024_schema(cursor)
 
-        assert runner.apply() == (24,)
+        assert runner.apply() == (24, 25)
         runner.check()
 
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=24")
-        assert runner.apply() == (24,)
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (24, 25)")
+        assert runner.apply() == (24, 25)
         runner.check()
     finally:
         connection.close()
@@ -1412,7 +1412,7 @@ def test_migration_024_recovers_one_unique_cross_second_legacy_nhtsa_run(
             )
             run_id = int(cursor.lastrowid)
 
-        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24,)
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24, 25)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1464,7 +1464,7 @@ def test_migration_024_legacy_recovery_tolerates_child_second_precision(
             )
             run_id = int(cursor.lastrowid)
 
-        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24,)
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24, 25)
         with connection.cursor() as cursor:
             cursor.execute("SELECT status FROM nhtsa_sync_runs WHERE id=%s", (run_id,))
             assert cursor.fetchone() == {"status": "interrupted"}
@@ -1557,7 +1557,7 @@ def test_migration_024_legacy_link_window_stops_after_five_seconds(
             run_id = int(cursor.lastrowid)
 
         if should_recover:
-            assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24,)
+            assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24, 25)
         else:
             with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
                 runner.apply(recover_stale_nhtsa_daemon_seconds=60)

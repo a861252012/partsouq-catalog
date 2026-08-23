@@ -52,6 +52,7 @@ CATALOG_MANIFEST = (
     (22, "022_group_receipt_run_key_index.sql", "41303ad2d06bbe682655bb276893893aa4f2a3d5f817bc34275b406920cd47fd"),
     (23, "023_partsouq_http_diagnostics.sql", "83951039e522c3bdf9caf887bd46ebf65594649f4ac57b4810a35a140da08918"),
     (24, "024_nhtsa_run_leases.sql", "7faeb30a4aa83a1aca8c768bf3a3170d0bed5783fa9aa53c2d207419dcc17182"),
+    (25, "025_tw_vncs_vehicles.sql", "dbe9d714c90da6d1ad56911ca31f3ba2fa02582a4d50fee9ca017b9307d329f0"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(

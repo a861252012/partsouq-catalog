@@ -209,9 +209,10 @@ KEY idx_vncs_code (body_or_engine_code, model_year)
 提交前必跑，證據記入 progress-log。
 
 **Skip 契約更正（2026-08-23）**：unit job 期望值由工作樹初稿的 217 更正為
-**263 = 207（env-gated，平台無關）+ 56（`MACOS_LAUNCH_AGENT_ONLY`，ubuntu 上
-skip；與 e2e job 的 `--expected-count 56` 交叉驗證一致）**。本機為 macOS，
-驗證時以 207 對帳。
+**268 = 212（env-gated，平台無關；含 VNCS integration 新案例）+ 56
+（`MACOS_LAUNCH_AGENT_ONLY`，ubuntu 上 skip；與 e2e job 的
+`--expected-count 56` 交叉驗證一致）**。本機為 macOS，驗證時以 212 對帳。
+（初稿 217 無法重現，判定為過時套件狀態下誤算。）
 
 ---
 

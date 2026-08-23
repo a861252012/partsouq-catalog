@@ -57,11 +57,12 @@ RECOVERY_MIN_AGE_SECONDS = 900
 MAX_CONSECUTIVE_FAILURES = 5
 NHTSA_BULK_COMPLETED = "stage=bulk_completed"
 NHTSA_API_COMPLETED = "stage=api_completed"
-DAEMON_JOBS = ("catalog", "nhtsa", "pending")
+DAEMON_JOBS = ("catalog", "nhtsa", "pending", "vncs")
 DEFAULT_INTERVAL_SECONDS = {
     "catalog": 30 * 24 * 60 * 60,
     "nhtsa": 24 * 60 * 60,
     "pending": 30,
+    "vncs": 30 * 24 * 60 * 60,
 }
 _SHUTDOWN_EVENT: threading.Event | None = None
 _JOB_CONTEXT = threading.local()
@@ -1303,19 +1304,26 @@ def _nhtsa_run_id(kind: str) -> str:
     return f"nhtsa-{kind}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
 
 
+def _vncs_run_id() -> str:
+    return f"vncs-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PartSouq / NHTSA 統一排程入口")
     parser.add_argument(
         "--job",
         required=True,
-        choices=("catalog", "nhtsa-bulk", "nhtsa-api", "nhtsa-vin", "nhtsa", "pending"),
-        help="catalog 僅跑型錄；nhtsa 依序執行 bulk 與 API；pending 消費後台要求。",
+        choices=("catalog", "nhtsa-bulk", "nhtsa-api", "nhtsa-vin", "nhtsa", "pending", "vncs"),
+        help=(
+            "catalog 僅跑型錄；nhtsa 依序執行 bulk 與 API；pending 消費後台要求；"
+            "vncs 同步台灣 MOENV VNCS 汽油/柴油車輛。"
+        ),
     )
     parser.add_argument("--scope", default="all", help="NHTSA 同步範圍，預設 all。")
     parser.add_argument(
         "--daemon",
         action="store_true",
-        help="常駐並依 interval 自動執行；僅支援 catalog、nhtsa、pending。",
+        help="常駐並依 interval 自動執行；僅支援 catalog、nhtsa、pending、vncs。",
     )
     parser.add_argument("--interval-seconds", type=int, default=None)
     parser.add_argument("--retry-base-seconds", type=int, default=None)
@@ -1437,6 +1445,20 @@ def dispatch(
             parent_scheduled_job_run_id=parent_scheduled_job_run_id,
         )
 
+    if job == "vncs":
+        return _run(
+            "vncs",
+            [
+                sys.executable,
+                "-m",
+                "partsouq_crawler",
+                "vncs-sync",
+                "--run-id",
+                _vncs_run_id(),
+            ],
+            parent_scheduled_job_run_id=parent_scheduled_job_run_id,
+        )
+
     return _run_nhtsa(scope)
 
 
@@ -1445,7 +1467,7 @@ def main() -> int:
     if not args.daemon:
         return dispatch_locked(args.job, args.scope)
     if args.job not in DAEMON_JOBS:
-        print("daemon 僅支援 catalog、nhtsa、pending", file=sys.stderr)
+        print("daemon 僅支援 catalog、nhtsa、pending、vncs", file=sys.stderr)
         return 2
     try:
         interval_seconds = (

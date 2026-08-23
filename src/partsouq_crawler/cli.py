@@ -33,6 +33,9 @@ from partsouq_crawler.services.common_crawl_import import CommonCrawlImportServi
 from partsouq_crawler.services.export import ExportService
 from partsouq_crawler.services.ingest import IngestService
 from partsouq_crawler.services.reparse import ReparseService
+from partsouq_crawler.vncs.config import VncsConfig
+from partsouq_crawler.vncs.repository import VncsMySQLRepository
+from partsouq_crawler.vncs.service import VncsSyncService
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,6 +177,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     nhtsa_status = subparsers.add_parser("nhtsa-status")
     _nhtsa_arguments(nhtsa_status, include_runtime=False)
+
+    vncs_sync = subparsers.add_parser(
+        "vncs-sync",
+        help="Sync Taiwan MOENV VNCS gasoline/diesel vehicles into MySQL",
+    )
+    vncs_sync.add_argument("--run-id", default="vncs-official")
+    vncs_sync.add_argument("--user-agent")
+    vncs_sync.add_argument("--timeout", type=float)
+    vncs_sync.add_argument("--rate-limit", type=float)
     return parser
 
 
@@ -198,6 +210,8 @@ def _nhtsa_arguments(parser: argparse.ArgumentParser, *, include_runtime: bool =
 async def dispatch(args: argparse.Namespace) -> int:
     if args.command.startswith("nhtsa-"):
         return await _dispatch_nhtsa(args)
+    if args.command == "vncs-sync":
+        return await _dispatch_vncs(args)
     repository = await Repository.create(args.sqlite)
     try:
         if args.command == "probe":
@@ -363,6 +377,42 @@ def _scheduled_job_run_id() -> int:
     if not value.isdigit() or int(value) <= 0:
         raise ValueError("NHTSA commands require a positive SCHEDULED_JOB_RUN_ID")
     return int(value)
+
+
+def _optional_scheduled_job_run_id() -> int | None:
+    """vncs-sync 允許無 scheduler 直接跑；有值時才驗證。"""
+    value = os.getenv("SCHEDULED_JOB_RUN_ID", "")
+    if not value:
+        return None
+    if not value.isdigit() or int(value) <= 0:
+        raise ValueError("SCHEDULED_JOB_RUN_ID must be a positive integer when provided")
+    return int(value)
+
+
+async def _dispatch_vncs(args: argparse.Namespace) -> int:
+    scheduled_job_run_id = _optional_scheduled_job_run_id()
+    config = VncsConfig.from_env(
+        user_agent=getattr(args, "user_agent", None),
+        request_timeout_seconds=getattr(args, "timeout", None),
+        rate_limit_seconds=getattr(args, "rate_limit", None),
+    )
+    try:
+        repository = VncsMySQLRepository.create(config)
+    except pymysql.MySQLError as error:
+        _print_json({"status": "failed", "error_type": type(error).__name__, "error": str(error)})
+        return 1
+    try:
+        report = await VncsSyncService(repository, config).run(
+            run_key=args.run_id,
+            scheduled_job_run_id=scheduled_job_run_id,
+        )
+        _print_json(report)
+        return 0 if report["status"] == "completed" else 1
+    except AdmissionLockBusy as error:
+        _print_json({"status": "deferred", "error_type": type(error).__name__})
+        return 75
+    finally:
+        repository.close()
 
 
 async def _probe(repository: Repository, args: argparse.Namespace) -> int:
