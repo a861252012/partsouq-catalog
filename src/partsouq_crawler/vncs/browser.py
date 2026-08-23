@@ -367,13 +367,21 @@ class VncsBrowserHarvester:
         rows = await page.evaluate(_GRID_ROWS_SCRIPT)
         if rows:
             return parse_grid_records([dict(row) for row in rows])
+        # AJAX 換頁瞬間 DOM 列可能短暫為空：先等一格再取一次，避免把
+        # 過渡狀態誤判成最終空頁。
+        await page.wait_for_timeout(500)
+        rows = await page.evaluate(_GRID_ROWS_SCRIPT)
+        if rows:
+            return parse_grid_records([dict(row) for row in rows])
         content = await page.content()
         try:
             # 相容路徑：伺服器若回傳傳統靜態表格，沿用既有 parser。
             return parse_vehicles(content.encode("utf-8"))
-        except VncsParserError:
+        except VncsParserError as error:
             if "wdgMain" in content:
                 # 格線存在但此頁沒有資料列（如篩選結果為空）：合法空頁。
+                # parse_vehicles 對現代格線頁會報「缺欄位」，同屬此類。
+                _ = error
                 return [], 0
             raise
 
