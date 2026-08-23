@@ -380,3 +380,19 @@
 5. **VNCS 全量**：汽油車 686 頁全量入庫成功；柴油首輪因連續高頻請求後
    站方降級而 fail-closed（診斷掃描 939 頁 0 壞列證明資料本身乾淨），
    改 2s/頁節流重跑中。
+
+## 2026-08-24（工作階段4）正式管線全綠與 VNCS 資料重建完成
+
+1. **B3 正式 bounded 10,000 達成（run14）**：bounded_success、parts_ok=10000、
+   evidence VERIFIED（306 artifacts）、bounded_parts=10,000、
+   v_current_catalog_parts=10,000、scheduler exit 0。三個前置修復
+   （合法空組 receipt、evidence unit 零筆例外、migration 027 CHECK 放寬）
+   缺一不可，另修第二種版型（uid=4160 三欄 Number|Name|Code，空名稱列
+   走 quarantine 政策）。
+2. **VNCS 資料重建完成**：先前兩輪 full run 因非 VIN 引擎碼無唯一約束而
+   累積跨 run 重複；清表後以分段韌性腳本（50 頁/段、失敗重試一次跳過、
+   2s/頁）重建：G 686 頁 → 3,981 列/2,462 VIN；D 939 頁 → 4,669 列/
+   691 VIN；合計 8,650 列 / 3,153 VIN，與理論值吻合。
+3. **NHTSA 解碼入庫 209 筆（驗收 >100 達標）**：含 sparse（Model/engine
+   NULL）與 ErrorCode≠0（歐系檢查碼警告）案例；未解出者為 NHTSA 無申報
+   的台灣專屬車，由 VNCS 自身欄位兜底。
