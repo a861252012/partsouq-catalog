@@ -323,7 +323,8 @@ DATASET_SPECS = {
         delimiter=",",
         has_header=False,
         field_names=(),
-        required_fields=("VIN", "Make", "Model", "ModelYear", "ErrorCode"),
+        # 與互動解碼契約一致：vPIC 對部分車型不回 Model，缺席不算錯。
+        required_fields=("VIN", "Make", "ModelYear", "ErrorCode"),
         identity_fields=("VIN",),
         external_id_field="VIN",
         make_field="Make",

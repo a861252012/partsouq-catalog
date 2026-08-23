@@ -708,20 +708,19 @@ class NhtsaMySQLRepository:
         if payload.get("VIN") != vin:
             raise ValueError("NHTSA VIN decode response does not match the requested VIN")
         make_name = str(payload.get("Make") or "").strip()
-        model_name = str(payload.get("Model") or "").strip()
+        model_name = str(payload.get("Model") or "").strip() or None
         model_year_raw = str(payload.get("ModelYear") or "").strip()
-        engine_configuration = str(payload.get("EngineConfiguration") or "").strip()
-        engine_model = str(payload.get("EngineModel") or "").strip()
+        engine_configuration = str(payload.get("EngineConfiguration") or "").strip() or None
+        engine_model = str(payload.get("EngineModel") or "").strip() or None
         displacement_raw = str(payload.get("DisplacementL") or "").strip()
-        trim_name = str(payload.get("Trim") or "").strip()
+        trim_name = str(payload.get("Trim") or "").strip() or None
         error_code = str(payload.get("ErrorCode") or "").strip()
+        # 使用者決策：Engine／Trim／Displacement 先留空等回填；vPIC 對部分
+        # 車型（尤其歐系）本來就不回 Model。因此只有 Make／ModelYear 是
+        # 必要欄位，其餘缺席一律存 NULL（部分解碼是預期行為，不是錯誤）。
         required_fields = {
             "Make": make_name,
-            "Model": model_name,
             "ModelYear": model_year_raw,
-            "EngineConfiguration": engine_configuration,
-            "DisplacementL": displacement_raw,
-            "Trim": trim_name,
         }
         missing_fields = [name for name, value in required_fields.items() if not value]
         if missing_fields:
@@ -738,16 +737,18 @@ class NhtsaMySQLRepository:
                 f"NHTSA VIN decode failed with ErrorCode={error_code}: "
                 f"{str(payload.get('ErrorText') or '').strip()}"
             )
-        try:
-            displacement_l = Decimal(displacement_raw)
-        except InvalidOperation as error:
-            raise ValueError(
-                f"NHTSA VIN decode returned an invalid DisplacementL: {displacement_raw}"
-            ) from error
-        if not displacement_l.is_finite() or displacement_l < 0:
-            raise ValueError(
-                f"NHTSA VIN decode returned an invalid DisplacementL: {displacement_raw}"
-            )
+        displacement_l: Decimal | None = None
+        if displacement_raw:
+            try:
+                displacement_l = Decimal(displacement_raw)
+            except InvalidOperation as error:
+                raise ValueError(
+                    f"NHTSA VIN decode returned an invalid DisplacementL: {displacement_raw}"
+                ) from error
+            if not displacement_l.is_finite() or displacement_l < 0:
+                raise ValueError(
+                    f"NHTSA VIN decode returned an invalid DisplacementL: {displacement_raw}"
+                )
         payload_json = json.dumps(
             dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )

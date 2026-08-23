@@ -2477,9 +2477,7 @@ def test_vin_publish_rejects_nonformal_source_key(tmp_path: Path) -> None:
         ({"ErrorCode": "1", "ErrorText": "Invalid VIN"}, "ErrorCode=1"),
         ({"VIN": OTHER_VIN}, "does not match the requested VIN"),
         ({"Make": ""}, "missing required fields: Make"),
-        ({"EngineConfiguration": ""}, "missing required fields: EngineConfiguration"),
-        ({"DisplacementL": ""}, "missing required fields: DisplacementL"),
-        ({"Trim": ""}, "missing required fields: Trim"),
+        ({"ModelYear": ""}, "missing required fields: ModelYear"),
     ),
 )
 def test_invalid_vin_decode_quarantines_unpublished_artifact(
@@ -2545,6 +2543,56 @@ def test_vin_decode_allows_optional_engine_model(
         with repository.connection.cursor() as cursor:
             cursor.execute("SELECT engine_model FROM nhtsa_vin_decodes WHERE vin = %s", (VIN,))
             assert cursor.fetchone()["engine_model"] is None
+    finally:
+        repository.clear_for_tests()
+        repository.close()
+
+
+def test_vin_decode_allows_sparse_payload_with_null_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vPIC 對部分車型（歐系常見）不回 Model／引擎欄位；使用者決策：
+    部分解碼是預期行為，缺的欄位存 NULL 而非拒絕整筆。"""
+    _patch_vin_client(
+        monkeypatch,
+        tmp_path,
+        _vin_payload(
+            Model="",
+            EngineConfiguration="",
+            EngineModel="",
+            DisplacementL="",
+            Trim="",
+        ),
+    )
+    repository = NhtsaMySQLRepository.create(_config(tmp_path))
+    try:
+        repository.clear_for_tests()
+        report = asyncio.run(
+            NhtsaApiSyncService(repository, _config(tmp_path)).decode_vin(
+                run_key="vin-sparse-decode",
+                vin=VIN,
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
+            )
+        )
+
+        assert report["status"] == "completed"
+        assert report["vehicle"]["model_name"] is None
+        assert report["vehicle"]["displacement_l"] is None
+        assert report["vehicle"]["trim_name"] is None
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT make_name, model_name, model_year, displacement_l, trim_name "
+                "FROM nhtsa_vin_decodes WHERE vin = %s",
+                (VIN,),
+            )
+            row = cursor.fetchone()
+            assert row is not None
+            assert row["make_name"] == "TEST MAKE"
+            assert row["model_name"] is None
+            assert int(row["model_year"]) == 2020
+            assert row["displacement_l"] is None
+            assert row["trim_name"] is None
     finally:
         repository.clear_for_tests()
         repository.close()

@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS nhtsa_source_artifacts (
 CREATE TABLE IF NOT EXISTS nhtsa_vin_decodes (
     vin CHAR(17) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
     make_name VARCHAR(255) NOT NULL,
-    model_name VARCHAR(512) NOT NULL,
+    # vPIC 對部分車型不回 Model（歐系常見）；部分解碼是預期行為。
+    model_name VARCHAR(512) NULL,
     model_year SMALLINT UNSIGNED NOT NULL,
     engine_configuration VARCHAR(255) NULL,
     engine_model VARCHAR(255) NULL,
