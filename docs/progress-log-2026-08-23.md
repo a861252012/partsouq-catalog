@@ -4,6 +4,7 @@
 
 | Commit | 內容 | Remote |
 |---|---|---|
+| `f80483e` | 更新最終交接與正式資料缺口 | 已 push `origin/main` |
 | `e687c4b` | diagnostic exact contract、fresh cleanup、真 MySQL 404 交易測試 | 已 push `origin/main` |
 | `949d91e` | 最終交接與進度文件 | 已 push |
 | `692076e` | bounded 競態、404／空解析 diagnostics、secret-safe HTTP 錯誤 | 已 push `origin/main` |
@@ -13,8 +14,8 @@
 | `a999c9a` | evidence 版本與發布閘門 | 已 push |
 | `baeb235` | 搬移專案並強化本機排程環境 | 已 push |
 
-目前最新程式 commit 與 `origin/main` 是
-`e687c4b8bf8f467a17f46a7fd49e6d9c1c717715`；本文件更新會另建文件 commit。
+交接盤點開始時，`HEAD` 與 `origin/main` 都是
+`f80483ea0adcad4afdc7879fec65a6e0fd3d58ec`。
 
 ## 2026-08-23 12:25–13:00
 
@@ -82,3 +83,19 @@
    fitment 仍 0；NHTSA run 1/2 仍 stale running。
 7. 更新最終交接文件，將下一步改為先完成 NHTSA lease／原子發布／stale recovery，
    再套 migration 023 與重跑正式 PartSouq 10,000。
+
+## 2026-08-23 13:13–13:18 最終交接盤點
+
+1. 確認唯一正式 checkout 是
+   `/Users/a861252012/Desktop/folder/code/partsouq-catalog`；舊 Documents 路徑只剩空目錄。
+2. 確認 `HEAD == origin/main == f80483e`，branch `main` 沒有 ahead／behind。
+3. 發現工作樹有未追蹤 `migrations/catalog/024_nhtsa_run_leases.sql`。它只是未完成草稿，
+   未進 manifest、runtime、測試或 DB，禁止直接執行或提交。
+4. 重新唯讀查證主 DB：raw parts 10,000、distinct part numbers 3,823、bounded／published／
+   current 皆 0、quarantine 2,260、NHTSA VIN decode／mapping／fitment 皆 0。
+5. NHTSA run 1／2 仍為 running；scheduler child 7／9 仍為 failed exit 124／125。
+   source artifacts 共 6 筆（5 imported、1 importing），current artifact 0。
+6. 主 DB catalog ledger 仍到 022，migration 023 未套，diagnostics table 不存在。
+7. Docker MySQL、admin、station-admin healthy，queue-scheduler running；兩個 health endpoint
+   均實際回 OK。catalog／NHTSA LaunchAgent 未載入。
+8. 沒有執行完整 E2E、沒有套 migration、沒有啟動正式爬蟲，也沒有更動主 DB。
