@@ -143,7 +143,10 @@ def _downgrade_nhtsa_024_schema(cursor: DictCursor) -> None:
         "DROP COLUMN parent_scheduled_job_run_id"
     )
     cursor.execute("DELETE FROM nhtsa_schema_migrations WHERE version=2")
-    cursor.execute("DELETE FROM catalog_schema_ledger WHERE version >= 28")
+    # 移除 024 起的全部 ledger 列（含其後版本）：單刪 24 會留下
+    # 「23 → 25」斷層觸發 gap 檢查；整段移除讓第二次 apply 自 024
+    # 起依序重放（各 migration 對既有 schema 冪等）。
+    cursor.execute("DELETE FROM catalog_schema_ledger WHERE version >= 24")
 
 
 def _insert_stale_direct_nhtsa_tuple(
@@ -1289,7 +1292,7 @@ def test_migration_023_creates_http_diagnostics_from_missing_table(
     try:
         with connection.cursor() as cursor:
             cursor.execute("DROP TABLE partsouq_http_diagnostics")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27)")
         assert runner.apply() == (23, 24, 25, 26, 27)
         runner.check()
         with connection.cursor() as cursor:
@@ -1339,7 +1342,7 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
             cursor.execute(
                 "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27)")
         with pytest.raises(MigrationError, match="migration:023 failed"):
             runner.apply()
         with connection.cursor() as cursor:
