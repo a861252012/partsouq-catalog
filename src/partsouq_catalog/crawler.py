@@ -22,11 +22,13 @@
 
 import gc
 import logging
+import re
 import threading
 import time
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from datetime import date
 from functools import partial
 from typing import Any, cast
 
@@ -111,6 +113,29 @@ def _canonical_catalog_request_url(raw_url: object, expected_path: str) -> str:
     ):
         raise RuntimeError("invalid PartSouq catalog URL")
     return urllib.parse.urlunsplit(("https", "partsouq.com", normalized_path, parsed_url.query, ""))
+
+
+def _vehicle_production_end_year(vehicle: Mapping[str, Any]) -> int | None:
+    """車輛生產結束年（西元）；生產結束年不明時回傳 None。
+
+    production_to 是 "YYYY-MM" 字串（parse_vehicles 產出）。只信
+    production_to：只有起始年的車代表「仍在產線上或期間未閉合」，
+    不視為老車。
+    """
+    match = re.match(r"^(\d{4})", str(vehicle.get("production_to") or ""))
+    return int(match.group(1)) if match else None
+
+
+def _vehicle_year_window_floor() -> int:
+    """動態年份下限＝執行當年 − vehicle_year_window（含該年）。
+
+    每次呼叫都以當天日期重算，不寫死：2026 執行 = 2006 年起，
+    2028 執行 = 2008 年起。window=0 表示不過濾（回傳 0，任何年份皆通過）。
+    """
+    window = int(CRAWL["vehicle_year_window"])
+    if window <= 0:
+        return 0
+    return date.today().year - window
 
 
 def _group_closure_mismatches(
@@ -718,6 +743,8 @@ class Crawler:
             vehicles = vehicles[:limit]
 
         pending: list[ParsedRecord] = []
+        skipped_by_year = 0
+        year_floor = _vehicle_year_window_floor()
         for vehicle in vehicles:
             key = self._vehicle_key(model_id, vehicle)
             # F1b：見即記錄（見 crawl_brand 的說明）—— 車型層縮水
@@ -725,7 +752,23 @@ class Crawler:
             self.crawl.seen("vehicle", key)
             if self.crawl.is_done("vehicle", key):
                 continue
+            if year_floor > 0:
+                end_year = _vehicle_production_end_year(vehicle)
+                if end_year is not None and end_year < year_floor:
+                    # 需求政策：生產期間與最近 N 年不重疊的車款直接跳過，
+                    # 不派工爬零件。刻意不 mark_done：政策是動態的（視窗
+                    # 隨執行年份前滑），未來的 run 重新評估，不留永久豁免。
+                    skipped_by_year += 1
+                    continue
             pending.append(vehicle)
+        if skipped_by_year:
+            log.info(
+                "  [%s] %d vehicle(s) ended production before %d; "
+                "skipped by vehicle-year-window policy",
+                model["name"],
+                skipped_by_year,
+                year_floor,
+            )
 
         # pick evidence 會鎖住 crawl_runs，seen 也屬於同一筆主執行緒交易。
         # worker 隨後會用自己的連線記錄 vehicle evidence；派工前若不提交，

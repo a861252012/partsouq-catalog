@@ -55,6 +55,7 @@ class CrawlConfig(TypedDict):
     min_brands: int
     limit_groups: int
     limit_parts: int
+    vehicle_year_window: int
     bounded_parts: int
     bounded_run_key: str
     scheduled_job_run_id: int
@@ -166,6 +167,11 @@ CRAWL: CrawlConfig = {
     "limit_groups": int(os.environ.get("PSQ_LIMIT_GROUPS", "0")),  # 全站零件組數上限（測試用）
     # 舊有的未發布 sample 上限；只供測試，不可與 bounded 模式併用。
     "limit_parts": int(os.environ.get("PSQ_LIMIT_PARTS", "0")),
+    # 只收錄「生產期間與最近 N 個日曆年重疊」的車款（含第 N 年）：
+    # 界線在每次執行時以當天日期動態計算（2026 跑 = 2006 年起，
+    # 2028 跑 = 2008 年起），不寫死年份。0 = 不過濾（全量）。
+    # 生產結束年不明的車款一律照爬，不因資料缺失而漏抓。
+    "vehicle_year_window": int(os.environ.get("PSQ_VEHICLE_YEAR_WINDOW", "0")),
     # 正式的有界資料集上限。只有精確達標、無爬取錯誤且通過
     # 品質關卡才會原子發布到 bounded_parts；不會改寫全站 snapshot。
     "bounded_parts": int(os.environ.get("PSQ_BOUNDED_PARTS", "0")),
