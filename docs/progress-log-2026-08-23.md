@@ -434,3 +434,40 @@ next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋�
    （含 cf cookie 輪換）。CloakBrowser 冷啟動曾兩次 60s 未就緒（暫時性，
    重啟後 2s 就緒）；手動重現發現缺 CLOAKBROWSER_CACHE_DIR 會卡下載，
    生產路徑恆設定之。
+
+## 2026-08-24（工作階段7）年份視窗政策、AGENTS.md 規範化與審查修正
+
+1. **migration 測試回歸事件（44be8b2）**：前次推送前僅跑相關子集，
+   三個 migration e2e 靜默轉紅。根因有二：降級輔助函式的 ledger 刪除
+   範圍未從目標版本一路涵蓋到最新版（gap 檢查會擋），清單又漏列中間
+   版本（第二次 apply 誤判已套用）。修法：`_downgrade_nhtsa_024_schema`
+   改 `DELETE ... WHERE version >= 24`，兩處清單補齊 `(23,24,25,26,27)`。
+   全套 pytest 重跑全綠。此事件寫入 AGENTS.md 硬性規定：凡影響行為的
+   commit，之前必須重跑全套關卡。
+2. **車款年份視窗政策（6eddd70）**：全量戰役只需近 20 年車款，新增
+   `PSQ_VEHICLE_YEAR_WINDOW`，crawler.py `_vehicle_year_window_floor`
+   以執行日動態計算下限（2026 跑 = 生產結束 ≥2006）。判定取
+   production_to 的年份前綴；結束年不明或仍在產線上的車一律照爬；
+   被跳過的車刻意不 mark_done——政策是動態的，留下永久 done 日後
+   放寬視窗就會漏爬。六個新測試以相對今天的日期推導期望值，不凍結
+   時鐘。skip 契約維持 268。run 1053 即以 `PSQ_VEHICLE_YEAR_WINDOW=20`
+   啟動，log 已見 skipped by vehicle-year-window policy。
+3. **AGENTS.md 制定**：第一版訂 coding style 硬性規定（禁語意不明的
+   別名與變數名），隨後比照 openai-agents-python 的 AGENTS.md 格式
+   重寫為四段式貢獻者指南：政策與強制規定、程式碼審查規則、專案
+   結構指南、操作指南（0c675be）。
+4. **子代理合規審查**：文件審查抓到 AGENTS.md 把 CATALOG_MANIFEST 誤寫
+   成 migrations/catalog/ 下的檔案，實際是 migrations.py 的常數；
+   程式審查抓到年份視窗測試的空斷言——用車名搜尋 mark_done 參數，
+   但 resume key 經 SHA256 雜湊，車名永遠不出現在參數裡，就算跳過的
+   車真的被標記 done 測試照樣通過。改為計算雜湊前的完整 resume key
+   逐筆比對（743aac5）。同 commit 增訂文案潤飾規範：備註、說明、docs
+   段落與 commit 敘述，定稿前須經 humanizer-zh-tw skill 潤飾。
+5. **後台帳密更換與舊映像 crash-loop**：站方後台帳密依使用者要求改為
+   root/root（僅 .env）。首次重啟直接退出：映像停在 16 小時前的版本，
+   不認得 ledger 內的 migration 027，啟動時 migration check 失敗——
+   AGENTS.md「容器映像需隨程式碼重建」的營運備忘實際應驗。
+   docker compose build 重建 station-admin 與 admin 後均 healthy，
+   含 CSRF token 的登入流程驗證通過。
+6. **爬蟲現況**：daemon 與 watchdog 正常；零件數小時增量 +8k → +13k →
+   +20k，累計 48,871 筆、車輛 9 台完成、磁碟剩 194GB。
