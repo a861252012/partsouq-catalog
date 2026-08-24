@@ -407,3 +407,30 @@ next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋�
 戰役**（18 品牌 × 全模型，估數日禮節爬行）才有意義。此為下一階段範圍決策：
 (a) 直接啟動全量 crawl（LaunchAgent 已具備，改 interval/一次性觸發）
 (b) 先以現有 10k 完成 C1-C2-D2 工具鏈，全量資料到位後重跑。
+
+## 2026-08-24（工作階段6）全量 crawl 正式啟動與運維配置
+
+**使用者決策**：直接啟動全量 crawl（選項 a）；要求詳細記錄實際完成時間並於
+完成時報告；硬碟保底 50GB，接近即自動停止。
+
+1. **啟動方式（重要教訓）**：證據系統強制 `scheduled_trigger_mode='daemon'`
+   （repositories.py record_http_evidence 驗證），手動 one-shot 觸發會在
+   第一筆證據寫入時崩潰（exit：invalid scheduler provenance）。必須以
+   `python -m partsouq_catalog.scheduler --job catalog --daemon` 啟動。
+2. **LaunchAgent 已暫停**（bootout），由本 session 的 daemon 取代：
+   `caffeinate -is uv run python -m partsouq_catalog.scheduler --job catalog
+   --daemon --interval-seconds 3600`，env 覆寫 **PSQ_BOUNDED_PARTS=0**
+   （否則 bounded 驗證閘門會無限重觸發）。run id **1053**，
+   started_at=2026-08-24 12:13 local。完成後應恢復 LaunchAgent：
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.partsouq.catalog-scheduler.plist`
+   （或改回 30 天 interval 的等效 daemon）。
+3. **監工腳本** `/tmp/opencode/crawl_watchdog.py`（每分鐘巡邏）：
+   磁碟可用 <55GB → SIGTERM 停爬＋報告＋通知；偵測完成 → 寫
+   `/tmp/opencode/fullcrawl-report.txt`（起訖時間/耗時/零件數）＋osascript
+   通知；每小時進度寫 `/tmp/opencode/fullcrawl-progress.log`。
+   完成時間權威來源＝scheduled_job_runs id 1053 的 finished_at。
+4. **初期觀察**：Toyota 1960-70 年代車款區大量空組／無名稱列（合法 quarantine，
+   忽略並記錄政策），parts 數短期不動屬正常。實測 ~213 groups/hr
+   （含 cf cookie 輪換）。CloakBrowser 冷啟動曾兩次 60s 未就緒（暫時性，
+   重啟後 2s 就緒）；手動重現發現缺 CLOAKBROWSER_CACHE_DIR 會卡下載，
+   生產路徑恆設定之。
