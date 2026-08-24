@@ -103,9 +103,11 @@ def test_old_vehicle_skipped_without_marking_done(monkeypatch) -> None:
     # 邊界含在內：生產結束年 == 下限（剛好 20 年）必須照爬。
     assert dispatched == ["BOUNDARY-IN", "RECENT", "OPEN-ENDED", "UNKNOWN-YEAR"]
     assert (failed, worked) == (0, True)
-    # 政策是動態的：被跳過的車不得留下永久 done 標記。
+    # 政策是動態的：被跳過的車不得留下永久 done 標記。resume key 經過
+    # 雜湊，車名不會出現在呼叫參數裡，必須比對雜湊前的完整 key。
+    ancient_resume_key = instance._vehicle_key(17, vehicles[0])
     for call in instance.crawl.mark_done.call_args_list:
-        assert "ANCIENT" not in str(call.args), call.args
+        assert call.args[1] != ancient_resume_key, call.args
 
 
 def test_all_old_vehicles_skip_without_parts_work(monkeypatch) -> None:

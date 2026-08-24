@@ -404,7 +404,7 @@ vid='0',1969 古董車；DONE 統計 brands=1/models=1/vehicles=2）——bounde
 語意在首個模型即達標停止（log:「part row limit reached; stopping before
 next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋原子發布
 全鏈證明）；但 C1 VIN↔車款 mapping 與 fitment 的實際價值需要**全量 crawl
-戰役**（18 品牌 × 全模型，估數日禮節爬行）才有意義。此為下一階段範圍決策：
+戰役**（18 品牌 × 全模型，受 politeness 節流，估需數日）才有意義。此為下一階段範圍決策：
 (a) 直接啟動全量 crawl（LaunchAgent 已具備，改 interval/一次性觸發）
 (b) 先以現有 10k 完成 C1-C2-D2 工具鏈，全量資料到位後重跑。
 

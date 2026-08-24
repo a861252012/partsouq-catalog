@@ -31,6 +31,20 @@
 - 術語採台灣慣用用法：資料庫、網路、程式、預設、支援、記錄（非紀錄
   作動詞用）、設定。
 
+### 文案潤飾（硬性規定）
+
+備註、說明、文件與 git commit 敘述在定稿前，必須以 `humanizer-zh-tw`
+skill 潤飾（位於
+`~/.config/opencode/skills/humanizer-zh-tw/SKILL.md`），去除 AI 寫作
+痕跡，確保語意通順好理解。適用範圍：
+
+- 程式內的中文註解與 docstring。
+- `docs/` 下所有說明文件的新增或改寫段落。
+- 每一筆 commit message 的中文敘述。
+- 對使用者的工作回報與決策說明。
+
+純機械性內容（log 訊息、錯誤字串、測試參數名）不在潤飾範圍。
+
 ### 變更驗證關卡（提交前必跑）
 
 凡是更動執行期程式碼、測試、migration 或建置／測試設定，提交前必須
@@ -62,7 +76,8 @@ PARTSOUQ_DB_NAME=partsouq_catalog_test NHTSA_TEST_MYSQL=1 UNIFIED_TEST_MYSQL=1 \
   只刪中間會觸發 gap 檢查（`ledger skips an active migration`），
   留下殘列則讓第二次 apply 誤判已套用。
 - `tests/test_catalog_migrations.py` 的敘述句數量清單與總和斷言。
-- `migrations/catalog/CATALOG_MANIFEST` 登記新檔案與 SHA256。
+- `src/partsouq_catalog/migrations.py` 的 `CATALOG_MANIFEST` 常數：
+  發布新 migration 時登記檔名與 SHA256。
 
 ### 工作狀態回報
 
@@ -75,7 +90,8 @@ PARTSOUQ_DB_NAME=partsouq_catalog_test NHTSA_TEST_MYSQL=1 UNIFIED_TEST_MYSQL=1 \
 - 預設在使用者目前的 checkout 與分支上工作。建立分支、切換分支、
   建立 worktree 需經使用者明確同意。
 - 只有使用者明確要求時才 commit / push。commit message 精簡、祈使句、
-  中文描述；本機已跑過全套關卡者以 `[skip ci]` 標記。
+  中文描述，敘述需先經 humanizer-zh-tw 潤飾（見「文案潤飾」）；
+  本機已跑過全套關卡者以 `[skip ci]` 標記。
 - 不修改 git config、不 force-push、不做互動式 rebase。
 
 ## 程式碼審查規則
@@ -124,7 +140,8 @@ port 3308）。
 - `src/partsouq_crawler/`：獨立爬蟲模組。
   - `nhtsa/`：vPIC API 與 bulk 下載、VIN 解碼部分欄位契約。
   - `vncs/`：台灣 MOENV VNCS（Playwright 收割器、TWCA TLS 錨定）。
-- `migrations/catalog/`：版本化 SQL migration＋`CATALOG_MANIFEST`。
+- `migrations/catalog/`：版本化 SQL migration；清單登記於
+  `src/partsouq_catalog/migrations.py` 的 `CATALOG_MANIFEST` 常數。
 - `db/station_admin.sql`：站方後台 schema 基準。
 - `tests/`：單元／整合／e2e；env-gated 測試需對應環境變數才執行。
 - `docs/progress-log-YYYY-MM-DD.md`：每個里程碑的工作歷程（必須如實
