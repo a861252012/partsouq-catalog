@@ -2471,51 +2471,239 @@ def test_vin_publish_rejects_nonformal_source_key(tmp_path: Path) -> None:
         repository.close()
 
 
-@pytest.mark.parametrize(
-    ("overrides", "expected_error"),
-    (
-        ({"VIN": OTHER_VIN}, "does not match the requested VIN"),
-        ({"Make": ""}, "missing required fields: Make"),
-        ({"ModelYear": ""}, "missing required fields: ModelYear"),
-    ),
-)
-def test_invalid_vin_decode_quarantines_unpublished_artifact(
+def test_vin_payload_mismatch_still_fails_and_quarantines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    overrides: dict[str, str],
-    expected_error: str,
 ) -> None:
-    _patch_vin_client(monkeypatch, tmp_path, _vin_payload(**overrides))
+    """回應 VIN 與請求不符是真正的錯誤（非終局無資料），維持失敗＋隔離。"""
+    _patch_vin_client(monkeypatch, tmp_path, _vin_payload(VIN=OTHER_VIN))
     repository = NhtsaMySQLRepository.create(_config(tmp_path))
     try:
         repository.clear_for_tests()
         report = asyncio.run(
             NhtsaApiSyncService(repository, _config(tmp_path)).decode_vin(
-                run_key="invalid-vin-fixture",
+                run_key="vin-mismatch-fixture",
                 vin=VIN,
                 scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
             )
         )
 
         assert report["status"] == "failed"
-        assert expected_error in str(report["error"])
+        assert "does not match the requested VIN" in str(report["error"])
         with repository.connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT status, error_message FROM nhtsa_source_artifacts ORDER BY id DESC LIMIT 1"
-            )
+            cursor.execute("SELECT status FROM nhtsa_source_artifacts ORDER BY id DESC LIMIT 1")
             artifact = cursor.fetchone()
             assert artifact is not None
             assert artifact["status"] == "quarantined"
-            assert expected_error in str(artifact["error_message"])
-            cursor.execute("SELECT COUNT(*) AS row_count FROM nhtsa_current_artifacts")
-            assert cursor.fetchone()["row_count"] == 0
+    finally:
+        repository.clear_for_tests()
+        repository.close()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_classification"),
+    (
+        (
+            {
+                "Make": "",
+                "ErrorCode": "7 - ManufacturerMarkedNotRegistered",
+                "ErrorText": "7 - Manufacturer is not registered with NHTSA.",
+                "SuggestedVIN": "TMBJJ7AE0EJ123456",
+            },
+            "nhtsa_unregistered",
+        ),
+        (
+            {"Make": "", "ErrorCode": "11 - VIN corrected, no information returned"},
+            "invalid_vin",
+        ),
+        (
+            {"ModelYear": "", "ErrorCode": "8 - No detailed data available currently"},
+            "no_detail_data",
+        ),
+    ),
+)
+def test_undecodable_vin_decode_completes_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, str],
+    expected_classification: str,
+) -> None:
+    """vPIC 合法回答「這顆 VIN 永遠解不出」時是終局結果：run 正常完成、
+    artifact 標記 undecodable 帶原因，不寫 nhtsa_vin_decodes、不發布。"""
+    _patch_vin_client(monkeypatch, tmp_path, _vin_payload(**overrides))
+    repository = NhtsaMySQLRepository.create(_config(tmp_path))
+    try:
+        repository.clear_for_tests()
+        scheduled_job_run_id = _scheduled_job(repository, "nhtsa-vin")
+        report = asyncio.run(
+            NhtsaApiSyncService(repository, _config(tmp_path)).decode_vin(
+                run_key="undecodable-vin-fixture",
+                vin=VIN,
+                scheduled_job_run_id=scheduled_job_run_id,
+            )
+        )
+
+        assert report["status"] == "completed"
+        assert report["outcome"] == "undecodable"
+        assert report["outcome_classification"] == expected_classification
+        assert report["vehicle"] is None
+        source_key = f"vpic_vin_sha256_{hashlib.sha256(VIN.encode()).hexdigest()}"
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status, error_message FROM nhtsa_source_artifacts "
+                "WHERE dataset_name = 'vpic_vin_decodes' AND source_key = %s "
+                "ORDER BY id DESC LIMIT 1",
+                (source_key,),
+            )
+            artifact = cursor.fetchone()
+            assert artifact is not None
+            assert artifact["status"] == "undecodable"
+            note = str(artifact["error_message"])
+            assert expected_classification in note
+            if overrides.get("SuggestedVIN"):
+                assert overrides["SuggestedVIN"] in note
+            else:
+                assert overrides["ErrorCode"].split(" - ")[0] in note
             cursor.execute("SELECT COUNT(*) AS row_count FROM nhtsa_vin_decodes")
+            assert cursor.fetchone()["row_count"] == 0
+            cursor.execute("SELECT COUNT(*) AS row_count FROM nhtsa_current_artifacts")
             assert cursor.fetchone()["row_count"] == 0
             cursor.execute(
                 "SELECT status FROM nhtsa_sync_runs WHERE id = %s",
                 (report["run_id"],),
             )
-            assert cursor.fetchone()["status"] == "failed"
+            assert cursor.fetchone()["status"] == "completed"
+            cursor.execute(
+                "SELECT status, exit_code FROM scheduled_job_runs WHERE id = %s",
+                (scheduled_job_run_id,),
+            )
+            assert cursor.fetchone() == {"status": "completed", "exit_code": 0}
+    finally:
+        repository.clear_for_tests()
+        repository.close()
+
+
+@pytest.mark.parametrize("legacy_status", ("quarantined", "undecodable"))
+def test_rerun_reclaims_misjudged_undecodable_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_status: str,
+) -> None:
+    """同內容重跑時沿用既有 artifact：舊版誤判隔離者被平反為
+    undecodable；已是 undecodable 者保持不變，不產生重複 artifact。"""
+    _patch_vin_client(monkeypatch, tmp_path, _vin_payload(Make=""))
+    repository = NhtsaMySQLRepository.create(_config(tmp_path))
+    try:
+        repository.clear_for_tests()
+        service = NhtsaApiSyncService(repository, _config(tmp_path))
+        first = asyncio.run(
+            service.decode_vin(
+                run_key="reclaim-first",
+                vin=VIN,
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
+            )
+        )
+        assert first["status"] == "completed"
+
+        source_key = f"vpic_vin_sha256_{hashlib.sha256(VIN.encode()).hexdigest()}"
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE nhtsa_source_artifacts SET status = %s, error_message = %s "
+                "WHERE dataset_name = 'vpic_vin_decodes' AND source_key = %s",
+                (legacy_status, "legacy misjudgment", source_key),
+            )
+            assert cursor.rowcount == 1
+
+        second = asyncio.run(
+            service.decode_vin(
+                run_key="reclaim-second",
+                vin=VIN,
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
+            )
+        )
+
+        assert second["status"] == "completed"
+        assert second["outcome"] == "undecodable"
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count, MAX(status) AS status "
+                "FROM nhtsa_source_artifacts "
+                "WHERE dataset_name = 'vpic_vin_decodes' AND source_key = %s",
+                (source_key,),
+            )
+            row = cursor.fetchone()
+            assert row is not None
+            assert int(row["row_count"]) == 1
+            assert row["status"] == "undecodable"
+    finally:
+        repository.clear_for_tests()
+        repository.close()
+
+
+def test_rerun_reinstates_legacy_misquarantined_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """舊版必填規則（連 Model 等選填欄位都要求）誤判隔離的內容：內容本身
+    可發布，重跑時平反為 imported 並走正常發布流程，不重複建立 artifact。"""
+    _patch_vin_client(
+        monkeypatch,
+        tmp_path,
+        _vin_payload(Model="", EngineConfiguration="", DisplacementL="", Trim=""),
+    )
+    repository = NhtsaMySQLRepository.create(_config(tmp_path))
+    try:
+        repository.clear_for_tests()
+        service = NhtsaApiSyncService(repository, _config(tmp_path))
+        first = asyncio.run(
+            service.decode_vin(
+                run_key="reinstate-first",
+                vin=VIN,
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
+            )
+        )
+        assert first["status"] == "completed"
+
+        source_key = f"vpic_vin_sha256_{hashlib.sha256(VIN.encode()).hexdigest()}"
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE nhtsa_source_artifacts SET status = 'quarantined', "
+                "error_message = 'NHTSA VIN decode is missing required fields: "
+                "Model, EngineConfiguration, DisplacementL, Trim' "
+                "WHERE dataset_name = 'vpic_vin_decodes' AND source_key = %s",
+                (source_key,),
+            )
+            assert cursor.rowcount == 1
+            cursor.execute("DELETE FROM nhtsa_current_artifacts")
+            cursor.execute("DELETE FROM nhtsa_vin_decodes")
+
+        second = asyncio.run(
+            service.decode_vin(
+                run_key="reinstate-second",
+                vin=VIN,
+                scheduled_job_run_id=_scheduled_job(repository, "nhtsa-vin"),
+            )
+        )
+
+        assert second["status"] == "completed"
+        assert "outcome" not in second
+        assert second["vehicle"] is not None
+        assert second["vehicle"]["make_name"] == "TEST MAKE"
+        with repository.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count, MAX(status) AS status "
+                "FROM nhtsa_source_artifacts "
+                "WHERE dataset_name = 'vpic_vin_decodes' AND source_key = %s",
+                (source_key,),
+            )
+            row = cursor.fetchone()
+            assert row is not None
+            assert int(row["row_count"]) == 1
+            assert row["status"] == "imported"
+            cursor.execute("SELECT make_name FROM nhtsa_vin_decodes WHERE vin = %s", (VIN,))
+            decoded = cursor.fetchone()
+            assert decoded is not None
+            assert decoded["make_name"] == "TEST MAKE"
     finally:
         repository.clear_for_tests()
         repository.close()

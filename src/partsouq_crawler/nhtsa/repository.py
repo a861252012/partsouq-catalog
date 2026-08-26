@@ -910,6 +910,105 @@ class NhtsaMySQLRepository:
             "trim_name": trim_name,
         }
 
+    def reinstate_quarantined_vin_artifact(
+        self,
+        lease: NhtsaRunLease,
+        artifact_id: int,
+    ) -> None:
+        """把舊版必填規則誤判隔離的單筆 VIN artifact 平反為 imported。
+
+        僅限已驗證、記錄完整的 vpic_vin_decodes artifact；平反後沿用既有
+        記錄走正常發布流程，不重複下載或重建。"""
+        with self.transaction() as connection, connection.cursor() as cursor:
+            self._assert_active_lease(cursor, lease)
+            cursor.execute(
+                """
+                UPDATE nhtsa_source_artifacts
+                SET status = 'imported', error_message = NULL,
+                    imported_at = COALESCE(imported_at, UTC_TIMESTAMP(6))
+                WHERE id = %s AND dataset_name = 'vpic_vin_decodes'
+                  AND status = 'quarantined' AND verified_at IS NOT NULL
+                """,
+                (artifact_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("VIN decode artifact cannot be reinstated from quarantine")
+
+    def complete_run_as_undecodable_vin_decode(
+        self,
+        lease: NhtsaRunLease,
+        artifact_id: int,
+        normalized_vin: str,
+        *,
+        note: str,
+        downloaded: int,
+        reused: int,
+        source_rows: int,
+        new_versions: int,
+        rejected_rows: int,
+    ) -> None:
+        """vPIC 合法回答「這顆 VIN 解不出」時的終局收尾。
+
+        不寫 nhtsa_vin_decodes、不發布 current artifact；artifact 標記為
+        'undecodable' 並保留分類原因（含 ErrorCode 與 SuggestedVIN）。
+        舊版誤判為隔離的 artifact 在此一併平反為 'undecodable'。"""
+        vin = normalize_vin(normalized_vin)
+        source_key = vin_source_key(vin)
+        with self.transaction() as connection, connection.cursor() as cursor:
+            run = self._assert_active_lease(cursor, lease)
+            scope_name, source_keys = self._lease_scope(run)
+            if scope_name != "api-vin" or source_keys != (source_key,):
+                raise ValueError("VIN decode lease scope does not match the requested VIN")
+            if source_rows != 1 or rejected_rows != 0:
+                raise ValueError("VIN decode run counters do not match one accepted record")
+            cursor.execute(
+                """
+                SELECT dataset_name, source_key, http_status, verified_at, status
+                FROM nhtsa_source_artifacts WHERE id = %s
+                """,
+                (artifact_id,),
+            )
+            artifact = cursor.fetchone()
+            if (
+                artifact is None
+                or artifact["dataset_name"] != "vpic_vin_decodes"
+                or artifact["source_key"] != source_key
+                or int(artifact["http_status"]) != 200
+                or artifact["verified_at"] is None
+                or artifact["status"] not in ("imported", "quarantined", "undecodable")
+            ):
+                raise ValueError("VIN decode artifact is not eligible for undecodable completion")
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS record_rows FROM nhtsa_artifact_records
+                WHERE artifact_id = %s
+                """,
+                (artifact_id,),
+            )
+            record_count_row = cursor.fetchone()
+            if record_count_row is None or int(record_count_row["record_rows"]) != 1:
+                raise ValueError("VIN decode artifact must carry exactly one stored record")
+            cursor.execute(
+                """
+                UPDATE nhtsa_source_artifacts
+                SET status = 'undecodable', error_message = %s,
+                    imported_at = COALESCE(imported_at, UTC_TIMESTAMP(6))
+                WHERE id = %s
+                """,
+                (note[:512], artifact_id),
+            )
+            self._finish_run(
+                cursor,
+                lease,
+                status="completed",
+                downloaded=downloaded,
+                reused=reused,
+                source_rows=source_rows,
+                new_versions=new_versions,
+                rejected_rows=rejected_rows,
+                error_message=None,
+            )
+
     def status_report(self) -> dict[str, Any]:
         with self.transaction() as connection, connection.cursor() as cursor:
             cursor.execute(

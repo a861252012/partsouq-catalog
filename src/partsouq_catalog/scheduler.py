@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import fcntl
+import json
 import os
 import selectors
 import signal
@@ -302,6 +303,14 @@ def _finish_request(
     return_code: int,
     error_message: str | None = None,
 ) -> None:
+    """更新後台爬取要求結果。
+
+    成功時 error_message 僅在呼叫端明確提供註記時寫入（目前用於
+    nhtsa-vin 的 undecodable 終局分類）；失敗時維持原行為。"""
+    if return_code == 0:
+        final_error_message = error_message
+    else:
+        final_error_message = error_message or f"scheduler exit code {return_code}"
     connection = _connect()
     try:
         with connection.cursor() as cursor:
@@ -312,14 +321,57 @@ def _finish_request(
                 "ELSE requested_scope END WHERE id = %s",
                 (
                     "completed" if return_code == 0 else "failed",
-                    None
-                    if return_code == 0
-                    else error_message or f"scheduler exit code {return_code}",
+                    final_error_message,
                     request_id,
                 ),
             )
     finally:
         connection.close()
+
+
+def _extract_undecodable_note(child_output: str | None) -> str | None:
+    """從 nhtsa-decode-vin 子程序輸出尾端找 JSON 報告。
+
+    報告以縮排 JSON 印在輸出最後，前面可能混有 log 行；從尾端往前回
+    掃到能完整解析的物件為止。報告顯示終局無資料（outcome=undecodable）
+    時，回傳要寫進 admin_crawl_requests.error_message 的註記；其餘情況
+    回 None，維持成功即 NULL 的原語意。"""
+    if not child_output:
+        return None
+    text = child_output.strip()
+    scan_from = text.rfind("{")
+    while scan_from >= 0:
+        try:
+            report = json.loads(text[scan_from:])
+        except json.JSONDecodeError:
+            scan_from = text.rfind("{", 0, scan_from)
+            continue
+        if not isinstance(report, dict) or report.get("status") != "completed":
+            return None
+        if report.get("outcome") != "undecodable":
+            return None
+        note = str(report.get("outcome_note") or "").strip()
+        return f"completed as undecodable; {note}" if note else "completed as undecodable"
+    return None
+
+
+def _latest_nhtsa_vin_child_output() -> str | None:
+    """取最近一筆 queue 觸發的 nhtsa-vin 子程序排程輸出。"""
+    connection = _dict_connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT output_text FROM scheduled_job_runs "
+                "WHERE job_name = 'nhtsa-vin' AND trigger_mode = 'queue' "
+                "ORDER BY id DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if not row:
+        return None
+    output = row.get("output_text")
+    return str(output) if output else None
 
 
 def _requeue_interrupted_requests() -> None:
@@ -1371,7 +1423,10 @@ def dispatch(
                     if return_code != LOCK_BUSY_EXIT_CODE:
                         exit_code = 1
                     continue
-                _finish_request(request_id, return_code)
+                completion_note: str | None = None
+                if return_code == 0 and str(request["job_name"]) == "nhtsa-vin":
+                    completion_note = _extract_undecodable_note(_latest_nhtsa_vin_child_output())
+                _finish_request(request_id, return_code, completion_note)
                 if return_code != 0:
                     exit_code = 1
             except AdmissionLockBusy:

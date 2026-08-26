@@ -909,6 +909,7 @@ def test_pending_jobs_record_queue_trigger_mode(monkeypatch) -> None:
         return 0
 
     monkeypatch.setattr(scheduler, "dispatch_locked", dispatch_locked)
+    monkeypatch.setattr(scheduler, "_latest_nhtsa_vin_child_output", lambda: None)
     monkeypatch.setattr(scheduler, "_finish_request", lambda *_args: None)
 
     assert scheduler.dispatch("pending", "all") == 0
@@ -1837,7 +1838,36 @@ def test_pending_invalid_vin_failure_is_terminal(monkeypatch) -> None:
 
     assert scheduler.dispatch("pending", "all") == 1
     defer_request.assert_not_called()
-    finish_request.assert_called_once_with(10, 1)
+    finish_request.assert_called_once_with(10, 1, None)
+
+
+def test_pending_successful_vin_request_carries_undecodable_note(monkeypatch) -> None:
+    """終局無資料時，成功的要求要帶上 undecodable 註記供後台稽核。"""
+    monkeypatch.setattr(scheduler, "_requeue_interrupted_requests", lambda: None)
+    monkeypatch.setattr(
+        scheduler,
+        "_pending_requests",
+        lambda: [{"id": 11, "job_name": "nhtsa-vin", "requested_scope": "VIN"}],
+    )
+    monkeypatch.setattr(scheduler, "_claim_request", lambda _request_id: True)
+    monkeypatch.setattr(scheduler, "dispatch_locked", lambda _job, _scope: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "_latest_nhtsa_vin_child_output",
+        lambda: (
+            '{"status": "completed", "outcome": "undecodable", '
+            '"outcome_note": "NHTSA reports no usable decode (invalid_vin)"}'
+        ),
+    )
+    finish_request = mock.MagicMock()
+    monkeypatch.setattr(scheduler, "_finish_request", finish_request)
+
+    assert scheduler.dispatch("pending", "all") == 0
+    finish_request.assert_called_once_with(
+        11,
+        0,
+        "completed as undecodable; NHTSA reports no usable decode (invalid_vin)",
+    )
 
 
 def test_interrupted_queue_rows_are_recovered_before_read(monkeypatch) -> None:
@@ -2528,3 +2558,48 @@ def test_catalog_auto_migration_refuses_when_job_lock_is_owned(monkeypatch) -> N
     )
     runner.assert_not_called()
     daemon_lock.close.assert_called_once_with()
+
+
+def test_extract_undecodable_note_returns_none_for_plain_success() -> None:
+    report = '{"status": "completed", "vehicle": {"make_name": "TEST MAKE"}}'
+    assert scheduler._extract_undecodable_note(report) is None
+
+
+def test_extract_undecodable_note_reads_terminal_outcome_from_tail() -> None:
+    output = (
+        "2026-08-25 12:00:00,000 crawler INFO nhtsa decode start\n"
+        "2026-08-25 12:00:01,000 crawler WARNING something\n"
+        "{\n"
+        '  "run_id": 1007,\n'
+        '  "status": "completed",\n'
+        '  "outcome": "undecodable",\n'
+        '  "outcome_classification": "nhtsa_unregistered",\n'
+        '  "outcome_note": "NHTSA reports no usable decode (nhtsa_unregistered); '
+        "ErrorCode='7 - ManufacturerMarkedNotRegistered'; "
+        "SuggestedVIN='TMBJJ7AE0EJ123456'\",\n"
+        '  "vehicle": null\n'
+        "}\n"
+    )
+
+    note = scheduler._extract_undecodable_note(output)
+
+    assert note is not None
+    assert note.startswith("completed as undecodable; ")
+    assert "nhtsa_unregistered" in note
+    assert "TMBJJ7AE0EJ123456" in note
+
+
+def test_extract_undecodable_note_handles_empty_and_broken_output() -> None:
+    assert scheduler._extract_undecodable_note(None) is None
+    assert scheduler._extract_undecodable_note("") is None
+    assert scheduler._extract_undecodable_note("not json at all\n{broken") is None
+    # 尾端 JSON 被截斷時不可誤判成有註記
+    assert (
+        scheduler._extract_undecodable_note('{\n  "status": "completed",\n  "outcome": "undeco')
+        is None
+    )
+
+
+def test_extract_undecodable_note_ignores_failed_reports() -> None:
+    report = '{"status": "failed", "error": "boom"}'
+    assert scheduler._extract_undecodable_note(report) is None

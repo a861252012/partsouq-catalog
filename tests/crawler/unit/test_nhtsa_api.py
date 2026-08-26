@@ -11,10 +11,75 @@ from partsouq_crawler.nhtsa.api import (
     normalize_vin,
     vin_source_key,
 )
+from partsouq_crawler.nhtsa.api_service import (
+    classify_undecodable_vin_payload,
+    undecodable_outcome_note,
+)
 from partsouq_crawler.nhtsa.datasets import ApiSource
 from partsouq_crawler.nhtsa.models import ParsedRecord
 
 VIN = "ZZZTEST00X0000001"
+
+
+def _decode_payload(**overrides: str) -> dict[str, str]:
+    payload = {
+        "VIN": VIN,
+        "Make": "TEST MAKE",
+        "Model": "TEST MODEL",
+        "ModelYear": "2020",
+        "ErrorCode": "0",
+        "ErrorText": "",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_classify_undecodable_returns_none_when_core_fields_present() -> None:
+    assert classify_undecodable_vin_payload(_decode_payload()) is None
+    # ErrorCode 僅供消費端判讀；核心欄位齊全就不是終局無資料。
+    assert (
+        classify_undecodable_vin_payload(_decode_payload(ErrorCode="1 - Check Digit issue")) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({"Make": "", "ErrorCode": "7 - ManufacturerMarkedNotRegistered"}, "nhtsa_unregistered"),
+        (
+            {"ModelYear": "", "ErrorCode": "7 - ManufacturerMarkedNotRegistered"},
+            "nhtsa_unregistered",
+        ),
+        ({"Make": "", "ErrorCode": "11 - VIN corrected, no information returned"}, "invalid_vin"),
+        ({"Make": "", "ErrorCode": "400 - Provided VIN is not valid"}, "invalid_vin"),
+        (
+            {"ModelYear": "", "ErrorCode": "8 - No detailed data available currently"},
+            "no_detail_data",
+        ),
+        ({"Make": "", "ErrorCode": ""}, "no_detail_data"),
+        ({"Make": "", "ErrorCode": "unexpected text"}, "no_detail_data"),
+    ),
+)
+def test_classify_undecodable_maps_error_codes_to_terminal_classes(
+    overrides: dict[str, str],
+    expected: str,
+) -> None:
+    assert classify_undecodable_vin_payload(_decode_payload(**overrides)) == expected
+
+
+def test_undecodable_outcome_note_carries_code_and_suggested_vin() -> None:
+    note = undecodable_outcome_note(
+        _decode_payload(
+            Make="",
+            ErrorCode="7 - ManufacturerMarkedNotRegistered",
+            SuggestedVIN="TMBJJ7AE0EJ123456",
+        ),
+        "nhtsa_unregistered",
+    )
+
+    assert note.startswith("NHTSA reports no usable decode (nhtsa_unregistered)")
+    assert "ErrorCode='7 - ManufacturerMarkedNotRegistered'" in note
+    assert "SuggestedVIN='TMBJJ7AE0EJ123456'" in note
 
 
 def test_api_policy_allows_collections_and_one_full_vin_decode() -> None:

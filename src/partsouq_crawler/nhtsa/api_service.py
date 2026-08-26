@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +31,66 @@ API_REQUEST_BUDGET = 15000
 MANUFACTURER_PAGE_SIZE = 100
 MAX_MANUFACTURER_PAGES = 500
 MODEL_EXPANSION_LOG_BATCH = 500
+
+# vPIC 以 HTTP 200 回應但 Make／ModelYear 缺席時，依 ErrorCode 判定這顆
+# VIN 是否「永遠解不出」的終局結果：7＝製造商未在美國註冊（歐系品牌常見）；
+# 1/11/400＝VIN 結構無效（檢查碼錯、非法字元）；8＝暫無詳細資料。
+# 這些是站方 API 的合法最終答案，不是可重試的暫時性失敗。
+UNDECODABLE_CLASSIFICATIONS: dict[str, frozenset[int]] = {
+    "nhtsa_unregistered": frozenset({7}),
+    "invalid_vin": frozenset({1, 11, 400}),
+    "no_detail_data": frozenset({8}),
+}
+
+
+def classify_undecodable_vin_payload(payload: Mapping[str, object]) -> str | None:
+    """回傳 vPIC payload 的終局「無資料」分類；None 代表可正常發布。
+
+    Make 與 ModelYear 齊全時一律視為可發布（ErrorCode 僅供消費端判讀）；
+    缺任一必要欄位且錯誤碼命中上表時為對應分類；錯誤碼無法解析時以
+    no_detail_data 收斂（內容上確實沒有可用解碼）。"""
+    make_name = str(payload.get("Make") or "").strip()
+    model_year_raw = str(payload.get("ModelYear") or "").strip()
+    if make_name and model_year_raw:
+        return None
+    error_code_text = str(payload.get("ErrorCode") or "").strip()
+    leading_code = error_code_text.split("-", 1)[0].strip()
+    parsed_code = int(leading_code) if leading_code.isdigit() else None
+    for classification, codes in UNDECODABLE_CLASSIFICATIONS.items():
+        if parsed_code is not None and parsed_code in codes:
+            return classification
+    return "no_detail_data"
+
+
+def undecodable_outcome_note(payload: Mapping[str, object], classification: str) -> str:
+    """組出要寫入 artifact error_message 與後台請求註記的機器可讀原因。"""
+    parts = [f"NHTSA reports no usable decode ({classification})"]
+    error_code_text = str(payload.get("ErrorCode") or "").strip()
+    if error_code_text:
+        parts.append(f"ErrorCode='{error_code_text[:120]}'")
+    suggested_vin = str(payload.get("SuggestedVIN") or "").strip()
+    if suggested_vin:
+        parts.append(f"SuggestedVIN='{suggested_vin[:32]}'")
+    return "; ".join(parts)[:400]
+
+
+def _single_record_payload(document: ApiDocument) -> dict[str, object] | None:
+    """回傳唯一一筆記錄的 payload；結構不符（0 筆、多筆、含拒絕列）回 None。"""
+    if document.count != 1 or len(document.records) != 1 or document.rejections:
+        return None
+    try:
+        payload = json.loads(document.records[0].payload_json)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _payload_matches_source_key(payload: Mapping[str, object], source_key: str) -> bool:
+    """確認 payload 的 VIN 與 artifact source key（sha256）一致。"""
+    vin = str(payload.get("VIN") or "").strip().upper()
+    if not vin:
+        return False
+    return hashlib.sha256(vin.encode()).hexdigest() in source_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +402,8 @@ class NhtsaApiSyncService:
         new_versions = 0
         rejected_rows = 0
         artifact_id: int | None = None
+        classification: str | None = None
+        undecodable_payload: dict[str, object] | None = None
         try:
             with lease_heartbeat(self.config, lease) as check_lease:
                 async with NhtsaApiClient(self.config) as client:
@@ -364,7 +428,41 @@ class NhtsaApiSyncService:
                     or str(payload.get("VIN") or "").upper() != normalized_vin
                 ):
                     raise ValueError("NHTSA VIN decode response does not match the requested VIN")
+                classification = classify_undecodable_vin_payload(payload)
+                if classification is not None:
+                    undecodable_payload = payload
                 check_lease()
+            if undecodable_payload is not None and classification is not None:
+                # vPIC 合法回答「這顆 VIN 永遠解不出」：視為終局結果正常收
+                # 尾，不寫 nhtsa_vin_decodes、不發布，避免無限重試。
+                outcome_note = undecodable_outcome_note(undecodable_payload, classification)
+                self.repository.complete_run_as_undecodable_vin_decode(
+                    lease,
+                    imported.artifact_id,
+                    normalized_vin,
+                    note=outcome_note,
+                    downloaded=downloaded,
+                    reused=reused,
+                    source_rows=source_rows,
+                    new_versions=new_versions,
+                    rejected_rows=rejected_rows,
+                )
+                return {
+                    "run_id": lease.id,
+                    "run_key": run_key,
+                    "scope": "vin",
+                    "status": "completed",
+                    "outcome": "undecodable",
+                    "outcome_classification": classification,
+                    "outcome_note": outcome_note,
+                    "api_requests": self.request_count,
+                    "artifacts_downloaded": downloaded,
+                    "artifacts_reused": reused,
+                    "source_rows": source_rows,
+                    "new_versions": new_versions,
+                    "rejected_rows": rejected_rows,
+                    "vehicle": None,
+                }
             vehicle = self.repository.complete_run_and_publish_vin_decode(
                 lease,
                 imported.artifact_id,
@@ -507,9 +605,34 @@ class NhtsaApiSyncService:
             document = self.parser.parse(body, source)
             return ApiSourceImport(int(str(existing["id"])), document, False, 0)
         if existing and existing["status"] == "quarantined":
+            document = self.parser.parse(body, source)
+            record_payload = _single_record_payload(document)
+            if (
+                record_payload is not None
+                and _payload_matches_source_key(record_payload, source.key)
+                and classify_undecodable_vin_payload(record_payload) is not None
+            ):
+                # 舊版把「終局無資料」誤判為隔離；此內容是合法的最終答案，
+                # 沿用既有 artifact（記錄已完整入庫），交由上層以 undecodable
+                # 收尾並把狀態平反。
+                return ApiSourceImport(int(str(existing["id"])), document, False, 0)
+            if (
+                record_payload is not None
+                and _payload_matches_source_key(record_payload, source.key)
+                and str(record_payload.get("Make") or "").strip()
+                and str(record_payload.get("ModelYear") or "").strip().isdigit()
+            ):
+                # 舊版必填規則（連 Model 等選填欄位都要求）誤判隔離的內容；
+                # 現行規則下可正常發布，先平反為 imported 再沿用既有 artifact。
+                self.repository.reinstate_quarantined_vin_artifact(lease, int(str(existing["id"])))
+                return ApiSourceImport(int(str(existing["id"])), document, False, 0)
             raise ValueError(
                 f"{source.key} API content is quarantined: {existing['error_message']}"
             )
+        if existing and existing["status"] == "undecodable":
+            # 同內容重跑：沿用既有 artifact，本輪 run 再次以 undecodable 完成。
+            document = self.parser.parse(body, source)
+            return ApiSourceImport(int(str(existing["id"])), document, False, 0)
         artifact_id = self.repository.create_artifact(
             lease,
             dataset_name=source.dataset_name,

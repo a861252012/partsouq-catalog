@@ -2117,10 +2117,11 @@ def test_scheduler_consumes_pending_admin_request(
         ],
     )
     monkeypatch.setattr(scheduler, "_claim_request", lambda _request_id: True)
+    monkeypatch.setattr(scheduler, "_latest_nhtsa_vin_child_output", lambda: None)
     monkeypatch.setattr(
         scheduler,
         "_finish_request",
-        lambda request_id, return_code: completed.append((request_id, return_code)),
+        lambda request_id, return_code, _note=None: completed.append((request_id, return_code)),
     )
     monkeypatch.setattr(scheduler, "_run", lambda _job_name, _command, **_kwargs: 0)
 
