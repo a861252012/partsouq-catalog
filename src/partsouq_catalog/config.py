@@ -162,8 +162,9 @@ CRAWL: CrawlConfig = {
     # 首頁品牌清單的最低品牌數（SOL P1）：首次爬取（空 DB）時閉合檢查
     # 拿「本次解析結果」對「DB 已知」沒有意義（兩者同源），縮水解析
     # 會被誤判成完整。低於此門檻視為網站縮水/反爬頁，run 直接 error。
-    # 目前站上有 18 個品牌；若站方增減請用環境變數調整。
-    "min_brands": int(os.environ.get("PSQ_MIN_BRANDS", "18")),
+    # 2026-08-25 實測站方公開品牌剩 17 個；門檻定 15 是縮水偵測地板，
+    # 不是精確計數，留餘裕吸收站方小幅增減。若再縮水請用環境變數調整。
+    "min_brands": int(os.environ.get("PSQ_MIN_BRANDS", "15")),
     "limit_groups": int(os.environ.get("PSQ_LIMIT_GROUPS", "0")),  # 全站零件組數上限（測試用）
     # 舊有的未發布 sample 上限；只供測試，不可與 bounded 模式併用。
     "limit_parts": int(os.environ.get("PSQ_LIMIT_PARTS", "0")),

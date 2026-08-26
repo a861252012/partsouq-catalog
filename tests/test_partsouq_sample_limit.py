@@ -1,6 +1,8 @@
 import errno
 import fcntl
 import os
+import subprocess
+import sys
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -278,6 +280,23 @@ def test_negative_limit_is_rejected(monkeypatch):
 
     with pytest.raises(ValueError, match="PSQ_LIMIT_PARTS"):
         Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+
+
+def test_min_brands_default_and_env_override(monkeypatch):
+    # 2026-08-25 起站方公開品牌剩 17，預設地板下修為 15；環境變數仍可覆寫。
+    read_value = "from partsouq_catalog.config import CRAWL; print(CRAWL['min_brands'])"
+
+    monkeypatch.delenv("PSQ_MIN_BRANDS", raising=False)
+    default = subprocess.run(
+        [sys.executable, "-c", read_value], capture_output=True, text=True, check=True
+    )
+    assert default.stdout.strip() == "15"
+
+    monkeypatch.setenv("PSQ_MIN_BRANDS", "17")
+    overridden = subprocess.run(
+        [sys.executable, "-c", read_value], capture_output=True, text=True, check=True
+    )
+    assert overridden.stdout.strip() == "17"
 
 
 @pytest.mark.skipif(

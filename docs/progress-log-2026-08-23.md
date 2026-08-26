@@ -557,9 +557,9 @@ next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋�
    _record_finish 會在 JSON 後附加說明文字，原解析用 json.loads 要求
    報告延伸到輸出結尾，註記因此全滅。改 json.JSONDecoder.raw_decode
    容忍報告後的尾巴，補回歸測試釘住（含截斷報告不可誤判）。
-4. **min_brands 風險未決**：config.py 預設 18 與站方現況 17 脫節，
-   重啟忘帶 PSQ_MIN_BRANDS=15 會重演停擺。選項：(a) 預設下修至 15 或
-   17；(b) 在 LaunchAgent/watchdog 釘死環境變數；(c) 維持現狀僅靠人
-   記。待使用者決策。
+4. **min_brands 預設下修**：config.py 預設 18 與站方現況 17 脫節，
+   重啟忘帶環境變數會重演停擺。使用者決策採 (a)：預設下修至 15（縮
+   水偵測地板，留餘裕吸收小幅增減），註解同步改寫，新增預設值與環
+   境變數覆寫的回歸測試。
 5. **關卡**：ruff／format／mypy --strict 全過；全套 pytest 含真 MySQL
    全綠（1104 項、0 失敗）；裸環境與帶變數各跑一輪取 skip 實證。
