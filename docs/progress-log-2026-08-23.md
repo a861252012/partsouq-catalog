@@ -471,3 +471,65 @@ next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋�
    含 CSRF token 的登入流程驗證通過。
 6. **爬蟲現況**：daemon 與 watchdog 正常；零件數小時增量 +8k → +13k →
    +20k，累計 48,871 筆、車輛 9 台完成、磁碟剩 194GB。
+
+## 2026-08-25–26（工作階段8）爬蟲停擺修復、登入牆診斷與 NHTSA 解碼管線戰役
+
+1. **爬蟲停擺的兩個坑**：接手時 daemon 已停滯數小時。坑一：站方公開
+   landing 的品牌連結從 18 縮到 17，CloakBrowser 驗證
+   `brand_links >= min_brands`（config.py 預設 18）失敗，cookie 匯不
+   出來。坑二：`.env` 的 DB 密碼含 shell 特殊字元，zsh `source .env`
+   把它展開成空字串，重啟的 daemon 直接 Access denied。處置：改用逐
+   行讀取不展開的方式載入環境，帶 `PSQ_MIN_BRANDS=15` 重啟（run 1054／
+   crawl_run 18），watchdog 也改用 `uv run --locked python` 起（系統
+   python3 缺 pymysql）。min_brands 要不要永久下修，等站方品牌清單穩
+   定再議。
+2. **PartSouq 登入牆診斷**：BMW／Mercedes-Benz／Volkswagen 的 locate
+   頁回 HTTP 200 但內容是 Auth 表單（同網域 POST `/en/user/auth/login`，
+   Yii CSRF token）。以案主提供的帳號實測：主站登入成功（回應出現
+   Log Out），但同一顆 session 點 BMW 照樣被擋，導覽列也不顯示這些
+   品牌——用 requests 重現了使用者在 Brave 裡看到的登入迴圈，證明問
+   題在站方授權而非瀏覽器設定。Google 索引收錄過賓士深度頁，代表內容
+   存在、缺的是帳號權限層級。後續由案主向站方客服確認歐系區存取資格。
+3. **NHTSA 解碼管線卡死與修復（99cc61d）**：admin_crawl_requests 的
+   nhtsa-vin 呈 209 completed／728 failed／0 pending，約 2,200 個 VIN
+   沒排進佇列。驗屍 quarantined artifact 分三類：ErrorCode 7＝製造商
+   未在美國註冊；1/11/400＝不合北美結構規則；8＝部分解碼。現場重打
+   vPIC 正常，排除網路因素——程式把「合法的沒資料答案」當成可重試失
+   敗（repository 對缺 Make/ModelYear 一律 raise）。修法：新增
+   `classify_undecodable_vin_payload` 分類終局結果，artifact 標記
+   `undecodable`（status 是 VARCHAR(32) 無 CHECK，免 migration）、run
+   正常完成；舊版必填規則（當年連 Model 都要求）誤判隔離的 artifact
+   加平反路徑 `reinstate_quarantined_vin_artifact`；scheduler 從子程
+   序輸出解析報告，讓後台請求帶分類註記。
+4. **修復過程現場抓到的三個 bug**：
+   - 已標 undecodable 的 artifact 重跑被自己的資格檢查（只收
+     imported/quarantined）擋下，放行三種狀態。
+   - scheduler 註記解析器假設報告是單行 JSON，實際 `_print_json` 輸
+     出縮排多行，改從輸出尾端回掃第一個能完整解析的 `{`。
+   - 補入列的 INSERT SELECT 用 pymysql 預設 autocommit=False，忘了
+     commit 就關連線，44 筆整批 rollback；當下對帳還對得起（同一連
+     線看得到未提交資料），直到最終覆蓋檢查短少 44 才暴露。改
+     autocommit=True 重補。
+5. **資料面收尾**：queue-scheduler 容器前後重建三次載入新程式。容器
+   重建有空窗：第一版只會處理終局無資料，誤判隔離的內容要等第二版平
+   反路徑，中間這段跑了 44 筆重跑失敗。728 筆歷史 failed 的 scope 已
+   遮罩無法直接重跑，保留原列加註 superseded，另以 VNCS VIN 清單全新
+   排入佇列（冪等排除：已有解碼、undecodable 或 imported artifact、
+   已在佇列者不再排）。最終覆蓋：3,153 個 VNCS VIN 全數有終局結果：
+   解碼 2,152、undecodable 1,001，quarantined 歸零。failed 終值 772＝歷史
+   728 加空窗期 44，全數標註 superseded；第二版上線後零新失敗。
+6. **「VIN 打錯字」假設翻案（自查證偽）**：最初把 564 筆 SuggestedVIN
+   解讀為「NHTSA 比對到正確 VIN、來源抄錯字」。自行驗證後推翻：
+   264/564 的第 9 位是英文字母（ISO 3779 允許、北美要求數字或 X）；
+   558/564 的第 10 位年碼與車籍年份不合（樣本 Toyota 86 ZN6、Mazda
+   CX-5 JM7 為日規，Scania YS2 歐規——第 10 位年碼本就是北美慣例）；
+   把檢查碼依公式補成合法 VIN 再問 vPIC，抽樣 12 筆全部仍查無資料。
+   修正後的結論：這批是非美規車，NHTSA 天然沒有它們的資料，來源不需
+   要修。例外約 45 筆建議碼中段連續 `!!!`（VDS 整段缺漏），值得人工
+   對照行照。教訓：SuggestedVIN 是結構修正建議，不是資料庫比對命中。
+7. **CI 契約同步**：新增環境閘控案例使 env-gated skip 212 → 214（全套
+   pytest 產 junit 後以 scripts/ci_assert_pytest_skips.py 實測統計），
+   ci.yml 與 tests/test_ci_contract.py 同步 268 → 270。
+8. **爬蟲現況（08-26 下午）**：daemon 與 watchdog 自 08-24 20:33 起
+   連續運轉約 42 小時；累計零件 275,326 筆、車輛 364 台、磁碟剩
+   189GB。KP30 舊資料清除維持延後至全量完成驗收之後。
