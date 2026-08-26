@@ -2589,6 +2589,34 @@ def test_extract_undecodable_note_reads_terminal_outcome_from_tail() -> None:
     assert "TMBJJ7AE0EJ123456" in note
 
 
+def test_extract_undecodable_note_tolerates_text_after_report() -> None:
+    # 子程序寫完報告後才異常退出時，_record_finish 會在報告後面附加
+    # 說明文字；註記解析必須仍找得到報告本體。
+    output = (
+        "{\n"
+        '  "status": "completed",\n'
+        '  "outcome": "undecodable",\n'
+        '  "outcome_classification": "no_detail_data",\n'
+        '  "outcome_note": "NHTSA reports no usable decode (no_detail_data)",\n'
+        '  "vehicle": null\n'
+        "}\n"
+        "2026-08-26 10:00:00,000 scheduler WARNING NHTSA child process exit 1 was observed after completion\n"
+    )
+    note = scheduler._extract_undecodable_note(output)
+
+    assert note is not None
+    assert note.startswith("completed as undecodable; ")
+    assert "no_detail_data" in note
+
+    # 截斷的報告即使後面還有文字，也不可誤判成有註記
+    assert (
+        scheduler._extract_undecodable_note(
+            '{\n  "status": "completed",\n  "outcome": "undeco"\nexit text\n'
+        )
+        is None
+    )
+
+
 def test_extract_undecodable_note_handles_empty_and_broken_output() -> None:
     assert scheduler._extract_undecodable_note(None) is None
     assert scheduler._extract_undecodable_note("") is None

@@ -69,7 +69,9 @@ PARTSOUQ_DB_NAME=partsouq_catalog_test NHTSA_TEST_MYSQL=1 UNIFIED_TEST_MYSQL=1 \
 新增 migration 或環境閘控測試時，以下項目必須同步更新並核對：
 
 - `.github/workflows/ci.yml` 與 `tests/test_ci_contract.py` 的 skip 總數
-  （目前 268＝212 環境閘控＋56 macOS 閘控）。新增一個 env-gated 測試
+  （目前 271＝206 環境閘控＋56 macOS 閘控＋9 站方瀏覽器 E2E 閘控；本機
+  裸環境實測 215 加 darwin-only AST 盤點 56。新增 env-gated 測試時以
+  同法重盤）。新增一個 env-gated 測試
   就要 +1。
 - `tests/e2e/test_catalog_migration_runner.py` 內各降級輔助函式的
   ledger 刪除清單：刪除範圍必須「從目標版本一路涵蓋到最新版」，

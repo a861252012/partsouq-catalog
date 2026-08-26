@@ -527,9 +527,39 @@ next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋�
    修正後的結論：這批是非美規車，NHTSA 天然沒有它們的資料，來源不需
    要修。例外約 45 筆建議碼中段連續 `!!!`（VDS 整段缺漏），值得人工
    對照行照。教訓：SuggestedVIN 是結構修正建議，不是資料庫比對命中。
-7. **CI 契約同步**：新增環境閘控案例使 env-gated skip 212 → 214（全套
-   pytest 產 junit 後以 scripts/ci_assert_pytest_skips.py 實測統計），
-   ci.yml 與 tests/test_ci_contract.py 同步 268 → 270。
+7. **CI 契約同步**：新增環境閘控案例後，ci.yml 與
+   tests/test_ci_contract.py 的 expected-count 同步更新。初判 270 有誤，
+   工作階段9 以實測重盤定為 271。
 8. **爬蟲現況（08-26 下午）**：daemon 與 watchdog 自 08-24 20:33 起
    連續運轉約 42 小時；累計零件 275,326 筆、車輛 364 台、磁碟剩
    189GB。KP30 舊資料清除維持延後至全量完成驗收之後。
+
+## 2026-08-26（工作階段9）需求符合性稽核、契約重盤與解析器強化
+
+1. **三路審查與兩輪資料稽核**：subAgent 分頭做（a）需求清單彙整
+   （33 條可機器驗證項）、（b）正式庫唯讀稽核、（c）99cc61d 程式深
+   審。資料面結論：孤兒 0、語意重複 0、證據鏈 2,295 筆全 daemon 且
+   body 覆蓋 100%、NHTSA 解碼欄位契約逐欄吻合、VIN 來源全數可回溯
+   VNCS、覆蓋恆等式 2,152＋1,001＝3,153 成立、migration manifest 與
+   ledger 零 drift。WARN 兩件：vehicles.fetched_at 僅近期列有值（政
+   策合規只能對 70 筆驗證，實測違規 0）；station_admin_fitments 有
+   53,997 筆 invalid_date_intersection——查證後確認是 view 對上游矛
+   盾的正確標記（confidence 0、is_verified 0），VIN fitment 查詢走
+   另一條嚴格比對鏈不受影響，非違規。
+2. **CI skip 契約翻案（P1）**：初版把契約改成 270，深審抓出帳算錯。
+   不再推算，改實測：本機裸環境全套 junit 得 env-gated 206；darwin-only
+   以 AST 盤點 parametrize 展開得 56（與舊記載吻合）；站方瀏覽器 E2E
+   閘控 9。ubuntu dispatch 真值＝271，三處同步修正。過程發現 CI 是
+   workflow_dispatch 手動觸發制，push 從不自動跑——契約錯了不會炸管
+   線，但仍是本機測試釘住的常數。舊記載「268＝212＋56」的分解漏計瀏
+   覽器閘控 9，已一併更正。
+3. **註記解析器強化（P2）**：子程序寫完報告後才異常退出時，
+   _record_finish 會在 JSON 後附加說明文字，原解析用 json.loads 要求
+   報告延伸到輸出結尾，註記因此全滅。改 json.JSONDecoder.raw_decode
+   容忍報告後的尾巴，補回歸測試釘住（含截斷報告不可誤判）。
+4. **min_brands 風險未決**：config.py 預設 18 與站方現況 17 脫節，
+   重啟忘帶 PSQ_MIN_BRANDS=15 會重演停擺。選項：(a) 預設下修至 15 或
+   17；(b) 在 LaunchAgent/watchdog 釘死環境變數；(c) 維持現狀僅靠人
+   記。待使用者決策。
+5. **關卡**：ruff／format／mypy --strict 全過；全套 pytest 含真 MySQL
+   全綠（1104 項、0 失敗）；裸環境與帶變數各跑一輪取 skip 實證。

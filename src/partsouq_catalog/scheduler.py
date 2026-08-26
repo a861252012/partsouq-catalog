@@ -333,16 +333,19 @@ def _extract_undecodable_note(child_output: str | None) -> str | None:
     """從 nhtsa-decode-vin 子程序輸出尾端找 JSON 報告。
 
     報告以縮排 JSON 印在輸出最後，前面可能混有 log 行；從尾端往前回
-    掃到能完整解析的物件為止。報告顯示終局無資料（outcome=undecodable）
-    時，回傳要寫進 admin_crawl_requests.error_message 的註記；其餘情況
-    回 None，維持成功即 NULL 的原語意。"""
+    掃到能完整解析的物件為止。報告物件後面允許再接其他文字——子程序
+    寫完報告後才異常退出時，_record_finish 會把異常說明附加在報告之
+    後。報告顯示終局無資料（outcome=undecodable）時，回傳要寫進
+    admin_crawl_requests.error_message 的註記；其餘情況回 None，維持
+    成功即 NULL 的原語意。"""
     if not child_output:
         return None
     text = child_output.strip()
+    decoder = json.JSONDecoder()
     scan_from = text.rfind("{")
     while scan_from >= 0:
         try:
-            report = json.loads(text[scan_from:])
+            report, _ = decoder.raw_decode(text, scan_from)
         except json.JSONDecodeError:
             scan_from = text.rfind("{", 0, scan_from)
             continue
