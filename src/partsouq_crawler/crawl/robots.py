@@ -18,6 +18,13 @@ class _AccessGroup:
     rules: tuple[_AccessRule, ...]
 
 
+def _is_valid_robots_pattern(value: str) -> bool:
+    """路徑樣板必須以 `/` 起頭；`$` 僅能作為結尾錨點。"""
+    if not value or value.startswith("/"):
+        return "$" not in value[:-1]
+    return False
+
+
 def _access_groups(text: str) -> tuple[_AccessGroup, ...]:
     groups: list[_AccessGroup] = []
     user_agents: list[str] = []
@@ -37,7 +44,7 @@ def _access_groups(text: str) -> tuple[_AccessGroup, ...]:
             if value:
                 user_agents.append(value)
         elif user_agents and directive in {"allow", "disallow"}:
-            if not value or value.startswith("/"):
+            if _is_valid_robots_pattern(value):
                 rules.append(_AccessRule(directive == "allow", value))
     if user_agents:
         groups.append(_AccessGroup(tuple(user_agents), tuple(rules)))

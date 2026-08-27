@@ -559,6 +559,7 @@ Disallow: /en/catalog/
         "User-agent: *\nDisallow /en/catalog/\n",
         "User-agent: partsouq-catalog-crawler\nAllow: *secret\n",
         "User-agent: partsouq-catalog-crawler\nDisallow: *secret\n",
+        "User-agent: partsouq-catalog-crawler\nDisallow: /en/catalog/$bad\n",
     ],
 )
 def test_robots_without_explicit_applicable_access_rule_fails_closed(
@@ -580,7 +581,6 @@ def test_robots_without_explicit_applicable_access_rule_fails_closed(
     [
         ("Disallow: /en/catalog/*", True),
         ("Disallow: /en/catalog/$", False),
-        ("Disallow: /en/catalog/$bad", False),
         ("Allow: /en/catalog/*", False),
         ("Allow:", False),
         ("Disallow:", False),
