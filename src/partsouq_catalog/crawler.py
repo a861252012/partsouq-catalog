@@ -138,6 +138,19 @@ def _vehicle_year_window_floor() -> int:
     return date.today().year - window
 
 
+def _brand_from_url(url: object) -> str | None:
+    """從 unit 頁 URL 的 `?c=` 參數取出品牌名（例：?c=Toyota → Toyota）。"""
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        from urllib.parse import parse_qs, urlparse
+
+        values = parse_qs(urlparse(url).query).get("c")
+        return values[0] if values else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _group_closure_mismatches(
     known_codes: dict[str, set[str]],
     parsed_groups: list[ParsedRecord],
@@ -489,6 +502,26 @@ class Crawler:
             time.sleep(breather)
         raise RuntimeError(
             f"[{ctx}] parsed 0 {what} from {len(html)}-byte page (site layout changed?)"
+        )
+
+    def _assert_expected_unit(self, html: str, group: ParsedRecord) -> None:
+        """身分斷言：抓回的頁面必須屬於預期的 unit（uid 出現在頁面中）。
+
+        防範「同 URL 回傳錯誤內容」（站方快取／負載均衡異常把別的組的
+        頁面送到本組的 URL）—— 這種情況沒有轉址，URL 層的 off-unit 檢查
+        （fetch_page 的 NonUnitPageError、get_response 的 unit 轉址 NotFound）
+        抓不到，只有頁面內容本身能驗證。
+
+        實測（subAgent 以真實瀏覽器抽查 30 組存證）：genuine 頁面（含合法
+        空組）全部含 uid、/locate 轉址頁全部不含，故以 uid 出現與否斷言
+        是安全的，不會誤殺合法空組。斷言失敗一律拋錯（fail-closed，該組
+        不寫任何 receipt，由續爬重試），絕不靜默寫入錯誤資料。"""
+        expected_uid = str(group.get("uid") or "")
+        if expected_uid and expected_uid in html:
+            return
+        raise RuntimeError(
+            f"[group={group.get('group_code')}] fetched page does not contain expected "
+            f"unit uid={expected_uid!r}; refusing receipt (wrong content at same URL?)"
         )
 
     def _brands(self) -> list[ParsedRecord]:
@@ -1526,6 +1559,8 @@ class Crawler:
         # quarantine 表 + 本行 log 就是完整紀錄；下次排程仍會重新
         # 拜訪（done 是 per run_key），站方補上名稱時自動落庫。
         if not parts and skipped_nameless:
+            # 身分斷言：即使整頁都是無名稱列，也必須確認是本組的頁面。
+            self._assert_expected_unit(html, group)
             log.warning(
                 "[%s group=%s] all %d row(s) lack product name; quarantined, "
                 "group receipted as done",
@@ -1554,6 +1589,9 @@ class Crawler:
         # 三輪 run 位元組級重現）。HTTP 200 且 0 malformed —— 這是站方
         # 的合法「此組無零件」，receipt done/0，不得讓整輪 run 失敗。
         if not parts and not malformed and has_empty_parts_table(html):
+            # 身分斷言：空表殼页也可能是「同 URL 回傳別的頁面」（/locate
+            # 轉址頁若剛好含表殼、或站方回錯內容），receipt 前必須驗明正身。
+            self._assert_expected_unit(html, group)
             log.info(
                 "[%s group=%s] parts table present but empty; site lists no "
                 "parts for this unit — receipted as done/0",
@@ -1576,6 +1614,9 @@ class Crawler:
                 fetched[map_key] = 0
             return False
         self._guard_parse(html, parts, "parts", f"{brand} group={group.get('group_code')}")
+        # 身分斷言（populated 路徑）：含零件的頁面同樣必須是本組的 unit 頁，
+        # 防範別的組的零件被寫到本組 group_id 下（misattribution）。
+        self._assert_expected_unit(html, group)
         parsed_row_count = len(parts)
         # bounded retry 可能在 commit 已成功、process 尚未更新記憶體計數
         # 時中斷。以 DB membership 為準，先排除同 run 已寫入的
@@ -1748,6 +1789,66 @@ class Crawler:
         return not complete_group
 
     # ------------------------------------------------------------- entry
+
+    def recover_null_groups(self, limit: int = 500) -> int:
+        """掃描 fetched_status IS NULL 的零件組，直接按 URL 重抓並 receipt。
+
+        這些組通常是「vehicle-walk 閉合對帳」機制下被遺漏的孤兒組
+        （活頁不再列出、或 preload 與實際頁面不一致），原本沒有獨立重抓
+        通道，會永久留 NULL。此處繞過 crawl_groups 的閉合守門，直接對
+        單元頁抓取與寫入，收斂長尾，不讓它們拖垮全站 success 對帳。
+        """
+        from datetime import datetime
+
+        # 獨立 / 一次性收斂（run_crawl --recover-only）時，run() 並未初始化
+        # crawl run；crawl_group 依賴 self.run_id 寫 receipt 與 membership，
+        # 故在此自給自足建立一筆 run，結束時標 success。run() 內呼叫時
+        # run_id 已存在，不重複初始化、也不代為 finish（由 run() 負責）。
+        # 收斂本質是「全站維護」動作，一律以 full 語意記錄，不沾 bounded /
+        # evidence 發布語意。
+        if self.run_id is None:
+            run_key = f"recover-{datetime.now():%Y%m%dT%H%M%S}"
+            self.crawl.run_key = run_key
+            self.run_id = self.crawl.start_run(
+                run_key,
+                fresh=self.fresh,
+                dataset_kind="full",
+                target_parts=None,
+                scheduled_job_run_id=self.scheduled_job_run_id,
+            )
+            self.db.commit()
+            initialized_here = True
+        else:
+            initialized_here = False
+        try:
+            rows = self.crawl.list_null_groups(limit)
+            if not rows:
+                return 0
+            recovered = 0
+            for row in rows:
+                brand = _brand_from_url(row["url"]) or "Toyota"
+                vehicle_id = int(cast(int, row["vehicle_id"]))
+                group: ParsedRecord = {
+                    "category_name": row["category_name"],
+                    "cid": row["cid"],
+                    "group_code": row["code"],
+                    "group_name": row["name"],
+                    "uid": row["uid"],
+                    "url": row["url"],
+                }
+                try:
+                    # skip_if_fetched=False：即使已標 done 也強制重抓；NULL 組
+                    # 的 fetched_status 為 NULL，不會被 skip 分支漏掉。
+                    self.crawl_group(brand, vehicle_id, group, skip_if_fetched=False)
+                    recovered += 1
+                except Exception:  # noqa: BLE001
+                    log.exception("recover_null_groups: 組 %s 重抓失敗", row["id"])
+            log.info("recover_null_groups: 處理 %d 組, 收斂 %d 組", len(rows), recovered)
+            return recovered
+        finally:
+            if initialized_here and self.run_id is not None:
+                self.crawl.finish_run(self.run_id, "success", self.counts, "recover-only")
+                self.db.commit()
 
     def run(self) -> dict[str, int]:
         """執行整趟爬取（進入點）。回傳統計計數；self.last_status 記錄
@@ -1987,6 +2088,17 @@ class Crawler:
                 self.db.commit()
                 # 每個品牌後回收一次：清掉解析樹的循環參考
                 gc.collect()
+
+            # 全站爬完後收尾：直接重抓遺留的 NULL 孤兒組（繞過 vehicle-walk
+            # 閉合守門，見 recover_null_groups）。只在本月完整 crawl 才跑，
+            # 避免干擾 bounded/sample 的配額與對帳。
+            if not self.bounded_mode and not self.sample_mode:
+                try:
+                    recovered = self.recover_null_groups()
+                    if recovered:
+                        log.info("recover_null_groups 收斂 %d 個 NULL 組", recovered)
+                except Exception:  # noqa: BLE001
+                    log.exception("recover_null_groups pass 失敗（不中斷本 run）")
 
             # 全站成功 = 完整 scope（沒有 start/limit 縮限）+ 當次 run
             # 沒有任何殘留 error（P0 修復）。局部執行、有 limit、或任何

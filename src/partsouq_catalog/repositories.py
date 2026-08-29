@@ -745,6 +745,24 @@ class CrawlRepository:
         row = cast(Row, cur.fetchone())
         return cast(int, row["n"])
 
+    def list_null_groups(self, limit: int = 500) -> Sequence[Row]:
+        """回傳 fetched_status IS NULL 的零件組，並經 categories 反查所屬車型
+        vehicle_id 與分類名稱／cid。這些組通常是 vehicle-walk 閉合對帳下被
+        遺漏的孤兒組，原本沒有獨立重抓通道，會永久留 NULL。
+        """
+        cur = self.db._execute(
+            "SELECT g.id, g.category_id, g.code, g.name, g.uid, g.url, "
+            "c.vehicle_id, c.name AS category_name, c.cid "
+            "FROM groups_t g "
+            "JOIN categories c ON c.id = g.category_id "
+            "WHERE g.fetched_status IS NULL "
+            "ORDER BY g.id "
+            "LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        return rows if rows is not None else []
+
     def count_quarantined(self, run_key: str = "") -> int:
         """回傳指定 run 列進 part_quarantine 的料號列數（供運維查詢）。
 

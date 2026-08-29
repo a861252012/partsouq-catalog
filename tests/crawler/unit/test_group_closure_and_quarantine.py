@@ -10,7 +10,11 @@ from unittest import mock
 import pytest
 
 from partsouq_catalog.config import CRAWL
-from partsouq_catalog.crawler import Crawler, _group_closure_mismatches
+from partsouq_catalog.crawler import (
+    Crawler,
+    _brand_from_url,
+    _group_closure_mismatches,
+)
 
 
 def _group() -> dict:
@@ -25,7 +29,10 @@ def _group() -> dict:
 
 
 def _parts_html(rows: list[tuple[str, str, str]]) -> str:
-    """rows: (part_number, name, code)。其餘欄位固定：Note 空、Qty 01、Range 空。"""
+    """rows: (part_number, name, code)。其餘欄位固定：Note 空、Qty 01、Range 空。
+
+    真實 unit 頁會在頁面中渲染所屬 uid（身分斷言依據），fixture 同步
+    含 uid=10001（與 _group() 一致），模擬 genuine 頁面。"""
     body = "".join(
         "<tr>"
         f'<td><a href="/en/search/all?q={part_number}">{part_number}</a></td>'
@@ -33,7 +40,7 @@ def _parts_html(rows: list[tuple[str, str, str]]) -> str:
         "</tr>"
         for part_number, name, code in rows
     )
-    return f"<table><tbody>{body}</tbody></table>"
+    return f'<input type="hidden" name="uid" value="10001"><table><tbody>{body}</tbody></table>'
 
 
 @pytest.fixture
@@ -221,3 +228,93 @@ def test_all_valid_page_marks_done_without_quarantine(sample_crawler) -> None:
         41, "2026-08-fixture", status="done", row_count=1
     )
     assert fetched == {("1", "1101", "10001"): 1}
+
+
+# ---------------------------------------------------------------------------
+# 身分斷言：同 URL 回傳錯誤內容時，任何 receipt 都必須拒絕（fail-closed）
+# ---------------------------------------------------------------------------
+
+
+def test_empty_table_receipt_refuses_page_without_expected_uid(sample_crawler) -> None:
+    """頁面不含本組 uid（同 URL 錯誤內容）時，即使有完整空表殼也不得
+    receipt done/0 —— 舊碼在這裡會把 /locate 首頁靜默標成空組。"""
+    sample_crawler._get.return_value = (
+        '<input type="hidden" name="uid" value="999999">'
+        "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th></tr></thead></table>"
+    )
+
+    with pytest.raises(RuntimeError, match="does not contain expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+    sample_crawler.parts.quarantine_parts.assert_not_called()
+
+
+def test_genuine_empty_unit_page_still_receipts_done_zero(sample_crawler) -> None:
+    """合法空組：頁面含本組 uid + 完整空表殼 → 照常 receipt done/0，
+    身分斷言不得誤殺 genuine 空頁。"""
+    sample_crawler._get.return_value = (
+        '<input type="hidden" name="uid" value="10001">'
+        "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th></tr></thead></table>"
+    )
+
+    truncated = sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    assert truncated is False
+    sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
+        41, "2026-08-fixture", status="done", row_count=0
+    )
+
+
+# ---------------------------------------------------------------------------
+# recover_null_groups：孤兒 NULL 組重抓通道（繞過 vehicle-walk 閉合守門）
+# ---------------------------------------------------------------------------
+
+
+def _null_group_row(uid: str, code: str, id_: int = 0) -> dict:
+    return {
+        "id": id_,
+        "vehicle_id": 7,
+        "category_name": "ENGINE/FUEL/TOOL",
+        "cid": "1",
+        "code": code,
+        "name": f"GROUP {code}",
+        "uid": uid,
+        "url": f"https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid={uid}",
+    }
+
+
+def test_brand_from_url_parses_c_param() -> None:
+    assert (
+        _brand_from_url("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") == "Toyota"
+    )
+    assert _brand_from_url("/en/catalog/genuine/unit?uid=1") is None
+    assert _brand_from_url("") is None
+
+
+def test_recover_null_groups_receipts_null_group(sample_crawler) -> None:
+    """單一 NULL 組經 recover pass 後應被 crawl_group 成功標 done。"""
+    sample_crawler.crawl.list_null_groups.return_value = [_null_group_row("10001", "1101", id_=999)]
+    sample_crawler._get.return_value = _parts_html([("P00001", "ENGINE BOLT", "11000")])
+
+    recovered = sample_crawler.recover_null_groups(limit=10)
+
+    assert recovered == 1
+    sample_crawler.crawl.list_null_groups.assert_called_once_with(10)
+    sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
+        41, "2026-08-fixture", status="done", row_count=1
+    )
+
+
+def test_recover_null_groups_survives_single_failure(sample_crawler) -> None:
+    """任一組重抓拋錯不應中斷整個 pass，成功組仍計入。"""
+    sample_crawler.crawl.list_null_groups.return_value = [
+        _null_group_row("10001", "1101", id_=999),
+        _null_group_row("10002", "1102", id_=998),
+    ]
+    sample_crawler.crawl_group = mock.MagicMock(side_effect=[RuntimeError("boom"), False])
+
+    recovered = sample_crawler.recover_null_groups(limit=10)
+
+    assert recovered == 1
+    assert sample_crawler.crawl_group.call_count == 2

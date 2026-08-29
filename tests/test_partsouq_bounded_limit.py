@@ -50,6 +50,8 @@ def _parts(count: int) -> list[dict]:
 
 
 def _parts_html(count: int) -> str:
+    # 真實 unit 頁會渲染所屬 uid（身分斷言依據）；fixture 同步含
+    # uid=10001（與 _group() 一致），模擬 genuine 頁面。
     rows = "".join(
         "<tr>"
         f'<td><a href="/en/search/all?q=P-{index:05d}">P-{index:05d}</a></td>'
@@ -57,7 +59,7 @@ def _parts_html(count: int) -> str:
         "</tr>"
         for index in range(count)
     )
-    return f"<table><tbody>{rows}</tbody></table>"
+    return f'<input type="hidden" name="uid" value="10001"><table><tbody>{rows}</tbody></table>'
 
 
 def _group() -> dict:
@@ -929,7 +931,9 @@ def test_bounded_partial_group_retry_removes_disappeared_membership(monkeypatch)
     instance.crawl = mock.MagicMock()
     instance.crawl.run_key = "bounded-resume-test"
     instance.crawl.previous_row_count.return_value = 0
-    instance._get = mock.MagicMock(return_value="<table></table>")
+    instance._get = mock.MagicMock(
+        return_value='<input type="hidden" name="uid" value="10001"><table></table>'
+    )
     with mock.patch(
         "partsouq_catalog.crawler.parse_parts",
         return_value=(_parts(10)[1:], 0, 0, []),

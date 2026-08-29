@@ -41,6 +41,12 @@ def main() -> int:
         default=int(CRAWL.get("workers", 4)),
         help="並行車型 worker 數（預設取自 PSQ_WORKERS 或 4）",
     )
+    parser.add_argument(
+        "--recover-only",
+        action="store_true",
+        help="只重抓 fetched_status IS NULL 的孤兒組並結束，不跑整趟爬取；"
+        "使用獨立 recover.lock，可與線上 daemon 並行",
+    )
     args = parser.parse_args()
 
     ensure_private_state_directory(LOG_DIR)
@@ -73,7 +79,9 @@ def main() -> int:
     lock_dir = (
         Path(configured_state_dir).expanduser().absolute() if configured_state_dir else LOG_DIR
     )
-    lock_path = lock_dir / "crawler.lock"
+    # --recover-only 是輕量維護通道，只補抓孤兒組；改用獨立 recover.lock，
+    # 不與整趟爬取的 crawler.lock 互斥，才能在不中斷線上 daemon 下併行執行。
+    lock_path = lock_dir / ("recover.lock" if args.recover_only else "crawler.lock")
     try:
         ensure_private_state_directory(lock_dir)
         lock_descriptor = open_private_state_file(
@@ -122,6 +130,11 @@ def main() -> int:
         governor = RequestGovernor(CRAWL["request_rate"], CRAWL["request_burst"])
         http = SessionManager(cookies, no_browser=args.no_browser, gov=governor)
         crawler = Crawler(http, db, workers=args.workers, governor=governor, fresh=args.fresh)
+        if args.recover_only:
+            # 跳過整趟 run()，直接收斂孤兒組後結束；finally 仍會關資源。
+            recovered = crawler.recover_null_groups()
+            log.info("recover-only 完成：收斂 %d 組", recovered)
+            return 0
         try:
             counts = crawler.run()
         except AdmissionLockBusy:

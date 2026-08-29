@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -503,6 +504,267 @@ def _launch_cloak() -> bool:
     )
     _stop_owned_browser()
     return False
+
+
+def _terminate_process_group(proc: "subprocess.Popen[bytes]") -> None:
+    """終止以 start_new_session 啟動的瀏覽器子程序 process group。"""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _is_cloudflare_challenge(text: str) -> bool:
+    """判斷頁面 HTML 是否為 Cloudflare 挑戰頁（managed challenge）。
+
+    同一份邏輯也內嵌在 fetch_page 的子程序腳本（獨立 venv，無法匯入
+    本模組），兩處必須保持同步：任何一邊放寬都等於放寬 fail-closed。
+    """
+    lowered = text.lower()
+    return (
+        "just a moment" in lowered
+        or "verify you are human" in lowered
+        or "請稍候" in text
+        or "cf-mitigated" in lowered
+    )
+
+
+class NonUnitPageError(Exception):
+    """瀏覽器最後落點不是請求的 unit 頁（被轉址到 /locate、首頁或別的組）。
+
+    fetch_page 的子程序腳本跑在獨立 venv，無法匯入本例外類別，故改用
+    sidecar marker 檔通報；父程序讀到 marker 再轉拋成此例外。HTTP 層會
+    把它轉成 NotFoundError，讓 crawl_group 把該組標成 not_found（terminal），
+    而非靜默 receipt 成 done/0。這是 fail-closed 在瀏覽器路徑上的對應防護。"""
+
+
+def _prepare_browser_launch() -> tuple[dict[str, str], Path, Path, str, str] | None:
+    """解析 CloakBrowser 啟動環境並完成 free binary contract 檢查。
+
+    供 fetch_page（頁面抓取）共用安全關鍵的 binary contract 邏輯；
+    refresh_session 的 cookie 匯出路徑另有一份相同檢查（保持各自獨立，
+    避免改動關鍵刷新路徑）。失敗回傳 None。
+    """
+    cache_override = os.environ.get("CLOAKBROWSER_CACHE_DIR")
+    if cache_override:
+        free_cache = Path(cache_override).expanduser()
+        private_state_root = free_cache.parent
+    else:
+        private_state_root = Path(
+            os.environ.get("PSQ_CLOAK_STATE_DIR", CLOAK["state_dir"])
+        ).expanduser()
+        free_cache = private_state_root / "free-browser-cache"
+    browser_home = free_cache.parent / "browser-home"
+    if any(
+        private_path_has_symlink(private_path)
+        for private_path in (private_state_root, free_cache, browser_home)
+    ):
+        log.error("refusing symlinked CloakBrowser private state path")
+        return None
+    _ensure_state_directory(free_cache)
+    if _free_cache_has_pro_artifacts(free_cache):
+        log.error("refusing CloakBrowser Pro artifacts in the dedicated free cache")
+        return None
+    _ensure_state_directory(browser_home)
+
+    expected_binary = os.environ.get("CLOAKBROWSER_BINARY_PATH", "")
+    expected_sha256 = os.environ.get("PSQ_CLOAK_EXPECTED_SHA256", "")
+    binary_contract_required = os.environ.get("PARTSOUQ_LAUNCHD_JOB") == "1"
+    binary_contract_enabled = bool(expected_binary or expected_sha256)
+    if (binary_contract_required or binary_contract_enabled) and (
+        not expected_binary
+        or not expected_sha256
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        log.error("incomplete verified CloakBrowser free binary contract")
+        return None
+    if binary_contract_enabled:
+        try:
+            resolved_binary = Path(expected_binary).expanduser().resolve(strict=True)
+            relative_binary = resolved_binary.relative_to(free_cache.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            log.error("verified CloakBrowser binary is outside the dedicated free cache: %s", error)
+            return None
+        if (
+            len(relative_binary.parts) < 2
+            or not relative_binary.parts[0].startswith("chromium-")
+            or "pro" in relative_binary.parts[0].lower()
+        ):
+            log.error("verified CloakBrowser binary is not in a free Chromium version directory")
+            return None
+        expected_binary = str(resolved_binary)
+        try:
+            with resolved_binary.open("rb") as binary_file:
+                binary_sha256 = hashlib.file_digest(binary_file, "sha256").hexdigest()
+        except OSError as error:
+            log.error("could not read verified CloakBrowser binary: %s", error)
+            return None
+        if binary_sha256 != expected_sha256:
+            log.error("verified CloakBrowser binary SHA256 mismatch")
+            return None
+
+    allowed_env = {
+        "CLOAKBROWSER_CACHE_DIR",
+        "CLOAKBROWSER_BINARY_PATH",
+        "DISPLAY",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "PATH",
+        "PLAYWRIGHT_NODEJS_PATH",
+        "PSQ_CLOAK_EXPECTED_SHA256",
+        "SHELL",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "XAUTHORITY",
+    }
+    env = {key: value for key, value in os.environ.items() if key in allowed_env}
+    env["CLOAKBROWSER_CACHE_DIR"] = str(free_cache)
+    env["HOME"] = str(browser_home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if expected_binary:
+        env["CLOAKBROWSER_BINARY_PATH"] = expected_binary
+    if expected_sha256:
+        env["PSQ_CLOAK_EXPECTED_SHA256"] = expected_sha256
+    return env, free_cache, browser_home, expected_binary, expected_sha256
+
+
+def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
+    """透過真實 CloakBrowser 抓取單一 catalog 頁面 HTML。
+
+    requests 傳輸即使帶有效 cf_clearance，仍會被 Cloudflare 以 TLS
+    fingerprint 擋下（403 managed challenge 或轉址挑戰）。真實瀏覽器具備
+    真實 fingerprint，載入同一份 cookie 即可通過 —— 這是 requests 被挑戰
+    時的最後手段。
+
+    回傳頁面 HTML；若瀏覽器仍拿到挑戰頁、或任何失敗，回傳 None（保留
+    fail-closed：HTTP 層會依此決定是否放棄該請求，絕不把挑戰頁當成
+    資料寫入）。"""
+    with _process_refresh_lock() as acquired:
+        if not acquired:
+            log.error("browser fetch lock held by another process; skip %s", url[:80])
+            return None
+        prepared = _prepare_browser_launch()
+        if prepared is None:
+            return None
+        env, free_cache, browser_home, _binary, _sha = prepared
+        cookie_file = CLOAK["cookie_file"]
+        out_file = CLOAK["state_dir"] / ".cloak-page-fetch.html"
+        marker_file = out_file.with_name(out_file.name + ".offunit")
+        script = (
+            "import asyncio, json, os, time\n"
+            "from urllib.parse import urlsplit, parse_qs\n"
+            "import cloakbrowser\n"
+            f"COOKIE_FILE = {str(cookie_file)!r}\n"
+            f"URL = {url!r}\n"
+            f"OUT = {str(out_file)!r}\n"
+            f"MARKER = {str(marker_file)!r}\n"
+            "def _unit_uid(u):\n"
+            "    return parse_qs(urlsplit(u).query).get('uid', [None])[0]\n"
+            "def _is_unit(u):\n"
+            "    p = urlsplit(u).path\n"
+            "    return p == '/en/catalog/genuine/unit' or p.startswith('/en/catalog/genuine/unit/')\n"
+            "async def main():\n"
+            "    b = await cloakbrowser.launch_async(headless=False)\n"
+            "    try:\n"
+            "        ctx = await b.new_context(viewport={'width':1366,'height':900})\n"
+            "        try:\n"
+            "            raw = json.load(open(COOKIE_FILE))\n"
+            "            ctx.add_cookies(\n"
+            "                [{'name': c['name'], 'value': c['value'],\n"
+            "                  'domain': c.get('domain', 'partsouq.com'),\n"
+            "                  'path': c.get('path', '/')} for c in raw]\n"
+            "            )\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        page = await ctx.new_page()\n"
+            "        await page.goto(URL, wait_until='domcontentloaded', timeout=60000)\n"
+            "        deadline = time.monotonic() + 60\n"
+            "        html = ''\n"
+            "        while time.monotonic() < deadline:\n"
+            "            html = await page.content()\n"
+            "            low = html.lower()\n"
+            "            if ('just a moment' not in low and 'verify you are human' not in low\n"
+            "                    and '\\u8acb\\u6682\\u5019' not in html and 'cf-mitigated' not in low):\n"
+            "                break\n"
+            "            await asyncio.sleep(3)\n"
+            "        # 落點不是原本請求的 unit 頁（被轉到 /locate、首頁或別的組）：\n"
+            "        # 寫 sidecar marker 而非 HTML，父程序據此拒絕（fail-closed）。\n"
+            "        final_url = page.url\n"
+            "        if not (_is_unit(final_url) and _unit_uid(final_url) == _unit_uid(URL)):\n"
+            "            with open(MARKER, 'w') as f:\n"
+            "                f.write(final_url)\n"
+            "            return\n"
+            "        tmp = OUT + '.tmp'\n"
+            "        with open(tmp, 'w') as f:\n"
+            "            f.write(html)\n"
+            "        os.replace(tmp, OUT)\n"
+            "    finally:\n"
+            "        await b.close()\n"
+            "asyncio.run(main())\n"
+        )
+        err_fd = _open_state_file_no_follow(
+            CLOAK["error_log_file"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        )
+        try:
+            err_log = os.fdopen(err_fd, "w")
+        except BaseException:
+            os.close(err_fd)
+            raise
+        fd, tmp_script = tempfile.mkstemp(suffix=".py", text=True)
+        with os.fdopen(fd, "w") as f:
+            f.write(script)
+        try:
+            if out_file.exists():
+                out_file.unlink()
+            proc = subprocess.Popen(
+                [*CLOAK["launcher"], CLOAK["venv_python"], "-u", tmp_script],
+                stdout=subprocess.DEVNULL,
+                stderr=err_log,
+                env=env,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                if out_file.exists():
+                    break
+                time.sleep(2)
+            if proc.poll() is None:
+                log.error("browser fetch timed out for %s; terminating", url[:80])
+                _terminate_process_group(proc)
+            if not out_file.exists() and not marker_file.exists():
+                log.error("browser fetch produced no output for %s", url[:80])
+                return None
+            if marker_file.exists():
+                final = marker_file.read_text(encoding="utf-8", errors="replace").strip()
+                marker_file.unlink(missing_ok=True)
+                out_file.unlink(missing_ok=True)
+                log.warning("browser fetch landed off-unit (%s); refusing %s", final, url[:80])
+                raise NonUnitPageError(final)
+            try:
+                html = out_file.read_text(encoding="utf-8", errors="replace")
+            finally:
+                out_file.unlink(missing_ok=True)
+        finally:
+            err_log.close()
+            os.unlink(tmp_script)
+        if _is_cloudflare_challenge(html):
+            log.warning("browser fetch returned a challenge page for %s; refusing", url[:80])
+            return None
+        return html
 
 
 def refresh_session() -> Cookies | None:

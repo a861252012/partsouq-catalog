@@ -741,3 +741,52 @@ def test_ambiguous_partsouq_path_fails_closed_without_request(url: str) -> None:
         manager.get(url)
 
     manager.session.get.assert_not_called()
+
+
+def test_browser_fallback_recovers_challenged_catalog_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    url = "https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1&vid=0"
+    manager = SessionManager()
+    manager._ensure_catalog_allowed = lambda _u: None
+    manager.session.get = Mock(return_value=CHALLENGE_RESPONSE)
+    monkeypatch.setattr("partsouq_catalog.http_client.force_refresh_session", lambda _v: None)
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
+    recovered = "<html><body>real unit page</body></html>"
+    monkeypatch.setattr("partsouq_catalog.http_client.fetch_page", lambda _u: recovered)
+
+    result = manager.get_response(url)
+
+    assert result.text == recovered
+    assert result.status_code == 200
+    assert result.final_url == url
+
+
+def test_browser_fallback_gives_up_when_fetch_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1&vid=0"
+    manager = SessionManager()
+    manager._ensure_catalog_allowed = lambda _u: None
+    manager.session.get = Mock(return_value=CHALLENGE_RESPONSE)
+    monkeypatch.setattr("partsouq_catalog.http_client.force_refresh_session", lambda _v: None)
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("partsouq_catalog.http_client.fetch_page", lambda _u: None)
+
+    with pytest.raises(ChallengeError, match="challenge"):
+        manager.get_response(url)
+
+
+def test_browser_fallback_does_not_trigger_for_non_catalog_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://example.org/some-page"
+    manager = SessionManager()
+    manager._ensure_catalog_allowed = lambda _u: None
+    manager.session.get = Mock(return_value=CHALLENGE_RESPONSE)
+    monkeypatch.setattr("partsouq_catalog.http_client.force_refresh_session", lambda _v: None)
+    monkeypatch.setattr("partsouq_catalog.http_client.time.sleep", lambda _seconds: None)
+    fetch_page = Mock(return_value="<html>should not happen</html>")
+    monkeypatch.setattr("partsouq_catalog.http_client.fetch_page", fetch_page)
+
+    with pytest.raises(ChallengeError, match="challenge"):
+        manager.get_response(url)
+    fetch_page.assert_not_called()

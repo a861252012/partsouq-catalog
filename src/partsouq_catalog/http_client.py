@@ -35,7 +35,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -48,6 +48,8 @@ from partsouq_crawler.crawl.robots import (
 
 from .cloak import (
     REFRESH_RETRY_BACKOFF,
+    NonUnitPageError,
+    fetch_page,
     force_refresh_session,
     get_session,
     reject_session,
@@ -148,6 +150,24 @@ def _response_envelope(
         text=text,
         fetched_at=datetime.now(UTC).replace(tzinfo=None),
         elapsed_ms=elapsed_ms,
+        attempt=attempt,
+    )
+
+
+def _browser_response(url: str, text: str, attempt: int) -> CatalogHttpResponse:
+    """用瀏覽器抓回的 HTML 組出與 _response_envelope 同形的成功回應。
+
+    status_code 固定 200（瀏覽器已確認通過挑戰）；text 即真實頁面內容，
+    後續 parser / evidence 與 requests 路徑完全一致。"""
+    raw_body = text.encode("utf-8")
+    return CatalogHttpResponse(
+        final_url=url,
+        status_code=200,
+        content_type="text/html",
+        raw_body_sha256=hashlib.sha256(raw_body).hexdigest(),
+        text=text,
+        fetched_at=datetime.now(UTC).replace(tzinfo=None),
+        elapsed_ms=0,
         attempt=attempt,
     )
 
@@ -377,6 +397,27 @@ class SessionManager:
                         _response_envelope(r, url, text, attempt),
                     )
                 if 300 <= r.status_code < 400:
+                    location = r.headers.get("Location", "") or ""
+                    # Cloudflare 挑戰轉址：視同 403 challenge —— ChallengeError
+                    # 才會被迴圈 except 捕捉，觸發 cookie 刷新與瀏覽器後備重試。
+                    if (
+                        self._is_challenge(r, text)
+                        or "challenge" in location.lower()
+                        or "cdn-cgi" in location.lower()
+                    ):
+                        raise ChallengeError(f"http 3xx challenge at {safe_url}")
+                    # unit 頁被轉址離開原 unit（uid 過期被導向 /locate、首頁
+                    # 或別的 unit）：該組在站端已不存在 → NotFoundError，由
+                    # crawl_group 標成 not_found（terminal），絕不靜默 receipt
+                    # 成 done/0。同 unit（同 uid）的站內正規化轉址不在此限，
+                    # 維持 fail-closed 交由瀏覽器後備跟隨。
+                    if self._is_unit_request(url) and not self._redirect_keeps_unit(url, location):
+                        raise NotFoundError(
+                            f"catalog unit redirected away at {safe_url} -> {location}",
+                            _response_envelope(r, url, text, attempt),
+                        )
+                    # 其他 catalog 頁面（索引等）的轉址維持 fail-closed：
+                    # 不跟隨、不猜測語意。
                     raise RobotsPolicyError(f"catalog redirect refused at {safe_url}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
@@ -469,6 +510,30 @@ class SessionManager:
                     type(e).__name__,
                 )
                 time.sleep(2 + random.random() * 2)
+        # requests 傳輸被 Cloudflare 以 TLS fingerprint 擋下（managed
+        # challenge / 轉址挑戰）時，退而求其次用真實瀏覽器抓取 —— 瀏覽器
+        # 具備真實 fingerprint，載入同一份 cookie 即可通過。這是 fail-closed
+        # 之外的最後手段：fetch_page 只在拿到「非挑戰」頁面時回傳 HTML，
+        # 否則回傳 None，我們仍照原邏輯拋錯，絕不把挑戰頁當成資料。
+        if (
+            not self.no_browser
+            and last_err is not None
+            and isinstance(last_err, (ChallengeError, RobotsPolicyError))
+            and self._is_catalog_url(url)
+        ):
+            try:
+                browser_html = fetch_page(url)
+            except NonUnitPageError as off_unit:
+                # 瀏覽器落點不是這個 unit 頁（被轉到 /locate、首頁或別的組）：
+                # 視同「此組在站端已不存在」，交給 crawl_group 標成 not_found
+                # （terminal），絕不靜默 receipt 成 done/0。
+                raise NotFoundError(
+                    f"browser fetch landed off-unit for {safe_url}: {off_unit}",
+                    None,
+                ) from off_unit
+            if browser_html is not None:
+                log.info("browser-fetch fallback succeeded for %s", safe_url)
+                return _browser_response(url, browser_html, attempt)
         raise last_err or RuntimeError(f"get failed: {safe_url}")
 
     def _ensure_catalog_allowed(self, url: str) -> None:
@@ -555,6 +620,41 @@ class SessionManager:
     def _has_applicable_robots_rules(text: str) -> bool:
         """確認本 crawler 或萬用 UA group 具有 Allow／Disallow 指令。"""
         return has_applicable_access_rules(text, CATALOG_PRODUCT_TOKEN)
+
+    @staticmethod
+    def _is_catalog_url(url: str) -> bool:
+        """判斷 URL 是否落在正式 catalog 主機的 /en/catalog 路徑下。
+
+        只用於決定是否對被挑戰的請求啟用瀏覽器抓取後備：非 catalog 的
+        請求（robots.txt、圖片等）不應走這條路。"""
+        parts = urlsplit(url)
+        return (parts.hostname or "").lower() in CATALOG_HOSTS and (
+            parts.path == "/en/catalog" or parts.path.startswith("/en/catalog/")
+        )
+
+    @staticmethod
+    def _is_unit_request(url: str) -> bool:
+        """判斷請求是否為 unit 頁（零件組明細頁）。
+
+        只有 unit 頁的 3xx 才賦予「組已 gone」語意；索引頁等其他
+        catalog 頁面的轉址維持 fail-closed（RobotsPolicyError）。"""
+        return urlsplit(url).path.rstrip("/") == "/en/catalog/genuine/unit"
+
+    @staticmethod
+    def _redirect_keeps_unit(requested_url: str, location: str) -> bool:
+        """判斷轉址目標是否仍是同一個 unit（同路徑且同 uid）。
+
+        同 unit 的站內正規化轉址（如補上參數）不算離開；uid 變了或
+        落到 /unit 以外路徑（/locate、首頁）都視為離開。location 允許
+        相對路徑，以 urljoin 對齊請求 URL 後比對。"""
+        if not location:
+            return False
+        target = urlsplit(urljoin(requested_url, location))
+        if target.path.rstrip("/") != "/en/catalog/genuine/unit":
+            return False
+        requested_uid = parse_qs(urlsplit(requested_url).query).get("uid", [None])[0]
+        target_uid = parse_qs(target.query).get("uid", [None])[0]
+        return requested_uid is not None and requested_uid == target_uid
 
     @staticmethod
     def _retry_after_seconds(r: requests.Response) -> float:

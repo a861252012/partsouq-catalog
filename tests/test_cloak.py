@@ -1286,3 +1286,126 @@ def test_psq_cloak_launcher_env_keeps_server_args_single_argv(monkeypatch) -> No
     importlib.reload(config)
     assert config.CLOAK["launcher"][2] == "--server-args=-screen"
     assert config.CLOAK["launcher"][3] == "0"
+
+
+def test_is_cloudflare_challenge_markers() -> None:
+    assert cloak._is_cloudflare_challenge("Just a moment...")
+    assert cloak._is_cloudflare_challenge("<title>Verify you are human</title>")
+    assert cloak._is_cloudflare_challenge("請稍候...")
+    assert cloak._is_cloudflare_challenge("cf-mitigated: challenge")
+    assert not cloak._is_cloudflare_challenge("<html><body>real catalog</body></html>")
+    assert not cloak._is_cloudflare_challenge("")
+
+
+@contextmanager
+def _fake_browser_lock():
+    yield True
+
+
+def _fake_prepare(_state):
+    return ({}, _state / "cache", _state / "home", "", "")
+
+
+def test_fetch_page_returns_html_when_browser_produces_page(monkeypatch, tmp_path) -> None:
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    out_file = tmp_path / ".cloak-page-fetch.html"
+    real_html = "<html><body>real catalog page</body></html>"
+
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+    monkeypatch.setattr(cloak.os, "killpg", lambda *_a, **_k: None)
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, _timeout: float) -> int:
+            return 0
+
+    def fake_popen(_argv, **_kwargs):
+        out_file.write_text(real_html, encoding="utf-8")
+        return FakeProc()
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+
+    assert (
+        cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") == real_html
+    )
+    assert not out_file.exists()
+
+
+def test_fetch_page_returns_none_on_challenge_page(monkeypatch, tmp_path) -> None:
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    out_file = tmp_path / ".cloak-page-fetch.html"
+    challenge_html = "<html><title>Just a moment...</title></html>"
+
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+    monkeypatch.setattr(cloak.os, "killpg", lambda *_a, **_k: None)
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, _timeout: float) -> int:
+            return 0
+
+    def fake_popen(_argv, **_kwargs):
+        out_file.write_text(challenge_html, encoding="utf-8")
+        return FakeProc()
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+
+    assert cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") is None
+    assert not out_file.exists()
+
+
+def test_fetch_page_skips_when_lock_unavailable(monkeypatch, tmp_path) -> None:
+    @contextmanager
+    def unavailable():
+        yield False
+
+    monkeypatch.setattr(cloak, "_process_refresh_lock", unavailable)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+    popen = mock.Mock()
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+
+    assert cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") is None
+    popen.assert_not_called()
+
+
+def test_fetch_page_raises_non_unit_when_browser_lands_off_unit(monkeypatch, tmp_path) -> None:
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    out_file = tmp_path / ".cloak-page-fetch.html"
+    marker = tmp_path / ".cloak-page-fetch.html.offunit"
+
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+    monkeypatch.setattr(cloak.os, "killpg", lambda *_a, **_k: None)
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, _timeout: float) -> int:
+            return 0
+
+    def fake_popen(_argv, **_kwargs):
+        # 模擬瀏覽器被轉址到 /locate 首頁：只寫 sidecar marker，不寫 HTML。
+        marker.write_text(
+            "https://partsouq.com/en/catalog/genuine/locate?c=Toyota", encoding="utf-8"
+        )
+        return FakeProc()
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(cloak.NonUnitPageError):
+        cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1&vid=0")
+    assert not out_file.exists()
+    assert not marker.exists()

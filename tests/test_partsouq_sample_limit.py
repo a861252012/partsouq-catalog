@@ -39,6 +39,8 @@ def _parts(count: int) -> list[dict]:
 
 
 def _parts_html(count: int) -> str:
+    # 真實 unit 頁會渲染所屬 uid（身分斷言依據）；fixture 同步含
+    # uid=10001（與 _group() 一致），模擬 genuine 頁面。
     rows = "".join(
         "<tr>"
         f'<td><a href="/en/search/all?q=P{index:05d}">P{index:05d}</a></td>'
@@ -46,7 +48,7 @@ def _parts_html(count: int) -> str:
         "</tr>"
         for index in range(count)
     )
-    return f"<table><tbody>{rows}</tbody></table>"
+    return f'<input type="hidden" name="uid" value="10001"><table><tbody>{rows}</tbody></table>'
 
 
 @pytest.fixture
@@ -445,6 +447,57 @@ def test_cli_has_distinct_exit_codes(monkeypatch, tmp_path, status, expected):
 
     assert run_crawl.main() == expected
     load_cookies.assert_called_once_with()
+
+
+def test_cli_recover_only_runs_recover_and_exits_zero(monkeypatch, tmp_path):
+    database = mock.MagicMock()
+    crawler = mock.MagicMock()
+    crawler.recover_null_groups.return_value = 3
+
+    monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(run_crawl, "Database", mock.MagicMock(return_value=database))
+    database.connect.return_value = database
+    load_cookies = mock.MagicMock(return_value={})
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setattr(run_crawl, "SessionManager", mock.MagicMock())
+    monkeypatch.setattr(run_crawl, "RequestGovernor", mock.MagicMock())
+    monkeypatch.setattr(run_crawl, "Crawler", mock.MagicMock(return_value=crawler))
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--recover-only", "--workers", "1"])
+
+    assert run_crawl.main() == 0
+    crawler.recover_null_groups.assert_called_once_with()
+    crawler.run.assert_not_called()
+
+
+def test_cli_recover_only_uses_separate_lock_from_full_crawl(monkeypatch, tmp_path):
+    # 線上 daemon 已持有 crawler.lock 時，--recover-only 仍應透過獨立
+    # recover.lock 取得鎖並執行，而非被擋在 crawler.lock 上（exit 2）。
+    shared_state = tmp_path / "shared-state"
+    shared_state.mkdir()
+    held_crawler_lock = open(shared_state / "crawler.lock", "a")
+    fcntl.flock(held_crawler_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    recover_lock_path = shared_state / "recover.lock"
+    crawler = mock.MagicMock()
+    crawler.recover_null_groups.return_value = 0
+    database = mock.MagicMock()
+
+    monkeypatch.setenv("PSQ_SCHEDULER_STATE_DIR", str(shared_state))
+    monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(run_crawl, "Database", mock.MagicMock(return_value=database))
+    database.connect.return_value = database
+    monkeypatch.setattr(run_crawl, "load_cookies", mock.MagicMock(return_value={}))
+    monkeypatch.setattr(run_crawl, "SessionManager", mock.MagicMock())
+    monkeypatch.setattr(run_crawl, "RequestGovernor", mock.MagicMock())
+    monkeypatch.setattr(run_crawl, "Crawler", mock.MagicMock(return_value=crawler))
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--recover-only", "--workers", "1"])
+
+    try:
+        assert run_crawl.main() == 0
+        assert recover_lock_path.exists()
+        crawler.recover_null_groups.assert_called_once_with()
+    finally:
+        fcntl.flock(held_crawler_lock, fcntl.LOCK_UN)
+        held_crawler_lock.close()
 
 
 def test_cli_uses_shared_scheduler_state_lock_across_worktrees(monkeypatch, tmp_path):
