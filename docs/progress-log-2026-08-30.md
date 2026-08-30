@@ -76,3 +76,46 @@ station overlay 與 snapshot isolation；所有資料在測試結束後隨暫時
 
 這些結果只證明程式契約與隔離環境行為。它不代表 full crawl、live NHTSA 欄位完整度，
 或 confirmed VIN mapping／VIN fitment 已在正式資料庫完成。
+
+## 08-30 晚間獨立驗證與正式機收斂
+
+本節由另一次工作階段補記。三個 subAgent 分頭複核 057acb5：程式碼審查
+（admission、crawler、repositories、scheduler、cloak 與 migration 028–035）
+沒有找到支援路徑上的具體缺陷；契約同步四項——CI skip 272/56、MANIFEST
+35 筆 SHA256、敘述句總和 675、ledger 刪除範圍連續涵蓋到 035——全部相符。
+ruff 與 strict mypy 全綠。
+
+pytest 起初跑出一堆失敗，逐輪定位後確認全是環境落差，不是程式問題：
+
+- 先 source .env 再跑測試，`PSQ_BOUNDED_*` 會觸發新版 scope 驗證，擋掉
+  37 個測試的 Crawler 建構。
+- 改用乾淨環境，這次缺 DB 憑證。compose 的 MySQL 密碼只從 .env 來，
+  config.py 預設密碼對不上，157 個 Access denied。
+- 測試資料庫停在 migration 29，ledger 記的 029 checksum 又與現行檔案
+  不符；舊 mysql 容器沒有 `--log-bin-trust-function-creators=1`，033 的
+  trigger 裝不上。
+
+處理：重建 mysql 容器；砍掉重建 `partsouq_catalog_test`（先載 `db/catalog.sql`
+與 `db/nhtsa.sql` 基線，再 apply 到 035）；順手刪掉三個殘留沙箱
+（`partsouq_gate_20260830_test` 和兩個 `partsouq_migration_*_test`）。
+之後全套 1,281 案 exit 0，0 失敗。
+
+這裡學到一件事：AGENTS.md 的標準關卡指令在這台機器跑不動，要先載 .env
+的 DB 憑證、再 unset 全部 `PSQ_*`。文件還沒改，先記在這。
+
+命名違規修正（已改、尚未提交）：`publish_bounded_parts` 的 scoped_source
+計數查詢與 source SELECT、`discard_invalid_bounded_membership` 的 UPDATE
+JOIN 與 scope_clause，單字母別名改成 part／source_group／category／
+vehicle／model／brand；`test_partsouq_bounded_limit.py` 與
+`test_partsouq_live_evidence.py` 的 SQL 斷言與 mock 跟著同步。第 656 行
+附近的 source_valid 子查詢也是單字母別名，但那是 1eb653d7 的既有碼，
+依審查規則不夾帶。
+
+正式機重啟：LaunchAgent 以 057acb5 release 啟動（排程間隔 2,592,000 秒）。
+migration 028–035 已套到 `partsouq_catalog`，desired scope singleton 為
+toyota/tacoma/2006。bounded run 43 於同日 19:31 以 `bounded_success` 收尾：
+2 車款、427 組、精確 10,000 筆全新 parts，過程零 ERROR／限流／逾時；
+`v_current_catalog_parts` 原子發布 10,000 筆，啟動時的 fail-closed 空窗
+就此關閉，正式讀取恢復。啟動初期 stderr 出現的「running jobs exist」
+升級失敗，是多個啟動 child 競爭的暫態——一個 child 先建了 running run，
+另一個的 030 preflight 被擋；migration 套完就不再發生，沒有資料影響。
