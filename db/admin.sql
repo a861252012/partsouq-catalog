@@ -215,7 +215,7 @@ DROP PROCEDURE ensure_published_snapshot_foreign_keys;
 -- Full snapshots are retained only as raw candidates. The formal catalog must
 -- expose a verified desired bounded snapshot and must never fall back to a
 -- full candidate.
-CREATE OR REPLACE VIEW v_current_catalog_parts AS
+CREATE OR REPLACE VIEW v_current_catalog_parts_evidence_base AS
 WITH verified_bounded_evidence AS (
 SELECT
     artifact.crawl_run_id,
@@ -364,6 +364,140 @@ JOIN (
   ON snapshot.row_count = 10000
  AND snapshot.min_crawl_run_id = current_run.id
  AND snapshot.max_crawl_run_id = current_run.id;
+
+-- 正式 snapshot 除了逐列 evidence 外，每個納入的 group 都必須有一張
+-- immutable receipt。若 quota 剛好在 unit 頁中途達標，receipt 會明確標為
+-- partial；缺 receipt、artifact 不一致或收據涵蓋範圍不完整時一律不輸出。
+CREATE OR REPLACE VIEW v_current_catalog_parts AS
+WITH snapshot_groups AS (
+    SELECT
+        bounded_part.crawl_run_id,
+        bounded_part.group_id,
+        COUNT(*) AS snapshot_part_count
+    FROM bounded_parts AS bounded_part
+    GROUP BY bounded_part.crawl_run_id, bounded_part.group_id
+),
+receipt_artifact_counts AS (
+    SELECT
+        snapshot_group.crawl_run_id,
+        snapshot_group.group_id,
+        receipt.source_artifact_id,
+        SUM(artifact_record.record_type = 'part') AS parsed_part_count,
+        SUM(
+            artifact_record.record_type = 'part'
+            AND artifact_record.accepted = 1
+        ) AS accepted_part_count,
+        COUNT(DISTINCT CASE
+            WHEN artifact_record.record_type = 'part' AND artifact_record.accepted = 1
+            THEN artifact_record.part_id
+        END) AS accepted_part_id_count,
+        SUM(artifact_record.record_type = 'quarantine_part') AS skipped_record_count
+    FROM snapshot_groups AS snapshot_group
+    STRAIGHT_JOIN bounded_group_receipts AS receipt
+      ON receipt.crawl_run_id = snapshot_group.crawl_run_id
+     AND receipt.group_id = snapshot_group.group_id
+    STRAIGHT_JOIN partsouq_artifact_records AS artifact_record FORCE INDEX (PRIMARY)
+      ON artifact_record.artifact_id = receipt.source_artifact_id
+     AND artifact_record.crawl_run_id = receipt.crawl_run_id
+    GROUP BY
+        snapshot_group.crawl_run_id,
+        snapshot_group.group_id,
+        receipt.source_artifact_id
+),
+receipt_snapshot_members AS (
+    SELECT
+        snapshot_group.crawl_run_id,
+        snapshot_group.group_id,
+        COUNT(DISTINCT bounded_part.part_id) AS accepted_snapshot_part_count
+    FROM snapshot_groups AS snapshot_group
+    STRAIGHT_JOIN bounded_group_receipts AS receipt
+      ON receipt.crawl_run_id = snapshot_group.crawl_run_id
+     AND receipt.group_id = snapshot_group.group_id
+    STRAIGHT_JOIN partsouq_artifact_records AS artifact_record FORCE INDEX (PRIMARY)
+      ON artifact_record.artifact_id = receipt.source_artifact_id
+     AND artifact_record.crawl_run_id = receipt.crawl_run_id
+     AND artifact_record.record_type = 'part'
+     AND artifact_record.accepted = 1
+    STRAIGHT_JOIN bounded_parts AS bounded_part
+      ON bounded_part.crawl_run_id = snapshot_group.crawl_run_id
+     AND bounded_part.group_id = snapshot_group.group_id
+     AND bounded_part.part_id = artifact_record.part_id
+     AND bounded_part.evidence_record_sha256 = artifact_record.record_sha256
+    GROUP BY snapshot_group.crawl_run_id, snapshot_group.group_id
+),
+receipt_integrity AS (
+    SELECT
+        snapshot_group.crawl_run_id,
+        snapshot_group.group_id,
+        snapshot_group.snapshot_part_count,
+        CASE
+            WHEN receipt.source_artifact_id IS NOT NULL
+             AND artifact.crawl_run_id = snapshot_group.crawl_run_id
+             AND artifact.capture_kind = 'live_http'
+             AND artifact.page_type = 'unit'
+             AND artifact.parser_name = 'parse_parts'
+             AND artifact.verification_status = 'verified'
+             AND artifact.http_status = 200
+             AND artifact.challenge_detected = 0
+             AND LOWER(artifact.content_type) LIKE 'text/html%'
+             AND artifact.malformed_row_count = 0
+             AND artifact.verified_at IS NOT NULL
+             AND receipt_artifact_counts.parsed_part_count = receipt.parsed_part_count
+             AND receipt_artifact_counts.accepted_part_count = receipt.accepted_part_count
+             AND receipt_artifact_counts.accepted_part_id_count = receipt.accepted_part_count
+             AND receipt_artifact_counts.skipped_record_count = receipt.skipped_record_count
+             AND artifact.parsed_record_count = (
+                 receipt.parsed_part_count + receipt.skipped_record_count
+             )
+             AND artifact.accepted_record_count = receipt.accepted_part_count
+             AND artifact.skipped_record_count = receipt.skipped_record_count
+             AND receipt_snapshot_members.accepted_snapshot_part_count
+                 = receipt.accepted_part_count
+             AND snapshot_group.snapshot_part_count = receipt.accepted_part_count
+             AND (
+                 (receipt.status = 'done'
+                  AND receipt.accepted_part_count = receipt.parsed_part_count)
+                 OR (receipt.status = 'partial'
+                     AND receipt.accepted_part_count > 0
+                     AND receipt.accepted_part_count < receipt.parsed_part_count)
+             )
+            THEN 1 ELSE 0
+        END AS is_verified
+    FROM snapshot_groups AS snapshot_group
+    LEFT JOIN bounded_group_receipts AS receipt
+      ON receipt.crawl_run_id = snapshot_group.crawl_run_id
+     AND receipt.group_id = snapshot_group.group_id
+    LEFT JOIN partsouq_http_artifacts AS artifact
+      ON artifact.id = receipt.source_artifact_id
+     AND artifact.crawl_run_id = receipt.crawl_run_id
+    LEFT JOIN receipt_artifact_counts
+      ON receipt_artifact_counts.crawl_run_id = snapshot_group.crawl_run_id
+     AND receipt_artifact_counts.group_id = snapshot_group.group_id
+     AND receipt_artifact_counts.source_artifact_id = receipt.source_artifact_id
+    LEFT JOIN receipt_snapshot_members
+      ON receipt_snapshot_members.crawl_run_id = snapshot_group.crawl_run_id
+     AND receipt_snapshot_members.group_id = snapshot_group.group_id
+),
+verified_bounded_group_receipts AS (
+    SELECT
+        receipt_integrity.crawl_run_id,
+        COUNT(*) AS snapshot_group_count,
+        SUM(receipt_integrity.snapshot_part_count) AS snapshot_part_count,
+        SUM(receipt_integrity.is_verified) AS verified_group_count,
+        SUM(
+            CASE WHEN receipt_integrity.is_verified = 1
+            THEN receipt_integrity.snapshot_part_count ELSE 0 END
+        ) AS verified_part_count
+    FROM receipt_integrity
+    GROUP BY receipt_integrity.crawl_run_id
+)
+SELECT evidence_base.*
+FROM v_current_catalog_parts_evidence_base AS evidence_base
+JOIN verified_bounded_group_receipts AS receipt_gate
+  ON receipt_gate.crawl_run_id = evidence_base.source_crawl_run_id
+ AND receipt_gate.snapshot_part_count = 10000
+ AND receipt_gate.verified_group_count = receipt_gate.snapshot_group_count
+ AND receipt_gate.verified_part_count = receipt_gate.snapshot_part_count;
 
 -- Compatibility readers must obey the same provenance gate; direct access to
 -- published_parts would expose a scheduler-running or failed candidate.

@@ -41,17 +41,19 @@ def _connect() -> Connection[DictCursor]:
     )
 
 
-def test_readiness_accepts_real_migration_019_contract() -> None:
+def test_readiness_accepts_real_migration_036_contract() -> None:
     connection = _connect()
     trace = QueryTrace()
     try:
         AdminRepository(AdminDatabase(connection, trace)).check_readiness()
-        assert trace.tags[-2:] == (
-            "health.backoffice-schema",
+        assert trace.tags[-4:] == (
             "health.published-provenance",
+            "health.quarantine-list",
+            "health.quarantine-run-key",
+            "health.backoffice-schema",
         )
     except AdminReadinessError:
-        pytest.fail("test database does not satisfy migration 030 readiness contract")
+        pytest.fail("test database does not satisfy migration 036 readiness contract")
     finally:
         connection.close()
 
@@ -493,6 +495,84 @@ def test_vin_view_keeps_raw_candidate_mapping_stale_and_shows_decode_warnings() 
             assert unmapped["mapping_status"] == "unmapped"
             assert unmapped["decode_status"] == "decoded_with_warning"
             assert unmapped["partsouq_vehicle_configuration_id"] is None
+        connection.rollback()
+    finally:
+        if fixture:
+            _cleanup_lock_fixture(connection, fixture)
+        else:
+            connection.rollback()
+        connection.close()
+
+
+def test_vin_view_marks_missing_strict_fitment_fields_as_partial() -> None:
+    connection = _connect()
+    fixture: dict[str, object] = {}
+    try:
+        _, fixture = _seed_lock_fixture(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT decode_completeness FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            assert cursor.fetchone() == {"decode_completeness": "decoded_complete"}
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_configuration = NULL, "
+                "displacement_l = NULL WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT decode_completeness FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            assert cursor.fetchone() == {"decode_completeness": "decoded_complete"}
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_model = NULL WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT decode_completeness FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            assert cursor.fetchone() == {
+                "decode_completeness": "partial_missing_powertrain_or_trim"
+            }
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_model = 'LOCK ENGINE', trim_name = NULL "
+                "WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT decode_completeness FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            assert cursor.fetchone() == {
+                "decode_completeness": "partial_missing_powertrain_or_trim"
+            }
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET trim_name = 'LOCK TRIM', "
+                "error_code = '18 - Other warning' WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT decode_completeness FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            assert cursor.fetchone() == {"decode_completeness": "decoded_complete_with_warning"}
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET error_code = '1, 8 - No detailed data' "
+                "WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT decode_completeness FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            assert cursor.fetchone() == {"decode_completeness": "partial_no_detail_data"}
         connection.rollback()
     finally:
         if fixture:

@@ -34,18 +34,35 @@ def _decode_payload(**overrides: str) -> dict[str, str]:
     return payload
 
 
-def test_classify_undecodable_returns_none_when_core_fields_present() -> None:
-    assert classify_undecodable_vin_payload(_decode_payload()) is None
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "0",
+        "1 - Check Digit issue",
+        "1, 7 - ManufacturerMarkedNotRegistered",
+        "1, 8 - No detailed data available currently",
+        "7, 8 - Multiple source conditions",
+    ),
+)
+def test_classify_undecodable_returns_none_when_core_fields_present(error_code: str) -> None:
     # ErrorCode 僅供消費端判讀；核心欄位齊全就不是終局無資料。
-    assert (
-        classify_undecodable_vin_payload(_decode_payload(ErrorCode="1 - Check Digit issue")) is None
-    )
+    assert classify_undecodable_vin_payload(_decode_payload(ErrorCode=error_code)) is None
 
 
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     (
         ({"Make": "", "ErrorCode": "7 - ManufacturerMarkedNotRegistered"}, "nhtsa_unregistered"),
+        ({"Make": "", "ErrorCode": "1,7"}, "nhtsa_unregistered"),
+        ({"Make": "", "ErrorCode": "1, 7 - ManufacturerMarkedNotRegistered"}, "nhtsa_unregistered"),
+        ({"Make": "", "ErrorCode": "7, 8 - Multiple source conditions"}, "nhtsa_unregistered"),
+        ({"Make": "", "ErrorCode": "1,8"}, "no_detail_data"),
+        (
+            {"Make": "", "ErrorCode": "1, 8 - No detailed data available currently"},
+            "no_detail_data",
+        ),
+        ({"Make": "", "ErrorCode": "1,11,400 - Invalid VIN"}, "invalid_vin"),
+        ({"Make": "", "ErrorCode": "1,11,14,400"}, "no_detail_data"),
         (
             {"ModelYear": "", "ErrorCode": "7 - ManufacturerMarkedNotRegistered"},
             "nhtsa_unregistered",

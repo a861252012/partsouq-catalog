@@ -277,6 +277,8 @@ def _record_verified_live_evidence(
     verify: bool = True,
     vehicle_engine: str | None = None,
     vehicle_trim_name: str | None = None,
+    unit_part_count: int = 10_000,
+    record_group_receipt: bool = True,
 ) -> None:
     vehicle_key = {
         "brand": "TOYOTA",
@@ -292,7 +294,7 @@ def _record_verified_live_evidence(
         "trim_name": vehicle_trim_name or "",
         "vid": "SITE-VID-1",
     }
-    unit_html = _parts_html(10_000)
+    unit_html = _parts_html(unit_part_count)
     pages: tuple[tuple[str, str, str, dict[str, object], str], ...] = (
         (
             "genuine",
@@ -384,11 +386,12 @@ def _record_verified_live_evidence(
                 "SELECT id FROM parts WHERE seen_run_id = %s ORDER BY part_number",
                 (run_id,),
             ).fetchall()
-            assert len(part_rows) == len(records) == 10_000
+            assert len(part_rows) == 10_000
+            assert len(records) == unit_part_count
             accepted_records = [
-                (int(row["id"]), record) for row, record in zip(part_rows, records, strict=True)
+                (int(row["id"]), record) for row, record in zip(part_rows, records, strict=False)
             ]
-        repository.record_http_evidence(
+        artifact_id = repository.record_http_evidence(
             run_id,
             scheduled_job_run_id,
             page_type=page_type,
@@ -409,6 +412,25 @@ def _record_verified_live_evidence(
             malformed_rows=malformed_rows,
             skipped_record_count=skipped_rows,
         )
+        if page_type == "unit" and record_group_receipt:
+            source_groups = database._execute(
+                "SELECT group_id, COUNT(*) AS accepted_part_count "
+                "FROM parts WHERE seen_run_id = %s GROUP BY group_id",
+                (run_id,),
+            ).fetchall()
+            assert len(source_groups) == 1
+            source_group = source_groups[0]
+            accepted_part_count = int(source_group["accepted_part_count"])
+            assert accepted_part_count == len(accepted_records)
+            repository.record_bounded_group_receipt(
+                run_id,
+                int(source_group["group_id"]),
+                artifact_id,
+                status="done" if accepted_part_count == len(records) else "partial",
+                parsed_part_count=len(records),
+                accepted_part_count=accepted_part_count,
+                skipped_record_count=skipped_rows,
+            )
     if verify:
         repository.verify_run_evidence(run_id)
 
@@ -1050,6 +1072,256 @@ def test_bounded_partial_group_retry_excludes_already_seen_keys(monkeypatch, raw
     )
 
 
+def test_bounded_all_seen_group_reuses_membership_and_records_receipt(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    accepted_parts = _parts(10)
+    instance.parts.bounded_group_context.return_value = {
+        "production_from": "2018-01",
+        "production_to": "2020-12",
+        "source_valid": 1,
+    }
+    instance.parts.seen_keys_in_group.return_value = {
+        (part["part_number"], part["range_str"]) for part in accepted_parts
+    }
+    instance.parts.part_ids_for_evidence.return_value = list(enumerate(accepted_parts, start=1))
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    instance.crawl.previous_row_count.return_value = 0
+    response = _catalog_response(_parts_html(10))
+    instance._fetch = mock.MagicMock(return_value=(response.text, response))
+    events: list[str] = []
+    instance._capture_http_evidence = mock.MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("artifact") or 901
+    )
+    instance.crawl.record_bounded_group_receipt.side_effect = lambda *_args, **_kwargs: (
+        events.append("receipt")
+    )
+    instance.crawl.mark_group_fetched.side_effect = lambda *_args, **_kwargs: events.append("done")
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "CAMRY",
+        "name": "CAMRY",
+        "model_code": "AXVA70",
+        "vid": "SITE-VID-1",
+    }
+    try:
+        assert (
+            instance.crawl_group(
+                "TOYOTA",
+                7,
+                _group(),
+                fetched={},
+                evidence_vehicle_key=evidence_vehicle_key,
+            )
+            is False
+        )
+    finally:
+        instance.close()
+
+    instance.parts.upsert_parts.assert_not_called()
+    instance.parts.part_ids_for_evidence.assert_called_once_with(41, accepted_parts)
+    instance._capture_http_evidence.assert_called_once()
+    instance.crawl.record_bounded_group_receipt.assert_called_once_with(
+        17,
+        41,
+        901,
+        status="done",
+        parsed_part_count=10,
+        accepted_part_count=10,
+        skipped_record_count=0,
+    )
+    instance.crawl.mark_group_fetched.assert_called_once_with(
+        41,
+        "bounded-resume-test",
+        status="done",
+        row_count=10,
+    )
+    assert events == ["artifact", "receipt", "done"]
+
+
+def test_bounded_all_seen_group_quarantines_quality_rejected_named_parts(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    valid, rejected = _parts(2)
+    rejected["code"] = ""
+    instance.parts = mock.MagicMock()
+    instance.parts.bounded_group_context.return_value = {
+        "production_from": "2018-01",
+        "production_to": "2020-12",
+        "source_valid": 1,
+    }
+    instance.parts.seen_keys_in_group.return_value = {(valid["part_number"], valid["range_str"])}
+    instance.parts.part_ids_for_evidence.return_value = [(1, valid)]
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    instance.crawl.previous_row_count.return_value = 0
+    response = _catalog_response(_parts_html(2))
+    instance._fetch = mock.MagicMock(return_value=(response.text, response))
+    instance._capture_http_evidence = mock.MagicMock(return_value=901)
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "CAMRY",
+        "name": "CAMRY",
+        "model_code": "AXVA70",
+        "vid": "SITE-VID-1",
+    }
+
+    with mock.patch(
+        "partsouq_catalog.crawler.parse_parts", return_value=([valid, rejected], 0, 0, [])
+    ):
+        try:
+            assert (
+                instance.crawl_group(
+                    "TOYOTA",
+                    7,
+                    _group(),
+                    fetched={},
+                    evidence_vehicle_key=evidence_vehicle_key,
+                )
+                is False
+            )
+        finally:
+            instance.close()
+
+    instance.parts.upsert_parts.assert_not_called()
+    instance.crawl.record_bounded_group_receipt.assert_called_once_with(
+        17,
+        41,
+        901,
+        status="partial",
+        parsed_part_count=2,
+        accepted_part_count=1,
+        skipped_record_count=0,
+    )
+    instance.parts.quarantine_parts.assert_called_once_with(
+        41,
+        "bounded-resume-test",
+        [rejected],
+        reason="bounded_quality_gate",
+    )
+
+
+def test_bounded_quality_gate_quarantines_all_excluded_named_parts(monkeypatch) -> None:
+    _bounded_config(monkeypatch)
+    database = mock.MagicMock()
+    instance = Crawler(mock.MagicMock(), database, workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.parts.bounded_group_context.return_value = {
+        "production_from": "2018-01",
+        "production_to": "2020-12",
+        "source_valid": 0,
+    }
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    instance.crawl.previous_row_count.return_value = 0
+    instance._get = mock.MagicMock(return_value=_parts_html(2))
+
+    try:
+        with pytest.raises(RuntimeError, match="all named part rows failed"):
+            instance.crawl_group("TOYOTA", 7, _group(), fetched={})
+    finally:
+        instance.close()
+
+    instance.parts.quarantine_parts.assert_called_once_with(
+        41,
+        "bounded-resume-test",
+        _parts(2),
+        reason="bounded_quality_gate",
+    )
+    instance.parts.upsert_parts.assert_not_called()
+    instance.crawl.mark_group_fetched.assert_not_called()
+    assert database.commit.call_count == 2
+
+
+def test_bounded_quality_gate_quarantines_mixed_rejected_named_parts(monkeypatch) -> None:
+    _bounded_config(monkeypatch, target=10_000)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    valid, rejected = _parts(2)
+    rejected["code"] = ""
+    instance.parts = mock.MagicMock()
+    instance.parts.bounded_group_context.return_value = {
+        "production_from": "2018-01",
+        "production_to": "2020-12",
+        "source_valid": 1,
+    }
+    instance.parts.seen_keys_in_group.return_value = set()
+    instance.parts.part_ids_for_evidence.side_effect = lambda _group_id, records: list(
+        enumerate(records, start=1)
+    )
+    instance.parts.upsert_parts.return_value = 1
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "bounded-resume-test"
+    instance.crawl.previous_row_count.return_value = 0
+    response = _catalog_response(_parts_html(2))
+    instance._fetch = mock.MagicMock(return_value=(response.text, response))
+    instance._capture_http_evidence = mock.MagicMock(return_value=901)
+    evidence_vehicle_key = {
+        "brand": "TOYOTA",
+        "model": "CAMRY",
+        "name": "CAMRY",
+        "model_code": "AXVA70",
+        "vid": "SITE-VID-1",
+    }
+
+    with mock.patch(
+        "partsouq_catalog.crawler.parse_parts", return_value=([valid, rejected], 0, 0, [])
+    ):
+        try:
+            assert (
+                instance.crawl_group(
+                    "TOYOTA",
+                    7,
+                    _group(),
+                    fetched={},
+                    evidence_vehicle_key=evidence_vehicle_key,
+                )
+                is False
+            )
+        finally:
+            instance.close()
+
+    instance.parts.upsert_parts.assert_called_once_with(41, [valid], 17, complete_group=True)
+    instance.crawl.record_bounded_group_receipt.assert_called_once_with(
+        17,
+        41,
+        901,
+        status="partial",
+        parsed_part_count=2,
+        accepted_part_count=1,
+        skipped_record_count=0,
+    )
+    instance.parts.quarantine_parts.assert_called_once_with(
+        41,
+        "bounded-resume-test",
+        [rejected],
+        reason="bounded_quality_gate",
+    )
+    instance.crawl.mark_group_fetched.assert_called_once_with(
+        41,
+        "bounded-resume-test",
+        status="done",
+        row_count=2,
+    )
+
+
 def test_official_error_page_returned_as_http_200_remains_fail_closed(monkeypatch) -> None:
     _bounded_config(monkeypatch, target=10_000)
     monkeypatch.setitem(CRAWL, "block_breather", 0)
@@ -1561,15 +1833,18 @@ def test_scoped_publish_allows_open_ended_and_rejects_known_old_rows_before_dele
     database._execute.side_effect = execute
     repository = CrawlRepository(database, "bounded-model-scope")
     repository._assert_verified_run_evidence = mock.MagicMock()  # type: ignore[method-assign]
+    repository._assert_bounded_group_receipts = mock.MagicMock()  # type: ignore[method-assign]
 
     if reaches_snapshot_mutation:
         with pytest.raises(SnapshotMutationReached):
             repository.publish_bounded_parts(17, 10_000)
-        repository._assert_verified_run_evidence.assert_called_once()  # type: ignore[attr-defined]
+        repository._assert_verified_run_evidence.assert_called_once()
+        repository._assert_bounded_group_receipts.assert_called_once_with(17, 10_000)
     else:
         with pytest.raises(RuntimeError, match="model scope mismatch"):
             repository.publish_bounded_parts(17, 10_000)
-        repository._assert_verified_run_evidence.assert_not_called()  # type: ignore[attr-defined]
+        repository._assert_verified_run_evidence.assert_not_called()
+        repository._assert_bounded_group_receipts.assert_not_called()
 
     assert all(
         call.args[0] != "DELETE FROM bounded_parts"
@@ -1608,6 +1883,11 @@ def test_scheduled_bounded_resume_requires_a_finished_failed_prior_attempt() -> 
     assert "receipt_group.fetched_run_key = candidate.run_key" in query
     assert "receipt_group.fetched_status" in query
     assert "REGEXP_LIKE(receipt_group.url" in query
+    assert "AS bad_bounded_receipt" in query
+    assert "bounded_group_receipts AS bounded_receipt" in query
+    assert "membership_part.seen_run_id = candidate.id" in query
+    assert "membership_receipt.group_id = membership_part.group_id" in query
+    assert "receipt_part.seen_run_id = candidate.id" in query
     assert params == (SANITIZER_VERSION, 10_000, None, None, None, 77)
 
     database.reset_mock()
@@ -1631,6 +1911,11 @@ def test_scheduled_bounded_resume_requires_a_finished_failed_prior_attempt() -> 
     assert "receipt_group.fetched_run_key = candidate.run_key" in query
     assert "receipt_group.fetched_status" in query
     assert "REGEXP_LIKE(receipt_group.url" in query
+    assert "AS bad_bounded_receipt" in query
+    assert "bounded_group_receipts AS bounded_receipt" in query
+    assert "membership_part.seen_run_id = candidate.id" in query
+    assert "membership_receipt.group_id = membership_part.group_id" in query
+    assert "receipt_part.seen_run_id = candidate.id" in query
     assert params == (SANITIZER_VERSION, 10_000, None, None, None)
 
 
@@ -1659,6 +1944,34 @@ def test_incompatible_bounded_resume_is_durably_rejected() -> None:
     assert "finished_at = COALESCE(finished_at, UTC_TIMESTAMP())" in update_query
     assert "SET evidence_status = 'rejected'" in update_query
     assert update_params == (17,)
+
+
+def test_exact_target_with_missing_bounded_receipt_is_durably_rejected() -> None:
+    database = mock.MagicMock()
+    cursor = mock.MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 18,
+        "run_key": "bounded-missing-receipt",
+        "evidence_status": "collecting",
+        "bad_run_status": 0,
+        "bad_evidence": 0,
+        "bad_receipt": 0,
+        "bad_bounded_receipt": 1,
+        "exhausted_with_failures": 0,
+    }
+    database._execute.return_value = cursor
+
+    assert (
+        CrawlRepository(database, "bounded-resume-contract").resumable_bounded_run_key(
+            10_000,
+            scheduled_job_run_id=None,
+        )
+        is None
+    )
+
+    update_query, update_params = database._execute.call_args_list[-1].args
+    assert "SET evidence_status = 'rejected'" in update_query
+    assert update_params == (18,)
 
 
 def test_exhausted_bounded_resume_with_failures_is_durably_rejected() -> None:
@@ -2596,7 +2909,28 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
             run_id=retry_run_id,
             scheduled_job_run_id=int(retry_scheduled_job_run_id),
             page_types=frozenset({"unit"}),
+            unit_part_count=10_001,
+            record_group_receipt=False,
         )
+        with pytest.raises(RuntimeError, match="invalid group receipts"):
+            first.publish_bounded_parts(retry_run_id, 10_000)
+        _record_verified_live_evidence(
+            database,
+            first,
+            run_id=retry_run_id,
+            scheduled_job_run_id=int(retry_scheduled_job_run_id),
+            page_types=frozenset({"unit"}),
+            unit_part_count=10_001,
+        )
+        assert database._execute(
+            "SELECT status, parsed_part_count, accepted_part_count "
+            "FROM bounded_group_receipts WHERE crawl_run_id = %s",
+            (retry_run_id,),
+        ).fetchone() == {
+            "status": "partial",
+            "parsed_part_count": 10_001,
+            "accepted_part_count": 10_000,
+        }
         first.publish_bounded_parts(retry_run_id, 10_000)
         first.finish_run(retry_run_id, "bounded_success", {"parts": 10_000})
         database.commit()
@@ -3800,10 +4134,10 @@ def test_mysql_bounded_resume_durably_rejects_invalid_group_receipt(
     (
         (10, True, False),
         (8, True, True),
-        (10, False, True),
+        (10, False, False),
     ),
 )
-def test_mysql_bounded_resume_retires_only_exhausted_failed_run(
+def test_mysql_bounded_resume_retires_exhausted_run_with_failures_or_missing_receipts(
     membership_count: int,
     has_error: bool,
     expected_resume: bool,
@@ -4570,8 +4904,12 @@ def test_mysql_hard_404_terminal_writes_commit_or_rollback_together(monkeypatch)
 
 
 def _clear_mysql_fixture(database: Database) -> None:
+    # 036 之後已發布 bounded receipt 不可直接刪除；測試清理先讓測試 run
+    # 離開 bounded_success，保留正式 schema 的不可變保護。
+    database._execute("UPDATE crawl_runs SET status = 'error' WHERE status = 'bounded_success'")
     for table in (
         "bounded_parts",
+        "bounded_group_receipts",
         "published_parts_previous",
         "published_parts",
         "partsouq_http_diagnostics",

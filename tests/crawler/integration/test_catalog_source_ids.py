@@ -31,6 +31,7 @@ def test_full_candidate_archive_preserves_source_ids_without_formal_mapping() ->
         for table in (
             "admin_vehicle_mappings",
             "bounded_parts",
+            "bounded_group_receipts",
             "published_parts_previous",
             "published_parts",
             "partsouq_artifact_records",
@@ -224,6 +225,7 @@ def test_full_candidate_archive_preserves_source_ids_without_formal_mapping() ->
         for table in (
             "admin_vehicle_mappings",
             "bounded_parts",
+            "bounded_group_receipts",
             "published_parts_previous",
             "published_parts",
             "partsouq_artifact_records",

@@ -84,10 +84,14 @@ class ScriptedDatabase:
                 "previous_column_ready": ready,
                 "previous_index_ready": ready,
                 "previous_foreign_key_ready": ready,
-                "formal_view_ready": ready,
+                "formal_evidence_base_view_ready": ready,
+                "formal_receipt_view_ready": ready,
                 "formal_view_columns_ready": ready,
+                "bounded_receipt_table_ready": ready,
                 "desired_scope_columns_ready": ready,
                 "bounded_snapshot_immutable_ready": ready,
+                "bounded_receipt_immutable_ready": ready,
+                "vin_decode_completeness_ready": ready,
             }
         if tag == "dashboard.system-data-summary":
             return {
@@ -150,7 +154,7 @@ class ScriptedDatabase:
         if tag.startswith("list.source-batch."):
             assert isinstance(params, Sequence)
             entity = tag.rsplit(".", 1)[-1]
-            source_ids = params if entity == "vin_vehicle_mappings" else params[1:]
+            source_ids = params if not ENTITY_SPECS[entity].editable_fields else params[1:]
             return [source_row(entity, int(value)) for value in source_ids if int(value) > 0]
         if tag.startswith("list.manual-batch."):
             return []

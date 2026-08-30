@@ -592,14 +592,14 @@ class PartRepository:
     ) -> int:
         """記錄站方合法存在但無法發布的零件列（SOL review P1 起）。
 
-        rows 為 parse_parts(diagnostics=True) 回傳的 skipped_rows（純料號
-        列，無可驗證產品名稱）。它們不落 parts 表（發布資料必須能把料號
-        對到名稱），寫進 part_quarantine 作為完整紀錄。
+        rows 通常是 parse_parts(diagnostics=True) 回傳的 skipped_rows（純
+        料號列，無可驗證產品名稱）；bounded 品質閘門排除的具名稱列也會
+        以不同 reason 留存。它們不落 parts 表，寫進 part_quarantine 作為
+        可追查紀錄。
 
-        「忽略 + 紀錄」政策（使用者決定）：呼叫端對含無名稱列的組照常
-        標 done、發布照常進行，quarantine 表就是這些料號的追蹤紀錄
-        （可用 count_quarantined / resolved_at 查詢）；不阻擋任何
-        發布 gate。站方之後補上名稱時，新 run 重新爬取會正常落庫。
+        無名稱列採「忽略 + 紀錄」政策：含該列的 group 可照常完成；品質
+        閘門排除的列則會讓 receipt 保持 partial 或整組失敗。兩者都用
+        quarantine 表追蹤，站方修正來源後，下次 run 會重新判定。
 
         resolved_at / resolution（migration 012）供運維標記處置狀態：
         管理員核對後可填寫，作為審計紀錄；純紀錄用途，不影響流程。
@@ -1036,6 +1036,98 @@ class CrawlRepository:
                 (run_key, status, row_count, group_id),
             )
 
+    def record_bounded_group_receipt(
+        self,
+        run_id: int,
+        group_id: int,
+        source_artifact_id: int,
+        *,
+        status: str,
+        parsed_part_count: int,
+        accepted_part_count: int,
+        skipped_record_count: int,
+    ) -> None:
+        """保存正式 bounded snapshot 的不可變群組收據。
+
+        ``groups_t.fetched_*`` 是下一次爬取可覆寫的續爬快取，不能拿來
+        證明已發布 snapshot 的歷史邊界。這份 receipt 綁定同一 transaction
+        的 verified unit artifact 與實際納入配額的 part 數；quota 在群組中途
+        達標時明確記為 ``partial``，不把未納入的來源列假稱已發布。
+        """
+        if run_id <= 0 or group_id <= 0 or source_artifact_id <= 0:
+            raise ValueError("bounded group receipt requires positive identifiers")
+        if min(parsed_part_count, accepted_part_count, skipped_record_count) < 0:
+            raise ValueError("bounded group receipt counts cannot be negative")
+        if status == "done":
+            if accepted_part_count != parsed_part_count:
+                raise ValueError("done bounded receipt must accept every parsed row")
+        elif status == "partial":
+            if not 0 < accepted_part_count < parsed_part_count:
+                raise ValueError("partial bounded receipt must retain a strict parsed subset")
+        else:
+            raise ValueError("unsupported bounded group receipt status")
+
+        run = self.db._execute(
+            "SELECT dataset_kind, target_parts, status FROM crawl_runs WHERE id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if (
+            not run
+            or run.get("dataset_kind") != "bounded"
+            or _db_int(run.get("target_parts") or 0) != 10_000
+            or run.get("status") != "running"
+        ):
+            raise RuntimeError(f"bounded group receipt run {run_id} is not active formal crawl")
+
+        artifact = self.db._execute(
+            "SELECT id FROM partsouq_http_artifacts "
+            "WHERE id = %s AND crawl_run_id = %s "
+            "AND capture_kind = 'live_http' AND page_type = 'unit' "
+            "AND parser_name = 'parse_parts' AND verification_status = 'verified' FOR UPDATE",
+            (source_artifact_id, run_id),
+        ).fetchone()
+        if not artifact:
+            raise RuntimeError("bounded group receipt artifact is not verified unit evidence")
+
+        evidence_counts = self.db._execute(
+            "SELECT "
+            "SUM(record_type = 'part') AS parsed_part_count, "
+            "SUM(record_type = 'part' AND accepted = 1) AS accepted_part_count, "
+            "COUNT(DISTINCT CASE WHEN record_type = 'part' AND accepted = 1 "
+            "THEN part_id END) AS accepted_part_ids, "
+            "SUM(record_type = 'quarantine_part') AS skipped_record_count "
+            "FROM partsouq_artifact_records WHERE artifact_id = %s AND crawl_run_id = %s",
+            (source_artifact_id, run_id),
+        ).fetchone()
+        if (
+            _db_int((evidence_counts or {}).get("parsed_part_count", 0)) != parsed_part_count
+            or _db_int((evidence_counts or {}).get("accepted_part_count", 0)) != accepted_part_count
+            or _db_int((evidence_counts or {}).get("accepted_part_ids", 0)) != accepted_part_count
+            or _db_int((evidence_counts or {}).get("skipped_record_count", 0))
+            != skipped_record_count
+        ):
+            raise RuntimeError("bounded group receipt does not match its artifact records")
+
+        self.db._execute(
+            "INSERT INTO bounded_group_receipts ("
+            "crawl_run_id, group_id, source_artifact_id, status, parsed_part_count, "
+            "accepted_part_count, skipped_record_count) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) AS new "
+            "ON DUPLICATE KEY UPDATE source_artifact_id = new.source_artifact_id, "
+            "status = new.status, parsed_part_count = new.parsed_part_count, "
+            "accepted_part_count = new.accepted_part_count, "
+            "skipped_record_count = new.skipped_record_count, recorded_at = UTC_TIMESTAMP(6)",
+            (
+                run_id,
+                group_id,
+                source_artifact_id,
+                status,
+                parsed_part_count,
+                accepted_part_count,
+                skipped_record_count,
+            ),
+        )
+
     def seen(self, scope: str, key: str) -> None:
         """記錄「本 run 遇見」某項目（不改變既有狀態）。
 
@@ -1229,6 +1321,10 @@ class CrawlRepository:
                     f"{existing.get('scheduled_job_run_id')!r}; refusing owner "
                     f"{scheduled_job_run_id!r}"
                 )
+            if fresh and existing.get("status") == "bounded_success":
+                raise RuntimeError(
+                    "published bounded run cannot be reused with --fresh; use a new run key"
+                )
         if fresh:
             cur = self.db._execute(
                 "INSERT INTO crawl_runs (run_key, started_at, status, dataset_kind, "
@@ -1304,6 +1400,10 @@ class CrawlRepository:
             )
             self.db._execute(
                 "DELETE FROM partsouq_http_diagnostics WHERE crawl_run_id = %s",
+                (run_id,),
+            )
+            self.db._execute(
+                "DELETE FROM bounded_group_receipts WHERE crawl_run_id = %s",
                 (run_id,),
             )
             self.db._execute(
@@ -1440,7 +1540,38 @@ class CrawlRepository:
                 "BINARY receipt_group.fetched_status = BINARY 'not_found') "
                 "OR NULLIF(TRIM(receipt_group.url), '') IS NULL OR NOT ("
                 f"{_canonical_unit_url_sql('receipt_group.url', 'receipt_group.uid')}))) "
-                "AS bad_receipt "
+                "AS bad_receipt, "
+                "((SELECT COUNT(*) FROM parts AS quota_part "
+                "WHERE quota_part.seen_run_id = candidate.id) >= candidate.target_parts "
+                "AND ((SELECT COUNT(DISTINCT membership_part.group_id) "
+                "FROM parts AS membership_part "
+                "WHERE membership_part.seen_run_id = candidate.id) <> ("
+                "SELECT COUNT(*) FROM bounded_group_receipts AS bounded_receipt "
+                "WHERE bounded_receipt.crawl_run_id = candidate.id) OR EXISTS ("
+                "SELECT 1 FROM parts AS membership_part "
+                "WHERE membership_part.seen_run_id = candidate.id "
+                "AND NOT EXISTS (SELECT 1 FROM bounded_group_receipts AS membership_receipt "
+                "WHERE membership_receipt.crawl_run_id = candidate.id "
+                "AND membership_receipt.group_id = membership_part.group_id)) OR EXISTS ("
+                "SELECT 1 FROM bounded_group_receipts AS bounded_receipt "
+                "WHERE bounded_receipt.crawl_run_id = candidate.id AND ("
+                "NOT ((bounded_receipt.status = 'done' "
+                "AND bounded_receipt.accepted_part_count = bounded_receipt.parsed_part_count) "
+                "OR (bounded_receipt.status = 'partial' "
+                "AND bounded_receipt.accepted_part_count > 0 "
+                "AND bounded_receipt.accepted_part_count < bounded_receipt.parsed_part_count)) "
+                "OR bounded_receipt.accepted_part_count <> (SELECT COUNT(*) "
+                "FROM parts AS receipt_part "
+                "WHERE receipt_part.seen_run_id = candidate.id "
+                "AND receipt_part.group_id = bounded_receipt.group_id) "
+                "OR NOT EXISTS (SELECT 1 FROM partsouq_http_artifacts AS receipt_artifact "
+                "WHERE receipt_artifact.id = bounded_receipt.source_artifact_id "
+                "AND receipt_artifact.crawl_run_id = candidate.id "
+                "AND receipt_artifact.capture_kind = 'live_http' "
+                "AND receipt_artifact.page_type = 'unit' "
+                "AND receipt_artifact.parser_name = 'parse_parts' "
+                "AND receipt_artifact.verification_status = 'verified'))))) "
+                "AS bad_bounded_receipt "
                 "FROM (SELECT id, run_key, evidence_status, target_parts FROM crawl_runs "
                 "WHERE dataset_kind = 'bounded' "
                 "AND target_parts = %s AND status IN ('running', 'error', 'interrupted') "
@@ -1484,7 +1615,38 @@ class CrawlRepository:
                 "BINARY receipt_group.fetched_status = BINARY 'not_found') "
                 "OR NULLIF(TRIM(receipt_group.url), '') IS NULL OR NOT ("
                 f"{_canonical_unit_url_sql('receipt_group.url', 'receipt_group.uid')}))) "
-                "AS bad_receipt "
+                "AS bad_receipt, "
+                "((SELECT COUNT(*) FROM parts AS quota_part "
+                "WHERE quota_part.seen_run_id = candidate.id) >= candidate.target_parts "
+                "AND ((SELECT COUNT(DISTINCT membership_part.group_id) "
+                "FROM parts AS membership_part "
+                "WHERE membership_part.seen_run_id = candidate.id) <> ("
+                "SELECT COUNT(*) FROM bounded_group_receipts AS bounded_receipt "
+                "WHERE bounded_receipt.crawl_run_id = candidate.id) OR EXISTS ("
+                "SELECT 1 FROM parts AS membership_part "
+                "WHERE membership_part.seen_run_id = candidate.id "
+                "AND NOT EXISTS (SELECT 1 FROM bounded_group_receipts AS membership_receipt "
+                "WHERE membership_receipt.crawl_run_id = candidate.id "
+                "AND membership_receipt.group_id = membership_part.group_id)) OR EXISTS ("
+                "SELECT 1 FROM bounded_group_receipts AS bounded_receipt "
+                "WHERE bounded_receipt.crawl_run_id = candidate.id AND ("
+                "NOT ((bounded_receipt.status = 'done' "
+                "AND bounded_receipt.accepted_part_count = bounded_receipt.parsed_part_count) "
+                "OR (bounded_receipt.status = 'partial' "
+                "AND bounded_receipt.accepted_part_count > 0 "
+                "AND bounded_receipt.accepted_part_count < bounded_receipt.parsed_part_count)) "
+                "OR bounded_receipt.accepted_part_count <> (SELECT COUNT(*) "
+                "FROM parts AS receipt_part "
+                "WHERE receipt_part.seen_run_id = candidate.id "
+                "AND receipt_part.group_id = bounded_receipt.group_id) "
+                "OR NOT EXISTS (SELECT 1 FROM partsouq_http_artifacts AS receipt_artifact "
+                "WHERE receipt_artifact.id = bounded_receipt.source_artifact_id "
+                "AND receipt_artifact.crawl_run_id = candidate.id "
+                "AND receipt_artifact.capture_kind = 'live_http' "
+                "AND receipt_artifact.page_type = 'unit' "
+                "AND receipt_artifact.parser_name = 'parse_parts' "
+                "AND receipt_artifact.verification_status = 'verified'))))) "
+                "AS bad_bounded_receipt "
                 "FROM (SELECT cr.id, cr.run_key, cr.evidence_status, cr.target_parts "
                 "FROM scheduled_job_runs AS current_job "
                 "JOIN crawl_runs AS cr ON cr.dataset_kind = 'bounded' "
@@ -1520,6 +1682,7 @@ class CrawlRepository:
             _db_int(row.get("bad_run_status") or 0) != 0
             or _db_int(row.get("bad_evidence") or 0) != 0
             or _db_int(row.get("bad_receipt") or 0) != 0
+            or _db_int(row.get("bad_bounded_receipt") or 0) != 0
             or _db_int(row.get("exhausted_with_failures") or 0) != 0
         )
         if incompatible:
@@ -2687,6 +2850,99 @@ class CrawlRepository:
         ):
             raise RuntimeError(f"bounded run {run_id} HTTP evidence manifest/dataset mismatch")
 
+    def _assert_bounded_group_receipts(self, run_id: int, target_parts: int) -> None:
+        """確認每個待發布群組都有可重放的 immutable receipt。"""
+        receipt_summary = self.db._execute(
+            "WITH source_groups AS ("
+            "SELECT part.group_id, COUNT(*) AS source_part_count "
+            "FROM parts AS part WHERE part.seen_run_id = %s GROUP BY part.group_id"
+            "), receipt_artifact_counts AS ("
+            "SELECT receipt.group_id, receipt.source_artifact_id, "
+            "SUM(artifact_record.record_type = 'part') AS parsed_part_count, "
+            "SUM(artifact_record.record_type = 'part' AND artifact_record.accepted = 1) "
+            "AS accepted_part_count, "
+            "COUNT(DISTINCT CASE WHEN artifact_record.record_type = 'part' "
+            "AND artifact_record.accepted = 1 THEN artifact_record.part_id END) "
+            "AS accepted_part_id_count, "
+            "SUM(artifact_record.record_type = 'quarantine_part') "
+            "AS skipped_record_count "
+            "FROM bounded_group_receipts AS receipt "
+            "JOIN source_groups AS source_group ON source_group.group_id = receipt.group_id "
+            "JOIN partsouq_artifact_records AS artifact_record "
+            "ON artifact_record.artifact_id = receipt.source_artifact_id "
+            "AND artifact_record.crawl_run_id = receipt.crawl_run_id "
+            "WHERE receipt.crawl_run_id = %s "
+            "GROUP BY receipt.group_id, receipt.source_artifact_id"
+            "), receipt_source_members AS ("
+            "SELECT receipt.group_id, COUNT(DISTINCT part.id) AS accepted_source_part_count "
+            "FROM bounded_group_receipts AS receipt "
+            "JOIN source_groups AS source_group ON source_group.group_id = receipt.group_id "
+            "JOIN partsouq_artifact_records AS artifact_record "
+            "ON artifact_record.artifact_id = receipt.source_artifact_id "
+            "AND artifact_record.crawl_run_id = receipt.crawl_run_id "
+            "AND artifact_record.record_type = 'part' AND artifact_record.accepted = 1 "
+            "JOIN parts AS part ON part.id = artifact_record.part_id "
+            "AND part.group_id = source_group.group_id AND part.seen_run_id = %s "
+            "GROUP BY receipt.group_id"
+            "), receipt_integrity AS ("
+            "SELECT source_group.group_id, source_group.source_part_count, "
+            "CASE WHEN receipt.source_artifact_id IS NOT NULL "
+            "AND artifact.crawl_run_id = %s "
+            "AND artifact.capture_kind = 'live_http' AND artifact.page_type = 'unit' "
+            "AND artifact.parser_name = 'parse_parts' "
+            "AND artifact.verification_status = 'verified' AND artifact.http_status = 200 "
+            "AND artifact.challenge_detected = 0 "
+            "AND LOWER(artifact.content_type) LIKE 'text/html%%' "
+            "AND artifact.malformed_row_count = 0 AND artifact.verified_at IS NOT NULL "
+            "AND receipt_artifact_counts.parsed_part_count = receipt.parsed_part_count "
+            "AND receipt_artifact_counts.accepted_part_count = receipt.accepted_part_count "
+            "AND receipt_artifact_counts.accepted_part_id_count = receipt.accepted_part_count "
+            "AND receipt_artifact_counts.skipped_record_count = receipt.skipped_record_count "
+            "AND artifact.parsed_record_count = (receipt.parsed_part_count "
+            "+ receipt.skipped_record_count) "
+            "AND artifact.accepted_record_count = receipt.accepted_part_count "
+            "AND artifact.skipped_record_count = receipt.skipped_record_count "
+            "AND receipt_source_members.accepted_source_part_count = receipt.accepted_part_count "
+            "AND source_group.source_part_count = receipt.accepted_part_count "
+            "AND ((receipt.status = 'done' "
+            "AND receipt.accepted_part_count = receipt.parsed_part_count) "
+            "OR (receipt.status = 'partial' AND receipt.accepted_part_count > 0 "
+            "AND receipt.accepted_part_count < receipt.parsed_part_count)) "
+            "THEN 1 ELSE 0 END AS is_verified "
+            "FROM source_groups AS source_group "
+            "LEFT JOIN bounded_group_receipts AS receipt "
+            "ON receipt.crawl_run_id = %s AND receipt.group_id = source_group.group_id "
+            "LEFT JOIN partsouq_http_artifacts AS artifact "
+            "ON artifact.id = receipt.source_artifact_id "
+            "AND artifact.crawl_run_id = receipt.crawl_run_id "
+            "LEFT JOIN receipt_artifact_counts "
+            "ON receipt_artifact_counts.group_id = source_group.group_id "
+            "AND receipt_artifact_counts.source_artifact_id = receipt.source_artifact_id "
+            "LEFT JOIN receipt_source_members "
+            "ON receipt_source_members.group_id = source_group.group_id"
+            ") SELECT COUNT(*) AS group_count, "
+            "COALESCE(SUM(source_part_count), 0) AS source_part_count, "
+            "COALESCE(SUM(is_verified), 0) AS verified_group_count, "
+            "COALESCE(SUM(CASE WHEN is_verified = 1 THEN source_part_count ELSE 0 END), 0) "
+            "AS verified_part_count FROM receipt_integrity",
+            (run_id, run_id, run_id, run_id, run_id),
+        ).fetchone()
+        group_count = _db_int((receipt_summary or {}).get("group_count", 0))
+        source_part_count = _db_int((receipt_summary or {}).get("source_part_count", 0))
+        verified_group_count = _db_int((receipt_summary or {}).get("verified_group_count", 0))
+        verified_part_count = _db_int((receipt_summary or {}).get("verified_part_count", 0))
+        if (
+            group_count <= 0
+            or source_part_count != target_parts
+            or verified_group_count != group_count
+            or verified_part_count != target_parts
+        ):
+            raise RuntimeError(
+                f"bounded run {run_id} has invalid group receipts: "
+                f"groups={verified_group_count}/{group_count}, "
+                f"parts={verified_part_count}/{source_part_count}"
+            )
+
     def reject_run_evidence(self, run_id: int) -> None:
         """讓不可能完成的 bounded run 不再被後續 scheduler 接手。"""
         self.db._execute(
@@ -3117,6 +3373,7 @@ class CrawlRepository:
         # 否則任何缺頁、fixture、跨排程或 9,999/10,000 覆蓋都 fail closed，
         # 並保留上一版 bounded_parts。
         self._assert_verified_run_evidence(run_id, run, target_parts)
+        self._assert_bounded_group_receipts(run_id, target_parts)
 
         desired_scope = self.db._execute(
             "SELECT scope_brand, scope_model, scope_vehicle_year_floor "

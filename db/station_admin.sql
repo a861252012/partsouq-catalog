@@ -774,6 +774,20 @@ SELECT
         WHEN d.error_code = '0' THEN 'decoded'
         ELSE 'decoded_with_warning'
     END AS decode_status,
+    CASE
+        -- 「完整」採嚴格 VIN 適配的必要欄位；EngineConfiguration 與
+        -- DisplacementL 是補充資訊，不能代替 EngineModel 或 Trim。
+        WHEN FIND_IN_SET(
+            '8',
+            REPLACE(SUBSTRING_INDEX(COALESCE(d.error_code, ''), '-', 1), ' ', '')
+        ) > 0 THEN 'partial_no_detail_data'
+        WHEN NULLIF(TRIM(d.model_name), '') IS NULL THEN 'partial_missing_model'
+        WHEN NULLIF(TRIM(d.engine_model), '') IS NULL
+          OR NULLIF(TRIM(d.trim_name), '') IS NULL
+            THEN 'partial_missing_powertrain_or_trim'
+        WHEN d.error_code = '0' THEN 'decoded_complete'
+        ELSE 'decoded_complete_with_warning'
+    END AS decode_completeness,
     d.error_code,
     d.error_text,
     'nhtsa_vpic' AS source_kind,

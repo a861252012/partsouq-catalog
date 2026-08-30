@@ -119,3 +119,45 @@ toyota/tacoma/2006。bounded run 43 於同日 19:31 以 `bounded_success` 收尾
 就此關閉，正式讀取恢復。啟動初期 stderr 出現的「running jobs exist」
 升級失敗，是多個啟動 child 競爭的暫態——一個 child 先建了 running run，
 另一個的 030 preflight 被擋；migration 套完就不再發生，沒有資料影響。
+
+## 08-31 receipt 契約與後台健康檢查
+
+本輪新增 migration 036。它把正式 bounded snapshot 的群組來源固定成
+`bounded_group_receipts`，並讓 current view 同時核對 receipt、artifact、
+accepted part 與 snapshot 成員。`done` 必須全數收錄；`partial` 必須是有收錄、
+但未全數收錄。已發布 run 的 receipt 不可更新或刪除。
+
+crawler 也補了兩個漏記路徑：同一頁同時有可收錄與品質閘門排除的具名稱料號，
+以及續爬時已看過可收錄料號但仍有被排除的具名稱料號。兩種情況都會寫入
+`part_quarantine`，不會讓未發布列消失。bounded 續爬的 SQL 少一個括號，會讓
+MySQL 8.4 解析失敗；已修正並加入回歸測試。
+
+兩個後台的 health/readiness 先驗證 migration 036 的 schema、view、trigger 與
+索引契約，再查資料。資料庫仍停在舊 schema、或 quarantine 索引缺失時，現在會
+受控回傳 503，不會洩漏原始 MySQL 500。fresh `admin.sql` 也同步使用與 migration
+相同的 join 順序與索引，避免歷史 artifact 很多時掃描整張 artifact record 表。
+
+NHTSA ErrorCode 改為辨識逗號分隔的多個 code；station-admin 顯示
+`decode_completeness`，不會把缺 Model、Engine 或 Trim 的解碼資料誤當成可做嚴格
+fitment 的完整資料。
+
+本輪第一次完整 gate 的兩項 failure 是 E2E fixture 只載入 `catalog.sql`，卻用
+migration 036 的後台 health 契約驗證索引缺失。fixture 改為載入完整 fresh schema
+後，測試真正驗到缺索引時的 503 行為。
+
+驗證使用暫時建立的 `partsouq_fullgate_20260831_test`：
+
+| Gate | 結果 |
+| --- | --- |
+| migration 001–036 replay 與 `check` | 通過 |
+| 完整 pytest | 1,293 passed、9 skipped、0 failed（共 1,302 項） |
+| Ruff check／format | 通過，170 files already formatted |
+| strict mypy（本輪 6 個 production module） | 通過，0 issues |
+| `git diff --check` | 通過 |
+
+本輪沒有手動寫入正式 `partsouq_catalog`，也沒有停止或重啟正式 daemon。測試結束後已
+刪除上述暫時資料庫。正式 ledger 目前只到 migration 035；唯讀 `check` 會先因
+`asset:station-admin` 的既有 checksum drift 停止，因此 migration 036 尚未套用。正式
+資料何時升級，仍必須先依既有流程處理 station-admin asset，再走排程與 migration。VIN 與
+PartSouq 的 confirmed mapping、嚴格 VIN fitment，以及真正三層零件分類，仍不能從目前
+來源資料自動補造。

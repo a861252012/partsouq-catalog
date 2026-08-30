@@ -1561,7 +1561,7 @@ class Crawler:
             log.warning(
                 "[%s group=%s] %d part row(s) without product name skipped; "
                 "they are recorded as quarantine and the group will still be "
-                "receipted as done (ignore-and-record policy)",
+                "marked done when no formal part is published (ignore-and-record policy)",
                 brand,
                 group.get("group_code"),
                 skipped_nameless,
@@ -1636,8 +1636,7 @@ class Crawler:
             # 身分斷言：即使整頁都是無名稱列，也必須確認是本組的頁面。
             self._assert_expected_unit(html, group)
             log.warning(
-                "[%s group=%s] all %d row(s) lack product name; quarantined, "
-                "group receipted as done",
+                "[%s group=%s] all %d row(s) lack product name; quarantined, group marked done",
                 brand,
                 group.get("group_code"),
                 skipped_nameless,
@@ -1661,14 +1660,14 @@ class Crawler:
         # 合法空組：站方渲染了完整零件表殼（Number|Name|Code 表頭）但
         # 沒有任何資料列（實例：TOYOTA1000 KP30 的 BODY STRIPE unit，
         # 三輪 run 位元組級重現）。HTTP 200 且 0 malformed —— 這是站方
-        # 的合法「此組無零件」，receipt done/0，不得讓整輪 run 失敗。
+        # 的合法「此組無零件」，只標 group done，不得讓整輪 run 失敗。
         if not parts and not malformed and has_empty_parts_table(html):
             # 身分斷言：空表殼页也可能是「同 URL 回傳別的頁面」（/locate
             # 轉址頁若剛好含表殼、或站方回錯內容），receipt 前必須驗明正身。
             self._assert_expected_unit(html, group)
             log.info(
                 "[%s group=%s] parts table present but empty; site lists no "
-                "parts for this unit — receipted as done/0",
+                "parts for this unit — group marked done",
                 brand,
                 group.get("group_code"),
             )
@@ -1695,6 +1694,7 @@ class Crawler:
         # bounded retry 可能在 commit 已成功、process 尚未更新記憶體計數
         # 時中斷。以 DB membership 為準，先排除同 run 已寫入的
         # natural key，避免重試反覆占用配額卻無法達到 target。
+        quality_rejected: list[ParsedRecord] = []
         if self.bounded_mode:
             if self.run_id is None:
                 raise RuntimeError("crawl run is not initialized")
@@ -1719,6 +1719,8 @@ class Crawler:
                 )
                 if context and context.get("source_valid") and required and has_year and overlaps:
                     eligible.append(part)
+                else:
+                    quality_rejected.append(part)
             if len(eligible) != len(parts):
                 log.warning(
                     "[%s group=%s] excluded %d row(s) from bounded quota quality gate",
@@ -1726,7 +1728,23 @@ class Crawler:
                     group.get("group_code"),
                     len(parts) - len(eligible),
                 )
-            parts = eligible
+            eligible_parts = eligible
+            if not eligible_parts:
+                # 具名稱列全數不符合正式來源／欄位品質，不能把它們當作
+                # 空組或 quota 已滿；留下 quarantine 後失敗，讓下一輪可
+                # 以站方修正後的實際內容重抓。
+                self.parts.quarantine_parts(
+                    group_id,
+                    run_key,
+                    parsed_source_parts,
+                    reason="bounded_quality_gate",
+                )
+                self.db.commit()
+                raise RuntimeError(
+                    f"[{brand} group={group.get('group_code')}] "
+                    "all named part rows failed the bounded quality gate"
+                )
+            parts = eligible_parts
             already_seen = self.parts.seen_keys_in_group(group_id, self.run_id)
             parsed_keys = {
                 (part.get("part_number") or "", part.get("range_str") or "") for part in parts
@@ -1742,12 +1760,57 @@ class Crawler:
                 for part in parts
                 if (part.get("part_number") or "", part.get("range_str") or "") not in already_seen
             ]
-            if not parts:
-                # 本組的合法零件在本次 run 都已 seen（bounded resume）：
-                # 照常 receipt。若同頁仍含有無名稱純料號列，一樣列進
-                # quarantine 記錄（使用者決定：不完整資料忽略 + 紀錄）。
+            if not parts and eligible_parts:
+                # 這組零件已在同一 run 寫入，但程序可能在寫 receipt 前中斷。
+                # 續跑時仍要以這次回應重建 evidence 與 receipt，否則達標後
+                # 會被發布閘門拒絕。不要重複 upsert 已有 membership。
+                if self.evidence_mode:
+                    if unit_response is None or source_group_key is None:
+                        raise RuntimeError(
+                            "formal part evidence is missing its HTTP or group context"
+                        )
+                    accepted_records = [
+                        (part_id, part_record_evidence(source_group_key, [part])[0])
+                        for part_id, part in self.parts.part_ids_for_evidence(
+                            group_id, eligible_parts
+                        )
+                    ]
+                    if len(accepted_records) != len(eligible_parts):
+                        raise RuntimeError(
+                            "formal part evidence could not resolve every accepted part id"
+                        )
+                    artifact_id = self._capture_http_evidence(
+                        unit_response,
+                        page_type="unit",
+                        parser_name="parse_parts",
+                        parser_context={"group_key": source_group_key},
+                        live_records=source_part_records,
+                        accepted_records=accepted_records,
+                        malformed_rows=malformed,
+                        skipped_record_count=skipped_nameless,
+                    )
+                    if artifact_id is None:
+                        raise RuntimeError("formal part evidence did not produce an artifact")
+                    self.crawl.record_bounded_group_receipt(
+                        self.run_id,
+                        group_id,
+                        artifact_id,
+                        status=(
+                            "done" if len(eligible_parts) == len(parsed_source_parts) else "partial"
+                        ),
+                        parsed_part_count=len(parsed_source_parts),
+                        accepted_part_count=len(eligible_parts),
+                        skipped_record_count=skipped_nameless,
+                    )
                 if skipped_nameless:
                     self.parts.quarantine_parts(group_id, run_key, skipped_rows)
+                if quality_rejected:
+                    self.parts.quarantine_parts(
+                        group_id,
+                        run_key,
+                        quality_rejected,
+                        reason="bounded_quality_gate",
+                    )
                 self.crawl.mark_group_fetched(
                     group_id, run_key, status="done", row_count=parsed_row_count
                 )
@@ -1774,6 +1837,11 @@ class Crawler:
                 self.parts.quarantine_parts(group_id, run_key, skipped_rows)
                 self.db.commit()
             parts = parts[:selected]
+
+        # receipt 的 done 只代表本頁所有具名稱的 parser 列都納入正式資料集。
+        # 品質閘門排除的具名稱列與 quota 截斷都要留下 partial，避免把
+        # 「已抓到但未發布」誤寫成完整收據。無名稱列另由 quarantine 記錄。
+        receipt_status = "done" if len(parts) == len(parsed_source_parts) else "partial"
 
         # F1b：零件寫入與 group terminal state 同一交易提交 —— 避免
         # 「零件寫了但狀態沒寫」時，重試把整組重抓一遍（浪費 rate
@@ -1802,7 +1870,7 @@ class Crawler:
                         raise RuntimeError(
                             "formal part evidence could not resolve every accepted part id"
                         )
-                    self._capture_http_evidence(
+                    artifact_id = self._capture_http_evidence(
                         unit_response,
                         page_type="unit",
                         parser_name="parse_parts",
@@ -1812,6 +1880,24 @@ class Crawler:
                         malformed_rows=malformed,
                         skipped_record_count=skipped_nameless,
                     )
+                    if artifact_id is None:
+                        raise RuntimeError("formal part evidence did not produce an artifact")
+                    self.crawl.record_bounded_group_receipt(
+                        self.run_id,
+                        group_id,
+                        artifact_id,
+                        status=receipt_status,
+                        parsed_part_count=len(parsed_source_parts),
+                        accepted_part_count=len(parts),
+                        skipped_record_count=skipped_nameless,
+                    )
+                if quality_rejected:
+                    self.parts.quarantine_parts(
+                        group_id,
+                        run_key,
+                        quality_rejected,
+                        reason="bounded_quality_gate",
+                    )
                 if complete_group:
                     # 同一組同時含有「合法零件」與「無名稱純料號列」時，
                     # 零件照常 receipt，無名稱列列進 quarantine 記錄
@@ -1820,7 +1906,7 @@ class Crawler:
                         self.parts.quarantine_parts(group_id, run_key, skipped_rows)
                         log.warning(
                             "[%s group=%s] %d row(s) lack product name; quarantined, "
-                            "group receipted as done",
+                            "group marked done",
                             brand,
                             group.get("group_code"),
                             skipped_nameless,

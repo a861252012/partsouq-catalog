@@ -20,6 +20,7 @@ from partsouq_catalog.migrations import (
     CatalogMigrationRunner,
     MigrationError,
     SchemaChange,
+    _normalize_bounded_group_receipt_check_clause,
     _normalize_http_diagnostic_check_clause,
     _normalize_nhtsa_check_clause,
     _repairable_stale_nhtsa_runs,
@@ -146,6 +147,35 @@ def test_http_diagnostic_check_normalizer_accepts_mysql_literal_charset_drift() 
     )
 
 
+def test_bounded_group_receipt_check_normalizer_keeps_status_count_pairing() -> None:
+    canonical = (
+        "((`accepted_part_count` <= `parsed_part_count`) AND "
+        "(((`status` = _utf8mb4\\'done\\') AND "
+        "(`accepted_part_count` = `parsed_part_count`)) OR "
+        "((`status` = _utf8mb4\\'partial\\') AND "
+        "(`accepted_part_count` > 0) AND "
+        "(`accepted_part_count` < `parsed_part_count`))))"
+    )
+    inverted = (
+        "((`accepted_part_count` <= `parsed_part_count`) AND "
+        "((`status` = _utf8mb4\\'partial\\') AND "
+        "(`accepted_part_count` = `parsed_part_count`) OR "
+        "((`status` = _utf8mb4\\'done\\') AND "
+        "(`accepted_part_count` > 0) AND "
+        "(`accepted_part_count` < `parsed_part_count`))))"
+    )
+
+    assert _normalize_bounded_group_receipt_check_clause(canonical) == (
+        "((accepted_part_count<=parsed_part_count)and"
+        "(((status='done')and(accepted_part_count=parsed_part_count))or"
+        "((status='partial')and(accepted_part_count>0)and"
+        "(accepted_part_count<parsed_part_count))))"
+    )
+    assert _normalize_bounded_group_receipt_check_clause(inverted) != (
+        _normalize_bounded_group_receipt_check_clause(canonical)
+    )
+
+
 def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
     changes = load_schema_changes(MIGRATIONS_DIR, STATION_SCHEMA)
     migrations = [change for change in changes if change.kind == "migration"]
@@ -190,8 +220,9 @@ def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
         12,
         11,
         11,
+        29,
     ]
-    assert sum(len(change.statements) for change in migrations if change.active) == 675
+    assert sum(len(change.statements) for change in migrations if change.active) == 704
     assert changes[-1].key == STATION_ADMIN_ASSET[0]
     assert changes[-1].statements
 

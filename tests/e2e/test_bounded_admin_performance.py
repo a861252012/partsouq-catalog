@@ -14,6 +14,7 @@ from typing import Any
 
 import pymysql
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pymysql.cursors import DictCursor
 
@@ -449,14 +450,19 @@ def test_fresh_admin_schema_current_view_is_verified_bounded_only(
         with connection.cursor() as cursor:
             cursor.execute("SHOW CREATE VIEW v_current_catalog_parts")
             view_sql = str(cursor.fetchone()["Create View"]).lower()
+            cursor.execute("SHOW CREATE VIEW v_current_catalog_parts_evidence_base")
+            evidence_base_view_sql = str(cursor.fetchone()["Create View"]).lower()
     finally:
         connection.close()
 
     assert "bounded_parts" in view_sql
-    assert "verified_bounded_evidence" in view_sql
-    assert "verified_bounded_records" in view_sql
-    assert "evidence_record_sha256" in view_sql
-    assert "catalog_desired_bounded_scope" in view_sql
+    assert "receipt_integrity" in view_sql
+    assert "verified_bounded_group_receipts" in view_sql
+    assert "v_current_catalog_parts_evidence_base" in view_sql
+    assert "verified_bounded_evidence" in evidence_base_view_sql
+    assert "verified_bounded_records" in evidence_base_view_sql
+    assert "evidence_record_sha256" in evidence_base_view_sql
+    assert "catalog_desired_bounded_scope" in evidence_base_view_sql
     assert "formal_full_parts" not in view_sql
     assert "published_parts" not in view_sql
 
@@ -1019,10 +1025,10 @@ def test_station_health_fails_closed_when_backoffice_schema_is_missing(
     station_app = create_app(performance_database.station_admin_config())
     station_app.testing = True
 
-    with pytest.raises(pymysql.MySQLError) as error:
-        station_app.test_client().get("/health")
+    response = station_app.test_client().get("/health")
 
-    assert error.value.args[0] == 1146
+    assert response.status_code == 503
+    assert "migration 036" in response.get_data(as_text=True)
     _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
 
     response = station_app.test_client().get("/health")
@@ -1036,10 +1042,11 @@ def test_data_admin_health_fails_closed_when_backoffice_schema_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure_catalog_database(monkeypatch, performance_database)
-    with pytest.raises(pymysql.MySQLError) as error:
+    with pytest.raises(HTTPException) as error:
         data_admin_app.health()
 
-    assert error.value.args[0] == 1146
+    assert error.value.status_code == 503
+    assert error.value.detail == "current catalog scope contract 尚未完成 migration 036"
     _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
     assert data_admin_app.health() == {"status": "ok"}
 
@@ -1077,10 +1084,9 @@ def test_station_health_fails_closed_when_backoffice_object_is_missing(
 
     station_app = create_app(performance_database.station_admin_config())
     station_app.testing = True
-    with pytest.raises(pymysql.MySQLError) as error:
-        station_app.test_client().get("/health")
+    response = station_app.test_client().get("/health")
 
-    assert error.value.args[0] in {1146, 1356}
+    assert response.status_code == 503
 
 
 @pytest.mark.parametrize(
@@ -1110,10 +1116,11 @@ def test_data_admin_health_fails_closed_when_schema_object_is_missing(
     finally:
         connection.close()
 
-    with pytest.raises(pymysql.MySQLError) as error:
+    with pytest.raises(HTTPException) as error:
         data_admin_app.health()
 
-    assert error.value.args[0] == 1146
+    assert error.value.status_code == 503
+    assert error.value.detail == "後台資料庫 readiness 查詢失敗"
 
 
 @pytest.mark.parametrize(
@@ -1329,6 +1336,7 @@ def test_health_endpoints_fail_closed_when_quarantine_index_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     index_name: str,
 ) -> None:
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:])
     _configure_catalog_database(monkeypatch, performance_database)
     connection = performance_database.connect(autocommit=True)
     try:
@@ -1338,15 +1346,15 @@ def test_health_endpoints_fail_closed_when_quarantine_index_is_missing(
         connection.close()
 
     try:
-        with pytest.raises(pymysql.OperationalError) as fastapi_error:
+        with pytest.raises(HTTPException) as fastapi_error:
             data_admin_app.health()
-        assert fastapi_error.value.args[0] == 1176
+        assert fastapi_error.value.status_code == 503
+        assert fastapi_error.value.detail == "後台資料庫 readiness 查詢失敗"
 
         station_app = create_app(performance_database.station_admin_config())
         station_app.testing = True
-        with pytest.raises(pymysql.OperationalError) as station_error:
-            station_app.test_client().get("/health")
-        assert station_error.value.args[0] == 1176
+        station_response = station_app.test_client().get("/health")
+        assert station_response.status_code == 503
     finally:
         _apply_sql_paths(performance_database, (MIGRATION_015_PATH,))
 

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pymysql
 import pytest
 
 from partsouq_station_admin.db import SqlParams
@@ -44,7 +45,11 @@ def test_ten_entities_read_adapter_views_in_the_unified_database() -> None:
     assert "mapping_status" in vin_spec.source_fields
     assert "mapping_status" in vin_spec.search_fields
     assert "mapping_status" in vin_spec.display_fields
+    assert "decode_completeness" in vin_spec.source_fields
+    assert "decode_completeness" in vin_spec.display_fields
     assert vin_spec.editable_fields == ()
+    assert ENTITY_SPECS["vin_part_fitments"].editable_fields == ()
+    assert FIELD_LABELS["decode_completeness"] == "來源完整度"
 
 
 @pytest.mark.parametrize("entity_type", ENTITY_SPECS)
@@ -489,15 +494,16 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
     AdminRepository(database).check_readiness()
 
     assert [call.tag for call in database.calls] == [
+        "health.published-provenance",
         "health.quarantine-list",
         "health.quarantine-run-key",
         "health.backoffice-schema",
-        "health.published-provenance",
     ]
-    assert "FORCE INDEX (idx_quarantine_list)" in database.calls[0].sql
-    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in database.calls[1].sql
-    assert database.calls[1].params == ("__health__",)
-    readiness_sql = database.calls[2].sql
+    contract_sql = database.calls[0].sql
+    assert "FORCE INDEX (idx_quarantine_list)" in database.calls[1].sql
+    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in database.calls[2].sql
+    assert database.calls[2].params == ("__health__",)
+    readiness_sql = database.calls[3].sql
     for table in (
         "station_admin_formal_vehicle_configurations",
         "station_admin_formal_taxonomy_nodes",
@@ -528,8 +534,10 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
         "published_parts",
         "published_parts_previous",
         "bounded_parts",
+        "bounded_group_receipts",
         "catalog_desired_bounded_scope",
         "crawl_runs",
+        "v_current_catalog_parts_evidence_base",
         "v_current_catalog_parts",
         "part_quarantine",
         "admin_vehicle_mappings",
@@ -539,12 +547,15 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
     ):
         assert table in readiness_sql
     assert "LIMIT 0" in readiness_sql
-    contract_sql = database.calls[3].sql
     for marker in (
         "idx_published_crawl_run",
         "fk_published_crawl_run",
         "fk_published_previous_crawl_run",
         "bounded_parts",
+        "v_current_catalog_parts_evidence_base",
+        "bounded_group_receipts",
+        "receipt_integrity",
+        "verified_bounded_group_receipts",
         "verified_bounded_evidence",
         "verified_bounded_records",
         "evidence_record_sha256",
@@ -561,6 +572,10 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
         "scope_vehicle_year_floor",
         "prevent_bounded_parts_update",
         "bounded_snapshot_immutable_ready",
+        "prevent_bounded_group_receipt_update",
+        "prevent_bounded_group_receipt_delete",
+        "bounded_receipt_immutable_ready",
+        "decode_completeness",
     ):
         assert marker in contract_sql
     assert "LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) = 0" in contract_sql
@@ -572,7 +587,25 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
 def test_readiness_rejects_incomplete_published_provenance_contract() -> None:
     database = ScriptedDatabase(QueryTrace(), readiness_contract_ready=False)
 
-    with pytest.raises(AdminReadinessError, match="migration 033"):
+    with pytest.raises(AdminReadinessError, match="migration 036"):
+        AdminRepository(database).check_readiness()
+
+
+def test_readiness_converts_post_contract_mysql_error() -> None:
+    class FailingReadinessDatabase(ScriptedDatabase):
+        def fetch_one(
+            self,
+            tag: str,
+            sql: str,
+            params: SqlParams = None,
+        ) -> dict[str, Any] | None:
+            if tag != "health.published-provenance":
+                raise pymysql.OperationalError(1146, "missing readiness table")
+            return super().fetch_one(tag, sql, params)
+
+    database = FailingReadinessDatabase(QueryTrace())
+
+    with pytest.raises(AdminReadinessError, match="後台資料庫 readiness 查詢失敗"):
         AdminRepository(database).check_readiness()
 
 

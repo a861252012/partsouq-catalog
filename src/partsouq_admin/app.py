@@ -397,55 +397,7 @@ def admin_page() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    _fetch_one(
-        "SELECT part_quarantine.id FROM part_quarantine "
-        "FORCE INDEX (idx_quarantine_list) "
-        "STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id "
-        "WHERE part_quarantine.resolved_at IS NULL "
-        "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC LIMIT 1"
-    )
-    _fetch_one(
-        "SELECT part_quarantine.id FROM part_quarantine "
-        "FORCE INDEX (idx_quarantine_run_key_resolved_updated) "
-        "STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id "
-        "WHERE part_quarantine.resolved_at IS NULL "
-        "AND part_quarantine.run_key = %s "
-        "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC LIMIT 1",
-        ("__health__",),
-    )
-    readiness_tables = "\nCROSS JOIN ".join(
-        (
-            "brands",
-            "models",
-            "vehicles",
-            "categories",
-            "groups_t",
-            "parts",
-            "published_parts",
-            "published_parts_previous",
-            "bounded_parts",
-            "catalog_desired_bounded_scope",
-            "crawl_runs",
-            "nhtsa_sync_runs",
-            "nhtsa_source_artifacts",
-            "nhtsa_current_artifacts",
-            "nhtsa_vin_decodes",
-            "admin_vehicle_mappings",
-            "admin_part_translations",
-            "admin_part_fitments",
-            "admin_category_labels",
-            "admin_reconciliation_items",
-            "admin_crawl_requests",
-            "scheduled_job_runs",
-            "part_quarantine",
-            "v_current_catalog_parts",
-            "v_vin_part_fitments",
-            "admin_override_heads",
-            "station_admin_effective_parts",
-        )
-    )
-    _fetch_one(f"SELECT 1 AS ready FROM {readiness_tables} LIMIT 0")
-    provenance_contract = _fetch_one(
+    provenance_contract_sql = (
         "SELECT "
         "EXISTS (SELECT 1 FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'published_parts' "
@@ -504,7 +456,8 @@ def health() -> dict[str, str]:
         "AND constraints.UPDATE_RULE = 'NO ACTION' "
         "AND constraints.DELETE_RULE = 'NO ACTION') AS previous_foreign_key_ready, "
         "EXISTS (SELECT 1 FROM information_schema.VIEWS "
-        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'v_current_catalog_parts' "
+        "WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'v_current_catalog_parts_evidence_base' "
         "AND LOCATE('bounded_parts', LOWER(VIEW_DEFINITION)) > 0 "
         "AND LOCATE('verified_bounded_evidence', LOWER(VIEW_DEFINITION)) > 0 "
         "AND LOCATE('verified_bounded_records', LOWER(VIEW_DEFINITION)) > 0 "
@@ -522,11 +475,21 @@ def health() -> dict[str, str]:
         "AND LOCATE('scope_vehicle_year_floor', LOWER(VIEW_DEFINITION)) > 0 "
         "AND LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) = 0 "
         "AND LOCATE('published_parts', LOWER(VIEW_DEFINITION)) = 0) "
-        "AS formal_view_ready, "
+        "AS formal_evidence_base_view_ready, "
+        "EXISTS (SELECT 1 FROM information_schema.VIEWS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'v_current_catalog_parts' "
+        "AND LOCATE('v_current_catalog_parts_evidence_base', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('bounded_group_receipts', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('receipt_integrity', LOWER(VIEW_DEFINITION)) > 0 "
+        "AND LOCATE('verified_bounded_group_receipts', LOWER(VIEW_DEFINITION)) > 0) "
+        "AS formal_receipt_view_ready, "
         "(SELECT IF(COUNT(*) = 2, 1, 0) FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'v_current_catalog_parts' "
         "AND COLUMN_NAME IN ('dataset_scope', 'source_crawl_run_id')) "
         "AS formal_view_columns_ready, "
+        "EXISTS (SELECT 1 FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bounded_group_receipts' "
+        "AND TABLE_TYPE = 'BASE TABLE') AS bounded_receipt_table_ready, "
         "(SELECT IF(COUNT(*) = 5, 1, 0) FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA = DATABASE() "
         "AND TABLE_NAME = 'catalog_desired_bounded_scope' "
@@ -539,8 +502,28 @@ def health() -> dict[str, str]:
         "AND ACTION_TIMING = 'BEFORE' "
         "AND EVENT_MANIPULATION = 'UPDATE' "
         "AND LOCATE('SIGNAL SQLSTATE', UPPER(ACTION_STATEMENT)) > 0) "
-        "AS bounded_snapshot_immutable_ready"
+        "AS bounded_snapshot_immutable_ready, "
+        "(SELECT IF(COUNT(*) = 2 "
+        "AND SUM(EVENT_OBJECT_TABLE = 'bounded_group_receipts') = 2 "
+        "AND SUM(ACTION_TIMING = 'BEFORE') = 2 "
+        "AND SUM(LOCATE('SIGNAL SQLSTATE', UPPER(ACTION_STATEMENT)) > 0) = 2 "
+        "AND SUM(LOCATE('FROM CRAWL_RUNS', UPPER(ACTION_STATEMENT)) > 0) = 2 "
+        "AND SUM(LOCATE('BOUNDED_SUCCESS', UPPER(ACTION_STATEMENT)) > 0) = 2 "
+        "AND SUM(TRIGGER_NAME = 'prevent_bounded_group_receipt_update' "
+        "AND EVENT_MANIPULATION = 'UPDATE') = 1 "
+        "AND SUM(TRIGGER_NAME = 'prevent_bounded_group_receipt_delete' "
+        "AND EVENT_MANIPULATION = 'DELETE') = 1, 1, 0) "
+        "FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() "
+        "AND TRIGGER_NAME IN ('prevent_bounded_group_receipt_update', "
+        "'prevent_bounded_group_receipt_delete')) AS bounded_receipt_immutable_ready"
     )
+    try:
+        provenance_contract = _fetch_one(provenance_contract_sql)
+    except pymysql.MySQLError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="後台資料庫 readiness 查詢失敗",
+        ) from error
     if provenance_contract is None or any(
         int(provenance_contract.get(key) or 0) != 1
         for key in (
@@ -550,16 +533,75 @@ def health() -> dict[str, str]:
             "previous_index_ready",
             "current_foreign_key_ready",
             "previous_foreign_key_ready",
-            "formal_view_ready",
+            "formal_evidence_base_view_ready",
+            "formal_receipt_view_ready",
             "formal_view_columns_ready",
+            "bounded_receipt_table_ready",
             "desired_scope_columns_ready",
             "bounded_snapshot_immutable_ready",
+            "bounded_receipt_immutable_ready",
         )
     ):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="current catalog scope contract 尚未完成 migration 033",
+            detail="current catalog scope contract 尚未完成 migration 036",
         )
+    readiness_tables = "\nCROSS JOIN ".join(
+        (
+            "brands",
+            "models",
+            "vehicles",
+            "categories",
+            "groups_t",
+            "parts",
+            "published_parts",
+            "published_parts_previous",
+            "bounded_parts",
+            "bounded_group_receipts",
+            "catalog_desired_bounded_scope",
+            "crawl_runs",
+            "nhtsa_sync_runs",
+            "nhtsa_source_artifacts",
+            "nhtsa_current_artifacts",
+            "nhtsa_vin_decodes",
+            "admin_vehicle_mappings",
+            "admin_part_translations",
+            "admin_part_fitments",
+            "admin_category_labels",
+            "admin_reconciliation_items",
+            "admin_crawl_requests",
+            "scheduled_job_runs",
+            "part_quarantine",
+            "v_current_catalog_parts_evidence_base",
+            "v_current_catalog_parts",
+            "v_vin_part_fitments",
+            "admin_override_heads",
+            "station_admin_effective_parts",
+        )
+    )
+    try:
+        _fetch_one(
+            "SELECT part_quarantine.id FROM part_quarantine "
+            "FORCE INDEX (idx_quarantine_list) "
+            "STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id "
+            "WHERE part_quarantine.resolved_at IS NULL "
+            "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC LIMIT 1"
+        )
+        _fetch_one(
+            "SELECT part_quarantine.id FROM part_quarantine "
+            "FORCE INDEX (idx_quarantine_run_key_resolved_updated) "
+            "STRAIGHT_JOIN groups_t ON groups_t.id = part_quarantine.group_id "
+            "WHERE part_quarantine.resolved_at IS NULL "
+            "AND part_quarantine.run_key = %s "
+            "ORDER BY part_quarantine.updated_at DESC, part_quarantine.id DESC LIMIT 1",
+            ("__health__",),
+        )
+        _fetch_one(f"SELECT 1 AS ready FROM {readiness_tables} LIMIT 0")
+    except pymysql.MySQLError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="後台資料庫 readiness 查詢失敗",
+        ) from error
     return {"status": "ok"}
 
 

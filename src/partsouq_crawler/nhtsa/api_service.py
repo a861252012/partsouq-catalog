@@ -35,7 +35,8 @@ MODEL_EXPANSION_LOG_BATCH = 500
 # vPIC 以 HTTP 200 回應但 Make／ModelYear 缺席時，依 ErrorCode 判定這顆
 # VIN 是否「永遠解不出」的終局結果：7＝製造商未在美國註冊（歐系品牌常見）；
 # 1/11/400＝VIN 結構無效（檢查碼錯、非法字元）；8＝暫無詳細資料。
-# 這些是站方 API 的合法最終答案，不是可重試的暫時性失敗。
+# 這些是站方 API 的合法最終答案，不是可重試的暫時性失敗。多碼以逗號
+# 分隔時，7 優先於 8；兩者都沒有才判定純 VIN 結構錯誤。
 UNDECODABLE_CLASSIFICATIONS: dict[str, frozenset[int]] = {
     "nhtsa_unregistered": frozenset({7}),
     "invalid_vin": frozenset({1, 11, 400}),
@@ -46,19 +47,24 @@ UNDECODABLE_CLASSIFICATIONS: dict[str, frozenset[int]] = {
 def classify_undecodable_vin_payload(payload: Mapping[str, object]) -> str | None:
     """回傳 vPIC payload 的終局「無資料」分類；None 代表可正常發布。
 
-    Make 與 ModelYear 齊全時一律視為可發布（ErrorCode 僅供消費端判讀）；
-    缺任一必要欄位且錯誤碼命中上表時為對應分類；錯誤碼無法解析時以
-    no_detail_data 收斂（內容上確實沒有可用解碼）。"""
+    Make 與 ModelYear 齊全時一律視為可發布（ErrorCode 僅供消費端判讀）。
+    缺任一必要欄位時，先判定 7、再判定 8，最後才判定純 VIN 結構錯誤；
+    無法解析的錯誤碼以 no_detail_data 收斂，因為內容沒有可用解碼。"""
     make_name = str(payload.get("Make") or "").strip()
     model_year_raw = str(payload.get("ModelYear") or "").strip()
     if make_name and model_year_raw:
         return None
     error_code_text = str(payload.get("ErrorCode") or "").strip()
-    leading_code = error_code_text.split("-", 1)[0].strip()
-    parsed_code = int(leading_code) if leading_code.isdigit() else None
-    for classification, codes in UNDECODABLE_CLASSIFICATIONS.items():
-        if parsed_code is not None and parsed_code in codes:
-            return classification
+    code_text = error_code_text.split("-", 1)[0]
+    codes = frozenset(
+        int(value.strip()) for value in code_text.split(",") if value.strip().isdigit()
+    )
+    if 7 in codes:
+        return "nhtsa_unregistered"
+    if 8 in codes:
+        return "no_detail_data"
+    if codes and codes <= UNDECODABLE_CLASSIFICATIONS["invalid_vin"]:
+        return "invalid_vin"
     return "no_detail_data"
 
 

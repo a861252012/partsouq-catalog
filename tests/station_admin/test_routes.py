@@ -63,10 +63,10 @@ def test_health_exercises_database_readiness_before_reporting_ok() -> None:
     assert response.json["entities"] == 10
     tags = [call.tag for call in databases[-1].calls]
     assert tags == [
+        "health.published-provenance",
         "health.quarantine-list",
         "health.quarantine-run-key",
         "health.backoffice-schema",
-        "health.published-provenance",
     ]
 
 
@@ -87,10 +87,10 @@ def test_authenticated_health_stays_public_but_opens_database() -> None:
     assert response.status_code == 200
     assert response.json == {"entities": 10, "status": "ok"}
     assert [call.tag for call in databases[-1].calls] == [
+        "health.published-provenance",
         "health.quarantine-list",
         "health.quarantine-run-key",
         "health.backoffice-schema",
-        "health.published-provenance",
     ]
 
 
@@ -111,7 +111,7 @@ def test_health_fails_closed_when_published_provenance_contract_is_stale() -> No
     response = app.test_client().get("/health")
 
     assert response.status_code == 503
-    assert b"migration 033" in response.data
+    assert b"migration 036" in response.data
     assert databases[-1].calls[-1].tag == "health.published-provenance"
 
 

@@ -60,6 +60,9 @@ def _clear_shared_database(repository: NhtsaMySQLRepository) -> None:
         cursor.execute("DELETE FROM admin_vehicle_mappings")
     repository.clear_for_tests()
     with repository.transaction() as connection, connection.cursor() as cursor:
+        # 036 對已發布 snapshot 的收據設不可變保護；此為隔離 fixture，
+        # 先讓測試 run 離開 bounded_success，才能刪除關聯收據。
+        cursor.execute("UPDATE crawl_runs SET status = 'error' WHERE status = 'bounded_success'")
         for table in (
             "admin_override_events",
             "admin_override_heads",
@@ -70,6 +73,7 @@ def _clear_shared_database(repository: NhtsaMySQLRepository) -> None:
             "admin_reconciliation_items",
             "admin_crawl_requests",
             "bounded_parts",
+            "bounded_group_receipts",
             "published_parts_previous",
             "published_parts",
             "partsouq_artifact_records",

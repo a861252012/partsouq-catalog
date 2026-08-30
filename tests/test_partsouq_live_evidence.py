@@ -1630,11 +1630,13 @@ def test_bounded_publish_checks_sealed_evidence_before_snapshot_mutation() -> No
             "_assert_verified_run_evidence",
             side_effect=RuntimeError("manifest mutation"),
         ) as evidence_gate,
+        mock.patch.object(repository, "_assert_bounded_group_receipts") as receipt_gate,
         pytest.raises(RuntimeError, match="manifest mutation"),
     ):
         repository.publish_bounded_parts(17, 10_000)
 
     evidence_gate.assert_called_once_with(17, run, 10_000)
+    receipt_gate.assert_not_called()
     executed_sql = [" ".join(call.args[0].split()) for call in database._execute.call_args_list]
     assert not any(sql.startswith("DELETE FROM bounded_parts") for sql in executed_sql)
 
@@ -1705,7 +1707,10 @@ def test_bounded_publish_revalidates_the_persisted_snapshot_evidence_binding() -
 
     database._execute.side_effect = execute
     repository = CrawlRepository(database, "bounded-snapshot-binding")
-    with mock.patch.object(repository, "_assert_verified_run_evidence") as evidence_gate:
+    with (
+        mock.patch.object(repository, "_assert_verified_run_evidence") as evidence_gate,
+        mock.patch.object(repository, "_assert_bounded_group_receipts") as receipt_gate,
+    ):
         assert repository.publish_bounded_parts(17, 10_000) == 10_000
 
     evidence_gate.assert_has_calls(
@@ -1715,6 +1720,7 @@ def test_bounded_publish_revalidates_the_persisted_snapshot_evidence_binding() -
         ]
     )
     assert evidence_gate.call_count == 2
+    receipt_gate.assert_called_once_with(17, 10_000)
     insert_sql = next(
         " ".join(call.args[0].split())
         for call in database._execute.call_args_list

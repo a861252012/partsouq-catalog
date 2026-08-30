@@ -63,6 +63,7 @@ CATALOG_MANIFEST = (
     (33, "033_bounded_snapshot_immutable.sql", "7b366aa536a155cc552547ed2553cdd6fad98daf0d51262eca98b63616d2d61f"),
     (34, "034_vin_fitment_strict_count.sql", "01d4131332cb49080dcf9687bc70e4c7af3194e1306e04653614dfb706726c9e"),
     (35, "035_revoke_invalid_legacy_snapshot_rows.sql", "d728ab56b7ca6c5f4838a48e41c43d240cb3b64a64733b4d93ccdb5f19c94357"),
+    (36, "036_bounded_group_receipt_contract.sql", "84277d048b553415528597661d9dccf0df3f54007cc1ac33031953cbe6ee70ff"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(
@@ -80,6 +81,8 @@ STATION_ADMIN_ASSET_HASHES = (
     "915a656a1db64d724434fe728e4d3d4521c8dad902bedcf47cb3e23a339bd6ea",
     "496b6b02360537573fd1d3f6910dccd0564f2371a07f7ab91f0ebb1152c6224d",
     "78ca6f42d5ddf0421d666530f6a5db3de159c6602cf713b3bc0bd5247a056456",
+    "afea8c129b4b32b52b2eee234c1bf3e520f58958cd255ace68eeeb9bc9970008",
+    "28b8d65fea6001fc50c7daf4ff6b0a116b5643557dc0060ea620fa0d9b634b03",
 )
 STATION_ADMIN_ASSET = (
     "asset:station-admin",
@@ -170,6 +173,16 @@ _HTTP_DIAGNOSTIC_CHECK_CLAUSES = {
     ),
 }
 
+_BOUNDED_GROUP_RECEIPT_CHECK_CLAUSES = {
+    "chk_bounded_group_receipt_status": "(statusin('done','partial'))",
+    "chk_bounded_group_receipt_counts": (
+        "((accepted_part_count<=parsed_part_count)and"
+        "(((status='done')and(accepted_part_count=parsed_part_count))or"
+        "((status='partial')and(accepted_part_count>0)and"
+        "(accepted_part_count<parsed_part_count))))"
+    ),
+}
+
 
 def _normalize_http_diagnostic_check_clause(clause: str) -> str:
     normalized = clause.strip().lower()
@@ -192,6 +205,14 @@ def _normalize_nhtsa_check_clause(clause: str) -> str:
         normalized,
     )
     return re.sub(r"\s+", " ", normalized)
+
+
+def _normalize_bounded_group_receipt_check_clause(clause: str) -> str:
+    """正規化 MySQL CHECK 的字面值與排版漂移，保留條件順序。"""
+    normalized = clause.strip().lower().replace("`", "")
+    normalized = normalized.replace("\\'", "'")
+    normalized = re.sub(r"_(?:ascii|latin1|utf8mb4)(?=')", "", normalized)
+    return re.sub(r"\s+", "", normalized)
 
 
 _DELIMITER_DIRECTIVE = re.compile(r"\s*DELIMITER\s+(\S+)\s*", re.IGNORECASE)
@@ -548,6 +569,8 @@ class CatalogMigrationRunner:
             _assert_no_owned_routines(connection, changes)
             _assert_http_diagnostics_contract(connection)
             _assert_nhtsa_run_lease_contract(connection)
+            _assert_bounded_group_receipt_contract(connection)
+            _assert_station_admin_vin_decode_contract(connection)
         finally:
             connection.close()
 
@@ -652,6 +675,10 @@ class CatalogMigrationRunner:
                         _assert_http_diagnostics_contract(connection)
                     if change.version == 24:
                         _assert_nhtsa_run_lease_contract(connection)
+                    if change.version == 36:
+                        _assert_bounded_group_receipt_contract(connection)
+                    if change.kind == "asset":
+                        _assert_station_admin_vin_decode_contract(connection)
                     if change.version is not None:
                         _assert_no_owned_routines(connection, (change,))
                     _finish(connection, change)
@@ -666,6 +693,8 @@ class CatalogMigrationRunner:
             validate_ledger(_load_ledger(connection), changes, complete=True)
             _assert_http_diagnostics_contract(connection)
             _assert_nhtsa_run_lease_contract(connection)
+            _assert_bounded_group_receipt_contract(connection)
+            _assert_station_admin_vin_decode_contract(connection)
             return tuple(applied)
         finally:
             if lock_name is not None:
@@ -1483,6 +1512,306 @@ def _assert_http_diagnostics_contract(connection: MigrationConnection) -> None:
         raise MigrationError(
             "partsouq_http_diagnostics schema contract mismatch: " + ",".join(failures)
         )
+
+
+def _assert_bounded_group_receipt_contract(connection: MigrationConnection) -> None:
+    """確認 036 的 receipt 實體與正式 view 沒有被 ledger 假綠掩蓋。"""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+              EXISTS (
+                SELECT 1
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+                  AND TABLE_TYPE = 'BASE TABLE'
+                  AND ENGINE = 'InnoDB'
+              ) AS receipt_table_ready,
+              (
+                SELECT COUNT(*)
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+              ) = 8
+              AND (
+                SELECT COUNT(*)
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+                  AND (
+                    (COLUMN_NAME = 'crawl_run_id' AND COLUMN_TYPE = 'int'
+                     AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'group_id' AND COLUMN_TYPE = 'int'
+                        AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'source_artifact_id'
+                        AND COLUMN_TYPE = 'bigint unsigned' AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'status' AND COLUMN_TYPE = 'varchar(16)'
+                        AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'parsed_part_count'
+                        AND COLUMN_TYPE = 'int unsigned' AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'accepted_part_count'
+                        AND COLUMN_TYPE = 'int unsigned' AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'skipped_record_count'
+                        AND COLUMN_TYPE = 'int unsigned' AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'recorded_at' AND COLUMN_TYPE = 'datetime(6)'
+                        AND IS_NULLABLE = 'NO')
+                  )
+              ) = 8 AS receipt_columns_ready,
+              (
+                SELECT COUNT(*)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+                  AND INDEX_NAME = 'PRIMARY'
+              ) = 2
+              AND (
+                SELECT COALESCE(SUM(
+                  (SEQ_IN_INDEX = 1 AND COLUMN_NAME = 'crawl_run_id')
+                  OR (SEQ_IN_INDEX = 2 AND COLUMN_NAME = 'group_id')
+                ), 0)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+                  AND INDEX_NAME = 'PRIMARY'
+              ) = 2 AS receipt_primary_key_ready,
+              (
+                SELECT COUNT(*)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+                  AND INDEX_NAME = 'uq_bounded_group_receipt_artifact'
+              ) = 1
+              AND (
+                SELECT COALESCE(SUM(
+                  NON_UNIQUE = 0
+                  AND SEQ_IN_INDEX = 1
+                  AND COLUMN_NAME = 'source_artifact_id'
+                ), 0)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_group_receipts'
+                  AND INDEX_NAME = 'uq_bounded_group_receipt_artifact'
+              ) = 1 AS receipt_artifact_unique_ready,
+              (
+                SELECT COUNT(*)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_parts'
+                  AND INDEX_NAME = 'idx_bounded_run_group'
+              ) = 2
+              AND (
+                SELECT COALESCE(SUM(
+                  (SEQ_IN_INDEX = 1 AND COLUMN_NAME = 'crawl_run_id')
+                  OR (SEQ_IN_INDEX = 2 AND COLUMN_NAME = 'group_id')
+                ), 0)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'bounded_parts'
+                  AND INDEX_NAME = 'idx_bounded_run_group'
+              ) = 2 AS bounded_group_index_ready,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.REFERENTIAL_CONSTRAINTS AS constraint_rule
+                JOIN information_schema.KEY_COLUMN_USAGE AS key_column
+                  ON key_column.CONSTRAINT_SCHEMA = constraint_rule.CONSTRAINT_SCHEMA
+                 AND key_column.TABLE_NAME = constraint_rule.TABLE_NAME
+                 AND key_column.CONSTRAINT_NAME = constraint_rule.CONSTRAINT_NAME
+                WHERE constraint_rule.CONSTRAINT_SCHEMA = DATABASE()
+                  AND constraint_rule.TABLE_NAME = 'bounded_group_receipts'
+                  AND constraint_rule.CONSTRAINT_NAME = 'fk_bounded_group_receipt_run'
+                  AND key_column.COLUMN_NAME = 'crawl_run_id'
+                  AND key_column.REFERENCED_TABLE_NAME = 'crawl_runs'
+                  AND key_column.REFERENCED_COLUMN_NAME = 'id'
+                  AND constraint_rule.DELETE_RULE = 'CASCADE'
+              ) AS receipt_run_foreign_key_ready,
+              (
+                SELECT COUNT(*)
+                FROM information_schema.REFERENTIAL_CONSTRAINTS AS constraint_rule
+                JOIN information_schema.KEY_COLUMN_USAGE AS key_column
+                  ON key_column.CONSTRAINT_SCHEMA = constraint_rule.CONSTRAINT_SCHEMA
+                 AND key_column.TABLE_NAME = constraint_rule.TABLE_NAME
+                 AND key_column.CONSTRAINT_NAME = constraint_rule.CONSTRAINT_NAME
+                WHERE constraint_rule.CONSTRAINT_SCHEMA = DATABASE()
+                  AND constraint_rule.TABLE_NAME = 'bounded_group_receipts'
+                  AND constraint_rule.CONSTRAINT_NAME = 'fk_bounded_group_receipt_artifact'
+                  AND (
+                    (key_column.ORDINAL_POSITION = 1
+                     AND key_column.COLUMN_NAME = 'source_artifact_id'
+                     AND key_column.REFERENCED_TABLE_NAME = 'partsouq_http_artifacts'
+                     AND key_column.REFERENCED_COLUMN_NAME = 'id')
+                    OR (key_column.ORDINAL_POSITION = 2
+                        AND key_column.COLUMN_NAME = 'crawl_run_id'
+                        AND key_column.REFERENCED_TABLE_NAME = 'partsouq_http_artifacts'
+                        AND key_column.REFERENCED_COLUMN_NAME = 'crawl_run_id')
+                  )
+              ) = 2 AS receipt_artifact_foreign_key_ready,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.CHECK_CONSTRAINTS AS check_constraint
+                JOIN information_schema.TABLE_CONSTRAINTS AS table_constraint
+                  ON table_constraint.CONSTRAINT_SCHEMA = check_constraint.CONSTRAINT_SCHEMA
+                 AND table_constraint.CONSTRAINT_NAME = check_constraint.CONSTRAINT_NAME
+                WHERE check_constraint.CONSTRAINT_SCHEMA = DATABASE()
+                  AND table_constraint.TABLE_SCHEMA = DATABASE()
+                  AND table_constraint.TABLE_NAME = 'bounded_group_receipts'
+                  AND table_constraint.CONSTRAINT_TYPE = 'CHECK'
+                  AND table_constraint.ENFORCED = 'YES'
+                  AND check_constraint.CONSTRAINT_NAME = 'chk_bounded_group_receipt_status'
+                  AND LOCATE('status', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+                  AND LOCATE('done', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+                  AND LOCATE('partial', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.CHECK_CONSTRAINTS AS check_constraint
+                JOIN information_schema.TABLE_CONSTRAINTS AS table_constraint
+                  ON table_constraint.CONSTRAINT_SCHEMA = check_constraint.CONSTRAINT_SCHEMA
+                 AND table_constraint.CONSTRAINT_NAME = check_constraint.CONSTRAINT_NAME
+                WHERE check_constraint.CONSTRAINT_SCHEMA = DATABASE()
+                  AND table_constraint.TABLE_SCHEMA = DATABASE()
+                  AND table_constraint.TABLE_NAME = 'bounded_group_receipts'
+                  AND table_constraint.CONSTRAINT_TYPE = 'CHECK'
+                  AND table_constraint.ENFORCED = 'YES'
+                  AND check_constraint.CONSTRAINT_NAME = 'chk_bounded_group_receipt_counts'
+                  AND LOCATE('accepted_part_count', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+                  AND LOCATE('parsed_part_count', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+                  AND LOCATE('status', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+                  AND LOCATE('done', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+                  AND LOCATE('partial', LOWER(check_constraint.CHECK_CLAUSE)) > 0
+              ) AS receipt_checks_ready,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.VIEWS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'v_current_catalog_parts_evidence_base'
+                  AND LOCATE('verified_bounded_evidence', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('verified_bounded_records', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('catalog_desired_bounded_scope', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('evidence_record_sha256', LOWER(VIEW_DEFINITION)) > 0
+              ) AS evidence_base_view_ready,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.VIEWS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'v_current_catalog_parts'
+                  AND LOCATE(
+                    'v_current_catalog_parts_evidence_base', LOWER(VIEW_DEFINITION)
+                  ) > 0
+                  AND LOCATE('bounded_group_receipts', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('receipt_integrity', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('verified_bounded_group_receipts', LOWER(VIEW_DEFINITION)) > 0
+              ) AS formal_receipt_view_ready,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.TRIGGERS
+                WHERE TRIGGER_SCHEMA = DATABASE()
+                  AND TRIGGER_NAME = 'prevent_bounded_group_receipt_update'
+                  AND EVENT_OBJECT_TABLE = 'bounded_group_receipts'
+                  AND ACTION_TIMING = 'BEFORE'
+                  AND EVENT_MANIPULATION = 'UPDATE'
+                  AND LOCATE('from crawl_runs', LOWER(ACTION_STATEMENT)) > 0
+                  AND LOCATE('old.crawl_run_id', LOWER(ACTION_STATEMENT)) > 0
+                  AND LOCATE('status = ''bounded_success''', LOWER(ACTION_STATEMENT)) > 0
+                  AND LOCATE('signal sqlstate', LOWER(ACTION_STATEMENT)) > 0
+              ) AS receipt_update_trigger_ready,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.TRIGGERS
+                WHERE TRIGGER_SCHEMA = DATABASE()
+                  AND TRIGGER_NAME = 'prevent_bounded_group_receipt_delete'
+                  AND EVENT_OBJECT_TABLE = 'bounded_group_receipts'
+                  AND ACTION_TIMING = 'BEFORE'
+                  AND EVENT_MANIPULATION = 'DELETE'
+                  AND LOCATE('from crawl_runs', LOWER(ACTION_STATEMENT)) > 0
+                  AND LOCATE('old.crawl_run_id', LOWER(ACTION_STATEMENT)) > 0
+                  AND LOCATE('status = ''bounded_success''', LOWER(ACTION_STATEMENT)) > 0
+                  AND LOCATE('signal sqlstate', LOWER(ACTION_STATEMENT)) > 0
+              ) AS receipt_delete_trigger_ready
+            """
+        )
+        contract = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT
+              check_constraint.CONSTRAINT_NAME AS constraint_name,
+              check_constraint.CHECK_CLAUSE AS check_clause,
+              table_constraint.ENFORCED AS enforced
+            FROM information_schema.CHECK_CONSTRAINTS AS check_constraint
+            JOIN information_schema.TABLE_CONSTRAINTS AS table_constraint
+              ON table_constraint.CONSTRAINT_SCHEMA = check_constraint.CONSTRAINT_SCHEMA
+             AND table_constraint.CONSTRAINT_NAME = check_constraint.CONSTRAINT_NAME
+            WHERE check_constraint.CONSTRAINT_SCHEMA = DATABASE()
+              AND table_constraint.TABLE_SCHEMA = DATABASE()
+              AND table_constraint.TABLE_NAME = 'bounded_group_receipts'
+              AND table_constraint.CONSTRAINT_TYPE = 'CHECK'
+              AND check_constraint.CONSTRAINT_NAME IN (
+                'chk_bounded_group_receipt_status',
+                'chk_bounded_group_receipt_counts'
+              )
+            ORDER BY check_constraint.CONSTRAINT_NAME
+            """
+        )
+        receipt_checks = {
+            str(row["constraint_name"]): (
+                _normalize_bounded_group_receipt_check_clause(str(row["check_clause"])),
+                str(row["enforced"]),
+            )
+            for row in cursor.fetchall()
+        }
+    contract_values = dict(contract or {})
+    contract_values["receipt_checks_ready"] = int(
+        receipt_checks
+        == {name: (clause, "YES") for name, clause in _BOUNDED_GROUP_RECEIPT_CHECK_CLAUSES.items()}
+    )
+    contract_keys = (
+        "receipt_table_ready",
+        "receipt_columns_ready",
+        "receipt_primary_key_ready",
+        "receipt_artifact_unique_ready",
+        "bounded_group_index_ready",
+        "receipt_run_foreign_key_ready",
+        "receipt_artifact_foreign_key_ready",
+        "receipt_checks_ready",
+        "evidence_base_view_ready",
+        "formal_receipt_view_ready",
+        "receipt_update_trigger_ready",
+        "receipt_delete_trigger_ready",
+    )
+    missing = [key for key in contract_keys if int(contract_values.get(key, 0)) != 1]
+    if missing:
+        raise MigrationError("bounded group receipt schema contract mismatch: " + ",".join(missing))
+
+
+def _assert_station_admin_vin_decode_contract(connection: MigrationConnection) -> None:
+    """確認 station-admin 的 VIN 解碼完整度欄位仍由正式 view 提供。"""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.VIEWS
+              WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'station_admin_vin_vehicle_mappings'
+                AND LOCATE('decode_completeness', LOWER(VIEW_DEFINITION)) > 0
+                AND LOCATE('partial_no_detail_data', LOWER(VIEW_DEFINITION)) > 0
+                AND LOCATE('partial_missing_model', LOWER(VIEW_DEFINITION)) > 0
+                AND LOCATE('partial_missing_powertrain_or_trim', LOWER(VIEW_DEFINITION)) > 0
+                AND LOCATE('decoded_complete', LOWER(VIEW_DEFINITION)) > 0
+                AND LOCATE('decoded_complete_with_warning', LOWER(VIEW_DEFINITION)) > 0
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'station_admin_vin_vehicle_mappings'
+                AND COLUMN_NAME = 'decode_completeness'
+            ) AS station_decode_contract_ready
+            """
+        )
+        contract = cursor.fetchone()
+    if not contract or int(contract.get("station_decode_contract_ready", 0)) != 1:
+        raise MigrationError("station-admin VIN decode schema contract mismatch")
 
 
 def _assert_nhtsa_run_lease_contract(connection: MigrationConnection) -> None:

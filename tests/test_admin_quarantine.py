@@ -243,19 +243,23 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
                 "previous_index_ready": 1,
                 "current_foreign_key_ready": 1,
                 "previous_foreign_key_ready": 1,
-                "formal_view_ready": 1,
+                "formal_evidence_base_view_ready": 1,
+                "formal_receipt_view_ready": 1,
                 "formal_view_columns_ready": 1,
+                "bounded_receipt_table_ready": 1,
                 "desired_scope_columns_ready": 1,
                 "bounded_snapshot_immutable_ready": 1,
+                "bounded_receipt_immutable_ready": 1,
             }
 
     monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
 
     assert admin_app.health() == {"status": "ok"}
-    assert "FORCE INDEX (idx_quarantine_list)" in queries[0][0]
-    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in queries[1][0]
-    assert queries[1][1] == ("__health__",)
-    readiness_sql = queries[2][0]
+    provenance_sql = queries[0][0]
+    assert "FORCE INDEX (idx_quarantine_list)" in queries[1][0]
+    assert "FORCE INDEX (idx_quarantine_run_key_resolved_updated)" in queries[2][0]
+    assert queries[2][1] == ("__health__",)
+    readiness_sql = queries[3][0]
     for table in (
         "brands",
         "models",
@@ -266,6 +270,7 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
         "published_parts",
         "published_parts_previous",
         "bounded_parts",
+        "bounded_group_receipts",
         "catalog_desired_bounded_scope",
         "crawl_runs",
         "nhtsa_sync_runs",
@@ -280,13 +285,13 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
         "admin_crawl_requests",
         "scheduled_job_runs",
         "part_quarantine",
+        "v_current_catalog_parts_evidence_base",
         "v_current_catalog_parts",
         "v_vin_part_fitments",
         "admin_override_heads",
         "station_admin_effective_parts",
     ):
         assert table in readiness_sql
-    provenance_sql = queries[3][0]
     assert "idx_published_crawl_run" in provenance_sql
     assert "fk_published_crawl_run" in provenance_sql
     assert "fk_published_previous_crawl_run" in provenance_sql
@@ -297,6 +302,11 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
     assert "qualified_full_runs" not in provenance_sql
     assert "full_scheduler_run" not in provenance_sql
     assert "bounded_parts" in provenance_sql
+    assert "v_current_catalog_parts_evidence_base" in provenance_sql
+    assert "bounded_group_receipts" in provenance_sql
+    assert "verified_bounded_group_receipts" in provenance_sql
+    assert "prevent_bounded_group_receipt_update" in provenance_sql
+    assert "prevent_bounded_group_receipt_delete" in provenance_sql
     assert "verified_bounded_evidence" in provenance_sql
     assert "verified_bounded_records" in provenance_sql
     assert "evidence_record_sha256" in provenance_sql
@@ -328,10 +338,13 @@ def test_health_fails_closed_when_published_provenance_schema_is_stale(
                 "previous_index_ready": 1,
                 "current_foreign_key_ready": 1,
                 "previous_foreign_key_ready": 1,
-                "formal_view_ready": 0,
+                "formal_evidence_base_view_ready": 0,
+                "formal_receipt_view_ready": 1,
                 "formal_view_columns_ready": 1,
+                "bounded_receipt_table_ready": 1,
                 "desired_scope_columns_ready": 1,
                 "bounded_snapshot_immutable_ready": 1,
+                "bounded_receipt_immutable_ready": 1,
             }
         return {}
 
@@ -341,7 +354,42 @@ def test_health_fails_closed_when_published_provenance_schema_is_stale(
         admin_app.health()
 
     assert exc_info.value.status_code == 503
-    assert "migration 033" in exc_info.value.detail
+    assert "migration 036" in exc_info.value.detail
+
+
+def test_health_converts_post_contract_mysql_error_to_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    contract = {
+        "current_column_ready": 1,
+        "previous_column_ready": 1,
+        "current_index_ready": 1,
+        "previous_index_ready": 1,
+        "current_foreign_key_ready": 1,
+        "previous_foreign_key_ready": 1,
+        "formal_evidence_base_view_ready": 1,
+        "formal_receipt_view_ready": 1,
+        "formal_view_columns_ready": 1,
+        "bounded_receipt_table_ready": 1,
+        "desired_scope_columns_ready": 1,
+        "bounded_snapshot_immutable_ready": 1,
+        "bounded_receipt_immutable_ready": 1,
+    }
+
+    def fetch_one(sql: str, params: tuple[object, ...] = ()) -> dict[str, int]:
+        if "information_schema.COLUMNS" in sql:
+            return contract
+        raise admin_app.pymysql.OperationalError(1146, "missing readiness table")
+
+    monkeypatch.setattr(admin_app, "_fetch_one", fetch_one)
+
+    with pytest.raises(HTTPException) as exc_info:
+        admin_app.health()
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "後台資料庫 readiness 查詢失敗"
 
 
 def test_database_summary_includes_quarantine_counts(

@@ -282,6 +282,7 @@ CREATE TABLE IF NOT EXISTS bounded_parts (
   evidence_record_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
   snapshot_at    DATETIME NOT NULL,
   KEY idx_bounded_run (crawl_run_id),
+  KEY idx_bounded_run_group (crawl_run_id, group_id),
   KEY idx_bounded_part_number (part_number),
   KEY idx_bounded_part_number_normalized (part_number_normalized),
   KEY idx_bounded_brand_model (brand, model),
@@ -696,3 +697,77 @@ CREATE TABLE IF NOT EXISTS partsouq_artifact_records (
     OR (accepted = 0 AND part_id IS NULL)
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 正式 bounded snapshot 的群組級不可變收據。groups_t.fetched_* 是下一輪
+-- 爬取可更新的續爬快取，不能證明既有 snapshot 的來源邊界；本表將每個
+-- 納入 snapshot 的 group 綁到同一 run 的 verified unit artifact。
+CREATE TABLE IF NOT EXISTS bounded_group_receipts (
+  crawl_run_id         INT NOT NULL,
+  group_id             INT NOT NULL,
+  source_artifact_id   BIGINT UNSIGNED NOT NULL,
+  status               VARCHAR(16) NOT NULL,
+  parsed_part_count    INT UNSIGNED NOT NULL,
+  accepted_part_count  INT UNSIGNED NOT NULL,
+  skipped_record_count INT UNSIGNED NOT NULL,
+  recorded_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (crawl_run_id, group_id),
+  UNIQUE KEY uq_bounded_group_receipt_artifact (source_artifact_id),
+  KEY idx_bounded_group_receipt_group (group_id),
+  CONSTRAINT fk_bounded_group_receipt_run FOREIGN KEY (crawl_run_id)
+    REFERENCES crawl_runs(id) ON DELETE CASCADE,
+  CONSTRAINT fk_bounded_group_receipt_artifact FOREIGN KEY (source_artifact_id, crawl_run_id)
+    REFERENCES partsouq_http_artifacts(id, crawl_run_id),
+  CONSTRAINT chk_bounded_group_receipt_status CHECK (
+    status IN ('done', 'partial')
+  ),
+  CONSTRAINT chk_bounded_group_receipt_counts CHECK (
+    accepted_part_count <= parsed_part_count
+    AND (
+      (status = 'done' AND accepted_part_count = parsed_part_count)
+      OR (
+        status = 'partial'
+        AND accepted_part_count > 0
+        AND accepted_part_count < parsed_part_count
+      )
+    )
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- receipt 會在 run 尚未發布時因重試而更新。當它已是 current bounded
+-- snapshot 並成功發布後，禁止改寫或刪除，避免歷史 snapshot 的群組來源
+-- 在事後失去可稽核性；下一版必須重新發布。
+DROP TRIGGER IF EXISTS prevent_bounded_group_receipt_update;
+DELIMITER //
+CREATE TRIGGER prevent_bounded_group_receipt_update
+BEFORE UPDATE ON bounded_group_receipts
+FOR EACH ROW
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM crawl_runs
+    WHERE crawl_runs.id = OLD.crawl_run_id
+      AND crawl_runs.status = 'bounded_success'
+  ) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'bounded group receipt is immutable after snapshot publication';
+  END IF;
+END//
+DELIMITER ;
+
+DROP TRIGGER IF EXISTS prevent_bounded_group_receipt_delete;
+DELIMITER //
+CREATE TRIGGER prevent_bounded_group_receipt_delete
+BEFORE DELETE ON bounded_group_receipts
+FOR EACH ROW
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM crawl_runs
+    WHERE crawl_runs.id = OLD.crawl_run_id
+      AND crawl_runs.status = 'bounded_success'
+  ) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'bounded group receipt is immutable after snapshot publication';
+  END IF;
+END//
+DELIMITER ;

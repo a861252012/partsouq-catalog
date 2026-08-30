@@ -23,7 +23,7 @@ PartSouq 的舊 SQLite 工具保留在 `partsouq_crawler` 套件中，僅作為�
 
 本機啟動後有兩個角色不同的後台：
 
-- [http://admin.partsouq.localhost:8086/](http://admin.partsouq.localhost:8086/) 是站方後台。支援 10 類資料的瀏覽、搜尋與明細；可寫類型以 overlay 新增、修改、停用與復原，絕不改寫爬蟲原始資料。VIN 車款對照是唯讀衍生資料，解碼與人工確認請使用 8000 的專用流程。列表預設每頁 30 筆，可選 10／25／30／50／100／200 筆。每次 overlay 寫入都保留 actor、reason、revision 與只能追加的 audit event。
+- [http://admin.partsouq.localhost:8086/](http://admin.partsouq.localhost:8086/) 是站方後台。支援 10 類資料的瀏覽、搜尋與明細；可寫類型以 overlay 新增、修改、停用與復原，絕不改寫爬蟲原始資料。VIN 車款對照與 VIN 零件適用性都是唯讀衍生資料，解碼與人工確認請使用 8000 的專用流程。列表預設每頁 30 筆，可選 10／25／30／50／100／200 筆。每次 overlay 寫入都保留 actor、reason、revision 與只能追加的 audit event。
 - [http://partsouq.localhost:8000/admin](http://partsouq.localhost:8000/admin) 是共用 DB 的資料品質與 API mapping dashboard，不是上述 10 類資料的完整 CRUD 後台。
 
 `.localhost` 是保留給本機 loopback 的 domain，已實測兩個 health endpoint，無須修改 `/etc/hosts` 或取得 root 權限。
@@ -55,7 +55,7 @@ PartSouq 會保存：
 - 車款生產月份區間、零件適用月份區間
 - PartSouq 引擎與 Grade／Trim
 
-系統先把品牌、型號做英數正規化，再以 NHTSA 年式落在 PartSouq 已發布生產區間內的資料列為「候選」。候選不會自動當成正確 mapping；管理者可確認 VIN 對應的 PartSouq `vehicle_id`。若兩個來源使用不同名稱，也可明確勾選人工 override，但必須留下確認依據，且目標車款仍須存在於目前已發布型錄及年份區間內。`GET /api/vins/{vin}/parts` 會分開回傳 `vehicle_mapping_status=confirmed` 與 `fitment_status=compatible_by_model_year`。後者只是年式相容判斷；沒有實際生產月份時，不宣稱零件月份已完全確認。有效期間是車款生產區間與零件適用區間的交集。
+系統先把品牌、型號做英數正規化，再以 NHTSA 年式落在 PartSouq 已發布生產區間內的資料列為「候選」。候選不會自動當成正確 mapping；管理者可確認 VIN 對應的 PartSouq `vehicle_id`。若兩個來源使用不同名稱，也可明確勾選人工 override，但必須留下確認依據，且目標車款仍須存在於目前已發布型錄及年份區間內。`GET /api/vins/{vin}/parts` 會分開回傳 `vehicle_mapping_status=confirmed` 與 `fitment_status=compatible_by_model_year_engine_trim`。後者代表型號、年式、引擎與 Trim 都通過嚴格比對；沒有實際生產月份時，不宣稱零件月份已完全確認。有效期間是車款生產區間與零件適用區間的交集。
 
 PartSouq 成功發布後，後台的 VIN mapping 列表會把已不在 current snapshot 的 `vehicle_id` 標為 `stale`；NHTSA 後續若修正同一 VIN 的品牌、型號或年式，原確認也會標為 `stale`，且不再回傳舊零件。管理者應重新查候選並以既有 mapping ID 更正；更正仍會重新驗證目標車款與年份，不能直接指定未發布車款。
 
@@ -100,7 +100,7 @@ docker compose up -d mysql
 ```
 
 runner 會以固定 manifest 從 001 開始檢查並重播尚未記錄的 active migration
-（001–012、015–035），不靠人工猜測既有 volume 的版本。013／014 已被 015
+（001–012、015–036），不靠人工猜測既有 volume 的版本。013／014 已被 015
 取代，不會在新升級執行。
 migration 019 會讓正式 bounded view fail closed：除了精確 10,000 筆與成功的
 daemon provenance，還必須有已 seal 的 live HTTP evidence、六種頁面類型與逐筆
@@ -142,6 +142,9 @@ migration 034 將 VIN fitment 的一般候選數計算改為 CTE，一次計算 
 migration 035 只會移除已綁 evidence digest、但 normalized 料號無法由 snapshot
 原始料號重算的 legacy 列；因此受影響的舊 10,000 筆 snapshot 也會 fail closed，
 直到新的 verified run 發布。
+migration 036 為每個正式 snapshot 的零件群組保存不可變 receipt，並逐一核對
+receipt、verified unit artifact 與被納入的 part。配額在群組中途達標時會標為
+`partial`；少任何一張 receipt 或任一數量對不上，正式 view 會回傳空資料。
 migration 005 若判定舊 vehicle tree 必須重建，仍會在刪除前 fail closed，且只接受
 備份後由操作者明確授權。
 
