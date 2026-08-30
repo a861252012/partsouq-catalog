@@ -295,7 +295,7 @@ def _repository_verification_fixture():
             cursor.fetchall.return_value = bodies
         elif normalized.startswith("SELECT records.artifact_id"):
             cursor.fetchall.return_value = record_rows
-        elif normalized.startswith("SELECT p.id, p.part_number"):
+        elif normalized.startswith("SELECT part.id, part.part_number"):
             cursor.fetchall.return_value = source_rows
         else:
             raise AssertionError(f"unexpected evidence query: {normalized}")
@@ -946,7 +946,7 @@ def test_completed_evidence_rebuilds_from_immutable_bounded_snapshot() -> None:
 
     def execute(sql, params=()):
         normalized = " ".join(sql.split())
-        if normalized.startswith("SELECT p.id, p.part_number"):
+        if normalized.startswith("SELECT part.id, part.part_number"):
             cursor = mock.MagicMock()
             cursor.fetchall.return_value = []
             return cursor
@@ -1674,7 +1674,7 @@ def test_bounded_publish_revalidates_the_persisted_snapshot_evidence_binding() -
             cursor.fetchall.return_value = []
         elif (
             normalized == "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s"
-            or normalized.startswith("SELECT COUNT(*) AS row_count FROM parts AS p")
+            or normalized.startswith("SELECT COUNT(*) AS row_count FROM parts AS part")
         ):
             cursor.fetchone.return_value = {"row_count": 10_000}
         elif normalized.startswith(

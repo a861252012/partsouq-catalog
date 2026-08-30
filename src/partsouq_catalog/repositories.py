@@ -1354,42 +1354,42 @@ class CrawlRepository:
         params: list[object] = [run_id]
         if scope_brand is not None:
             scope_clause = (
-                "OR CAST(LOWER(TRIM(b.name)) AS BINARY) <> CAST(%s AS BINARY) "
-                "OR CAST(LOWER(TRIM(m.name)) AS BINARY) <> CAST(%s AS BINARY) "
-                "OR (v.production_to IS NOT NULL "
-                "AND CAST(LEFT(v.production_to, 4) AS UNSIGNED) < %s) "
+                "OR CAST(LOWER(TRIM(brand.name)) AS BINARY) <> CAST(%s AS BINARY) "
+                "OR CAST(LOWER(TRIM(model.name)) AS BINARY) <> CAST(%s AS BINARY) "
+                "OR (vehicle.production_to IS NOT NULL "
+                "AND CAST(LEFT(vehicle.production_to, 4) AS UNSIGNED) < %s) "
             )
             params.extend((scope_brand, scope_model, scope_vehicle_year_floor))
         cur = self.db._execute(
-            "UPDATE parts AS p "
-            "JOIN groups_t AS g ON g.id = p.group_id "
-            "JOIN categories AS c ON c.id = g.category_id "
-            "JOIN vehicles AS v ON v.id = c.vehicle_id "
-            "JOIN models AS m ON m.id = v.model_id "
-            "JOIN brands AS b ON b.id = m.brand_id "
-            "SET p.seen_run_id = NULL WHERE p.seen_run_id = %s AND ("
-            "NULLIF(TRIM(p.part_number), '') IS NULL "
-            "OR NULLIF(TRIM(p.name), '') IS NULL "
-            "OR NULLIF(TRIM(p.code), '') IS NULL "
-            "OR NULLIF(TRIM(b.name), '') IS NULL "
-            "OR NULLIF(TRIM(m.name), '') IS NULL "
-            "OR NULLIF(TRIM(v.name), '') IS NULL "
-            "OR NULLIF(TRIM(v.model_code), '') IS NULL "
-            "OR NULLIF(TRIM(v.vid), '') IS NULL "
-            "OR NULLIF(TRIM(c.cid), '') IS NULL "
-            "OR NULLIF(TRIM(c.name), '') IS NULL "
-            "OR NULLIF(TRIM(g.name), '') IS NULL "
-            "OR NULLIF(TRIM(g.code), '') IS NULL "
-            "OR NULLIF(TRIM(g.uid), '') IS NULL "
-            "OR (v.production_from IS NULL AND v.production_to IS NULL "
-            "AND p.part_from IS NULL AND p.part_to IS NULL) "
-            "OR (p.part_to IS NOT NULL AND v.production_from IS NOT NULL "
-            "AND p.part_to < v.production_from) "
-            "OR (v.production_to IS NOT NULL AND p.part_from IS NOT NULL "
-            "AND v.production_to < p.part_from) "
+            "UPDATE parts AS part "
+            "JOIN groups_t AS source_group ON source_group.id = part.group_id "
+            "JOIN categories AS category ON category.id = source_group.category_id "
+            "JOIN vehicles AS vehicle ON vehicle.id = category.vehicle_id "
+            "JOIN models AS model ON model.id = vehicle.model_id "
+            "JOIN brands AS brand ON brand.id = model.brand_id "
+            "SET part.seen_run_id = NULL WHERE part.seen_run_id = %s AND ("
+            "NULLIF(TRIM(part.part_number), '') IS NULL "
+            "OR NULLIF(TRIM(part.name), '') IS NULL "
+            "OR NULLIF(TRIM(part.code), '') IS NULL "
+            "OR NULLIF(TRIM(brand.name), '') IS NULL "
+            "OR NULLIF(TRIM(model.name), '') IS NULL "
+            "OR NULLIF(TRIM(vehicle.name), '') IS NULL "
+            "OR NULLIF(TRIM(vehicle.model_code), '') IS NULL "
+            "OR NULLIF(TRIM(vehicle.vid), '') IS NULL "
+            "OR NULLIF(TRIM(category.cid), '') IS NULL "
+            "OR NULLIF(TRIM(category.name), '') IS NULL "
+            "OR NULLIF(TRIM(source_group.name), '') IS NULL "
+            "OR NULLIF(TRIM(source_group.code), '') IS NULL "
+            "OR NULLIF(TRIM(source_group.uid), '') IS NULL "
+            "OR (vehicle.production_from IS NULL AND vehicle.production_to IS NULL "
+            "AND part.part_from IS NULL AND part.part_to IS NULL) "
+            "OR (part.part_to IS NOT NULL AND vehicle.production_from IS NOT NULL "
+            "AND part.part_to < vehicle.production_from) "
+            "OR (vehicle.production_to IS NOT NULL AND part.part_from IS NOT NULL "
+            "AND vehicle.production_to < part.part_from) "
             f"{scope_clause}"
-            "OR NULLIF(TRIM(g.url), '') IS NULL OR NOT ("
-            f"{_canonical_unit_url_sql('g.url', 'g.uid')}))",
+            "OR NULLIF(TRIM(source_group.url), '') IS NULL OR NOT ("
+            f"{_canonical_unit_url_sql('source_group.url', 'source_group.uid')}))",
             tuple(params),
         )
         return cur.rowcount
@@ -2288,19 +2288,22 @@ class CrawlRepository:
             ).fetchall()
         else:
             source_part_rows = self.db._execute(
-                "SELECT p.id, p.part_number, p.name, p.code, p.note, p.quantity, "
-                "p.range_str, p.part_from, p.part_to, g.code AS group_code, g.uid, "
-                "c.cid, c.name AS category_name, v.name AS vehicle_name, v.model_code, "
-                "v.prod_period, v.production_from, v.production_to, v.engine, "
-                "v.grade AS trim_name, v.vid, m.name AS model_name, b.name AS brand_name, "
-                "g.url AS source_url "
-                "FROM parts AS p "
-                "JOIN groups_t AS g ON g.id = p.group_id "
-                "JOIN categories AS c ON c.id = g.category_id "
-                "JOIN vehicles AS v ON v.id = c.vehicle_id "
-                "JOIN models AS m ON m.id = v.model_id "
-                "JOIN brands AS b ON b.id = m.brand_id "
-                "WHERE p.seen_run_id = %s ORDER BY p.id",
+                "SELECT part.id, part.part_number, part.name, part.code, part.note, "
+                "part.quantity, part.range_str, part.part_from, part.part_to, "
+                "source_group.code AS group_code, source_group.uid, "
+                "category.cid, category.name AS category_name, "
+                "vehicle.name AS vehicle_name, vehicle.model_code, "
+                "vehicle.prod_period, vehicle.production_from, vehicle.production_to, "
+                "vehicle.engine, vehicle.grade AS trim_name, vehicle.vid, "
+                "model.name AS model_name, brand.name AS brand_name, "
+                "source_group.url AS source_url "
+                "FROM parts AS part "
+                "JOIN groups_t AS source_group ON source_group.id = part.group_id "
+                "JOIN categories AS category ON category.id = source_group.category_id "
+                "JOIN vehicles AS vehicle ON vehicle.id = category.vehicle_id "
+                "JOIN models AS model ON model.id = vehicle.model_id "
+                "JOIN brands AS brand ON brand.id = model.brand_id "
+                "WHERE part.seen_run_id = %s ORDER BY part.id",
                 (run_id,),
             ).fetchall()
         source_part_ids = {_db_int(row["id"]) for row in source_part_rows}
@@ -3089,17 +3092,17 @@ class CrawlRepository:
             )
         if scope_brand is not None:
             scoped_source = self.db._execute(
-                "SELECT COUNT(*) AS row_count FROM parts AS p "
-                "JOIN groups_t AS g ON g.id = p.group_id "
-                "JOIN categories AS c ON c.id = g.category_id "
-                "JOIN vehicles AS v ON v.id = c.vehicle_id "
-                "JOIN models AS m ON m.id = v.model_id "
-                "JOIN brands AS b ON b.id = m.brand_id "
-                "WHERE p.seen_run_id = %s "
-                "AND CAST(LOWER(TRIM(b.name)) AS BINARY) = CAST(%s AS BINARY) "
-                "AND CAST(LOWER(TRIM(m.name)) AS BINARY) = CAST(%s AS BINARY) "
-                "AND (v.production_to IS NULL "
-                "OR CAST(LEFT(v.production_to, 4) AS UNSIGNED) >= %s)",
+                "SELECT COUNT(*) AS row_count FROM parts AS part "
+                "JOIN groups_t AS source_group ON source_group.id = part.group_id "
+                "JOIN categories AS category ON category.id = source_group.category_id "
+                "JOIN vehicles AS vehicle ON vehicle.id = category.vehicle_id "
+                "JOIN models AS model ON model.id = vehicle.model_id "
+                "JOIN brands AS brand ON brand.id = model.brand_id "
+                "WHERE part.seen_run_id = %s "
+                "AND CAST(LOWER(TRIM(brand.name)) AS BINARY) = CAST(%s AS BINARY) "
+                "AND CAST(LOWER(TRIM(model.name)) AS BINARY) = CAST(%s AS BINARY) "
+                "AND (vehicle.production_to IS NULL "
+                "OR CAST(LEFT(vehicle.production_to, 4) AS UNSIGNED) >= %s)",
                 (run_id, scope_brand, scope_model, scope_vehicle_year_floor),
             ).fetchone()
             scoped_count = _db_int((scoped_source or {}).get("row_count", 0))

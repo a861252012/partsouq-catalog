@@ -1493,11 +1493,12 @@ def test_scoped_membership_only_rejects_known_production_end_before_floor() -> N
     )
 
     query, params = database._execute.call_args.args
-    assert "CAST(LOWER(TRIM(b.name)) AS BINARY) <> CAST(%s AS BINARY)" in query
-    assert "CAST(LOWER(TRIM(m.name)) AS BINARY) <> CAST(%s AS BINARY)" in query
-    assert "OR v.production_to IS NULL" not in query
+    assert "CAST(LOWER(TRIM(brand.name)) AS BINARY) <> CAST(%s AS BINARY)" in query
+    assert "CAST(LOWER(TRIM(model.name)) AS BINARY) <> CAST(%s AS BINARY)" in query
+    assert "OR vehicle.production_to IS NULL" not in query
     assert (
-        "OR (v.production_to IS NOT NULL AND CAST(LEFT(v.production_to, 4) AS UNSIGNED) < %s)"
+        "OR (vehicle.production_to IS NOT NULL "
+        "AND CAST(LEFT(vehicle.production_to, 4) AS UNSIGNED) < %s)"
     ) in query
     assert params == (17, "toyota", "tacoma", 2006)
 
@@ -1539,11 +1540,11 @@ def test_scoped_publish_allows_open_ended_and_rejects_known_old_rows_before_dele
             cursor.fetchall.return_value = []
         elif normalized == "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s":
             cursor.fetchone.return_value = {"row_count": 10_000}
-        elif normalized.startswith("SELECT COUNT(*) AS row_count FROM parts AS p"):
-            assert "CAST(LOWER(TRIM(b.name)) AS BINARY) = CAST(%s AS BINARY)" in normalized
-            assert "CAST(LOWER(TRIM(m.name)) AS BINARY) = CAST(%s AS BINARY)" in normalized
-            assert "v.production_to IS NULL OR" in normalized
-            assert "CAST(LEFT(v.production_to, 4) AS UNSIGNED) >= %s" in normalized
+        elif normalized.startswith("SELECT COUNT(*) AS row_count FROM parts AS part"):
+            assert "CAST(LOWER(TRIM(brand.name)) AS BINARY) = CAST(%s AS BINARY)" in normalized
+            assert "CAST(LOWER(TRIM(model.name)) AS BINARY) = CAST(%s AS BINARY)" in normalized
+            assert "vehicle.production_to IS NULL OR" in normalized
+            assert "CAST(LEFT(vehicle.production_to, 4) AS UNSIGNED) >= %s" in normalized
             cursor.fetchone.return_value = {"row_count": scoped_count}
         elif normalized.startswith("SELECT scope_brand, scope_model, scope_vehicle_year_floor"):
             cursor.fetchone.return_value = {
