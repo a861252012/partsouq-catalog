@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -19,11 +18,19 @@ import pymysql
 import pytest
 from fastapi.testclient import TestClient
 from playwright._impl import _transport as playwright_transport
-from playwright.sync_api import Browser, Error, Playwright, expect, sync_playwright
+from playwright.sync_api import Browser, Error, Playwright, Route, expect, sync_playwright
 from pymysql.cursors import DictCursor
 from werkzeug.serving import make_server
 
 from partsouq_admin import app as data_admin_app
+from partsouq_catalog.config import DB_CONFIG as CATALOG_DB_CONFIG
+from partsouq_catalog.db import Database
+from partsouq_catalog.repositories import (
+    BrandRepository,
+    CrawlRepository,
+    PartRepository,
+    VehicleRepository,
+)
 from partsouq_crawler.crawl.browser_fetcher import (
     browser_driver_environment,
     browser_process_environment,
@@ -31,6 +38,8 @@ from partsouq_crawler.crawl.browser_fetcher import (
 from partsouq_station_admin.app import create_app
 from partsouq_station_admin.config import AdminConfig
 from tests.e2e.test_bounded_admin_performance import LOCAL_DATABASE_HOSTS, _mysql_statements
+from tests.test_partsouq_bounded_limit import _parts as bounded_fixture_parts
+from tests.test_partsouq_bounded_limit import _record_verified_live_evidence
 
 pytestmark = pytest.mark.skipif(
     os.getenv("STATION_ADMIN_E2E") != "1",
@@ -46,8 +55,8 @@ SCHEMA_PATHS = (
 )
 DATABASE_NAME_PATTERN = re.compile(r"^[a-z0-9_]+_test$")
 TARGET_PART_ID = 200
-PUBLISHED_PART_NAME = "E2E SOURCE PART 0200"
-PUBLISHED_PART_NUMBER = f"E2E-{TARGET_PART_ID:06d}"
+PUBLISHED_PART_NAME = "Part 199"
+PUBLISHED_PART_NUMBER = "P-00199"
 NORMALIZED_PART_NAME = "E2E NORMALIZED PART 0200"
 NORMALIZED_PART_NUMBER = "E2E NORMALIZED-000200"
 NORMALIZED_PART_NUMBER_NORMALIZED = "E2ENORMALIZED000200"
@@ -177,136 +186,107 @@ def _apply_schemas(database: E2EDatabase) -> None:
 
 
 def _seed_parts(database: E2EDatabase) -> None:
-    connection = database.connect()
+    previous_catalog_config = dict(CATALOG_DB_CONFIG)
+    CATALOG_DB_CONFIG.update(
+        {
+            "host": database.host,
+            "port": database.port,
+            "user": database.user,
+            "password": database.password,
+            "database": database.database,
+        }
+    )
+    catalog_database = Database().connect()
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO brands(name, code, url) VALUES (%s, %s, %s)",
-                ("E2E MOTORS", "E2E", "https://partsouq.example/e2e"),
-            )
-            brand_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO models(brand_id, name, ssd, url, fetched_at) "
-                "VALUES (%s, %s, %s, %s, UTC_TIMESTAMP())",
-                (brand_id, "E2E MODEL", "model-secret", "https://partsouq.example/e2e/model"),
-            )
-            model_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO vehicles("
-                "model_id, identity_hash, name, model_code, prod_period, "
-                "production_from, production_to, engine, grade, ssd, vid, url, fetched_at"
-                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, UTC_TIMESTAMP())",
-                (
-                    model_id,
-                    hashlib.sha256(b"station-admin-e2e-vehicle").hexdigest(),
-                    "E2E VEHICLE",
-                    "E2E-1000",
-                    "01.2020 - 12.2025",
-                    "2020-01",
-                    "2025-12",
-                    "E2E ENGINE",
-                    "E2E TRIM",
-                    "vehicle-secret",
-                    "E2E-VID",
-                    "https://partsouq.example/e2e/vehicle?ssd=vehicle-secret",
-                ),
-            )
-            vehicle_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO categories(vehicle_id, name, cid, fetched_at) "
-                "VALUES (%s, %s, %s, UTC_TIMESTAMP())",
-                (vehicle_id, "E2E MAIN CATEGORY", "E2E-CID"),
-            )
-            category_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO groups_t("
-                "category_id, code, name, uid, url, fetched_at, fetched_status, "
-                "fetched_row_count, verified_row_count"
-                ") VALUES (%s, %s, %s, %s, %s, UTC_TIMESTAMP(), %s, %s, %s)",
-                (
-                    category_id,
-                    "E2E1",
-                    "E2E GROUP",
-                    "E2E-UID",
-                    "https://partsouq.example/e2e/group?ssd=group-secret",
-                    "done",
-                    1000,
-                    1000,
-                ),
-            )
-            group_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO crawl_runs(run_key, started_at, finished_at, status, parts_ok) "
-                "VALUES (%s, UTC_TIMESTAMP(), UTC_TIMESTAMP(), 'sample', 1000)",
-                ("e2e-sample",),
-            )
-            run_id = cursor.lastrowid
-            rows = [
-                (
-                    group_id,
-                    f"E2E-{index:06d}",
-                    f"E2E SOURCE PART {index:04d}",
-                    f"C{index:04d}",
-                    "fixture",
-                    "01",
-                    "01.2020 - 12.2025",
-                    "2020-01",
-                    "2025-12",
-                    f"https://partsouq.example/e2e/part/{index}?ssd=part-secret",
-                    run_id,
-                )
-                for index in range(1, 1001)
-            ]
-            cursor.executemany(
-                "INSERT INTO parts("
-                "group_id, part_number, name, code, note, quantity, range_str, "
-                "part_from, part_to, url, seen_run_id"
-                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                rows,
-            )
-            cursor.execute(
-                "INSERT INTO scheduled_job_runs("
-                "job_name, trigger_mode, status, started_at, finished_at, exit_code"
-                ") VALUES ('catalog', 'daemon', 'completed', UTC_TIMESTAMP(6), "
-                "UTC_TIMESTAMP(6), 0)"
-            )
-            scheduled_job_run_id = cursor.lastrowid
-            cursor.execute(
+        catalog_database._execute(
+            "INSERT INTO catalog_desired_bounded_scope "
+            "(singleton_id, scope_brand, scope_model, scope_vehicle_year_floor) "
+            "VALUES (1, 'toyota', 'camry', 2018)"
+        )
+        scheduled_job_run_id = int(
+            catalog_database._execute(
+                "INSERT INTO scheduled_job_runs(job_name, trigger_mode, status, started_at) "
+                "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+            ).lastrowid
+        )
+        sample_run_id = int(
+            catalog_database._execute(
                 "INSERT INTO crawl_runs("
-                "run_key, started_at, finished_at, status, dataset_kind, target_parts, "
-                "scheduled_job_run_id, parts_ok, error_msg"
-                ") VALUES ('e2e-formal-full', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), "
-                "'success', 'full', NULL, %s, 1, NULL)",
-                (scheduled_job_run_id,),
-            )
-            formal_crawl_run_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO published_parts("
-                "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, brand, model, vehicle_name, "
-                "vehicle_code, prod_period, production_from, production_to, engine, trim_name, "
-                "part_name, part_number, part_number_normalized, category_id, category_cid, "
-                "category_main, "
-                "category_group, group_id, group_code, group_uid, part_range, part_from, "
-                "part_to, source_url, note, quantity, code, snapshot_at"
-                ") SELECT p.id, %s, v.id, m.id, v.vid, b.name, m.name, v.name, v.model_code, "
-                "v.prod_period, v.production_from, v.production_to, v.engine, v.grade, "
-                "p.name, p.part_number, "
-                "UPPER(REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')), "
-                "c.id, c.cid, c.name, g.name, g.id, g.code, g.uid, "
-                "p.range_str, p.part_from, p.part_to, p.url, p.note, p.quantity, p.code, "
-                "UTC_TIMESTAMP() FROM parts AS p "
-                "JOIN groups_t AS g ON g.id = p.group_id "
-                "JOIN categories AS c ON c.id = g.category_id "
-                "JOIN vehicles AS v ON v.id = c.vehicle_id "
-                "JOIN models AS m ON m.id = v.model_id "
-                "JOIN brands AS b ON b.id = m.brand_id WHERE p.id = %s",
-                (formal_crawl_run_id, TARGET_PART_ID),
-            )
-            cursor.execute(
-                "UPDATE parts SET part_number = %s, name = %s WHERE id = %s",
-                (NORMALIZED_PART_NUMBER, NORMALIZED_PART_NAME, TARGET_PART_ID),
-            )
-            cursor.execute(
+                "run_key, started_at, finished_at, status, dataset_kind, parts_ok"
+                ") VALUES ('station-admin-e2e-sample', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), "
+                "'sample', 'sample', 1000)"
+            ).lastrowid
+        )
+        brands = BrandRepository(catalog_database)
+        vehicles = VehicleRepository(catalog_database)
+        parts = PartRepository(catalog_database)
+        brand_id = brands.upsert_brand("TOYOTA", "https://partsouq.com/en/catalog/genuine")
+        model_id = brands.upsert_model(
+            brand_id,
+            "CAMRY",
+            "MODEL-SSD",
+            "https://partsouq.com/en/catalog/genuine/locate?c=TOYOTA",
+        )
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CAMRY",
+                "model_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "engine": "A25A-FKS",
+                "grade": "LE",
+                "vid": "SITE-VID-1",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10001",
+            "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&cid=1&uid=10001&vid=SITE-VID-1",
+        )
+        crawl = CrawlRepository(catalog_database, "station-admin-e2e-bounded")
+        crawl_run_id = crawl.start_run(
+            "station-admin-e2e-bounded",
+            fresh=True,
+            dataset_kind="bounded",
+            target_parts=10_000,
+            scheduled_job_run_id=scheduled_job_run_id,
+            scope_brand="TOYOTA",
+            scope_model="CAMRY",
+            scope_vehicle_year_floor=2018,
+        )
+        assert parts.upsert_parts(group_id, bounded_fixture_parts(10_000), crawl_run_id) == 10_000
+        catalog_database.commit()
+        _record_verified_live_evidence(
+            catalog_database,
+            crawl,
+            run_id=crawl_run_id,
+            scheduled_job_run_id=scheduled_job_run_id,
+            vehicle_engine="A25A-FKS",
+            vehicle_trim_name="LE",
+        )
+        assert crawl.publish_bounded_parts(crawl_run_id, 10_000) == 10_000
+        crawl.finish_run(crawl_run_id, "bounded_success", {"parts": 10_000})
+        catalog_database._execute(
+            "UPDATE scheduled_job_runs SET status = 'completed', exit_code = 0, "
+            "finished_at = UTC_TIMESTAMP(6) WHERE id = %s",
+            (scheduled_job_run_id,),
+        )
+        catalog_database._execute(
+            "UPDATE parts SET seen_run_id = %s WHERE id BETWEEN 1 AND 1000",
+            (sample_run_id,),
+        )
+        catalog_database._execute(
+            "UPDATE parts SET part_number = %s, name = %s WHERE id = %s",
+            (NORMALIZED_PART_NUMBER, NORMALIZED_PART_NAME, TARGET_PART_ID),
+        )
+        artifact_id = int(
+            catalog_database._execute(
                 "INSERT INTO nhtsa_source_artifacts("
                 "dataset_name, source_key, source_url, http_status, response_headers_json, "
                 "sha256, stored_path, byte_count, parser_name, parser_version, status, "
@@ -314,31 +294,34 @@ def _seed_parts(database: E2EDatabase) -> None:
                 ") VALUES ('vpic_vin_decodes', 'e2e-vin', %s, 200, '{}', %s, %s, 2, "
                 "'e2e', '1', 'imported', UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP(), 1, 1)",
                 ("https://vpic.example/e2e", "a" * 64, "e2e-vin.json"),
-            )
-            artifact_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO nhtsa_vin_decodes("
-                "vin, make_name, model_name, model_year, engine_configuration, engine_model, "
-                "displacement_l, trim_name, error_code, payload_json, source_url, "
-                "source_artifact_id, decoded_at"
-                ") VALUES (%s, 'E2E MOTORS', 'E2E MODEL', 2022, 'INLINE', 'E2E ENGINE', "
-                "2.0, 'E2E TRIM', '0', '{}', %s, %s, UTC_TIMESTAMP())",
-                (VIN, "https://vpic.example/e2e", artifact_id),
-            )
-            cursor.execute(
-                "INSERT INTO admin_vehicle_mappings("
-                "vin_prefix, vin, partsouq_vehicle_id, make_name, model_name, model_year, "
-                "engine, trim_name, source_name"
-                ") VALUES (%s, %s, %s, 'E2E MOTORS', 'E2E MODEL', 2022, "
-                "'INLINE / E2E ENGINE', 'E2E TRIM', 'e2e')",
-                (VIN[:11], VIN, vehicle_id),
-            )
-        connection.commit()
+            ).lastrowid
+            or 0
+        )
+        catalog_database._execute(
+            "INSERT INTO nhtsa_vin_decodes("
+            "vin, make_name, model_name, model_year, engine_configuration, engine_model, "
+            "displacement_l, trim_name, error_code, payload_json, source_url, "
+            "source_artifact_id, decoded_at"
+            ") VALUES (%s, 'TOYOTA', 'CAMRY', 2020, 'INLINE', 'A25A-FKS', "
+            "2.0, 'LE', '0', '{}', %s, %s, UTC_TIMESTAMP())",
+            (VIN, "https://vpic.example/e2e", artifact_id),
+        )
+        catalog_database._execute(
+            "INSERT INTO admin_vehicle_mappings("
+            "vin_prefix, vin, partsouq_vehicle_id, make_name, model_name, model_year, "
+            "engine, trim_name, source_name"
+            ") VALUES (%s, %s, %s, 'TOYOTA', 'CAMRY', 2020, "
+            "'A25A-FKS', 'LE', 'e2e')",
+            (VIN[:11], VIN, vehicle_id),
+        )
+        catalog_database.commit()
     except BaseException:
-        connection.rollback()
+        catalog_database.rollback()
         raise
     finally:
-        connection.close()
+        catalog_database.close()
+        CATALOG_DB_CONFIG.clear()
+        CATALOG_DB_CONFIG.update(previous_catalog_config)
 
 
 def test_station_admin_e2e_fixture_requires_auth_and_formal_provenance(
@@ -358,7 +341,7 @@ def test_station_admin_e2e_fixture_requires_auth_and_formal_provenance(
             )
             published = cursor.fetchone()
         assert published is not None
-        assert published["dataset_scope"] == "full"
+        assert published["dataset_scope"] == "bounded"
         assert int(published["source_crawl_run_id"]) > 0
     finally:
         connection.close()
@@ -603,7 +586,7 @@ def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
                 "INSERT INTO part_quarantine("
                 "group_id, part_number, range_str, reason, run_key"
                 ") SELECT id, 'E2E-Q0001', 'E2E-RANGE', 'nameless', 'e2e-run' "
-                "FROM groups_t WHERE code = 'E2E1' LIMIT 1"
+                "FROM groups_t WHERE code = '1101' LIMIT 1"
             )
             cursor.execute(
                 "INSERT INTO part_quarantine("
@@ -611,7 +594,7 @@ def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
                 "resolved_at, resolution"
                 ") SELECT id, 'E2E-Q0002', 'E2E-RANGE', 'nameless', 'e2e-run', "
                 "UTC_TIMESTAMP(), 'resolved in e2e' "
-                "FROM groups_t WHERE code = 'E2E1' LIMIT 1"
+                "FROM groups_t WHERE code = '1101' LIMIT 1"
             )
         connection.commit()
     except BaseException:
@@ -690,6 +673,39 @@ def test_admin_quarantine_loads_without_token_then_refreshes_with_token(
             expect(resolved_row.locator("td")).to_have_count(8)
             expect(newly_resolved_row).to_contain_text("verified in browser e2e")
 
+            mapping_url = f"{admin_url}/api/vin-vehicle-mappings/999"
+            mapping_payload = {
+                "id": 999,
+                "vin": VIN,
+                "partsouq_vehicle_id": 77,
+                "source_name": "manual-sparse-override",
+                "source_reference": "browser e2e sparse evidence",
+                "updated_at": "2026-08-29T12:00:00",
+            }
+
+            def serve_sparse_mapping(route: Route) -> None:
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(mapping_payload),
+                )
+
+            page.route(mapping_url, serve_sparse_mapping)
+            page.locator("#vin-mapping-id").fill("999")
+            page.locator("#vin-mapping-load").click()
+            expect(page.locator("#vin-mapping-form [name=source_name]")).to_have_value(
+                "manual-confirmed"
+            )
+            expect(page.locator("#vin-mapping-form [name=allow_name_override]")).to_be_checked()
+            with page.expect_request(
+                lambda request: request.url == mapping_url and request.method == "PUT"
+            ) as mapping_request:
+                page.locator("#vin-mapping-form > button").click()
+            submitted_mapping = json.loads(mapping_request.value.post_data or "{}")
+            assert submitted_mapping["source_name"] == "manual-confirmed"
+            assert submitted_mapping["allow_name_override"] == "true"
+            assert submitted_mapping["expected_updated_at"] == "2026-08-29T12:00:00"
+
             page.locator("#token").fill("")
             page.locator("#quarantine-refresh").click()
             expect(page.locator("#quarantine-table-body")).to_contain_text("無紀錄")
@@ -705,11 +721,16 @@ def _read_database_evidence(database: E2EDatabase) -> dict[str, object]:
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT part_number, name, code FROM parts WHERE id = %s", (TARGET_PART_ID,)
+                "SELECT p.part_number, p.name, p.code, g.name AS group_name, "
+                "v.name AS vehicle_name FROM parts AS p "
+                "JOIN groups_t AS g ON g.id = p.group_id "
+                "JOIN categories AS c ON c.id = g.category_id "
+                "JOIN vehicles AS v ON v.id = c.vehicle_id WHERE p.id = %s",
+                (TARGET_PART_ID,),
             )
             source = cursor.fetchone()
             cursor.execute(
-                "SELECT part_number, part_name FROM published_parts WHERE part_id = %s",
+                "SELECT part_number, part_name FROM v_current_catalog_parts WHERE part_id = %s",
                 (TARGET_PART_ID,),
             )
             published = cursor.fetchone()
@@ -760,13 +781,21 @@ def _cleanup_override(database: E2EDatabase) -> None:
         connection.close()
 
 
-def _update_source_code(database: E2EDatabase) -> None:
+def _mutate_normalized_catalog(database: E2EDatabase) -> None:
     connection = database.connect()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE parts SET code = %s WHERE id = %s",
                 (UPDATED_SOURCE_CODE, TARGET_PART_ID),
+            )
+            cursor.execute(
+                "UPDATE groups_t SET name = 'MUTATED NORMALIZED GROUP', "
+                "code = 'MUTATED-GROUP' WHERE id = 1"
+            )
+            cursor.execute(
+                "UPDATE vehicles SET name = 'MUTATED NORMALIZED VEHICLE', "
+                "model_code = 'MUTATED-VEHICLE' WHERE id = 1"
             )
         connection.commit()
     except BaseException:
@@ -814,12 +843,24 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
                 page.get_by_role("button", name="登入").click()
                 expect(page).to_have_url(re.compile(r"/entities/part_numbers$"))
 
+                page.goto(f"{base_url}/entities/vin_vehicle_mappings")
+                expect(page.get_by_role("link", name="加入 VIN 解碼")).to_be_visible()
+                expect(page.get_by_role("link", name="新增人工資料")).to_have_count(0)
+                page.locator(".record-list tbody a").first.click()
+                expect(page.get_by_role("link", name="編輯覆寫")).to_have_count(0)
+                expect(page.locator("section.actions")).to_have_count(0)
+                rejected_vin_editor = page.request.get(
+                    f"{base_url}/entities/vin_vehicle_mappings/new",
+                    fail_on_status_code=False,
+                )
+                assert rejected_vin_editor.status == 400
+
                 page.goto(base_url)
                 current_card = page.locator(".summary-grid > div").filter(has_text="目前正式資料列")
                 normalized_history_card = page.locator(".summary-grid > div").filter(
                     has_text="normalized 歷史總列數"
                 )
-                expect(current_card).to_contain_text("1")
+                expect(current_card).to_contain_text("10000")
                 expect(normalized_history_card).to_contain_text("1000")
 
                 before_override = _read_pre_override_api_evidence(data_client, headers)
@@ -851,7 +892,7 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
                 expect(page.get_by_text("顯示 1 到 1，共 1 筆記錄", exact=True)).to_be_visible()
                 page.get_by_role("link", name=f"source:{TARGET_PART_ID}").click()
                 expect(page.get_by_role("heading", name=re.compile(r"source:200"))).to_be_visible()
-                expect(page.get_by_text(NORMALIZED_PART_NAME, exact=True)).to_be_visible()
+                expect(page.get_by_text(PUBLISHED_PART_NAME, exact=True)).to_be_visible()
 
                 page.get_by_role("link", name="編輯覆寫").click()
                 page.locator('input[name="field__number_raw"]').fill(OVERRIDE_PART_NUMBER)
@@ -877,28 +918,34 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
                 expect(page.locator(".page-title p")).to_contain_text("覆寫版本 2")
 
                 page.get_by_role("link", name="編輯覆寫").click()
-                _update_source_code(e2e_database)
-                page.get_by_label("修改原因").fill("E2E stale source")
+                _mutate_normalized_catalog(e2e_database)
+                page.get_by_label("修改原因").fill("E2E snapshot isolation")
                 page.get_by_role("button", name="儲存新版本").click()
                 expect(
                     page.get_by_text(
-                        "爬蟲來源資料已更新；請重新載入後再套用人工修改",
+                        "已新增一筆覆寫版本；來源型錄資料未被修改。",
                         exact=True,
                     )
                 ).to_be_visible()
-
-                page.goto(f"{base_url}/entities/part_numbers/source:{TARGET_PART_ID}")
-                page.get_by_role("link", name="編輯覆寫").click()
-                page.get_by_label("修改原因").fill("E2E rebase after source refresh")
-                page.get_by_role("button", name="儲存新版本").click()
                 expect(page.locator(".page-title p")).to_contain_text("覆寫版本 3")
+
+                page.goto(f"{base_url}/entities/diagrams/source:1")
+                expect(page.get_by_text("PARTIAL ENGINE ASSEMBLY", exact=True)).to_be_visible()
+                page.goto(f"{base_url}/entities/vehicle_configurations/source:1")
+                expect(page.get_by_text("CAMRY", exact=True).first).to_be_visible()
+                expect(page.get_by_text("MUTATED NORMALIZED VEHICLE", exact=True)).to_have_count(0)
+                page.goto(f"{base_url}/entities/part_numbers/source:{TARGET_PART_ID}")
 
                 page.get_by_label("原因").fill("E2E retire")
                 page.get_by_role("button", name="停用").click()
                 expect(page.locator(".page-title p")).to_contain_text("狀態 retired")
                 expect(page.locator(".page-title p")).to_contain_text("覆寫版本 4")
                 retired = _read_effective_api_evidence(data_client, headers)
-                assert retired == {"published": [], "sample": [], "fitments": [], "vin": []}
+                assert retired["published"] == []
+                assert retired["sample"] == []
+                assert retired["fitments"] == []
+                assert len(retired["vin"]) == 9_999
+                assert all(int(row["part_id"]) != TARGET_PART_ID for row in retired["vin"])
 
                 page.get_by_label("原因").fill("E2E restore")
                 page.get_by_role("button", name="恢復").click()
@@ -925,6 +972,8 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
             "part_number": NORMALIZED_PART_NUMBER,
             "name": NORMALIZED_PART_NAME,
             "code": UPDATED_SOURCE_CODE,
+            "group_name": "MUTATED NORMALIZED GROUP",
+            "vehicle_name": "MUTATED NORMALIZED VEHICLE",
         }
         assert evidence["published"] == {
             "part_number": PUBLISHED_PART_NUMBER,
@@ -957,11 +1006,11 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
         assert [event["reason"] for event in events] == [
             "E2E update",
             "E2E clear boolean override",
-            "E2E rebase after source refresh",
+            "E2E snapshot isolation",
             "E2E retire",
             "E2E restore",
         ]
-        assert json.loads(events[0]["before_json"])["name_en_raw"] == NORMALIZED_PART_NAME
+        assert json.loads(events[0]["before_json"])["name_en_raw"] == PUBLISHED_PART_NAME
         assert json.loads(events[0]["after_json"])["name_en_raw"] == OVERRIDE_PART_NAME
         assert json.loads(events[0]["after_json"])["is_assembly_inferred"] is True
         assert json.loads(events[1]["after_json"])["is_assembly_inferred"] == 0
@@ -976,11 +1025,15 @@ def _read_effective_api_evidence(
     published = client.get(
         "/api/parts",
         params={"part_number": OVERRIDE_PART_NUMBER_NORMALIZED, "pageSize": 200},
+        headers=headers,
     )
     assert published.status_code == 200
-    sample = client.get("/api/sample-parts", params={"pageSize": 200})
+    sample = client.get("/api/sample-parts", params={"pageSize": 200}, headers=headers)
     assert sample.status_code == 200
-    fitments = client.get(f"/api/parts/{OVERRIDE_PART_NUMBER_NORMALIZED}/fitments")
+    fitments = client.get(
+        f"/api/parts/{OVERRIDE_PART_NUMBER_NORMALIZED}/fitments",
+        headers=headers,
+    )
     assert fitments.status_code == 200
     vin = client.get(f"/api/vins/{VIN}/parts", headers=headers)
     assert vin.status_code == 200
@@ -999,16 +1052,21 @@ def _read_pre_override_api_evidence(
     published = client.get(
         "/api/parts",
         params={"part_number": PUBLISHED_PART_NUMBER, "pageSize": 200},
+        headers=headers,
     )
     assert published.status_code == 200
     unpublished_search = client.get(
         "/api/parts",
         params={"part_number": NORMALIZED_PART_NUMBER_NORMALIZED, "pageSize": 200},
+        headers=headers,
     )
     assert unpublished_search.status_code == 200
-    sample = client.get("/api/sample-parts", params={"pageSize": 200})
+    sample = client.get("/api/sample-parts", params={"pageSize": 200}, headers=headers)
     assert sample.status_code == 200
-    fitments = client.get(f"/api/parts/{PUBLISHED_PART_NUMBER}/fitments")
+    fitments = client.get(
+        f"/api/parts/{PUBLISHED_PART_NUMBER}/fitments",
+        headers=headers,
+    )
     assert fitments.status_code == 200
     vin = client.get(f"/api/vins/{VIN}/parts", headers=headers)
     assert vin.status_code == 200
@@ -1023,12 +1081,19 @@ def _read_pre_override_api_evidence(
 
 def _assert_snapshot_boundary(evidence: dict[str, list[dict[str, object]]]) -> None:
     assert evidence["unpublished_search"] == []
-    for key in ("published", "fitments", "vin"):
+    for key in ("published", "fitments"):
         rows = evidence[key]
         assert len(rows) == 1
         assert rows[0]["part_number"] == PUBLISHED_PART_NUMBER
         assert rows[0]["part_name"] == PUBLISHED_PART_NAME
         assert rows[0]["station_override_revision"] == 0
+    vin_rows = evidence["vin"]
+    assert len(vin_rows) == 10_000
+    target_rows = [row for row in vin_rows if int(row["part_id"]) == TARGET_PART_ID]
+    assert len(target_rows) == 1
+    assert target_rows[0]["part_number"] == PUBLISHED_PART_NUMBER
+    assert target_rows[0]["part_name"] == PUBLISHED_PART_NAME
+    assert target_rows[0]["station_override_revision"] == 0
     sample = evidence["sample"]
     assert len(sample) == 1
     assert sample[0]["part_number"] == NORMALIZED_PART_NUMBER
@@ -1039,8 +1104,16 @@ def _assert_snapshot_boundary(evidence: dict[str, list[dict[str, object]]]) -> N
 def _assert_effective_part_visible(
     evidence: dict[str, list[dict[str, object]]],
 ) -> None:
-    for rows in evidence.values():
+    for key in ("published", "sample", "fitments"):
+        rows = evidence[key]
         assert len(rows) == 1
         assert rows[0]["part_number"] == OVERRIDE_PART_NUMBER
         assert rows[0]["part_name"] == OVERRIDE_PART_NAME
         assert rows[0]["station_override_revision"] in {1, 5}
+    vin_rows = evidence["vin"]
+    assert len(vin_rows) == 10_000
+    target_rows = [row for row in vin_rows if int(row["part_id"]) == TARGET_PART_ID]
+    assert len(target_rows) == 1
+    assert target_rows[0]["part_number"] == OVERRIDE_PART_NUMBER
+    assert target_rows[0]["part_name"] == OVERRIDE_PART_NAME
+    assert target_rows[0]["station_override_revision"] in {1, 5}

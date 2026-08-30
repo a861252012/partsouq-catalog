@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
@@ -19,6 +20,7 @@ from partsouq_catalog.migrations import (
     CatalogMigrationRunner,
     MigrationError,
     SchemaChange,
+    _normalize_http_diagnostic_check_clause,
     _normalize_nhtsa_check_clause,
     _repairable_stale_nhtsa_runs,
     load_schema_changes,
@@ -29,6 +31,18 @@ from partsouq_catalog.migrations import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations" / "catalog"
 STATION_SCHEMA = PROJECT_ROOT / "db" / "station_admin.sql"
+
+
+def test_migration_module_entrypoint_exposes_cli_help() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "partsouq_catalog.migrations", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "Apply or verify catalog schema migrations" in completed.stdout
 
 
 def test_admission_release_query_failure_closes_owner_connection() -> None:
@@ -115,6 +129,23 @@ def test_nhtsa_check_normalizer_does_not_accept_unlisted_literal_charset() -> No
     assert _normalize_nhtsa_check_clause(clause) == "binary _binary'writer'"
 
 
+def test_http_diagnostic_check_normalizer_accepts_mysql_literal_charset_drift() -> None:
+    latin1 = (
+        "(json_valid(`parser_context_json`) and "
+        "(not(regexp_like(lower(cast(`parser_context_json` as char charset latin1)),"
+        "_latin1\\'ssd=\\'))))"
+    )
+    utf8mb4 = (
+        "(json_valid(`parser_context_json`) and "
+        "(not(regexp_like(lower(cast(`parser_context_json` as char charset utf8mb4)),"
+        "_utf8mb4\\'ssd=\\'))))"
+    )
+
+    assert _normalize_http_diagnostic_check_clause(latin1) == (
+        _normalize_http_diagnostic_check_clause(utf8mb4)
+    )
+
+
 def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
     changes = load_schema_changes(MIGRATIONS_DIR, STATION_SCHEMA)
     migrations = [change for change in changes if change.kind == "migration"]
@@ -151,8 +182,16 @@ def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
         10,
         3,
         3,
+        3,
+        10,
+        12,
+        11,
+        16,
+        12,
+        11,
+        11,
     ]
-    assert sum(len(change.statements) for change in migrations if change.active) == 589
+    assert sum(len(change.statements) for change in migrations if change.active) == 675
     assert changes[-1].key == STATION_ADMIN_ASSET[0]
     assert changes[-1].statements
 
@@ -193,6 +232,7 @@ def test_docker_services_gate_schema_without_enabling_migration_or_scheduler(
         "station-admin",
     }
     default_model = json.loads(compose_config("config", "--format", "json"))["services"]
+    assert default_model["mysql"]["command"] == ["--log-bin-trust-function-creators=1"]
     assert default_model["admin"]["entrypoint"] == ["partsouq-checked-entrypoint"]
     assert default_model["station-admin"]["entrypoint"] == ["partsouq-checked-entrypoint"]
     migration_model = json.loads(

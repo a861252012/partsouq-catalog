@@ -524,12 +524,12 @@ class SessionManager:
             try:
                 browser_html = fetch_page(url)
             except NonUnitPageError as off_unit:
-                # 瀏覽器落點不是這個 unit 頁（被轉到 /locate、首頁或別的組）：
-                # 視同「此組在站端已不存在」，交給 crawl_group 標成 not_found
-                # （terminal），絕不靜默 receipt 成 done/0。
-                raise NotFoundError(
-                    f"browser fetch landed off-unit for {safe_url}: {off_unit}",
-                    None,
+                # Browser fallback 沒有可驗證的 HTTP 404 envelope。落到
+                # /locate 可能是站方下架，也可能是 challenge、錯品牌或
+                # 錯 context；一律 fail-closed，不能寫 terminal not_found。
+                raise RobotsPolicyError(
+                    f"browser fetch landed outside requested catalog page for "
+                    f"{safe_url}: {off_unit}"
                 ) from off_unit
             if browser_html is not None:
                 log.info("browser-fetch fallback succeeded for %s", safe_url)

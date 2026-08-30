@@ -138,6 +138,9 @@ CONFIG_ENV=(
   PSQ_MAX_DELAY
   PSQ_MAX_RUN_DAYS
   PSQ_MIN_BRANDS
+  PSQ_BOUNDED_BRAND
+  PSQ_BOUNDED_MODEL
+  PSQ_VEHICLE_YEAR_WINDOW
   PSQ_EVIDENCE_MAX_BODY_BYTES
   PSQ_EVIDENCE_MAX_RUN_BYTES
   PSQ_EVIDENCE_MAX_ARTIFACTS
@@ -164,6 +167,16 @@ CONFIG_EXPORTS=$(/usr/bin/env -i "${CONFIG_INPUT_ENV[@]}" /bin/zsh -c '
   source "$ENV_FILE" >/dev/null
   if [[ "${PARTSOUQ_DB_NAME:-}" != "partsouq_catalog" ]]; then
     print -u2 "formal catalog scheduler requires PARTSOUQ_DB_NAME=partsouq_catalog"
+    exit 2
+  fi
+  SCOPE_BRAND=${PSQ_BOUNDED_BRAND:-}
+  SCOPE_MODEL=${PSQ_BOUNDED_MODEL:-}
+  SCOPE_YEAR_WINDOW=${PSQ_VEHICLE_YEAR_WINDOW:-}
+  if [[ -z "${SCOPE_BRAND//[[:space:]]/}" \
+      || -z "${SCOPE_MODEL//[[:space:]]/}" \
+      || "$SCOPE_YEAR_WINDOW" != <-> \
+      || "$SCOPE_YEAR_WINDOW" -le 0 ]]; then
+    print -u2 "formal catalog scheduler requires non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL and positive PSQ_VEHICLE_YEAR_WINDOW"
     exit 2
   fi
   for NAME in \

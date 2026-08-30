@@ -5,7 +5,7 @@
     <div><h1>{{ spec.title }}</h1><p>可搜尋、指定頁碼，並自行選擇每頁筆數。正式資料預設排除歷史 sample。</p></div>
     <div>
       {% if spec.key == 'vin_vehicle_mappings' %}<a class="button secondary" href="{{ url_for('admin.vin_decode_request') }}">加入 VIN 解碼</a>{% endif %}
-      <a class="button" href="{{ url_for('admin.entity_create', entity_type=spec.key) }}">新增人工資料</a>
+      {% if spec.editable_fields %}<a class="button" href="{{ url_for('admin.entity_create', entity_type=spec.key) }}">新增人工資料</a>{% endif %}
     </div>
   </div>
   <form class="filters" method="get">
@@ -13,7 +13,7 @@
     {% if spec.key in ['part_numbers', 'part_occurrences', 'fitments'] %}
       <label>資料來源
         <select name="dataset">
-          <option value="formal" {% if source_scope == 'formal' %}selected{% endif %}>目前正式資料（full 優先，否則 bounded）</option>
+          <option value="formal" {% if source_scope == 'formal' %}selected{% endif %}>目前正式 snapshot（已通過發布閘門）</option>
           <option value="historical_sample" {% if source_scope == 'historical_sample' %}selected{% endif %}>歷史 sample（非正式）</option>
         </select>
       </label>

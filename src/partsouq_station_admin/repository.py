@@ -101,11 +101,25 @@ _SOURCE_LOCK_SQL = {
         FOR SHARE
     """,
     "vin_part_fitments": """
-        SELECT m.id, d.vin, p.part_id
+        SELECT m.id, d.vin,
+               published.part_id AS published_part_id,
+               previous.part_id AS previous_part_id,
+               bounded.part_id AS bounded_part_id
         FROM admin_vehicle_mappings AS m
         JOIN nhtsa_vin_decodes AS d ON d.vin = m.vin
-        JOIN published_parts AS p ON p.vehicle_id = m.partsouq_vehicle_id
-        WHERE m.id = %s AND p.part_id = %s
+        LEFT JOIN published_parts AS published
+          ON published.vehicle_id = m.partsouq_vehicle_id
+         AND published.part_id = %s
+        LEFT JOIN published_parts_previous AS previous
+          ON previous.vehicle_id = m.partsouq_vehicle_id
+         AND previous.part_id = %s
+        LEFT JOIN bounded_parts AS bounded
+          ON bounded.vehicle_id = m.partsouq_vehicle_id
+         AND bounded.part_id = %s
+        WHERE m.id = %s
+          AND (published.part_id IS NOT NULL
+               OR previous.part_id IS NOT NULL
+               OR bounded.part_id IS NOT NULL)
         FOR SHARE
     """,
     "reconciliation_cases": """
@@ -331,6 +345,7 @@ _VIN_VEHICLE_FIELDS = (
     "transmission_style",
     "plant_country",
     "partsouq_vehicle_configuration_id",
+    "mapping_status",
     "decode_status",
     "error_code",
     "error_text",
@@ -340,31 +355,7 @@ _VIN_VEHICLE_FIELDS = (
     "created_at",
     "updated_at",
 )
-_VIN_VEHICLE_EDITABLE_FIELDS = (
-    "vin",
-    "make_name",
-    "model_name",
-    "series_name",
-    "body_class",
-    "vehicle_type",
-    "model_year",
-    "manufacturer_name",
-    "trim_name",
-    "engine_configuration",
-    "engine_cylinders",
-    "displacement_l_raw",
-    "engine_model",
-    "engine_manufacturer",
-    "fuel_type_primary",
-    "drive_type",
-    "transmission_style",
-    "plant_country",
-    "partsouq_vehicle_configuration_id",
-    "decode_status",
-    "error_code",
-    "error_text",
-    "source_kind",
-)
+_VIN_VEHICLE_EDITABLE_FIELDS: tuple[str, ...] = ()
 _VIN_PART_FIELDS = (
     "vin_vehicle_mapping_id",
     "part_number_id",
@@ -519,7 +510,6 @@ MONTH_FIELD_PAIRS = (
 ENUM_VALUES = {
     ("vehicle_configurations", "production_precision"): frozenset({"unknown", "year", "month"}),
     ("part_term_mappings", "mapping_status"): frozenset({"confirmed"}),
-    ("vin_vehicle_mappings", "decode_status"): frozenset({"decoded", "error"}),
     ("reconciliation_cases", "severity"): frozenset({"normal"}),
     ("reconciliation_cases", "status"): frozenset({"open", "matched", "rejected"}),
 }
@@ -639,12 +629,12 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
     ),
     "vin_vehicle_mappings": EntitySpec(
         key="vin_vehicle_mappings",
-        title="VIN 對應車型",
+        title="VIN 解碼與車型確認",
         table="station_admin_vin_vehicle_mappings",
         record_type="vin_vehicle_mapping",
         source_fields=_VIN_VEHICLE_FIELDS,
         editable_fields=_VIN_VEHICLE_EDITABLE_FIELDS,
-        search_fields=("vin", "make_name", "model_name", "series_name"),
+        search_fields=("vin", "make_name", "model_name", "series_name", "mapping_status"),
         display_fields=(
             "vin",
             "make_name",
@@ -655,6 +645,7 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
             "engine_configuration",
             "displacement_l_raw",
             "partsouq_vehicle_configuration_id",
+            "mapping_status",
         ),
     ),
     "vin_part_fitments": EntitySpec(
@@ -819,6 +810,7 @@ class AdminRepository:
                 "published_parts",
                 "published_parts_previous",
                 "bounded_parts",
+                "catalog_desired_bounded_scope",
                 "crawl_runs",
                 "v_current_catalog_parts",
                 "part_quarantine",
@@ -922,26 +914,27 @@ class AdminRepository:
                   AND key_columns.TABLE_NAME = 'published_parts_previous'
                   AND key_columns.CONSTRAINT_NAME = 'fk_published_previous_crawl_run'
               ) AS previous_foreign_key_ready,
-              EXISTS (
+                  EXISTS (
                 SELECT 1 FROM information_schema.VIEWS
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = 'v_current_catalog_parts'
-                  AND LOCATE('qualified_full_runs', LOWER(VIEW_DEFINITION)) > 0
-                  AND LOCATE('formal_current_parts', LOWER(VIEW_DEFINITION)) > 0
-                  AND LOCATE('formal_previous_parts', LOWER(VIEW_DEFINITION)) > 0
-                  AND LOCATE('published_parts_previous', LOWER(VIEW_DEFINITION)) > 0
-                  AND LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) > 0
-                  AND LOCATE('full_scheduler_run', LOWER(VIEW_DEFINITION)) > 0
-                  AND LOCATE('linked_crawl_runs', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('bounded_parts', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('verified_bounded_evidence', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('verified_bounded_records', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('evidence_record_sha256', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('partsouq_http_artifacts', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('partsouq_artifact_records', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('evidence_status', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('live_http', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('trigger_mode', LOWER(VIEW_DEFINITION)) > 0
                   AND LOCATE('daemon', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('catalog_desired_bounded_scope', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('desired_scope', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('scope_brand', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('scope_model', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('scope_vehicle_year_floor', LOWER(VIEW_DEFINITION)) > 0
+                  AND LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) = 0
+                  AND LOCATE('published_parts', LOWER(VIEW_DEFINITION)) = 0
               ) AS formal_view_ready,
               (
                 SELECT IF(COUNT(*) = 2, 1, 0)
@@ -949,7 +942,26 @@ class AdminRepository:
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = 'v_current_catalog_parts'
                   AND COLUMN_NAME IN ('dataset_scope', 'source_crawl_run_id')
-              ) AS formal_view_columns_ready
+              ) AS formal_view_columns_ready,
+              (
+                SELECT IF(COUNT(*) = 5, 1, 0)
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'catalog_desired_bounded_scope'
+                  AND COLUMN_NAME IN (
+                    'singleton_id', 'scope_brand', 'scope_model',
+                    'scope_vehicle_year_floor', 'updated_at'
+                  )
+              ) AS desired_scope_columns_ready,
+              EXISTS (
+                SELECT 1 FROM information_schema.TRIGGERS
+                WHERE TRIGGER_SCHEMA = DATABASE()
+                  AND TRIGGER_NAME = 'prevent_bounded_parts_update'
+                  AND EVENT_OBJECT_TABLE = 'bounded_parts'
+                  AND ACTION_TIMING = 'BEFORE'
+                  AND EVENT_MANIPULATION = 'UPDATE'
+                  AND LOCATE('SIGNAL SQLSTATE', UPPER(ACTION_STATEMENT)) > 0
+              ) AS bounded_snapshot_immutable_ready
             """,
         )
         contract_keys = (
@@ -961,11 +973,13 @@ class AdminRepository:
             "previous_foreign_key_ready",
             "formal_view_ready",
             "formal_view_columns_ready",
+            "desired_scope_columns_ready",
+            "bounded_snapshot_immutable_ready",
         )
         if provenance_contract is None or any(
             int(provenance_contract.get(key) or 0) != 1 for key in contract_keys
         ):
-            raise AdminReadinessError("bounded evidence provenance schema 尚未完成 migration 019")
+            raise AdminReadinessError("current catalog scope contract 尚未完成 migration 033")
 
     def list_quarantine(
         self,
@@ -1139,65 +1153,157 @@ class AdminRepository:
                     JOIN nhtsa_source_artifacts AS a ON a.id = c.artifact_id
                 ) AS nhtsa_current_records,
                 (SELECT COUNT(*) FROM nhtsa_vin_decodes) AS nhtsa_vin_decodes,
+                (
+                    SELECT COUNT(DISTINCT terminal_artifact.source_key)
+                    FROM nhtsa_source_artifacts AS terminal_artifact
+                    WHERE terminal_artifact.dataset_name = 'vpic_vin_decodes'
+                      AND terminal_artifact.status = 'undecodable'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM nhtsa_vin_decodes AS decoded_vin
+                          JOIN nhtsa_source_artifacts AS decoded_artifact
+                            ON decoded_artifact.id = decoded_vin.source_artifact_id
+                          WHERE decoded_artifact.dataset_name = terminal_artifact.dataset_name
+                            AND decoded_artifact.source_key = terminal_artifact.source_key
+                      )
+                ) AS nhtsa_terminal_undecodable_vins,
                 current_catalog.*,
+                desired_scope.*,
                 bounded.*
             FROM (
                 SELECT MAX(dataset_scope) AS partsouq_current_scope,
+                       MAX(source_crawl_run_id) AS partsouq_current_crawl_run_id,
                        COUNT(*) AS partsouq_current_rows,
                        COUNT(DISTINCT part_number_normalized)
                            AS partsouq_current_distinct_part_numbers
                 FROM v_current_catalog_parts
             ) AS current_catalog
             CROSS JOIN (
-                SELECT MAX(r.id) AS bounded_crawl_run_id,
-                       MAX(r.target_parts) AS bounded_target_parts,
-                       MAX(r.status) AS bounded_status,
-                       MAX(r.scheduled_job_run_id) AS bounded_scheduled_job_run_id,
-                       MAX(jobs.trigger_mode) AS bounded_scheduler_trigger_mode,
-                       MAX(jobs.status) AS bounded_scheduler_status,
-                       MAX(jobs.exit_code) AS bounded_scheduler_exit_code,
-                       MAX(scheduler_links.crawl_run_count)
+                SELECT MAX(desired.scope_brand) AS desired_scope_brand,
+                       MAX(desired.scope_model) AS desired_scope_model,
+                       MAX(desired.scope_vehicle_year_floor)
+                           AS desired_scope_vehicle_year_floor,
+                       MAX(desired.updated_at) AS desired_scope_updated_at
+                FROM (SELECT 1 AS singleton) AS desired_anchor
+                LEFT JOIN catalog_desired_bounded_scope AS desired
+                    ON desired.singleton_id = 1
+            ) AS desired_scope
+            CROSS JOIN (
+                SELECT MAX(bounded_metadata.id) AS bounded_crawl_run_id,
+                       MAX(bounded_metadata.target_parts) AS bounded_target_parts,
+                       MAX(bounded_metadata.status) AS bounded_status,
+                       MAX(bounded_metadata.scope_brand) AS bounded_scope_brand,
+                       MAX(bounded_metadata.scope_model) AS bounded_scope_model,
+                       MAX(bounded_metadata.scope_vehicle_year_floor)
+                           AS bounded_scope_vehicle_year_floor,
+                       MAX(bounded_metadata.scheduled_job_run_id)
+                           AS bounded_scheduled_job_run_id,
+                       MAX(bounded_metadata.scheduler_trigger_mode)
+                           AS bounded_scheduler_trigger_mode,
+                       MAX(bounded_metadata.scheduler_status)
+                           AS bounded_scheduler_status,
+                       MAX(bounded_metadata.scheduler_exit_code)
+                           AS bounded_scheduler_exit_code,
+                       MAX(bounded_metadata.scheduler_linked_crawl_runs)
                            AS bounded_scheduler_linked_crawl_runs,
-                       MAX(CASE WHEN DATABASE() <> 'partsouq_catalog'
-                           OR LOWER(COALESCE(r.run_key, '')) LIKE 'sample-%%'
-                           OR LOWER(COALESCE(jobs.output_text, ''))
-                               REGEXP 'browser-assisted|fixture|synthetic|fake'
-                           THEN 1 ELSE 0 END) AS bounded_non_live_data_marker,
-                       COUNT(bp.part_id) AS partsouq_bounded_rows,
+                       MAX(bounded_metadata.non_live_data_marker)
+                           AS bounded_non_live_data_marker,
+                       COUNT(bounded_part.part_id) AS partsouq_bounded_rows,
                        COUNT(overrides.id) AS bounded_active_override_rows,
-                       COUNT(DISTINCT bp.part_number_normalized)
+                       COUNT(DISTINCT bounded_part.part_number_normalized)
                            AS partsouq_bounded_distinct_part_numbers
                 FROM (SELECT 1 AS singleton) AS anchor
                 LEFT JOIN (
-                    SELECT id, run_key, target_parts, status, scheduled_job_run_id
-                    FROM crawl_runs
-                    WHERE dataset_kind = 'bounded'
-                    ORDER BY started_at DESC, id DESC
+                    SELECT latest_bounded_run.id,
+                           latest_bounded_run.run_key,
+                           latest_bounded_run.target_parts,
+                           latest_bounded_run.status,
+                           latest_bounded_run.scope_brand,
+                           latest_bounded_run.scope_model,
+                           latest_bounded_run.scope_vehicle_year_floor,
+                           latest_bounded_run.scheduled_job_run_id,
+                           scheduled_job.trigger_mode AS scheduler_trigger_mode,
+                           scheduled_job.status AS scheduler_status,
+                           scheduled_job.exit_code AS scheduler_exit_code,
+                           scheduler_links.crawl_run_count
+                               AS scheduler_linked_crawl_runs,
+                           CASE WHEN DATABASE() <> 'partsouq_catalog'
+                               OR LOWER(COALESCE(latest_bounded_run.run_key, ''))
+                                   LIKE 'sample-%%'
+                               OR LOWER(COALESCE(scheduled_job.output_text, ''))
+                                   REGEXP 'browser-assisted|fixture|synthetic|fake'
+                               THEN 1 ELSE 0 END AS non_live_data_marker
+                    FROM (
+                        SELECT id, run_key, target_parts, status,
+                               scope_brand, scope_model, scope_vehicle_year_floor,
+                               scheduled_job_run_id
+                        FROM crawl_runs
+                        WHERE dataset_kind = 'bounded'
+                        ORDER BY started_at DESC, id DESC
+                        LIMIT 1
+                    ) AS latest_bounded_run
+                    LEFT JOIN scheduled_job_runs AS scheduled_job
+                        ON scheduled_job.id = latest_bounded_run.scheduled_job_run_id
+                    LEFT JOIN (
+                        SELECT scheduled_job_run_id, COUNT(*) AS crawl_run_count
+                        FROM crawl_runs
+                        WHERE scheduled_job_run_id IS NOT NULL
+                        GROUP BY scheduled_job_run_id
+                    ) AS scheduler_links
+                        ON scheduler_links.scheduled_job_run_id = scheduled_job.id
                     LIMIT 1
-                ) AS r ON TRUE
-                LEFT JOIN scheduled_job_runs AS jobs ON jobs.id = r.scheduled_job_run_id
-                LEFT JOIN (
-                    SELECT scheduled_job_run_id, COUNT(*) AS crawl_run_count
-                    FROM crawl_runs
-                    WHERE scheduled_job_run_id IS NOT NULL
-                    GROUP BY scheduled_job_run_id
-                ) AS scheduler_links
-                    ON scheduler_links.scheduled_job_run_id = jobs.id
-                LEFT JOIN bounded_parts AS bp ON bp.crawl_run_id = r.id
+                ) AS bounded_metadata ON TRUE
+                LEFT JOIN v_current_catalog_parts AS bounded_part
+                    ON bounded_part.dataset_scope = 'bounded'
+                   AND bounded_part.source_crawl_run_id = bounded_metadata.id
                 LEFT JOIN admin_override_heads AS overrides
                     ON overrides.entity_type = 'part_numbers'
-                   AND overrides.source_record_id = bp.part_id
+                   AND overrides.source_record_id = bounded_part.part_id
                    AND overrides.status = 'active'
             ) AS bounded
             """,
             )
             or {}
         )
+        desired_scope = (
+            row.get("desired_scope_brand"),
+            row.get("desired_scope_model"),
+            (
+                int(row["desired_scope_vehicle_year_floor"])
+                if row.get("desired_scope_vehicle_year_floor") is not None
+                else None
+            ),
+        )
+        latest_bounded_scope = (
+            row.get("bounded_scope_brand"),
+            row.get("bounded_scope_model"),
+            (
+                int(row["bounded_scope_vehicle_year_floor"])
+                if row.get("bounded_scope_vehicle_year_floor") is not None
+                else None
+            ),
+        )
+        desired_scope_configured = (
+            isinstance(desired_scope[0], str)
+            and bool(desired_scope[0])
+            and isinstance(desired_scope[1], str)
+            and bool(desired_scope[1])
+            and desired_scope[2] is not None
+        )
+        scope_matches_desired = desired_scope_configured and latest_bounded_scope == desired_scope
+        scope_blocking_reason = (
+            None
+            if scope_matches_desired
+            else "bounded_scope_mismatch"
+            if desired_scope_configured
+            else "bounded_desired_scope_not_configured"
+        )
         return {
             "partsouq_normalized_rows": int(row.get("partsouq_normalized_rows", 0)),
             "partsouq_distinct_part_numbers": int(row.get("partsouq_distinct_part_numbers", 0)),
             "partsouq_published_rows": int(row.get("partsouq_published_rows", 0)),
             "partsouq_current_scope": row.get("partsouq_current_scope"),
+            "partsouq_current_crawl_run_id": row.get("partsouq_current_crawl_run_id"),
             "partsouq_current_rows": int(row.get("partsouq_current_rows", 0)),
             "partsouq_current_distinct_part_numbers": int(
                 row.get("partsouq_current_distinct_part_numbers", 0)
@@ -1218,8 +1324,22 @@ class AdminRepository:
             ),
             "bounded_non_live_data_marker": int(row.get("bounded_non_live_data_marker") or 0),
             "bounded_active_override_rows": int(row.get("bounded_active_override_rows") or 0),
+            "desired_bounded_scope": {
+                "brand": desired_scope[0],
+                "model": desired_scope[1],
+                "vehicle_year_floor": desired_scope[2],
+                "updated_at": row.get("desired_scope_updated_at"),
+            },
+            "latest_bounded_run_scope": {
+                "brand": latest_bounded_scope[0],
+                "model": latest_bounded_scope[1],
+                "vehicle_year_floor": latest_bounded_scope[2],
+            },
+            "bounded_scope_matches_desired": scope_matches_desired,
+            "bounded_scope_blocking_reason": scope_blocking_reason,
             "nhtsa_current_records": int(row.get("nhtsa_current_records", 0)),
             "nhtsa_vin_decodes": int(row.get("nhtsa_vin_decodes", 0)),
+            "nhtsa_terminal_undecodable_vins": int(row.get("nhtsa_terminal_undecodable_vins", 0)),
         }
 
     def crawl_monitoring(self) -> dict[str, tuple[dict[str, Any], ...]]:
@@ -1299,22 +1419,38 @@ class AdminRepository:
         if page < 1:
             raise AdminDataError("頁碼不可小於 1")
         normalized_query = query.strip()
-        total = self._record_count(spec, normalized_query, include_retired)
-        total_pages = max(1, math.ceil(total / size))
-        current_page = min(page, total_pages)
-        offset = (current_page - 1) * size
-        visible_keys = self._page_keys(
-            spec,
-            normalized_query,
-            offset,
-            size,
-            include_retired,
-        )
+        with self.database.transaction(read_only=True):
+            bounded_crawl_run_id = (
+                self._current_bounded_crawl_run_id()
+                if normalized_query and spec.table == "station_admin_formal_part_numbers"
+                else None
+            )
+            total = self._record_count(
+                spec,
+                normalized_query,
+                include_retired,
+                bounded_crawl_run_id,
+            )
+            total_pages = max(1, math.ceil(total / size))
+            current_page = min(page, total_pages)
+            offset = (current_page - 1) * size
+            visible_keys = self._page_keys(
+                spec,
+                normalized_query,
+                offset,
+                size,
+                include_retired,
+                bounded_crawl_run_id,
+            )
 
-        source_ids = [int(row["sort_id"]) for row in visible_keys if int(row["kind_order"]) == 0]
-        manual_ids = [int(row["sort_id"]) for row in visible_keys if int(row["kind_order"]) == 1]
-        source_rows = self._source_batch(spec, source_ids, size)
-        manual_rows = self._manual_batch(spec, manual_ids, size)
+            source_ids = [
+                int(row["sort_id"]) for row in visible_keys if int(row["kind_order"]) == 0
+            ]
+            manual_ids = [
+                int(row["sort_id"]) for row in visible_keys if int(row["kind_order"]) == 1
+            ]
+            source_rows = self._source_batch(spec, source_ids, size)
+            manual_rows = self._manual_batch(spec, manual_ids, size) if spec.editable_fields else []
 
         source_by_id = {int(row["id"]): self._source_record(spec, row) for row in source_rows}
         manual_by_id = {
@@ -1347,9 +1483,20 @@ class AdminRepository:
         spec: EntitySpec,
         query: str,
         include_retired: bool,
+        bounded_crawl_run_id: int | None,
     ) -> int:
         if query:
-            row = self._search_record_count(spec, query, include_retired)
+            row = self._search_record_count(
+                spec,
+                query,
+                include_retired,
+                bounded_crawl_run_id,
+            )
+        elif not spec.editable_fields:
+            row = self.database.fetch_one(
+                f"list.count.{spec.key}",
+                f"SELECT COUNT(*) AS total FROM {spec.table}",
+            )
         else:
             row = self.database.fetch_one(
                 f"list.count.{spec.key}",
@@ -1380,12 +1527,21 @@ class AdminRepository:
         spec: EntitySpec,
         query: str,
         include_retired: bool,
+        bounded_crawl_run_id: int | None,
     ) -> dict[str, Any] | None:
         source_search_values = self._source_search_values(spec, query)
         override_search_value = f"%{query}%"
-        candidate_sql = " UNION ".join(
-            f"SELECT id FROM {spec.table} WHERE `{field}` LIKE %s" for field in spec.search_fields
+        candidate_sql, candidate_params = self._source_search_candidates(
+            spec,
+            source_search_values,
+            bounded_crawl_run_id,
         )
+        if not spec.editable_fields:
+            return self.database.fetch_one(
+                f"list.count.{spec.key}",
+                f"SELECT COUNT(*) AS total FROM ({candidate_sql}) AS matches",
+                candidate_params,
+            )
         effective_search = " OR ".join(
             "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$."
             + field
@@ -1424,7 +1580,7 @@ class AdminRepository:
             ) AS matches
             """,
             [
-                *source_search_values,
+                *candidate_params,
                 spec.key,
                 spec.key,
                 int(include_retired),
@@ -1442,9 +1598,29 @@ class AdminRepository:
         offset: int,
         limit: int,
         include_retired: bool,
+        bounded_crawl_run_id: int | None,
     ) -> list[dict[str, Any]]:
         if query:
-            return self._search_page_keys(spec, query, offset, limit, include_retired)
+            return self._search_page_keys(
+                spec,
+                query,
+                offset,
+                limit,
+                include_retired,
+                bounded_crawl_run_id,
+            )
+
+        if not spec.editable_fields:
+            return self.database.fetch_all(
+                f"list.keys.{spec.key}",
+                f"""
+                SELECT 0 AS kind_order, id AS sort_id
+                FROM {spec.table}
+                ORDER BY sort_id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
 
         sql = f"""
             (
@@ -1482,12 +1658,26 @@ class AdminRepository:
         offset: int,
         limit: int,
         include_retired: bool,
+        bounded_crawl_run_id: int | None,
     ) -> list[dict[str, Any]]:
         source_search_values = self._source_search_values(spec, query)
         override_search_value = f"%{query}%"
-        candidate_sql = " UNION ".join(
-            f"SELECT id FROM {spec.table} WHERE `{field}` LIKE %s" for field in spec.search_fields
+        candidate_sql, candidate_params = self._source_search_candidates(
+            spec,
+            source_search_values,
+            bounded_crawl_run_id,
         )
+        if not spec.editable_fields:
+            return self.database.fetch_all(
+                f"list.keys.{spec.key}",
+                f"""
+                SELECT 0 AS kind_order, candidates.id AS sort_id
+                FROM ({candidate_sql}) AS candidates
+                ORDER BY sort_id DESC
+                LIMIT %s OFFSET %s
+                """,
+                [*candidate_params, limit, offset],
+            )
         effective_search = " OR ".join(
             "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(h.payload_json, '$."
             + field
@@ -1529,7 +1719,7 @@ class AdminRepository:
             LIMIT %s OFFSET %s
         """
         params: list[object] = [
-            *source_search_values,
+            *candidate_params,
             spec.key,
             spec.key,
             int(include_retired),
@@ -1541,6 +1731,62 @@ class AdminRepository:
             offset,
         ]
         return self.database.fetch_all(f"list.keys.{spec.key}", sql, params)
+
+    def _current_bounded_crawl_run_id(self) -> int | None:
+        snapshots = self.database.fetch_all(
+            "list.snapshot.part_numbers",
+            """
+            SELECT dataset_scope, source_crawl_run_id
+            FROM v_current_catalog_parts
+            GROUP BY dataset_scope, source_crawl_run_id
+            LIMIT 2
+            """,
+        )
+        if len(snapshots) != 1 or snapshots[0].get("dataset_scope") != "bounded":
+            return None
+        crawl_run_id = int(snapshots[0].get("source_crawl_run_id") or 0)
+        return crawl_run_id if crawl_run_id > 0 else None
+
+    @staticmethod
+    def _source_search_candidates(
+        spec: EntitySpec,
+        search_values: list[str],
+        bounded_crawl_run_id: int | None,
+    ) -> tuple[str, list[object]]:
+        if spec.table == "station_admin_formal_part_numbers" and bounded_crawl_run_id is not None:
+            return (
+                """
+                SELECT bounded_parts.part_id AS id
+                FROM bounded_parts
+                WHERE bounded_parts.crawl_run_id = %s
+                  AND bounded_parts.brand LIKE %s
+                UNION
+                SELECT bounded_parts.part_id AS id
+                FROM bounded_parts FORCE INDEX (idx_bounded_part_number_normalized)
+                WHERE bounded_parts.crawl_run_id = %s
+                  AND bounded_parts.part_number_normalized LIKE %s
+                UNION
+                SELECT bounded_parts.part_id AS id
+                FROM bounded_parts
+                WHERE bounded_parts.crawl_run_id = %s
+                  AND bounded_parts.part_name LIKE %s
+                """,
+                [
+                    bounded_crawl_run_id,
+                    search_values[0],
+                    bounded_crawl_run_id,
+                    search_values[1],
+                    bounded_crawl_run_id,
+                    search_values[2],
+                ],
+            )
+        return (
+            " UNION ".join(
+                f"SELECT id FROM {spec.table} WHERE `{field}` LIKE %s"
+                for field in spec.search_fields
+            ),
+            list(search_values),
+        )
 
     @staticmethod
     def _source_search_values(spec: EntitySpec, query: str) -> list[str]:
@@ -1561,6 +1807,16 @@ class AdminRepository:
         padded_ids = [*source_ids, *([0] * (page_size - len(source_ids)))]
         placeholders = ", ".join(["%s"] * page_size)
         fields = ", ".join(f"s.`{field}`" for field in spec.source_fields)
+        if not spec.editable_fields:
+            return self.database.fetch_all(
+                f"list.source-batch.{spec.key}",
+                f"""
+                SELECT s.id, {fields}
+                FROM {spec.table} AS s
+                WHERE s.id IN ({placeholders})
+                """,
+                padded_ids,
+            )
         return self.database.fetch_all(
             f"list.source-batch.{spec.key}",
             f"""
@@ -1602,6 +1858,8 @@ class AdminRepository:
     def get_record(self, entity_type: str, identity_key: str) -> RecordDetail:
         spec = entity_spec(entity_type)
         source_id, manual_uuid = self._parse_identity(identity_key)
+        if source_id is None and not spec.editable_fields:
+            raise RecordNotFoundError("找不到來源資料")
         base = self._detail_base(spec, source_id or 0)
         head = self.database.fetch_one(
             f"detail.head.{spec.key}",
@@ -1714,6 +1972,7 @@ class AdminRepository:
         ]
 
     def _detail_base(self, spec: EntitySpec, source_id: int) -> dict[str, Any] | None:
+        spec = self._formal_source_spec(spec)
         fields = ", ".join(f"`{field}`" for field in spec.source_fields)
         return self.database.fetch_one(
             f"detail.base.{spec.key}",
@@ -1730,6 +1989,8 @@ class AdminRepository:
         reason: str,
     ) -> str:
         spec = entity_spec(entity_type)
+        if not spec.editable_fields:
+            raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
         cleaned = self._clean_payload(spec, payload)
         if spec.key == "part_numbers" and not all(
             cleaned.get(field) for field in ("number_raw", "name_en_raw")
@@ -1842,10 +2103,12 @@ class AdminRepository:
         reason: str,
     ) -> int:
         spec = entity_spec(entity_type)
+        if not spec.editable_fields:
+            raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
         source_id, manual_uuid = self._parse_identity(identity_key)
         actor, reason = self._audit_fields(actor, reason)
         with self.database.transaction():
-            base = self._locked_base(spec, source_id or 0)
+            base = self._locked_base(self._formal_source_spec(spec), source_id or 0)
             head = self.database.fetch_one(
                 f"write.lock-head.{spec.key}",
                 """
@@ -1981,6 +2244,11 @@ class AdminRepository:
         )
 
     @staticmethod
+    def _formal_source_spec(spec: EntitySpec) -> EntitySpec:
+        source_table = _FORMAL_SOURCE_TABLES.get(spec.key)
+        return replace(spec, table=source_table) if source_table is not None else spec
+
+    @staticmethod
     def _source_lock_query(spec: EntitySpec, source_id: int) -> tuple[str, tuple[int, ...]]:
         if spec.key == "taxonomy_nodes":
             if source_id % 2 == 0:
@@ -2006,7 +2274,7 @@ class AdminRepository:
             )
         if spec.key == "vin_part_fitments":
             mapping_id, part_id = divmod(source_id, 4294967296)
-            return _SOURCE_LOCK_SQL[spec.key], (mapping_id, part_id)
+            return _SOURCE_LOCK_SQL[spec.key], (part_id, part_id, part_id, mapping_id)
         return _SOURCE_LOCK_SQL[spec.key], (source_id,)
 
     def _insert_event(
@@ -2175,7 +2443,8 @@ class AdminRepository:
     @classmethod
     def _source_record(cls, spec: EntitySpec, row: dict[str, Any]) -> RecordView:
         source_payload = cls._source_payload(spec, row)
-        override = cls._json_object(row.get("override_payload_json"))
+        read_only = not spec.editable_fields
+        override = {} if read_only else cls._json_object(row.get("override_payload_json"))
         source_id = int(row["id"])
         return RecordView(
             entity_type=spec.key,
@@ -2184,10 +2453,14 @@ class AdminRepository:
             manual_uuid=None,
             payload=cls._display_mapping({**source_payload, **override}),
             source_payload=cls._display_mapping(source_payload),
-            status=str(row.get("override_status") or "active"),
-            revision=int(row.get("override_revision") or 0),
+            status="active" if read_only else str(row.get("override_status") or "active"),
+            revision=0 if read_only else int(row.get("override_revision") or 0),
             base_sha256=canonical_sha256(source_payload),
-            updated_at=row.get("override_updated_at") or row.get("updated_at"),
+            updated_at=(
+                row.get("updated_at")
+                if read_only
+                else row.get("override_updated_at") or row.get("updated_at")
+            ),
         )
 
     @classmethod

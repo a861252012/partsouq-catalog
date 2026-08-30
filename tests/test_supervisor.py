@@ -76,6 +76,58 @@ def test_cleanup_release_failure_discards_connection_and_propagates(monkeypatch)
     database._discard_thread_conn.assert_called_once_with()
 
 
+def test_kill_other_crawlers_gives_sigterm_cleanup_budget_before_sigkill(monkeypatch) -> None:
+    instance = supervisor.Supervisor(workers=1)
+    alive = True
+    commands: list[list[str]] = []
+
+    def run(command, **_kwargs):
+        nonlocal alive
+        commands.append(command)
+        if command == ["ps", "-eo", "pid=,ppid=,args="]:
+            return mock.Mock(
+                returncode=0,
+                stdout=("4242 1 /usr/bin/python3 -m partsouq_catalog.run_crawl --workers 1\n"),
+            )
+        if command[:4] == ["ps", "-o", "ppid=,command=", "-p"]:
+            return mock.Mock(returncode=0, stdout="1 python crawler")
+        if command == ["kill", "-TERM", "4242"]:
+            return mock.Mock(returncode=0)
+        if command == ["kill", "-9", "4242"]:
+            alive = False
+            return mock.Mock(returncode=0)
+        if command == ["ps", "-o", "args=", "-p", "4242"]:
+            return mock.Mock(
+                returncode=0 if alive else 1,
+                stdout=(
+                    "/usr/bin/python3 -m partsouq_catalog.run_crawl --workers 1" if alive else ""
+                ),
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr(supervisor.subprocess, "run", run)
+    monkeypatch.setattr(supervisor, "CHILD_TERMINATE_GRACE_SECONDS", 0.0)
+
+    assert instance._kill_other_crawlers() is True
+    assert ["kill", "-TERM", "4242"] in commands
+    assert ["kill", "-9", "4242"] in commands
+    assert commands.index(["kill", "-TERM", "4242"]) < commands.index(["kill", "-9", "4242"])
+
+
+def test_kill_current_waits_shared_browser_cleanup_budget(monkeypatch) -> None:
+    instance = supervisor.Supervisor(workers=1)
+    process = mock.MagicMock(pid=4243)
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    instance.proc = process
+
+    assert instance._kill_current("test") is True
+
+    process.terminate.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=supervisor.CHILD_TERMINATE_GRACE_SECONDS)
+    process.kill.assert_not_called()
+
+
 def test_child_admission_defer_does_not_count_as_restart(monkeypatch) -> None:
     instance = supervisor.Supervisor(workers=1)
     process = mock.MagicMock()

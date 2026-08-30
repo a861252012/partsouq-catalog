@@ -12,10 +12,18 @@ import argparse
 import fcntl
 import logging
 import os
+import signal
 import sys
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
-from .admission import AdmissionLockBusy
+from .admission import (
+    AdmissionLockBusy,
+    CatalogRuntimeLockBusy,
+    acquire_catalog_runtime_lock,
+)
+from .cloak import _begin_browser_shutdown, _finish_browser_shutdown
 from .config import CRAWL, LOG_DIR, load_cookies
 from .crawler import Crawler
 from .db import Database
@@ -45,7 +53,7 @@ def main() -> int:
         "--recover-only",
         action="store_true",
         help="只重抓 fetched_status IS NULL 的孤兒組並結束，不跑整趟爬取；"
-        "使用獨立 recover.lock，可與線上 daemon 並行",
+        "與正式爬取共用 crawler.lock，不可和線上 daemon 並行",
     )
     args = parser.parse_args()
 
@@ -72,6 +80,26 @@ def main() -> int:
     if args.brand:
         CRAWL["start_brand"] = args.brand
 
+    scheduled_job_run_id = int(CRAWL["scheduled_job_run_id"])
+    scheduled_scope_invalid = scheduled_job_run_id > 0 and (
+        int(CRAWL["limit_parts"]) != 0
+        or int(CRAWL["bounded_parts"]) != 10_000
+        or not str(CRAWL["bounded_brand"]).strip()
+        or not str(CRAWL["bounded_model"]).strip()
+        or int(CRAWL["vehicle_year_window"]) <= 0
+    )
+    if scheduled_scope_invalid:
+        log.error(
+            "scheduled catalog crawl requires PSQ_LIMIT_PARTS=0, "
+            "PSQ_BOUNDED_PARTS=10000, non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL, "
+            "and positive PSQ_VEHICLE_YEAR_WINDOW"
+        )
+        root_logger = logging.getLogger()
+        for handler in handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        return 64
+
     # supervisor 的 flock 只能防兩個 supervisor；直接 CLI（尤其
     # --fresh）也必須共用 crawler lock，否則兩趟 run 會同時重設 state
     # 與發布 snapshot。
@@ -79,9 +107,9 @@ def main() -> int:
     lock_dir = (
         Path(configured_state_dir).expanduser().absolute() if configured_state_dir else LOG_DIR
     )
-    # --recover-only 是輕量維護通道，只補抓孤兒組；改用獨立 recover.lock，
-    # 不與整趟爬取的 crawler.lock 互斥，才能在不中斷線上 daemon 下併行執行。
-    lock_path = lock_dir / ("recover.lock" if args.recover_only else "crawler.lock")
+    # recover 也會改 group receipt 與 part membership，必須和 full crawl
+    # 共用鎖；兩者併行會讓正式 run 的發布來源被 recover run 拆走。
+    lock_path = lock_dir / "crawler.lock"
     try:
         ensure_private_state_directory(lock_dir)
         lock_descriptor = open_private_state_file(
@@ -99,6 +127,21 @@ def main() -> int:
             root_logger.removeHandler(handler)
             handler.close()
         raise
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    sigterm_installed = False
+
+    def terminate(signum: int, _frame: object) -> None:
+        # Supervisor._kill_current() 送 SIGTERM；轉成可展開 finally 的
+        # SystemExit，讓 run_crawl 先回收 owned browser process group。
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, terminate)
+        sigterm_installed = True
+    except ValueError:
+        # 測試可能從非 main thread 呼叫；正式 CLI 一定在 main thread。
+        pass
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -109,6 +152,12 @@ def main() -> int:
         # 組合根：組裝各層元件。--fresh 的 reset 已移到 Crawler.run，
         # 與 start_run 在同一交易，不會在 cookie 初始化失敗時先毀進度。
         db = Database().connect()
+        runtime_lock_connection = db.open_owner_connection()
+        try:
+            runtime_lease = acquire_catalog_runtime_lock(runtime_lock_connection)
+        except CatalogRuntimeLockBusy:
+            log.error("another catalog crawler owns the database runtime lock; exiting")
+            return 2
         crawler: Crawler | None = None
         # 只讀既有 cookie；此處不得呼叫 get_session()。第一次真正的 HTTP
         # 請求才由 SessionManager.ensure_fresh() 視需要啟動瀏覽器，確保
@@ -129,10 +178,27 @@ def main() -> int:
         # 都受全域限流（SOL P1）。
         governor = RequestGovernor(CRAWL["request_rate"], CRAWL["request_burst"])
         http = SessionManager(cookies, no_browser=args.no_browser, gov=governor)
-        crawler = Crawler(http, db, workers=args.workers, governor=governor, fresh=args.fresh)
+        crawler = Crawler(
+            http,
+            db,
+            workers=args.workers,
+            governor=governor,
+            fresh=args.fresh,
+            runtime_guard=runtime_lease.assert_owned,
+        )
         if args.recover_only:
-            # 跳過整趟 run()，直接收斂孤兒組後結束；finally 仍會關資源。
-            recovered = crawler.recover_null_groups()
+            if crawler.sample_mode or crawler.bounded_mode or crawler.part_limit:
+                log.error("recover-only requires PSQ_LIMIT_PARTS=0 and PSQ_BOUNDED_PARTS=0")
+                return 64
+            # 跳過整趟 run()，直接收斂孤兒組；部分失敗要回傳非零狀態。
+            try:
+                recovered = crawler.recover_null_groups()
+            except AdmissionLockBusy:
+                log.warning("schema migration in progress; recover-only deferred before writing")
+                return 75
+            except Exception:
+                log.exception("recover-only 未完整收斂")
+                return 1
             log.info("recover-only 完成：收斂 %d 組", recovered)
             return 0
         try:
@@ -147,17 +213,48 @@ def main() -> int:
             return 0
         if crawler.last_status == "sample":
             return 3
+        if crawler.last_status == "bounded_under_target":
+            return 4
         return 1
     finally:
+        active_error = sys.exception()
+        cleanup_errors: list[Exception] = []
+
+        def cleanup(label: str, action: Callable[[], object]) -> None:
+            try:
+                action()
+            except Exception as error:
+                cleanup_errors.append(error)
+                log.exception("%s failed during crawler shutdown", label)
+
+        # scheduler 的 SIGINT 會讓主執行緒先進入這裡；必須在等待 worker
+        # pool 前回收目前 browser process group，否則 worker 可能卡在
+        # fetch_page，而已脫離 scheduler 子群組的 Chromium 會變成孤兒。
+        cleanup("owned browser shutdown", _begin_browser_shutdown)
         if "crawler" in locals() and crawler is not None:
-            crawler.close()
+            cleanup("crawler worker pool close", crawler.close)
+        cleanup("browser shutdown state reset", _finish_browser_shutdown)
+        if "runtime_lease" in locals():
+            cleanup("catalog runtime lease close", runtime_lease.close)
+        if "runtime_lock_connection" in locals() and runtime_lock_connection.open:
+            cleanup("catalog runtime owner connection close", runtime_lock_connection.close)
         if "db" in locals():
-            db.close()
-        lock_fd.close()
+            cleanup("database close", db.close)
+        cleanup("crawler lock close", lock_fd.close)
+        if sigterm_installed:
+            cleanup(
+                "SIGTERM handler restore",
+                lambda: signal.signal(signal.SIGTERM, previous_sigterm),
+            )
         root_logger = logging.getLogger()
         for handler in handlers:
-            root_logger.removeHandler(handler)
-            handler.close()
+            cleanup(
+                "log handler detach",
+                partial(root_logger.removeHandler, handler),
+            )
+            cleanup("log handler close", handler.close)
+        if active_error is None and cleanup_errors:
+            raise cleanup_errors[0]
 
 
 if __name__ == "__main__":

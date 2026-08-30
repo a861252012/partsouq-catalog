@@ -6,7 +6,7 @@
       <h1>{{ spec.title }} <code>{{ detail.record.identity_key }}</code></h1>
       <p>狀態 {{ detail.record.status }} · 覆寫版本 {{ detail.record.revision }} · base hash <code>{{ detail.record.base_sha256 }}</code></p>
     </div>
-    <a class="button" href="{{ url_for('admin.entity_edit', entity_type=spec.key, identity_key=detail.record.identity_key) }}">編輯覆寫</a>
+    {% if spec.editable_fields %}<a class="button" href="{{ url_for('admin.entity_edit', entity_type=spec.key, identity_key=detail.record.identity_key) }}">編輯覆寫</a>{% endif %}
   </div>
   <section>
     <h2>目前有效內容</h2>
@@ -15,7 +15,7 @@
   {% if detail.record.source_payload %}
     <section><h2>不可變來源內容</h2><details><summary>展開原始欄位</summary><pre>{{ detail.record.source_payload | tojson(indent=2) }}</pre></details></section>
   {% endif %}
-  <section class="actions">
+  {% if spec.editable_fields %}<section class="actions">
     <h2>狀態操作</h2>
     <form method="post" action="{{ url_for('admin.entity_restore' if detail.record.status == 'retired' else 'admin.entity_retire', entity_type=spec.key, identity_key=detail.record.identity_key) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -24,7 +24,7 @@
       <label>原因<input name="reason" required></label>
       <button type="submit" class="{{ 'button' if detail.record.status == 'retired' else 'danger' }}">{{ '恢復' if detail.record.status == 'retired' else '停用' }}</button>
     </form>
-  </section>
+  </section>{% endif %}
   <section>
     <h2>異動事件{% if detail.events_truncated %}（僅顯示最新 100 筆）{% endif %}</h2>
     <div class="table-wrap"><table><thead><tr><th>版本</th><th>動作</th><th>操作者</th><th>原因</th><th>時間</th></tr></thead><tbody>

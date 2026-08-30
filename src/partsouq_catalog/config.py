@@ -57,6 +57,8 @@ class CrawlConfig(TypedDict):
     limit_parts: int
     vehicle_year_window: int
     bounded_parts: int
+    bounded_brand: str
+    bounded_model: str
     bounded_run_key: str
     scheduled_job_run_id: int
     evidence_max_body_bytes: int
@@ -176,6 +178,10 @@ CRAWL: CrawlConfig = {
     # 正式的有界資料集上限。只有精確達標、無爬取錯誤且通過
     # 品質關卡才會原子發布到 bounded_parts；不會改寫全站 snapshot。
     "bounded_parts": int(os.environ.get("PSQ_BOUNDED_PARTS", "0")),
+    # 正式 bounded 可鎖定單一品牌與型號；兩者必須同時設定。
+    # 爬蟲仍會完整解析首頁與 locate 頁，再從站方結果挑出唯一目標。
+    "bounded_brand": os.environ.get("PSQ_BOUNDED_BRAND", "").strip(),
+    "bounded_model": os.environ.get("PSQ_BOUNDED_MODEL", "").strip(),
     # 排程重試必須沿用同一個 logical run 才能續爬。空值時由
     # Crawler 先找同 target/provenance 的未完成 run，沒有才建新 key。
     "bounded_run_key": os.environ.get("PSQ_BOUNDED_RUN_KEY", "").strip(),

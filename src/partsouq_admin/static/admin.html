@@ -64,7 +64,7 @@
       <section class="panel" style="margin-bottom:16px">
         <h2>零件資料</h2>
         <div class="table-controls">
-          <label>資料來源<select id="parts-dataset"><option value="current">目前正式資料（full 優先，否則 bounded）</option><option value="bounded">指定最新 bounded（未發布全量）</option><option value="sample">舊樣本（僅供診斷）</option></select></label>
+          <label>資料來源<select id="parts-dataset"><option value="current">目前正式資料（已驗證 bounded）</option><option value="bounded">指定已驗證 bounded</option><option value="sample">舊樣本（僅供診斷）</option></select></label>
           <label>每頁筆數<select id="parts-page-size"><option value="10">10</option><option value="25">25</option><option value="30">30</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
         </div>
         <p id="parts-page-status" class="note warning" style="margin-top:12px">讀取中…</p>
@@ -161,15 +161,15 @@
         </section>
         <section>
           <h2>確認 VIN 與 PartSouq 車款</h2>
-          <p class="note">先執行 NHTSA VIN 解碼，再從候選車款確認正確的 PartSouq vehicle ID。</p>
+          <p class="note">先執行 NHTSA VIN 解碼，再從候選車款確認正確的 PartSouq vehicle ID。只有 <code>exact</code> 可直接確認；<code>manual_review_required</code> 與 <code>ambiguous_manual_review_required</code> 都必須勾選人工確認並填寫依據。</p>
           <form id="vin-mapping-form" data-endpoint="/api/vin-vehicle-mappings">
             <label>既有 mapping ID（更正時填寫）</label><div class="two"><input id="vin-mapping-id" name="mapping_id" type="number" min="1"><button id="vin-mapping-load" class="secondary" type="button">載入 mapping</button></div>
             <input id="vin-mapping-version" name="expected_updated_at" type="hidden">
             <label>完整 VIN</label><input name="vin" required minlength="17" maxlength="17">
             <label>PartSouq vehicle ID</label><input name="partsouq_vehicle_id" type="number" min="1" required>
             <label>來源</label><input name="source_name" value="manual-confirmed">
-            <label><input name="allow_name_override" type="checkbox" value="true"> 品牌／型號／年份／引擎／Trim 不一致，改用人工確認</label>
-            <label>人工確認依據（跨來源不一致時必填）</label><input name="source_reference">
+            <label><input name="allow_name_override" type="checkbox" value="true"> 候選需要人工審查或跨來源不一致</label>
+            <label>人工確認依據（人工審查時必填）</label><input name="source_reference">
             <button>確認車款對應</button>
           </form>
         </section>
@@ -222,6 +222,11 @@
         return result;
       }
       function renderSummary(summary) {
+        const vinStatusLabels = {
+          awaiting_authorized_vin: '尚未提供合法 VIN',
+          terminal_undecodable: '已提供，但 NHTSA 無法解碼',
+          decoded: '已有解碼資料'
+        };
         const datasetCards = summary.nhtsa.datasets.map(dataset => [
           `NHTSA ${dataset.dataset_name}`, dataset.row_count
         ]);
@@ -232,8 +237,14 @@
           ['目前正式來源', summary.current_catalog.dataset_scope ?? '尚無'],
           ['目前正式適用列', summary.current_catalog.fitment_rows],
           ['目前正式不重複料號', summary.current_catalog.unique_part_numbers],
-          ['已發布適用列', summary.published.fitment_rows], ['不重複料號', summary.published.unique_part_numbers],
+          ['已驗證正式適用列', summary.published.fitment_rows], ['已驗證不重複料號', summary.published.unique_part_numbers],
           ['排程限量進度', `${summary.bounded.fitment_rows}/${summary.bounded.target_rows || 10000}`],
+          ['目前指定限量範圍', summary.bounded.desired_scope.brand
+            ? `${summary.bounded.desired_scope.brand}/${summary.bounded.desired_scope.model}/${summary.bounded.desired_scope.vehicle_year_floor}`
+            : '尚未設定'],
+          ['最新限量 run 範圍', summary.bounded.latest_run_scope.brand
+            ? `${summary.bounded.latest_run_scope.brand}/${summary.bounded.latest_run_scope.model}/${summary.bounded.latest_run_scope.vehicle_year_floor}`
+            : '尚無'],
           ['限量不重複料號', summary.bounded.unique_part_numbers],
           ['限量適用車款', summary.bounded.unique_vehicles],
           ['限量非 ASCII 名稱（英文未驗證）', summary.bounded.name_language.english_name_unverified_rows],
@@ -248,7 +259,13 @@
           ['NHTSA rejected rows', summary.nhtsa.rejected_rows],
           ...datasetCards,
           ['NHTSA VIN 解碼', summary.nhtsa.vin_decodes],
-          ['VIN 輸入狀態', summary.nhtsa.vin_decode_status === 'awaiting_authorized_vin' ? '尚未提供合法 VIN' : '已有解碼資料'],
+          ['NHTSA 無法解碼 VIN', summary.nhtsa.terminal_undecodable_vins],
+          ['NHTSA 缺車型名稱（非阻擋）', summary.data_quality.nhtsa.model_name_missing_rows ?? 0],
+          ['NHTSA 缺引擎形式（非阻擋）', summary.data_quality.nhtsa.engine_configuration_missing_rows ?? 0],
+          ['NHTSA 缺引擎型號（非阻擋）', summary.data_quality.nhtsa.engine_model_missing_rows ?? 0],
+          ['NHTSA 缺排氣量（非阻擋）', summary.data_quality.nhtsa.displacement_missing_rows ?? 0],
+          ['NHTSA 缺 Trim（非阻擋）', summary.data_quality.nhtsa.trim_name_missing_rows ?? 0],
+          ['VIN 輸入狀態', vinStatusLabels[summary.nhtsa.vin_decode_status] || summary.nhtsa.vin_decode_status],
           ['已確認 VIN mapping', summary.mappings.confirmed],
           ['過期 mapping', summary.mappings.stale],
           ['樣本不重複料號', summary.sample_progress.unique_part_numbers],
@@ -268,7 +285,7 @@
         summaryStatus.className = summary.bounded_ready ? 'note ok' : 'note warning';
         summaryStatus.textContent = summary.bounded_ready
           ? `正式排程限量資料已通過 10,000 筆技術 gate；不代表完整需求已符合。產品英文名稱尚未做語言驗證，小分類來源也尚不可得。crawl run ${summary.bounded.crawl_run_id}，scheduler run ${summary.bounded.scheduler.run_id}。`
-          : `正式排程限量 10,000 筆資料尚未通過驗收。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
+          : `正式排程限量 10,000 筆資料尚未通過驗收${summary.bounded.scope_matches_desired ? '' : '；指定範圍與最新 run 不一致或尚未設定'}。最近爬取：${latest ? `${latest.status}，${latest.parts_ok} 列` : '尚無紀錄'}。`;
         const reasonLabels = {
           no_bounded_crawl_run: '尚無正式 bounded crawl run；舊 sample 不列入驗收',
           bounded_dataset_kind_invalid: '最新限量 run 的 dataset kind 不是 bounded',
@@ -282,6 +299,8 @@
           bounded_scheduler_not_completed: 'scheduler 尚未成功完成或 exit code 不是 0',
           bounded_scheduler_link_not_unique: 'scheduler run 連到不只一個 crawl run',
           bounded_non_live_data_marker: '偵測到 test／fixture／synthetic／sample 標記，不可列為正式成果',
+          bounded_desired_scope_not_configured: '尚未設定目前正式 bounded 品牌、型號與年份下限',
+          bounded_scope_mismatch: '最新 bounded run 的品牌、型號或年份下限與目前指定範圍不一致',
           bounded_required_fields_missing: '限量資料缺少料號、名稱、品牌、型號或車款',
           bounded_ids_missing: '限量資料缺少 DB 關聯 ID',
           bounded_source_ids_missing: '限量資料缺少 PartSouq vid/cid/uid/code',
@@ -292,12 +311,12 @@
           bounded_snapshot_run_mismatch: 'bounded snapshot 混入其他 crawl run',
           bounded_active_overrides_present: '限量資料存在有效人工覆寫；不符合禁止人工介入驗收',
           bounded_source_values_mismatch: 'bounded snapshot 與 normalized 來源值不一致',
-          full_catalog_not_published: '正式全量 PartSouq snapshot 尚未發布；通過 gate 的 bounded 資料可暫作目前正式來源',
+          verified_bounded_catalog_not_ready: '已驗證的 10,000 筆 bounded 目錄尚未通過正式資料 gate',
           sample_rows_below_target: '樣本資料尚未達到目標筆數',
-          published_parts_data_quality_failed: '已發布資料有必填欄位、ID、年份、分類或關聯缺漏',
           sample_parts_data_quality_failed: '樣本資料有必填欄位、ID、年份、分類或關聯缺漏',
           no_nhtsa_reference_data: 'NHTSA 基礎資料尚未同步',
           awaiting_authorized_vin: '尚未提供合法持有或獲授權的完整 VIN；VIN 解碼等待輸入',
+          no_usable_vin_decode: '已提供 VIN，但 NHTSA 尚未產生可用解碼',
           nhtsa_required_fields_missing: 'NHTSA 必填欄位有缺漏',
           no_confirmed_vin_mapping: '沒有已確認的 VIN 與 PartSouq 車款 mapping',
           stale_or_unconfirmed_vin_mapping: '仍有過期或未確認的 VIN mapping',
@@ -327,9 +346,9 @@
         partsPageSize.value = String(result.pageSize);
         const rows = result.items.map(item => {
           const row = document.createElement('tr');
-          const status = item.dataset_status === 'scheduled_bounded_not_full_published'
-            ? '正式排程限量（未發布全量）'
-            : item.dataset_status === 'sample_not_published' ? '舊樣本（僅供診斷）' : '完整已發布';
+          const status = item.dataset_status === 'verified_bounded'
+            ? '已驗證目前範圍'
+            : item.dataset_status === 'sample_not_published' ? '舊樣本（僅供診斷）' : '人工維護';
           const ids = `part_id: ${item.part_id ?? '—'}\nmodel_id: ${item.model_id ?? '—'}\nvehicle_id: ${item.vehicle_id ?? '—'} / vid: ${item.vehicle_vid ?? '—'}\ncategory_id: ${item.category_id ?? '—'} / cid: ${item.category_cid ?? '—'}\ngroup_id: ${item.group_id ?? '—'} / uid: ${item.group_uid ?? '—'}`;
           const part = `${item.part_number ?? '—'}\nCode: ${item.part_code ?? '—'}`;
           const vehicle = `${item.model ?? '—'}\n${item.vehicle_name ?? '—'} / ${item.vehicle_code ?? '—'}`;
@@ -365,19 +384,21 @@
         partsPrev.disabled = result.page <= 1 || result.totalPages === 0;
         partsNext.disabled = result.totalPages === 0 || result.page >= result.totalPages;
         partsLast.disabled = result.totalPages === 0 || result.page >= result.totalPages;
-        partsPageStatus.className = partsDataset.value === 'current' && result.datasetScope === 'full'
-          ? 'note' : 'note warning';
+        partsPageStatus.className = result.datasetScope === 'bounded' ? 'note' : 'note warning';
         partsPageStatus.textContent = partsDataset.value === 'bounded'
-          ? '目前指定顯示最新 bounded_success 限量資料；不是完整全量 snapshot。'
+          ? '目前只顯示符合指定品牌、型號與年份下限的正式 bounded 資料；不符合時會保持空白。'
           : partsDataset.value === 'sample'
             ? '目前顯示舊 sample，只供診斷，不列入 10,000 筆驗收。'
-            : result.datasetScope === 'full'
-              ? '目前正式來源為完整已發布 snapshot。'
-              : result.datasetScope === 'bounded'
-                ? '尚無完整已發布 snapshot；目前正式來源為最新 bounded_success 限量資料。'
-                : '目前沒有可用的正式 full／bounded 資料。';
+            : result.datasetScope === 'bounded'
+              ? '目前正式來源為已驗證、且符合指定範圍的 10,000 筆 bounded 資料。'
+              : '目前沒有可用的已驗證 bounded 資料。';
       }
       async function refreshPartsPage() {
+        if (!token()) {
+          renderPartsPage({ items: [], datasetScope: null, crawlRunId: null, page: 1, pageSize: partsState.pageSize, total: 0, totalPages: 0 });
+          statusMessage('請先輸入後台 token，再重新整理。', true);
+          return;
+        }
         try {
           renderPartsPage(await call(partsPagePath()));
           statusMessage('已刷新零件資料。');
@@ -481,14 +502,21 @@
         } catch (error) { statusMessage(error.message, true); }
       }
       async function refresh() {
+        if (!token()) {
+          renderPartsPage({ items: [], datasetScope: null, crawlRunId: null, page: 1, pageSize: partsState.pageSize, total: 0, totalPages: 0 });
+          renderQuarantine({ items: [], page: 1, pageSize: 50, total: 0, totalPages: 0 });
+          statusMessage('請先輸入後台 token，再按重新整理。', true);
+          output.textContent = '';
+          return;
+        }
         try {
           const [summary, partsPage, translations, categories] = await Promise.all([
             call('/api/database-summary'), call(partsPagePath()), call('/api/part-translations'),
             call('/api/categories')
           ]);
-          const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs, quarantine] = token() ? await Promise.all([
+          const [vehicles, nhtsaVehicles, vinMappings, reconciliation, requests, jobs, quarantine] = await Promise.all([
             call('/api/vehicle-mappings'), call('/api/nhtsa/vehicles'), call('/api/vin-vehicle-mappings'), call('/api/reconciliation-items'), call('/api/crawl-requests'), call('/api/job-runs'), call(quarantinePath())
-          ]) : [[], [], [], [], [], [], { items: [], page: 1, pageSize: 50, total: 0, totalPages: 0 }];
+          ]);
           renderSummary(summary);
           renderPartsPage(partsPage);
           renderQuarantine(quarantine);
@@ -502,9 +530,11 @@
         const current = await call(`/api/vin-vehicle-mappings/${mappingId}`);
         vinMappingForm.elements.vin.value = current.vin ?? '';
         vinMappingForm.elements.partsouq_vehicle_id.value = current.partsouq_vehicle_id ?? '';
-        vinMappingForm.elements.source_name.value = current.source_name ?? 'manual-confirmed';
+        vinMappingForm.elements.source_name.value = current.source_name === 'manual-sparse-override'
+          ? 'manual-confirmed'
+          : current.source_name ?? 'manual-confirmed';
         vinMappingForm.elements.source_reference.value = current.source_reference ?? '';
-        vinMappingForm.elements.allow_name_override.checked = current.source_name === 'manual-name-override';
+        vinMappingForm.elements.allow_name_override.checked = ['manual-name-override', 'manual-sparse-override'].includes(current.source_name);
         vinMappingVersion.value = current.updated_at ?? '';
         if (!vinMappingVersion.value) throw new Error('mapping 缺少版本資料，無法安全編輯。');
         statusMessage(`已載入 mapping ${mappingId}。`);

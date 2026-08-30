@@ -68,11 +68,11 @@ def test_database_summary_fails_closed_for_empty_database(
         "target_rows": 1000,
         "latest_run_rows": 0,
         "unique_part_numbers": 0,
-        "published_rows": 0,
+        "current_catalog_rows": 0,
     }
     assert "sample_rows_below_target" in summary["demo_blocking_reasons"]
     assert "no_nhtsa_reference_data" in summary["demo_blocking_reasons"]
-    assert "full_catalog_not_published" in summary["production_pending_reasons"]
+    assert "verified_bounded_catalog_not_ready" in summary["production_pending_reasons"]
     assert "awaiting_authorized_vin" in summary["production_pending_reasons"]
     assert "no_confirmed_vin_mapping" not in summary["production_pending_reasons"]
     assert "partsouq_small_category_source_unavailable" in summary["production_pending_reasons"]
@@ -82,6 +82,14 @@ def test_database_summary_fails_closed_for_empty_database(
     }
     assert "SUM(a.source_rows)" in one_queries[0]
     assert "FROM nhtsa_current_records" not in one_queries[0]
+    assert "decoded_artifact.source_key = terminal_artifact.source_key" in one_queries[0]
+    assert "decoded_vin.vin = terminal_artifact.source_key" not in one_queries[0]
+    assert one_queries[0].count("scheduled_job.output_text") == 1
+    assert "AS bounded_run_context ON TRUE" in one_queries[0]
+    assert "FROM v_current_catalog_parts AS current_bounded" in one_queries[0]
+    assert "current_bounded.dataset_scope = 'bounded'" in one_queries[0]
+    assert "LEFT JOIN bounded_parts AS bp" not in one_queries[0]
+    assert "catalog_desired_bounded_scope AS desired" in one_queries[0]
     assert "SUM(a.source_rows)" in all_queries[0]
     assert "FROM nhtsa_current_records" not in all_queries[0]
 
@@ -157,12 +165,13 @@ def test_part_queries_return_internal_and_partsouq_source_ids(
     assert fitment_params == ("123AB", "123AB")
     assert sample_params == (25, 50)
     assert bounded_params == ("0948115501", "0948115501", 25, 75)
-    assert "FROM bounded_parts AS bp" in bounded_sql
+    assert "FROM v_current_catalog_parts AS bp" in bounded_sql
+    assert "bp.dataset_scope = 'bounded'" in bounded_sql
+    assert "FROM bounded_parts AS bp" not in bounded_sql
     assert "candidate.part_number_normalized = %s" in bounded_sql
     assert "UNION ALL SELECT candidate_override.part_id" in bounded_sql
-    assert "dataset_kind = 'bounded'" in bounded_sql
-    assert "status = 'bounded_success'" in bounded_sql
-    assert "scheduled_bounded_not_full_published" in bounded_sql
+    assert "candidate.dataset_scope = 'bounded'" in bounded_sql
+    assert "'verified_bounded' AS dataset_status" in bounded_sql
     assert "FROM v_current_catalog_parts AS current_part" in published_sql
     assert "candidate.part_number_normalized = %s" in published_sql
     assert "UNION ALL SELECT candidate_override.part_id" in published_sql
@@ -181,6 +190,8 @@ def test_part_pagination_validates_page_size_and_calculates_total_pages(
 ) -> None:
     monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: {"total": 1000})
     monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+    headers = {"X-Admin-Token": "test-token"}
 
     with TestClient(admin_app.app) as client:
         for page_size, total_pages in (
@@ -191,14 +202,18 @@ def test_part_pagination_validates_page_size_and_calculates_total_pages(
             (100, 10),
             (200, 5),
         ):
-            response = client.get(f"/api/sample-parts?page=1&pageSize={page_size}")
+            response = client.get(f"/api/sample-parts?page=1&pageSize={page_size}", headers=headers)
             assert response.status_code == 200
             assert response.json()["pageSize"] == page_size
             assert response.json()["totalPages"] == total_pages
 
-        assert client.get("/api/sample-parts").json()["pageSize"] == 10
-        assert client.get("/api/sample-parts?page=0&pageSize=25").status_code == 422
-        assert client.get("/api/sample-parts?page=1&pageSize=15").status_code == 422
+        assert client.get("/api/sample-parts", headers=headers).json()["pageSize"] == 10
+        assert (
+            client.get("/api/sample-parts?page=0&pageSize=25", headers=headers).status_code == 422
+        )
+        assert (
+            client.get("/api/sample-parts?page=1&pageSize=15", headers=headers).status_code == 422
+        )
 
 
 @pytest.mark.parametrize(
@@ -206,7 +221,7 @@ def test_part_pagination_validates_page_size_and_calculates_total_pages(
     (
         ("/api/parts", "v_current_catalog_parts", "current_part.snapshot_at DESC"),
         ("/api/sample-parts", "status = 'sample'", "p.id ASC"),
-        ("/api/bounded-parts", "bounded_parts", "bp.part_id ASC"),
+        ("/api/bounded-parts", "v_current_catalog_parts", "bp.part_id ASC"),
     ),
 )
 def test_part_page_endpoints_clamp_out_of_range_page(
@@ -227,9 +242,14 @@ def test_part_page_endpoints_clamp_out_of_range_page(
 
     monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
     monkeypatch.setattr(admin_app, "_fetch_all", capture_all)
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
 
     with TestClient(admin_app.app) as client:
-        response = client.get(path, params={"page": 99, "pageSize": 10})
+        response = client.get(
+            path,
+            params={"page": 99, "pageSize": 10},
+            headers={"X-Admin-Token": "test-token"},
+        )
 
     assert response.status_code == 200
     payload = response.json()
@@ -246,13 +266,47 @@ def test_empty_part_page_endpoints_use_page_one_and_zero_total_pages(
 ) -> None:
     monkeypatch.setattr(admin_app, "_fetch_one", lambda *_args, **_kwargs: {"total": 0})
     monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
 
     with TestClient(admin_app.app) as client:
-        response = client.get(path, params={"page": 99, "pageSize": 10})
+        response = client.get(
+            path,
+            params={"page": 99, "pageSize": 10},
+            headers={"X-Admin-Token": "test-token"},
+        )
 
     assert response.status_code == 200
     assert response.json()["page"] == 1
     assert response.json()["totalPages"] == 0
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/api/database-summary",
+        "/api/parts",
+        "/api/sample-parts",
+        "/api/bounded-parts",
+        "/api/parts/TESTPART001/fitments",
+        "/api/part-translations",
+        "/api/categories",
+    ),
+)
+def test_read_endpoints_require_admin_token_before_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    def fail_database_access(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("未授權請求不應查詢資料庫")
+
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "test-token")
+    monkeypatch.setattr(admin_app, "_fetch_one", fail_database_access)
+    monkeypatch.setattr(admin_app, "_fetch_all", fail_database_access)
+
+    with TestClient(admin_app.app) as client:
+        response = client.get(path)
+
+    assert response.status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -364,6 +418,8 @@ def test_categories_mark_small_category_source_unavailable(
     assert "manual_only" in queries[0]
     assert "sample_not_published" in queries[0]
     assert "status = 'sample'" in queries[0]
+    assert "FROM v_current_catalog_parts" in queries[0]
+    assert "FROM bounded_parts AS bp" not in queries[0]
 
 
 def test_data_quality_queries_require_partsouq_part_code(
@@ -388,8 +444,8 @@ def test_data_quality_queries_require_partsouq_part_code(
     assert "TRIM(bp.vehicle_code)" in queries[0]
     assert "DATABASE() <> 'partsouq_catalog'" in queries[0]
     assert "bp.part_number_normalized <>" in queries[0]
-    assert "v_current_catalog_parts AS current_year" in mapping_status_sql
-    assert "current_year.production_from IS NOT NULL" in mapping_status_sql
+    assert "FROM v_current_catalog_parts WHERE vehicle_id IS NOT NULL" in mapping_status_sql
+    assert "sparse.production_from IS NOT NULL" in mapping_status_sql
     assert "d.model_year >=" in mapping_status_sql
 
 
@@ -405,9 +461,9 @@ def test_mapping_list_requires_current_catalog_vehicle_year_range(
 
     assert admin_app.list_vin_vehicle_mappings(limit=1) == []
 
-    assert "v_current_catalog_parts AS current_year" in queries[0]
-    assert "current_year.production_from IS NOT NULL" in queries[0]
-    assert "current_year.production_to IS NOT NULL" in queries[0]
+    assert "FROM v_current_catalog_parts WHERE vehicle_id IS NOT NULL" in queries[0]
+    assert "sparse.production_from IS NOT NULL" in queries[0]
+    assert "sparse.production_to IS NOT NULL" in queries[0]
     assert "d.model_year >=" in queries[0]
 
 
@@ -581,7 +637,7 @@ def test_database_summary_separates_nhtsa_reference_sync_from_vin_readiness(
     monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: datasets)
     monkeypatch.setenv("PSQ_LIMIT_PARTS", "1000")
 
-    def summary_for(vin_decodes: int) -> dict:
+    def summary_for(vin_decodes: int, terminal_undecodable_vins: int = 0) -> dict:
         responses = iter(
             [
                 {
@@ -593,6 +649,7 @@ def test_database_summary_separates_nhtsa_reference_sync_from_vin_readiness(
                     "nhtsa_failed_runs": 0,
                     "nhtsa_rejected_rows": 0,
                     "nhtsa_vin_decodes": vin_decodes,
+                    "nhtsa_terminal_undecodable_vins": terminal_undecodable_vins,
                 },
                 {"confirmed": 0, "stale": 0},
                 {},
@@ -625,7 +682,7 @@ def test_database_summary_separates_nhtsa_reference_sync_from_vin_readiness(
     assert waiting["demo_ready"] is True
     assert waiting["production_ready"] is False
     assert waiting["demo_blocking_reasons"] == []
-    assert "full_catalog_not_published" in waiting["production_pending_reasons"]
+    assert "verified_bounded_catalog_not_ready" in waiting["production_pending_reasons"]
     assert "awaiting_authorized_vin" in waiting["production_pending_reasons"]
     assert "no_confirmed_vin_mapping" not in waiting["production_pending_reasons"]
     assert waiting["nhtsa"] == {
@@ -635,6 +692,7 @@ def test_database_summary_separates_nhtsa_reference_sync_from_vin_readiness(
         "sync_runs": {"total": 1, "completed": 1, "failed": 0},
         "rejected_rows": 0,
         "vin_decodes": 0,
+        "terminal_undecodable_vins": 0,
         "vin_decode_status": "awaiting_authorized_vin",
     }
 
@@ -642,6 +700,63 @@ def test_database_summary_separates_nhtsa_reference_sync_from_vin_readiness(
 
     assert "awaiting_authorized_vin" not in decoded_without_mapping["production_pending_reasons"]
     assert "no_confirmed_vin_mapping" in decoded_without_mapping["production_pending_reasons"]
+
+    terminal = summary_for(0, 1)
+    assert "awaiting_authorized_vin" not in terminal["production_pending_reasons"]
+    assert "no_usable_vin_decode" in terminal["production_pending_reasons"]
+    assert terminal["nhtsa"]["vin_decode_status"] == "terminal_undecodable"
+    assert terminal["nhtsa"]["terminal_undecodable_vins"] == 1
+
+
+def test_nhtsa_optional_decode_gaps_are_non_blocking_completeness_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            {
+                "published_fitment_rows": 1,
+                "nhtsa_current_records": 1,
+                "nhtsa_vin_decodes": 1,
+            },
+            {"confirmed": 1, "stale": 0},
+            {},
+            {"row_count": 0},
+            {
+                "required_field_missing_rows": 0,
+                "model_name_missing_rows": 1,
+                "engine_configuration_missing_rows": 1,
+                "engine_model_missing_rows": 1,
+                "displacement_missing_rows": 1,
+                "trim_name_missing_rows": 1,
+            },
+            None,
+            None,
+        ]
+    )
+    captured_sql: list[str] = []
+
+    def fetch_one(sql: str, *_args: object, **_kwargs: object) -> dict | None:
+        captured_sql.append(sql)
+        return next(responses)
+
+    monkeypatch.setattr(admin_app, "_fetch_one", fetch_one)
+    monkeypatch.setattr(admin_app, "_fetch_all", lambda *_args, **_kwargs: [])
+
+    summary = admin_app.database_summary()
+
+    assert "nhtsa_required_fields_missing" not in summary["production_pending_reasons"]
+    assert summary["data_quality"]["nhtsa"] == {
+        "required_field_missing_rows": 0,
+        "model_name_missing_rows": 1,
+        "engine_configuration_missing_rows": 1,
+        "engine_model_missing_rows": 1,
+        "displacement_missing_rows": 1,
+        "trim_name_missing_rows": 1,
+    }
+    quality_sql = captured_sql[4]
+    assert "OR NULLIF(TRIM(make_name), '') IS NULL OR model_year IS NULL" in quality_sql
+    assert "AS model_name_missing_rows" in quality_sql
+    assert "AS engine_configuration_missing_rows" in quality_sql
 
 
 def _bounded_summary(
@@ -656,6 +771,9 @@ def _bounded_summary(
         "bounded_run_key": "bounded-10000-20260820T120000000000",
         "bounded_dataset_kind": "bounded",
         "bounded_run_status": "bounded_success",
+        "bounded_scope_brand": "toyota",
+        "bounded_scope_model": "tacoma",
+        "bounded_scope_vehicle_year_floor": 2006,
         "bounded_target_parts": 10000,
         "bounded_run_parts_ok": 10000,
         "bounded_scheduled_job_run_id": 77,
@@ -688,6 +806,10 @@ def _bounded_summary(
         "current_catalog_rows": 10000,
         "current_unique_part_numbers": 9234,
         "current_non_ascii_part_name_rows": 237,
+        "desired_scope_brand": "toyota",
+        "desired_scope_model": "tacoma",
+        "desired_scope_vehicle_year_floor": 2006,
+        "desired_scope_updated_at": datetime(2026, 8, 30, 12, 0, 0),
     }
     counts.update(count_overrides)
     responses = iter(
@@ -717,6 +839,18 @@ def test_bounded_summary_requires_exact_scheduled_10000_rows(
     assert summary["bounded"]["fitment_rows"] == 10000
     assert summary["bounded"]["snapshot_crawl_run_id"] == 42
     assert summary["bounded"]["unique_part_numbers"] == 9234
+    assert summary["bounded"]["desired_scope"] == {
+        "brand": "toyota",
+        "model": "tacoma",
+        "vehicle_year_floor": 2006,
+        "updated_at": datetime(2026, 8, 30, 12, 0, 0),
+    }
+    assert summary["bounded"]["latest_run_scope"] == {
+        "brand": "toyota",
+        "model": "tacoma",
+        "vehicle_year_floor": 2006,
+    }
+    assert summary["bounded"]["scope_matches_desired"] is True
     assert summary["bounded"]["scheduler"] == {
         "run_id": 77,
         "job_name": "catalog",
@@ -763,7 +897,7 @@ def test_bounded_summary_requires_exact_scheduled_10000_rows(
         },
     }
     assert summary["production_ready"] is False
-    assert "full_catalog_not_published" in summary["production_pending_reasons"]
+    assert "verified_bounded_catalog_not_ready" not in summary["production_pending_reasons"]
     assert "partsouq_english_name_language_not_verified" in summary["production_pending_reasons"]
     assert (
         "partsouq_live_mapping_evidence_not_verified" not in summary["production_pending_reasons"]
@@ -836,6 +970,15 @@ def test_bounded_summary_requires_source_evidence_for_every_bounded_row(
             {"bounded_evidence_manifest_sha256": None},
             "bounded_live_mapping_evidence_not_verified",
         ),
+        (
+            {
+                "desired_scope_brand": None,
+                "desired_scope_model": None,
+                "desired_scope_vehicle_year_floor": None,
+            },
+            "bounded_desired_scope_not_configured",
+        ),
+        ({"bounded_scope_model": "1000"}, "bounded_scope_mismatch"),
     ),
 )
 def test_bounded_summary_fails_closed(
@@ -847,6 +990,31 @@ def test_bounded_summary_fails_closed(
 
     assert summary["bounded_ready"] is False
     assert reason in summary["bounded"]["blocking_reasons"]
+
+
+def test_bounded_scope_mismatch_reports_empty_current_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _bounded_summary(
+        monkeypatch,
+        bounded_scope_model="1000",
+        bounded_fitment_rows=0,
+        bounded_snapshot_min_run_id=None,
+        bounded_snapshot_max_run_id=None,
+        bounded_unique_part_numbers=0,
+        bounded_unique_vehicles=0,
+        bounded_official_source_url_rows=0,
+        current_catalog_scope=None,
+        current_catalog_crawl_run_id=None,
+        current_catalog_rows=0,
+        current_unique_part_numbers=0,
+    )
+
+    assert summary["bounded_ready"] is False
+    assert summary["bounded"]["scope_matches_desired"] is False
+    assert "bounded_scope_mismatch" in summary["bounded"]["blocking_reasons"]
+    assert summary["bounded"]["fitment_rows"] == 0
+    assert summary["current_catalog"]["fitment_rows"] == 0
 
 
 def test_admin_page_loads_summary_published_and_sample_parts() -> None:
@@ -862,7 +1030,7 @@ def test_admin_page_loads_summary_published_and_sample_parts() -> None:
         assert f'<option value="{page_size}">{page_size}</option>' in html
     assert "cell.textContent = value" in html
     assert "舊樣本（僅供診斷）" in html
-    assert "正式排程限量（未發布全量）" in html
+    assert "目前正式資料（已驗證 bounded）" in html
     assert '<option value="current">' in html
     assert html.index('<option value="current">') < html.index('<option value="sample">')
     assert "舊 sample，只供診斷，不列入 10,000 筆驗收" in html
@@ -871,6 +1039,10 @@ def test_admin_page_loads_summary_published_and_sample_parts() -> None:
     assert 'id="parts-page-number"' in html
     assert "event.key === 'Enter'" in html
     assert "const current = await call(`/api/vin-vehicle-mappings/${mappingId}`)" in html
+    assert "current.source_name === 'manual-sparse-override'" in html
+    assert "? 'manual-confirmed'" in html
+    assert "ambiguous_manual_review_required" in html
+    assert "人工審查時必填" in html
     assert "if (!body.expected_updated_at)" in html
     assert "vinMappingId.addEventListener('input', () => { vinMappingVersion.value = ''; })" in html
     assert "const current = await call(`${endpoint}/${body.mapping_id}`)" not in html
@@ -878,14 +1050,31 @@ def test_admin_page_loads_summary_published_and_sample_parts() -> None:
     assert 'id="parts-range-label"' in html
     assert "共用 DB 資料總覽" in html
     assert "NHTSA 基礎資料" in html
+    assert "NHTSA 缺引擎形式（非阻擋）" in html
     assert "尚未提供合法 VIN" in html
-    assert "正式全量 PartSouq snapshot 尚未發布" in html
+    assert "已驗證的 10,000 筆 bounded 目錄尚未通過正式資料 gate" in html
     assert "沒有成功發布的 NHTSA VIN 解碼" not in html
     assert "站方小分類來源尚未取得" in html
     assert '<option value="catalog">' not in html
     assert "<code>part_id</code>" in html
     assert "<code>vehicle_vid</code>" in html
     assert "<code>part_code</code> 是零件表 Code，不是型號 ID" in html
+
+
+def test_sparse_mapping_ui_reload_payload_passes_update_validation() -> None:
+    payload = admin_app.VinVehicleMappingUpdateInput.model_validate(
+        {
+            "vin": "ZZZTEST00X0000001",
+            "partsouq_vehicle_id": 77,
+            "source_name": "manual-confirmed",
+            "source_reference": "browser e2e sparse evidence",
+            "allow_name_override": "true",
+            "expected_updated_at": "2026-08-29T12:00:00",
+        }
+    )
+
+    assert payload.source_name == "manual-confirmed"
+    assert payload.allow_name_override is True
 
 
 def test_catalog_crawl_request_is_rejected_from_short_job_queue() -> None:

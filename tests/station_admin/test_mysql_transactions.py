@@ -51,7 +51,7 @@ def test_readiness_accepts_real_migration_019_contract() -> None:
             "health.published-provenance",
         )
     except AdminReadinessError:
-        pytest.fail("test database does not satisfy migration 019 readiness contract")
+        pytest.fail("test database does not satisfy migration 030 readiness contract")
     finally:
         connection.close()
 
@@ -204,7 +204,7 @@ def _seed_lock_fixture(
             "INSERT INTO admin_vehicle_mappings("
             "vin_prefix, vin, partsouq_vehicle_id, make_name, model_name, model_year, engine, "
             "trim_name, source_name"
-            ") VALUES (%s, %s, %s, %s, %s, 2020, 'Inline 4 / LOCK ENGINE', 'LOCK TRIM', "
+            ") VALUES (%s, %s, %s, %s, %s, 2020, 'LOCK ENGINE', 'LOCK TRIM', "
             "'lock-test')",
             (vin[:11], vin, vehicle_id, f"LOCK-{suffix}", f"MODEL-{suffix}"),
         )
@@ -263,7 +263,11 @@ def _cleanup_lock_fixture(connection: Connection[DictCursor], fixture: dict[str,
         cursor.execute(
             "DELETE FROM admin_part_translations WHERE id = %s", (fixture["translation_id"],)
         )
+        cursor.execute("DELETE FROM bounded_parts WHERE part_id = %s", (fixture["part_id"],))
         cursor.execute("DELETE FROM published_parts WHERE part_id = %s", (fixture["part_id"],))
+        cursor.execute(
+            "DELETE FROM published_parts_previous WHERE part_id = %s", (fixture["part_id"],)
+        )
         cursor.execute("DELETE FROM crawl_runs WHERE id = %s", (fixture["crawl_run_id"],))
         cursor.execute(
             "DELETE FROM scheduled_job_runs WHERE id = %s",
@@ -282,7 +286,17 @@ def test_each_entity_locks_real_source_rows_and_blocks_crawler_update() -> None:
         locker.begin()
         repository = AdminRepository(AdminDatabase(locker, QueryTrace()))
         for entity_type, source_id in entity_ids.items():
+            # 此 fixture 只有 raw full candidate。VIN fitment 僅能從已驗證的
+            # current bounded snapshot 推導，因此不應在站方正式 view 出現。
+            if entity_type == "vin_part_fitments":
+                continue
             assert repository._locked_base(ENTITY_SPECS[entity_type], source_id) is not None
+        assert (
+            repository._locked_base(
+                ENTITY_SPECS["vin_part_fitments"], entity_ids["vin_part_fitments"]
+            )
+            is None
+        )
         assert (
             repository._locked_base(
                 ENTITY_SPECS["taxonomy_nodes"], int(fixture["taxonomy_group_id"])
@@ -308,6 +322,184 @@ def test_each_entity_locks_real_source_rows_and_blocks_crawler_update() -> None:
         else:
             locker.rollback()
         locker.close()
+
+
+@pytest.mark.parametrize(
+    ("source_table", "locked_field"),
+    (
+        ("published_parts", "published_part_id"),
+        ("published_parts_previous", "previous_part_id"),
+        ("bounded_parts", "bounded_part_id"),
+    ),
+)
+def test_vin_part_fitment_locks_the_physical_snapshot_source(
+    source_table: str, locked_field: str
+) -> None:
+    locker = _connect()
+    writer = _connect()
+    fixture: dict[str, object] = {}
+    try:
+        entity_ids, fixture = _seed_lock_fixture(locker)
+        if source_table == "published_parts_previous":
+            with locker.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO published_parts_previous "
+                    "SELECT * FROM published_parts WHERE part_id = %s",
+                    (fixture["part_id"],),
+                )
+                cursor.execute(
+                    "DELETE FROM published_parts WHERE part_id = %s",
+                    (fixture["part_id"],),
+                )
+            locker.commit()
+        elif source_table == "bounded_parts":
+            with locker.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO bounded_parts("
+                    "part_id, crawl_run_id, vehicle_id, model_id, vehicle_vid, brand, model, "
+                    "vehicle_name, vehicle_code, prod_period, production_from, production_to, "
+                    "engine, trim_name, part_name, part_number, part_number_normalized, "
+                    "category_id, category_cid, category_main, category_group, group_id, "
+                    "group_code, group_uid, part_range, source_url, code, snapshot_at"
+                    ") SELECT p.part_id, p.crawl_run_id, p.vehicle_id, p.model_id, 'LOCK-VID', "
+                    "p.brand, p.model, p.vehicle_name, p.vehicle_code, p.prod_period, "
+                    "p.production_from, p.production_to, p.engine, p.trim_name, p.part_name, "
+                    "p.part_number, p.part_number_normalized, c.id, c.cid, p.category_main, "
+                    "'LOCK GROUP', g.id, p.group_code, g.uid, p.part_range, "
+                    "'https://example.test/lock', 'LOCK-CODE', p.snapshot_at "
+                    "FROM published_parts AS p "
+                    "JOIN groups_t AS g ON g.id = p.group_id "
+                    "JOIN categories AS c ON c.id = g.category_id "
+                    "WHERE p.part_id = %s",
+                    (fixture["part_id"],),
+                )
+                cursor.execute(
+                    "DELETE FROM published_parts WHERE part_id = %s",
+                    (fixture["part_id"],),
+                )
+            locker.commit()
+
+        source_id = entity_ids["vin_part_fitments"]
+        locker.begin()
+        repository = AdminRepository(AdminDatabase(locker, QueryTrace()))
+        lock_sql, lock_params = repository._source_lock_query(
+            ENTITY_SPECS["vin_part_fitments"], source_id
+        )
+        locked = repository.database.fetch_all(
+            "write.lock-source.vin_part_fitments", lock_sql, lock_params
+        )
+        assert len(locked) == 1
+        assert locked[0][locked_field] == fixture["part_id"]
+
+        with writer.cursor() as cursor:
+            cursor.execute("SET SESSION innodb_lock_wait_timeout = 1")
+        writer.begin()
+        with writer.cursor() as cursor:
+            with pytest.raises(pymysql.err.OperationalError) as captured:
+                cursor.execute(
+                    f"DELETE FROM {source_table} WHERE part_id = %s",
+                    (fixture["part_id"],),
+                )
+            assert captured.value.args[0] == 1205
+    finally:
+        writer.rollback()
+        writer.close()
+        if fixture:
+            _cleanup_lock_fixture(locker, fixture)
+        else:
+            locker.rollback()
+        locker.close()
+
+
+def test_vin_view_keeps_raw_candidate_mapping_stale_and_shows_decode_warnings() -> None:
+    connection = _connect()
+    fixture: dict[str, object] = {}
+    try:
+        _, fixture = _seed_lock_fixture(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT mapping_status, decode_status, model_name, "
+                "partsouq_vehicle_configuration_id "
+                "FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            mapped = cursor.fetchone()
+            assert mapped is not None
+            # `published_parts` 是 raw full candidate，不是正式 current catalog；
+            # 同一 mapping 不得因為 raw row 存在而被誤標為 confirmed。
+            assert mapped["mapping_status"] == "stale"
+            assert mapped["decode_status"] == "decoded"
+            assert mapped["partsouq_vehicle_configuration_id"] is not None
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_configuration = NULL, "
+                "displacement_l = NULL WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT mapping_status FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            optional_uncomparable_fields = cursor.fetchone()
+            assert optional_uncomparable_fields is not None
+            assert optional_uncomparable_fields["mapping_status"] == "stale"
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_configuration = 'Inline 4', "
+                "displacement_l = 2.0 WHERE vin = %s",
+                (fixture["vin"],),
+            )
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET model_name = CONCAT(model_name, '-STALE') "
+                "WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            cursor.execute(
+                "SELECT mapping_status, decode_status "
+                "FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            stale = cursor.fetchone()
+            assert stale is not None
+            assert stale["mapping_status"] == "stale"
+            assert stale["decode_status"] == "decoded"
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET model_name = %s, error_code = '8' WHERE vin = %s",
+                (mapped["model_name"], fixture["vin"]),
+            )
+            cursor.execute(
+                "SELECT mapping_status, decode_status "
+                "FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            warning = cursor.fetchone()
+            assert warning is not None
+            assert warning["mapping_status"] == "stale"
+            assert warning["decode_status"] == "decoded_with_warning"
+
+            cursor.execute(
+                "DELETE FROM admin_vehicle_mappings WHERE id = %s",
+                (fixture["mapping_id"],),
+            )
+            cursor.execute(
+                "SELECT mapping_status, decode_status, "
+                "partsouq_vehicle_configuration_id "
+                "FROM station_admin_vin_vehicle_mappings WHERE vin = %s",
+                (fixture["vin"],),
+            )
+            unmapped = cursor.fetchone()
+            assert unmapped is not None
+            assert unmapped["mapping_status"] == "unmapped"
+            assert unmapped["decode_status"] == "decoded_with_warning"
+            assert unmapped["partsouq_vehicle_configuration_id"] is None
+        connection.rollback()
+    finally:
+        if fixture:
+            _cleanup_lock_fixture(connection, fixture)
+        else:
+            connection.rollback()
+        connection.close()
 
 
 def test_quarantine_resolve_uses_occurrence_key_and_is_single_use() -> None:

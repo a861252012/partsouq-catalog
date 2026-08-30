@@ -5,6 +5,7 @@
    使用者決定：不完整資料不阻擋發布）。
 """
 
+from contextlib import contextmanager, nullcontext
 from unittest import mock
 
 import pytest
@@ -40,11 +41,16 @@ def _parts_html(rows: list[tuple[str, str, str]]) -> str:
         "</tr>"
         for part_number, name, code in rows
     )
-    return f'<input type="hidden" name="uid" value="10001"><table><tbody>{body}</tbody></table>'
+    return (
+        '<input type="hidden" name="uid" value="10001">'
+        '<input type="hidden" name="c" value="Toyota">'
+        f"<table><tbody>{body}</tbody></table>"
+    )
 
 
 @pytest.fixture
 def sample_crawler(monkeypatch):
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     monkeypatch.setitem(CRAWL, "limit_parts", 1000)
     monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=4)
@@ -243,11 +249,133 @@ def test_empty_table_receipt_refuses_page_without_expected_uid(sample_crawler) -
         "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th></tr></thead></table>"
     )
 
-    with pytest.raises(RuntimeError, match="does not contain expected"):
+    with pytest.raises(RuntimeError, match="does not identify expected"):
         sample_crawler.crawl_group("TOYOTA", 7, _group())
 
     sample_crawler.crawl.mark_group_fetched.assert_not_called()
     sample_crawler.parts.quarantine_parts.assert_not_called()
+
+
+def test_empty_table_receipt_refuses_uid_substring_match(sample_crawler) -> None:
+    """UID 必須完整相同；10001 不得接受實際 UID 100011。"""
+    sample_crawler._get.return_value = (
+        '<input type="hidden" name="uid" value="100011">'
+        "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th></tr></thead></table>"
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_canonical_uid_takes_precedence_over_hidden_input(sample_crawler) -> None:
+    """正式頁已有 canonical 時，不得用頁內其他同名欄位掩蓋錯誤落點。"""
+    sample_crawler._get.return_value = (
+        '<link rel="canonical" '
+        'href="https://partsouq.com/en/catalog/genuine/unit?uid=100011">'
+        '<input type="hidden" name="uid" value="10001">'
+        "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th></tr></thead></table>"
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_populated_page_refuses_wrong_unit_identity(sample_crawler) -> None:
+    """有可發布零件時也必須先驗 uid，不能只保護空表路徑。"""
+    sample_crawler._get.return_value = _parts_html([("P00001", "ENGINE BOLT", "11000")]).replace(
+        'value="10001"', 'value="100011"'
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    sample_crawler.parts.upsert_parts.assert_not_called()
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_all_nameless_page_refuses_wrong_unit_identity(sample_crawler) -> None:
+    """全為無名稱列時也不能先 quarantine 再把錯頁 receipt 成 done。"""
+    sample_crawler._get.return_value = _parts_html([("IMG10001", "", "B10")]).replace(
+        'value="10001"', 'value="100011"'
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    sample_crawler.parts.quarantine_parts.assert_not_called()
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_canonical_context_must_match_requested_group(sample_crawler) -> None:
+    """canonical 的 uid 相同仍不夠，請求中已有的車輛 context 也要一致。"""
+    group = _group()
+    group["url"] = "/en/catalog/genuine/unit?c=Toyota&vid=7&cid=1&uid=10001"
+    sample_crawler._get.return_value = (
+        '<link rel="canonical" href="https://partsouq.com/en/catalog/genuine/unit?'
+        'c=Nissan&amp;vid=7&amp;cid=1&amp;uid=10001">'
+        + _parts_html([("P00001", "ENGINE BOLT", "11000")])
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, group)
+
+    sample_crawler.parts.upsert_parts.assert_not_called()
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_canonical_origin_must_be_official_https(sample_crawler) -> None:
+    """canonical 的 uid 正確仍不能接受非正式 origin。"""
+    sample_crawler._get.return_value = (
+        '<link rel="canonical" '
+        'href="http://partsouq.com/en/catalog/genuine/unit?uid=10001">'
+        + _parts_html([("P00001", "ENGINE BOLT", "11000")])
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    sample_crawler.parts.upsert_parts.assert_not_called()
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_canonical_accepts_official_www_host(sample_crawler) -> None:
+    sample_crawler._get.return_value = (
+        '<link rel="canonical" '
+        'href="https://www.partsouq.com/en/catalog/genuine/unit?uid=10001">'
+        + _parts_html([("P00001", "ENGINE BOLT", "11000")])
+    )
+
+    truncated = sample_crawler.crawl_group("TOYOTA", 7, _group())
+
+    assert truncated is False
+    sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
+        41,
+        "2026-08-fixture",
+        status="done",
+        row_count=1,
+    )
+
+
+def test_hidden_identity_must_match_requested_context(sample_crawler) -> None:
+    """沒有 canonical 的舊頁也必須核對請求中既有的車輛 context。"""
+    group = _group()
+    group["url"] = "/en/catalog/genuine/unit?c=Toyota&vid=7&cid=1&uid=10001"
+    sample_crawler._get.return_value = (
+        '<input type="hidden" name="uid" value="10001">'
+        '<input type="hidden" name="c" value="Nissan">'
+        '<input type="hidden" name="vid" value="7">'
+        '<input type="hidden" name="cid" value="1">'
+        "<table><thead><tr><th>Number</th><th>Name</th><th>Code</th></tr></thead></table>"
+    )
+
+    with pytest.raises(RuntimeError, match="does not identify expected"):
+        sample_crawler.crawl_group("TOYOTA", 7, group)
+
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
 
 
 def test_genuine_empty_unit_page_still_receipts_done_zero(sample_crawler) -> None:
@@ -300,21 +428,109 @@ def test_recover_null_groups_receipts_null_group(sample_crawler) -> None:
     recovered = sample_crawler.recover_null_groups(limit=10)
 
     assert recovered == 1
-    sample_crawler.crawl.list_null_groups.assert_called_once_with(10)
+    sample_crawler.crawl.list_null_groups.assert_called_once_with(
+        10,
+        run_key="2026-08-fixture",
+        run_id=17,
+        after_id=0,
+    )
     sample_crawler.crawl.mark_group_fetched.assert_called_once_with(
         41, "2026-08-fixture", status="done", row_count=1
     )
 
 
-def test_recover_null_groups_survives_single_failure(sample_crawler) -> None:
-    """任一組重抓拋錯不應中斷整個 pass，成功組仍計入。"""
+def test_recover_null_groups_reports_partial_failure(sample_crawler) -> None:
+    """同批其他組仍會執行，但任一失敗都不能把整個 pass 標成成功。"""
     sample_crawler.crawl.list_null_groups.return_value = [
         _null_group_row("10001", "1101", id_=999),
         _null_group_row("10002", "1102", id_=998),
     ]
     sample_crawler.crawl_group = mock.MagicMock(side_effect=[RuntimeError("boom"), False])
 
+    with pytest.raises(RuntimeError, match="recovered=1/2, failed=1"):
+        sample_crawler.recover_null_groups(limit=10)
+
+    assert sample_crawler.crawl_group.call_count == 2
+
+
+def test_recover_null_groups_rejects_part_limit_truncation(sample_crawler) -> None:
+    sample_crawler.crawl.list_null_groups.return_value = [_null_group_row("10001", "1101", id_=999)]
+    sample_crawler.crawl_group = mock.MagicMock(return_value=True)
+
+    with pytest.raises(RuntimeError, match="recovered=0/1, failed=1"):
+        sample_crawler.recover_null_groups(limit=10)
+
+    sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+def test_standalone_recover_marks_partial_failure_as_error(sample_crawler) -> None:
+    sample_crawler.run_id = None
+    sample_crawler.crawl.start_run.return_value = 99
+    sample_crawler.crawl.list_null_groups.return_value = [
+        _null_group_row("10001", "1101", id_=999),
+        _null_group_row("10002", "1102", id_=998),
+    ]
+    sample_crawler.crawl_group = mock.MagicMock(side_effect=[False, RuntimeError("boom")])
+
+    with pytest.raises(RuntimeError, match="recovered=1/2, failed=1"):
+        sample_crawler.recover_null_groups(limit=10)
+
+    sample_crawler.crawl.list_null_groups.assert_called_once_with(
+        10,
+        run_key=None,
+        run_id=None,
+        after_id=0,
+    )
+    finish_args = sample_crawler.crawl.finish_run.call_args.args
+    assert finish_args[0] == 99
+    assert finish_args[1] == "error"
+    assert "recovered=1/2, failed=1" in finish_args[3]
+
+
+def test_standalone_recover_closes_marker_when_admission_release_fails(
+    monkeypatch, sample_crawler
+) -> None:
+    events: list[str] = []
+
+    @contextmanager
+    def admission(_connection):
+        yield
+        events.append("release")
+        raise RuntimeError("admission release failed")
+
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", admission)
+    sample_crawler.run_id = None
+    sample_crawler.crawl.start_run.return_value = 99
+    sample_crawler.db.commit.side_effect = lambda: events.append("commit")
+    sample_crawler.crawl.finish_run.side_effect = lambda *_args: events.append("finish-error")
+
+    with pytest.raises(RuntimeError, match="admission release failed"):
+        sample_crawler.recover_null_groups(limit=10)
+
+    assert events == ["commit", "release", "finish-error", "commit"]
+    sample_crawler.crawl.finish_run.assert_called_once_with(
+        99,
+        "error",
+        sample_crawler.counts,
+        "admission release failed",
+    )
+    sample_crawler.crawl.list_null_groups.assert_not_called()
+
+
+def test_recover_null_groups_drains_all_keyset_batches(sample_crawler) -> None:
+    first_batch = [
+        _null_group_row(str(10_000 + index), str(1_100 + index), id_=index)
+        for index in range(1, 11)
+    ]
+    second_batch = [_null_group_row("10011", "1111", id_=11)]
+    sample_crawler.crawl.list_null_groups.side_effect = [first_batch, second_batch]
+    sample_crawler.crawl_group = mock.MagicMock(return_value=False)
+
     recovered = sample_crawler.recover_null_groups(limit=10)
 
-    assert recovered == 1
-    assert sample_crawler.crawl_group.call_count == 2
+    assert recovered == 11
+    assert sample_crawler.crawl.list_null_groups.call_args_list == [
+        mock.call(10, run_key="2026-08-fixture", run_id=17, after_id=0),
+        mock.call(10, run_key="2026-08-fixture", run_id=17, after_id=10),
+    ]
+    assert sample_crawler.crawl_group.call_count == 11

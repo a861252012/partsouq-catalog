@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import plistlib
+import shlex
 import shutil
 import stat
 import subprocess
@@ -67,6 +68,9 @@ def _make_staged_runtime(
     tmp_path: Path,
     *,
     database: str = "partsouq_catalog",
+    scope_brand: str = "TOYOTA",
+    scope_model: str = "TACOMA",
+    year_window: str = "20",
 ) -> tuple[Path, Path, Path]:
     home = tmp_path / "home"
     release = home / "Library/Application Support/partsouq-catalog/releases" / "test-release"
@@ -82,7 +86,10 @@ def _make_staged_runtime(
         "PARTSOUQ_DB_PORT=3308\n"
         f"PARTSOUQ_DB_NAME={database}\n"
         "PARTSOUQ_DB_USER=partsouq\n"
-        "PARTSOUQ_DB_PASSWORD=db-secret\n",
+        "PARTSOUQ_DB_PASSWORD=db-secret\n"
+        f"PSQ_BOUNDED_BRAND={shlex.quote(scope_brand)}\n"
+        f"PSQ_BOUNDED_MODEL={shlex.quote(scope_model)}\n"
+        f"PSQ_VEHICLE_YEAR_WINDOW={shlex.quote(year_window)}\n",
         encoding="utf-8",
     )
     execution_log = tmp_path / "runtime-execution.log"
@@ -91,7 +98,11 @@ def _make_staged_runtime(
         "set -eu\n"
         '[[ "$PARTSOUQ_DB_NAME" = "partsouq_catalog" ]]\n'
         '[[ "$PSQ_BOUNDED_PARTS" = "10000" ]]\n'
+        f'[[ "$PSQ_BOUNDED_BRAND" = {scope_brand!r} ]]\n'
+        f'[[ "$PSQ_BOUNDED_MODEL" = {scope_model!r} ]]\n'
+        f'[[ "$PSQ_VEHICLE_YEAR_WINDOW" = {year_window!r} ]]\n'
         '[[ "$PSQ_LIMIT_PARTS" = "0" ]]\n'
+        '[[ "$PSQ_MIN_BRANDS" = "15" ]]\n'
         '[[ "$CLOAKBROWSER_AUTO_UPDATE" = "false" ]]\n'
         '[[ -z "${PARTSOUQ_ADMIN_TOKEN:-}" ]]\n'
         '[[ -z "${CLOAKBROWSER_LICENSE_KEY:-}" ]]\n'
@@ -149,7 +160,13 @@ def _make_staged_runtime(
     return home, project, execution_log
 
 
-def _make_installable_project(tmp_path: Path) -> Path:
+def _make_installable_project(
+    tmp_path: Path,
+    *,
+    scope_brand: str = "TOYOTA",
+    scope_model: str = "TACOMA",
+    year_window: str = "20",
+) -> Path:
     project = tmp_path / "source project"
     shutil.copytree(PROJECT_ROOT / "deploy", project / "deploy")
     for filename in ("README.md", "pyproject.toml", "uv.lock"):
@@ -184,6 +201,9 @@ def _make_installable_project(tmp_path: Path) -> Path:
         "PARTSOUQ_MYSQL_ROOT_PASSWORD=root-secret\n"
         "PARTSOUQ_ADMIN_TOKEN=admin-secret\n"
         "PARTSOUQ_STATION_ADMIN_SECRET_KEY=station-secret\n"
+        f"PSQ_BOUNDED_BRAND={shlex.quote(scope_brand)}\n"
+        f"PSQ_BOUNDED_MODEL={shlex.quote(scope_model)}\n"
+        f"PSQ_VEHICLE_YEAR_WINDOW={shlex.quote(year_window)}\n"
         "PSQ_WORKERS=4\n",
         encoding="utf-8",
     )
@@ -196,6 +216,9 @@ def _make_fake_uv(
     fail_sync: bool = False,
     scheduler_ready: bool = True,
     download_pro_artifact: bool = False,
+    scope_brand: str = "TOYOTA",
+    scope_model: str = "TACOMA",
+    year_window: str = "20",
 ) -> tuple[Path, Path, Path]:
     uv = tmp_path / "uv"
     uv_log = tmp_path / "uv.log"
@@ -261,6 +284,9 @@ def _make_fake_uv(
         "      print -r -- '#!/bin/zsh' > \"$TARGET\"\n"
         "      print -r -- 'set -eu' >> \"$TARGET\"\n"
         '      print -r -- \'[[ "$PARTSOUQ_DB_NAME" = "partsouq_catalog" ]]\' >> "$TARGET"\n'
+        f'      print -r -- \'[[ "$PSQ_BOUNDED_BRAND" = {scope_brand!r} ]]\' >> "$TARGET"\n'
+        f'      print -r -- \'[[ "$PSQ_BOUNDED_MODEL" = {scope_model!r} ]]\' >> "$TARGET"\n'
+        f'      print -r -- \'[[ "$PSQ_VEHICLE_YEAR_WINDOW" = {year_window!r} ]]\' >> "$TARGET"\n'
         '      print -r -- \'[[ "$CLOAKBROWSER_AUTO_UPDATE" = "false" ]]\' >> "$TARGET"\n'
         f"      print -r -- 'print -r -- ${{0:t}} >> {str(execution_log)!r}' >> \"$TARGET\"\n"
         '      if [[ "$NAME" = "partsouq-scheduler" ]]; then\n'
@@ -346,6 +372,9 @@ def test_compose_requires_explicit_scheduler_profile_and_checks_admin_health() -
 
     assert 'profiles: ["scheduler"]' in scheduler_anchor
     assert compose.count("<<: *scheduler-base") == 3
+    assert "PSQ_BOUNDED_BRAND: ${PSQ_BOUNDED_BRAND:-TOYOTA}" in scheduler_anchor
+    assert "PSQ_BOUNDED_MODEL: ${PSQ_BOUNDED_MODEL:-TACOMA}" in scheduler_anchor
+    assert "PSQ_VEHICLE_YEAR_WINDOW: ${PSQ_VEHICLE_YEAR_WINDOW:-20}" in scheduler_anchor
     assert "http://127.0.0.1:8000/api/health" in compose
     assert "PARTSOUQ_ADMIN_BIND_HOST: 0.0.0.0" in compose
     assert "http://127.0.0.1:8086/health" in compose
@@ -372,6 +401,11 @@ def test_macos_catalog_scheduler_stages_a_tcc_safe_locked_runtime() -> None:
     assert "export CLOAKBROWSER_AUTO_UPDATE=false" in launcher
     assert "export PSQ_LIMIT_PARTS=0" in launcher
     assert "export PSQ_BOUNDED_PARTS=10000" in launcher
+    assert '"PSQ_BOUNDED_BRAND=$SCOPE_BRAND"' in launcher
+    assert '"PSQ_BOUNDED_MODEL=$SCOPE_MODEL"' in launcher
+    assert '"PSQ_VEHICLE_YEAR_WINDOW=$SCOPE_YEAR_WINDOW"' in launcher
+    assert "formal catalog scheduler requires non-empty PSQ_BOUNDED_BRAND" in launcher
+    assert "formal catalog scheduler requires non-empty PSQ_BOUNDED_BRAND" in installer
     assert '[[ "${PARTSOUQ_DB_NAME:-}" != "partsouq_catalog" ]]' in launcher
     assert "READY_MARKER=" in launcher
     assert '"PARTSOUQ_APPLY_MIGRATIONS_ON_START=1"' in launcher
@@ -399,6 +433,12 @@ def test_macos_catalog_scheduler_stages_a_tcc_safe_locked_runtime() -> None:
     assert "8#$TARGET_MODE & 8#2" in installer
     assert "GROUP_WRITABLE_BY_CURRENT_USER" in installer
     assert "runtime symlink target has unsafe owner or writable mode" in installer
+    for scope_name in (
+        "PSQ_BOUNDED_BRAND",
+        "PSQ_BOUNDED_MODEL",
+        "PSQ_VEHICLE_YEAR_WINDOW",
+    ):
+        assert scope_name in installer
     symlink_preflight = installer.split("reject_existing_symlink_ancestors \\\n", 1)[1].split(
         "/bin/mkdir -p", 1
     )[0]
@@ -452,10 +492,192 @@ def test_macos_catalog_scheduler_rejects_non_production_database(tmp_path: Path)
 
 
 @MACOS_LAUNCH_AGENT_ONLY
+@pytest.mark.parametrize(
+    "missing_name",
+    ("PSQ_BOUNDED_BRAND", "PSQ_BOUNDED_MODEL", "PSQ_VEHICLE_YEAR_WINDOW"),
+)
+def test_macos_catalog_scheduler_rejects_missing_model_scope_before_child(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    home, project, execution_log = _make_staged_runtime(tmp_path)
+    release = project.parent
+    scheduler_config = release / "scheduler.env"
+    scheduler_config.write_text(
+        "".join(
+            line
+            for line in scheduler_config.read_text(encoding="utf-8").splitlines(keepends=True)
+            if not line.startswith(f"{missing_name}=")
+        ),
+        encoding="utf-8",
+    )
+    (release / "runtime.sha256").write_text(
+        "\n".join(_runtime_manifest_lines(release)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [project / "deploy/run-macos-catalog-scheduler.zsh"],
+        cwd=tmp_path,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ["PATH"],
+            "PARTSOUQ_LAUNCHD_JOB": "1",
+            "LAUNCHD_JOB": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "requires non-empty PSQ_BOUNDED_BRAND" in result.stderr
+    assert not execution_log.exists()
+
+
+@MACOS_LAUNCH_AGENT_ONLY
+@pytest.mark.parametrize(
+    ("scope_brand", "scope_model", "year_window"),
+    (
+        ("   ", "TACOMA", "20"),
+        ("TOYOTA", "   ", "20"),
+        ("TOYOTA", "TACOMA", "abc"),
+        ("TOYOTA", "TACOMA", "0"),
+        ("TOYOTA", "TACOMA", "-1"),
+    ),
+)
+def test_macos_catalog_scheduler_rejects_invalid_model_scope_before_child(
+    tmp_path: Path,
+    scope_brand: str,
+    scope_model: str,
+    year_window: str,
+) -> None:
+    home, project, execution_log = _make_staged_runtime(
+        tmp_path,
+        scope_brand=scope_brand,
+        scope_model=scope_model,
+        year_window=year_window,
+    )
+
+    result = subprocess.run(
+        [project / "deploy/run-macos-catalog-scheduler.zsh"],
+        cwd=tmp_path,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ["PATH"],
+            "PARTSOUQ_LAUNCHD_JOB": "1",
+            "LAUNCHD_JOB": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "requires non-empty PSQ_BOUNDED_BRAND" in result.stderr
+    assert not execution_log.exists()
+
+
+@MACOS_LAUNCH_AGENT_ONLY
+@pytest.mark.parametrize(
+    "missing_name",
+    ("PSQ_BOUNDED_BRAND", "PSQ_BOUNDED_MODEL", "PSQ_VEHICLE_YEAR_WINDOW"),
+)
+def test_macos_catalog_installer_rejects_missing_model_scope_before_staging(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    project = _make_installable_project(tmp_path)
+    env_path = project / ".env"
+    env_path.write_text(
+        "".join(
+            line
+            for line in env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            if not line.startswith(f"{missing_name}=")
+        ),
+        encoding="utf-8",
+    )
+    uv, uv_log, _execution_log = _make_fake_uv(tmp_path)
+    launchctl, launchctl_log, _launchctl_state = _make_fake_launchctl(tmp_path)
+
+    result = subprocess.run(
+        [project / "deploy/install-macos-catalog-scheduler.zsh", "--no-start"],
+        cwd=project,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": os.environ["PATH"],
+            "PARTSOUQ_LAUNCHCTL_BIN": str(launchctl),
+            "PARTSOUQ_RUNTIME_PYTHON": sys._base_executable,
+            "PARTSOUQ_UV_BIN": str(uv),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "requires non-empty PSQ_BOUNDED_BRAND" in result.stderr
+    assert not uv_log.exists()
+    assert not launchctl_log.exists()
+
+
+@MACOS_LAUNCH_AGENT_ONLY
+@pytest.mark.parametrize(
+    ("scope_brand", "scope_model", "year_window"),
+    (
+        ("   ", "TACOMA", "20"),
+        ("TOYOTA", "   ", "20"),
+        ("TOYOTA", "TACOMA", "abc"),
+        ("TOYOTA", "TACOMA", "0"),
+        ("TOYOTA", "TACOMA", "-1"),
+    ),
+)
+def test_macos_catalog_installer_rejects_invalid_model_scope_before_staging(
+    tmp_path: Path,
+    scope_brand: str,
+    scope_model: str,
+    year_window: str,
+) -> None:
+    project = _make_installable_project(
+        tmp_path,
+        scope_brand=scope_brand,
+        scope_model=scope_model,
+        year_window=year_window,
+    )
+    uv, uv_log, _execution_log = _make_fake_uv(tmp_path)
+    launchctl, launchctl_log, _launchctl_state = _make_fake_launchctl(tmp_path)
+
+    result = subprocess.run(
+        [project / "deploy/install-macos-catalog-scheduler.zsh", "--no-start"],
+        cwd=project,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": os.environ["PATH"],
+            "PARTSOUQ_LAUNCHCTL_BIN": str(launchctl),
+            "PARTSOUQ_RUNTIME_PYTHON": sys._base_executable,
+            "PARTSOUQ_UV_BIN": str(uv),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "requires non-empty PSQ_BOUNDED_BRAND" in result.stderr
+    assert not uv_log.exists()
+    assert not launchctl_log.exists()
+
+
+@MACOS_LAUNCH_AGENT_ONLY
 def test_macos_staged_runner_survives_source_removal_and_filters_environment(
     tmp_path: Path,
 ) -> None:
-    home, project, execution_log = _make_staged_runtime(tmp_path)
+    home, project, execution_log = _make_staged_runtime(
+        tmp_path,
+        scope_brand="HONDA",
+        scope_model="CIVIC",
+        year_window="15",
+    )
     environment = {
         "HOME": str(home),
         "PATH": os.environ["PATH"],
@@ -715,8 +937,18 @@ def test_macos_catalog_install_is_tcc_safe_repeatable_and_source_independent(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
-    project = _make_installable_project(tmp_path)
-    uv, uv_log, execution_log = _make_fake_uv(tmp_path)
+    project = _make_installable_project(
+        tmp_path,
+        scope_brand="HONDA",
+        scope_model="CIVIC",
+        year_window="15",
+    )
+    uv, uv_log, execution_log = _make_fake_uv(
+        tmp_path,
+        scope_brand="HONDA",
+        scope_model="CIVIC",
+        year_window="15",
+    )
     launchctl, launchctl_log, launchctl_state = _make_fake_launchctl(tmp_path)
     environment = {
         "HOME": str(home),
@@ -838,6 +1070,9 @@ def test_macos_catalog_install_is_tcc_safe_repeatable_and_source_independent(
     scheduler_config = (release / "scheduler.env").read_text(encoding="utf-8")
     assert "PARTSOUQ_DB_NAME=partsouq_catalog" in scheduler_config
     assert "PARTSOUQ_DB_PASSWORD=db\\ secret\\ with\\ spaces" in scheduler_config
+    assert "PSQ_BOUNDED_BRAND=HONDA" in scheduler_config
+    assert "PSQ_BOUNDED_MODEL=CIVIC" in scheduler_config
+    assert "PSQ_VEHICLE_YEAR_WINDOW=15" in scheduler_config
     for secret_name in (
         "PARTSOUQ_MYSQL_ROOT_PASSWORD",
         "PARTSOUQ_ADMIN_TOKEN",
@@ -2049,12 +2284,32 @@ def test_name_override_requires_audit_reference(source_reference: str | None) ->
 
 
 def test_override_source_name_cannot_bypass_audit_flow() -> None:
-    with pytest.raises(ValueError, match="只允許由人工確認流程設定"):
-        VinVehicleMappingInput(
-            vin="ZZZTEST00X0000001",
-            partsouq_vehicle_id=42,
-            source_name="manual-name-override",
-        )
+    for source_name in (
+        "manual-name-override",
+        "MANUAL-NAME-OVERRIDE",
+        "Manual-Name-Override",
+        "manual-sparse-override",
+        "MANUAL-SPARSE-OVERRIDE",
+        "Manual-Sparse-Override",
+    ):
+        with pytest.raises(ValueError, match="只允許由人工確認流程設定"):
+            VinVehicleMappingInput(
+                vin="ZZZTEST00X0000001",
+                partsouq_vehicle_id=42,
+                source_name=source_name,
+            )
+
+
+def test_name_override_source_is_canonicalized_after_audit_opt_in() -> None:
+    mapping = VinVehicleMappingInput(
+        vin="ZZZTEST00X0000001",
+        partsouq_vehicle_id=42,
+        source_name="MANUAL-NAME-OVERRIDE",
+        source_reference="人工覆核證據",
+        allow_name_override=True,
+    )
+
+    assert mapping.source_name == "manual-name-override"
 
 
 def test_vehicle_candidates_exclude_unmapped_legacy_snapshots(
@@ -2067,10 +2322,114 @@ def test_vehicle_candidates_exclude_unmapped_legacy_snapshots(
     )
 
     assert list_vin_vehicle_candidates("ZZZTEST00X0000001") == []
-    assert "p.vehicle_id IS NOT NULL" in queries[0]
-    assert "UPPER(p.engine)" in queries[0]
-    assert "UPPER(p.trim_name)" in queries[0]
-    assert "d.displacement_l IS NOT NULL" in queries[0]
+    assert "catalog_part.vehicle_id IS NOT NULL" in queries[0]
+    assert "UPPER(catalog_part.engine)" in queries[0]
+    assert "UPPER(catalog_part.trim_name)" in queries[0]
+    assert "vin_decode.displacement_l AS nhtsa_displacement_l" in queries[0]
+    assert "vin_decode.displacement_l IS NOT NULL" not in queries[0]
+    assert "vin_decode.engine_configuration" in queries[0]
+    assert "NULLIF(TRIM(vin_decode.engine_configuration)" not in queries[0]
+
+
+def test_vehicle_candidates_classify_distinct_strict_vehicle_ids_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    common = {
+        "partsouq_brand": "TOYOTA",
+        "partsouq_model": "TACOMA",
+        "vehicle_name": "TACOMA",
+        "catalog_dataset_scope": "bounded",
+        "catalog_crawl_run_id": 23,
+        "prod_period": "08.2015 -",
+        "production_from": "2015-08",
+        "production_to": None,
+        "engine": "2GR-FKS",
+        "trim_name": "SR5",
+        "nhtsa_engine_configuration": "V-Shaped",
+        "nhtsa_engine_model": "2GR-FKS",
+        "nhtsa_displacement_l": "3.500000000",
+        "nhtsa_trim_name": "SR5",
+        "candidate_strict_match": 1,
+        "candidate_sparse": 0,
+    }
+    monkeypatch.setattr(
+        "partsouq_admin.app._fetch_all",
+        lambda _query, _params: [
+            {**common, "partsouq_vehicle_id": 41, "vehicle_code": "GRN305L"},
+            {**common, "partsouq_vehicle_id": 42, "vehicle_code": "GRN310L"},
+        ],
+    )
+
+    candidates = list_vin_vehicle_candidates("ZZZTEST00X0000001")
+
+    assert {candidate["candidate_status"] for candidate in candidates} == {
+        "ambiguous_manual_review_required"
+    }
+    assert all(
+        candidate["candidate_reason"] == "multiple_normalized_make_model_year_engine_trim_matches"
+        for candidate in candidates
+    )
+
+
+def test_vehicle_candidates_keep_sparse_and_trim_aliases_for_manual_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "partsouq_admin.app._fetch_all",
+        lambda _query, _params: [
+            {
+                "partsouq_vehicle_id": 51,
+                "partsouq_brand": "TOYOTA",
+                "partsouq_model": "TACOMA",
+                "vehicle_name": "TACOMA",
+                "vehicle_code": "GRN305L",
+                "catalog_dataset_scope": "bounded",
+                "catalog_crawl_run_id": 23,
+                "prod_period": "08.2015 -",
+                "production_from": "2015-08",
+                "production_to": None,
+                "engine": "2GR-FKS",
+                "trim_name": "SR5 / SR5 PREMIUM",
+                "nhtsa_engine_configuration": "V-Shaped",
+                "nhtsa_engine_model": "2GR-FKS",
+                "nhtsa_displacement_l": "3.500000000",
+                "nhtsa_trim_name": "SR5",
+                "candidate_strict_match": 0,
+                "candidate_sparse": 0,
+            },
+            {
+                "partsouq_vehicle_id": 52,
+                "partsouq_brand": "TOYOTA",
+                "partsouq_model": "TACOMA",
+                "vehicle_name": "TACOMA",
+                "vehicle_code": "GRN325L",
+                "catalog_dataset_scope": "bounded",
+                "catalog_crawl_run_id": 23,
+                "prod_period": "08.2015 -",
+                "production_from": "2015-08",
+                "production_to": None,
+                "engine": None,
+                "trim_name": None,
+                "nhtsa_engine_configuration": None,
+                "nhtsa_engine_model": None,
+                "nhtsa_displacement_l": None,
+                "nhtsa_trim_name": None,
+                "candidate_strict_match": 0,
+                "candidate_sparse": 1,
+            },
+        ],
+    )
+
+    candidates = list_vin_vehicle_candidates("ZZZTEST00X0000001")
+
+    assert [candidate["candidate_status"] for candidate in candidates] == [
+        "manual_review_required",
+        "manual_review_required",
+    ]
+    assert [candidate["candidate_reason"] for candidate in candidates] == [
+        "normalized_make_model_year_engine_trim_manual_review",
+        "normalized_make_model_year_sparse_optional_fields",
+    ]
 
 
 def test_scheduler_runs_nhtsa_in_order(monkeypatch: pytest.MonkeyPatch) -> None:

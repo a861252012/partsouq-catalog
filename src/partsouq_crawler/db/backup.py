@@ -35,22 +35,28 @@ async def publish_snapshot(
     except FileExistsError as error:
         raise RuntimeError(f"snapshot publish lock already exists: {lock_path}") from error
 
-    database_fd, database_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-    )
-    manifest_fd, manifest_name = tempfile.mkstemp(
-        prefix=f".{manifest_path.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-    )
-    os.close(database_fd)
-    os.close(manifest_fd)
-    temporary_database = Path(database_name)
-    temporary_manifest = Path(manifest_name)
-
+    database_fd: int | None = None
+    manifest_fd: int | None = None
+    temporary_database: Path | None = None
+    temporary_manifest: Path | None = None
     try:
+        database_fd, database_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary_database = Path(database_name)
+        manifest_fd, manifest_name = tempfile.mkstemp(
+            prefix=f".{manifest_path.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary_manifest = Path(manifest_name)
+        os.close(database_fd)
+        database_fd = None
+        os.close(manifest_fd)
+        manifest_fd = None
+
         await backup_database(source, temporary_database)
         snapshot = await aiosqlite.connect(
             f"file:{temporary_database}?mode=ro",
@@ -115,10 +121,14 @@ async def publish_snapshot(
         )
         return manifest
     finally:
+        if database_fd is not None:
+            os.close(database_fd)
+        if manifest_fd is not None:
+            os.close(manifest_fd)
         await asyncio.to_thread(
             _remove_paths,
-            temporary_database,
-            temporary_manifest,
+            *((temporary_database,) if temporary_database is not None else ()),
+            *((temporary_manifest,) if temporary_manifest is not None else ()),
             lock_path,
         )
 

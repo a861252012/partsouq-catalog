@@ -245,6 +245,8 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
                 "previous_foreign_key_ready": 1,
                 "formal_view_ready": 1,
                 "formal_view_columns_ready": 1,
+                "desired_scope_columns_ready": 1,
+                "bounded_snapshot_immutable_ready": 1,
             }
 
     monkeypatch.setattr(admin_app, "_fetch_one", capture_one)
@@ -264,6 +266,7 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
         "published_parts",
         "published_parts_previous",
         "bounded_parts",
+        "catalog_desired_bounded_scope",
         "crawl_runs",
         "nhtsa_sync_runs",
         "nhtsa_source_artifacts",
@@ -287,20 +290,26 @@ def test_health_exercises_indexes_and_backoffice_schema(monkeypatch: pytest.Monk
     assert "idx_published_crawl_run" in provenance_sql
     assert "fk_published_crawl_run" in provenance_sql
     assert "fk_published_previous_crawl_run" in provenance_sql
-    assert "formal_current_parts" in provenance_sql
-    assert "formal_previous_parts" in provenance_sql
-    assert "formal_full_parts" in provenance_sql
-    assert "published_parts_previous" in provenance_sql
-    assert "qualified_full_runs" in provenance_sql
-    assert "full_scheduler_run" in provenance_sql
+    assert "formal_current_parts" not in provenance_sql
+    assert "formal_previous_parts" not in provenance_sql
+    assert "LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) = 0" in provenance_sql
+    assert "LOCATE('published_parts', LOWER(VIEW_DEFINITION)) = 0" in provenance_sql
+    assert "qualified_full_runs" not in provenance_sql
+    assert "full_scheduler_run" not in provenance_sql
     assert "bounded_parts" in provenance_sql
     assert "verified_bounded_evidence" in provenance_sql
     assert "verified_bounded_records" in provenance_sql
+    assert "evidence_record_sha256" in provenance_sql
     assert "partsouq_http_artifacts" in provenance_sql
     assert "partsouq_artifact_records" in provenance_sql
     assert "evidence_status" in provenance_sql
     assert "live_http" in provenance_sql
     assert "source_crawl_run_id" in provenance_sql
+    assert "catalog_desired_bounded_scope" in provenance_sql
+    assert "desired_scope" in provenance_sql
+    assert "scope_brand" in provenance_sql
+    assert "scope_model" in provenance_sql
+    assert "scope_vehicle_year_floor" in provenance_sql
     assert "provenance_count" not in provenance_sql
     assert "LIMIT 0" in readiness_sql
 
@@ -321,6 +330,8 @@ def test_health_fails_closed_when_published_provenance_schema_is_stale(
                 "previous_foreign_key_ready": 1,
                 "formal_view_ready": 0,
                 "formal_view_columns_ready": 1,
+                "desired_scope_columns_ready": 1,
+                "bounded_snapshot_immutable_ready": 1,
             }
         return {}
 
@@ -330,7 +341,7 @@ def test_health_fails_closed_when_published_provenance_schema_is_stale(
         admin_app.health()
 
     assert exc_info.value.status_code == 503
-    assert "migration 019" in exc_info.value.detail
+    assert "migration 033" in exc_info.value.detail
 
 
 def test_database_summary_includes_quarantine_counts(

@@ -277,6 +277,9 @@ CREATE TABLE IF NOT EXISTS bounded_parts (
   note           TEXT NULL,
   quantity       VARCHAR(16) NULL,
   code           VARCHAR(64) NOT NULL,
+  -- 發布時寫入已接受 live evidence 的內容雜湊；之後 raw parts 的
+  -- seen_run_id 或內容更新不會改寫這份正式 snapshot 的證據綁定。
+  evidence_record_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
   snapshot_at    DATETIME NOT NULL,
   KEY idx_bounded_run (crawl_run_id),
   KEY idx_bounded_part_number (part_number),
@@ -321,6 +324,36 @@ CREATE TABLE IF NOT EXISTS bounded_parts (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 已發布的 bounded snapshot 是 append-and-replace 資料集。發布流程會
+-- DELETE + INSERT 整批替換；禁止 UPDATE，避免證據 digest 仍存在時，投影欄位
+-- 被直接改寫而繼續被正式 view 讀取。
+DROP TRIGGER IF EXISTS prevent_bounded_parts_update;
+CREATE TRIGGER prevent_bounded_parts_update
+BEFORE UPDATE ON bounded_parts
+FOR EACH ROW
+  SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'bounded_parts snapshot is immutable; publish a replacement snapshot';
+
+-- 正式 bounded catalog 的部署目標。這是 singleton；空表代表尚未啟用
+-- 任何 bounded snapshot。品牌／型號只接受 trim 後的小寫 canonical 值。
+CREATE TABLE IF NOT EXISTS catalog_desired_bounded_scope (
+  singleton_id TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  scope_brand VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  scope_model VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  scope_vehicle_year_floor SMALLINT UNSIGNED NOT NULL,
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+    ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (singleton_id),
+  CONSTRAINT chk_catalog_desired_scope_singleton CHECK (singleton_id = 1),
+  CONSTRAINT chk_catalog_desired_scope_canonical CHECK (
+    NULLIF(TRIM(scope_brand), '') IS NOT NULL
+    AND NULLIF(TRIM(scope_model), '') IS NOT NULL
+    AND CAST(scope_brand AS BINARY) = CAST(LOWER(TRIM(scope_brand)) AS BINARY)
+    AND CAST(scope_model AS BINARY) = CAST(LOWER(TRIM(scope_model)) AS BINARY)
+    AND scope_vehicle_year_floor BETWEEN 1886 AND 2100
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- 爬蟲狀態 (斷點續爬)
 CREATE TABLE IF NOT EXISTS crawl_state (
   id           INT AUTO_INCREMENT PRIMARY KEY,
@@ -362,6 +395,9 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
   status       VARCHAR(16) NULL,             -- running / success / error
   dataset_kind VARCHAR(16) NOT NULL DEFAULT 'full', -- full / sample / bounded
   target_parts INT NULL,
+  scope_brand VARCHAR(64) NULL,
+  scope_model VARCHAR(128) NULL,
+  scope_vehicle_year_floor SMALLINT UNSIGNED NULL,
   scheduled_job_run_id BIGINT UNSIGNED NULL,
   brands_ok    INT DEFAULT 0,
   models_ok    INT DEFAULT 0,
@@ -385,6 +421,18 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
   CONSTRAINT fk_crawl_run_schedule FOREIGN KEY (scheduled_job_run_id)
     REFERENCES scheduled_job_runs(id),
   CONSTRAINT chk_crawl_run_target CHECK (target_parts IS NULL OR target_parts > 0),
+  CONSTRAINT chk_crawl_run_model_scope CHECK (
+    (
+      scope_brand IS NULL
+      AND scope_model IS NULL
+      AND scope_vehicle_year_floor IS NULL
+    ) OR (
+      NULLIF(TRIM(scope_brand), '') IS NOT NULL
+      AND NULLIF(TRIM(scope_model), '') IS NOT NULL
+      AND scope_vehicle_year_floor IS NOT NULL
+      AND scope_vehicle_year_floor BETWEEN 1886 AND 2100
+    )
+  ),
   CONSTRAINT chk_crawl_run_evidence_status CHECK (
     BINARY evidence_status = BINARY 'missing'
     OR BINARY evidence_status = BINARY 'collecting'
@@ -648,16 +696,3 @@ CREATE TABLE IF NOT EXISTS partsouq_artifact_records (
     OR (accepted = 0 AND part_id IS NULL)
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Catalog-only compatibility view。整合 admin schema 後會被重建為
--- v_current_catalog_parts 的欄位投影，並套用 scheduler provenance gate。
-CREATE OR REPLACE VIEW v_parts AS
-SELECT
-  part_id, vehicle_id, model_id, vehicle_vid,
-  brand, model, vehicle_name, vehicle_code, prod_period,
-  production_from, production_to, engine, trim_name,
-  part_name, part_number,
-  category_id, category_cid, category_main, category_group,
-  group_id, group_code, group_uid,
-  part_range, part_from, part_to, source_url, note, quantity, code
-FROM published_parts;

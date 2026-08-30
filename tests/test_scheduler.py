@@ -4,7 +4,7 @@ import errno
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -28,12 +28,26 @@ class FakeStopEvent:
 
 @pytest.fixture(autouse=True)
 def isolate_scheduler_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSQ_BOUNDED_BRAND", "TOYOTA")
+    monkeypatch.setenv("PSQ_BOUNDED_MODEL", "TACOMA")
+    monkeypatch.setenv("PSQ_VEHICLE_YEAR_WINDOW", "20")
     monkeypatch.setattr(scheduler, "acquire_catalog_writer_admission", lambda _connection: "test")
     monkeypatch.setattr(
         scheduler,
         "release_catalog_writer_admission",
         lambda _connection, _lock_name: None,
     )
+    monkeypatch.setattr(
+        scheduler,
+        "_sync_catalog_desired_bounded_scope",
+        lambda: ("toyota", "tacoma", 2006),
+    )
+
+
+@pytest.fixture
+def catalog_daemon_without_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """讓純退避測試不連線資料庫；recovery 行為由專屬測試覆蓋。"""
+    monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", lambda _job: False)
 
 
 def test_record_start_persists_trigger_mode(monkeypatch) -> None:
@@ -56,6 +70,30 @@ def test_record_start_persists_trigger_mode(monkeypatch) -> None:
         assert cursor.execute.call_args.args[1] == (None, "catalog", "daemon")
     finally:
         del scheduler._JOB_CONTEXT.trigger_mode
+
+
+def test_record_start_preserves_admission_release_error_after_connection_closed(
+    monkeypatch,
+) -> None:
+    cursor = mock.MagicMock(lastrowid=77)
+    cursor.__enter__.return_value = cursor
+    connection = mock.MagicMock()
+    connection.open = True
+    connection.cursor.return_value = cursor
+
+    @contextmanager
+    def failing_admission(_connection):
+        yield
+        connection.open = False
+        raise RuntimeError("admission release failed")
+
+    monkeypatch.setattr(scheduler, "_connect", lambda: connection)
+    monkeypatch.setattr(scheduler, "catalog_writer_admission", failing_admission)
+
+    with pytest.raises(RuntimeError, match="admission release failed"):
+        scheduler._record_start("catalog")
+
+    connection.close.assert_not_called()
 
 
 def test_schema_migration_defers_scheduler_before_child_spawn(monkeypatch) -> None:
@@ -573,6 +611,10 @@ def test_run_allows_kill_timer_to_finish_owned_process_group(monkeypatch) -> Non
     assert stdout.closed
 
 
+def test_child_kill_timer_exceeds_owned_browser_cleanup_budget() -> None:
+    assert scheduler.OWNED_BROWSER_CLEANUP_BUDGET_SECONDS < scheduler.CHILD_TERMINATE_GRACE_SECONDS
+
+
 def test_run_does_not_wait_for_escaped_descendant_holding_stdout(tmp_path, monkeypatch) -> None:
     pid_path = tmp_path / "escaped-child.pid"
     finished: list[tuple[int, int, str]] = []
@@ -1013,6 +1055,9 @@ def test_catalog_is_not_delayed_without_exact_bounded_success(monkeypatch) -> No
         "crawl_status": "bounded_success",
         "target_parts": 10_000,
         "parts_ok": 10_000,
+        "scope_brand": "TOYOTA",
+        "scope_model": "TACOMA",
+        "scope_vehicle_year_floor": scheduler.date.today().year - 20,
         "snapshot_rows": 9_999,
         "evidence_status": "verified",
         "evidence_manifest_sha256": "a" * 64,
@@ -1037,6 +1082,92 @@ def test_catalog_is_not_delayed_without_exact_bounded_success(monkeypatch) -> No
     evidence_audit.return_value = False
     assert scheduler._seconds_until_next_run("catalog", 100) == 0
     assert "jobs.trigger_mode = 'daemon'" in cursor.execute.call_args.args[0]
+
+
+def test_catalog_interval_requires_the_same_model_scope_and_frozen_year_floor(
+    monkeypatch,
+) -> None:
+    floor = scheduler.date.today().year - 20
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = {
+        "job_name": "catalog",
+        "status": "completed",
+        "age_seconds": 10,
+        "crawl_run_id": 17,
+        "dataset_kind": "bounded",
+        "crawl_status": "bounded_success",
+        "target_parts": 10_000,
+        "parts_ok": 10_000,
+        "scope_brand": "TOYOTA",
+        "scope_model": "TACOMA",
+        "scope_vehicle_year_floor": floor,
+        "snapshot_rows": 10_000,
+        "evidence_status": "verified",
+        "evidence_manifest_sha256": "a" * 64,
+        "evidence_dataset_sha256": "b" * 64,
+        "evidence_artifact_count": 250,
+        "evidence_record_count": 10_000,
+        "evidence_verified_at": object(),
+    }
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_dict_connect", lambda: connection)
+    monkeypatch.setattr(scheduler, "_audit_catalog_evidence", lambda *_args: True)
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    monkeypatch.setenv("PSQ_BOUNDED_BRAND", "TOYOTA")
+    monkeypatch.setenv("PSQ_BOUNDED_MODEL", "TACOMA")
+    monkeypatch.setenv("PSQ_VEHICLE_YEAR_WINDOW", "20")
+
+    assert scheduler._seconds_until_next_run("catalog", 100) == 90
+    query = cursor.execute.call_args.args[0]
+    assert "runs.scope_brand" in query
+    assert "runs.scope_model" in query
+    assert "runs.scope_vehicle_year_floor" in query
+
+    cursor.fetchone.return_value["scope_vehicle_year_floor"] = floor - 1
+    assert scheduler._seconds_until_next_run("catalog", 100) == 0
+
+    cursor.fetchone.return_value["scope_vehicle_year_floor"] = floor
+    cursor.fetchone.return_value["scope_brand"] = "LEXUS"
+    assert scheduler._seconds_until_next_run("catalog", 100) == 0
+
+    cursor.fetchone.return_value["scope_brand"] = "TOYOTA"
+    cursor.fetchone.return_value["scope_model"] = "CAMRY"
+    assert scheduler._seconds_until_next_run("catalog", 100) == 0
+
+
+def test_catalog_closed_under_target_restart_keeps_full_interval_cooldown(monkeypatch) -> None:
+    floor = scheduler.date.today().year - 20
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = {
+        "job_name": "catalog",
+        "status": "failed",
+        "scheduler_exit_code": 4,
+        "age_seconds": 10,
+        "dataset_kind": "bounded",
+        "crawl_status": "error",
+        "target_parts": 10_000,
+        "parts_ok": 8_000,
+        "scope_brand": "TOYOTA",
+        "scope_model": "TACOMA",
+        "scope_vehicle_year_floor": floor,
+        "evidence_status": "rejected",
+        "snapshot_rows": 0,
+    }
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler, "_dict_connect", lambda: connection)
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    monkeypatch.setenv("PSQ_BOUNDED_BRAND", "Toyota")
+    monkeypatch.setenv("PSQ_BOUNDED_MODEL", "Tacoma")
+    monkeypatch.setenv("PSQ_VEHICLE_YEAR_WINDOW", "20")
+
+    assert scheduler._seconds_until_next_run("catalog", 100) == 90
+
+    cursor.fetchone.return_value["scope_model"] = "CAMRY"
+    assert scheduler._seconds_until_next_run("catalog", 100) == 0
 
 
 def test_catalog_sample_never_satisfies_daemon_cadence(monkeypatch) -> None:
@@ -1088,6 +1219,7 @@ def test_catalog_crash_after_publish_is_reconciled_without_recrawl(monkeypatch) 
     candidate_call = cursor.execute.call_args_list[0]
     candidate_query = candidate_call.args[0]
     assert "jobs.trigger_mode = 'daemon'" in candidate_query
+    assert "jobs.status = 'running'" in candidate_query
     assert "jobs.status = 'failed'" in candidate_query
     assert "jobs.exit_code <> 0" in candidate_query
     assert "runs.status = 'bounded_success'" in candidate_query
@@ -1108,6 +1240,7 @@ def test_catalog_crash_after_publish_is_reconciled_without_recrawl(monkeypatch) 
         for call in cursor.execute.call_args_list
         if call.args[0].startswith("UPDATE scheduled_job_runs AS jobs")
     )
+    assert "SET jobs.status = 'completed'" in reconciliation_call.args[0]
     assert "jobs.finished_at = runs.finished_at" in reconciliation_call.args[0]
     assert "jobs.status = 'failed'" in reconciliation_call.args[0]
     assert "jobs.exit_code <> 0" in reconciliation_call.args[0]
@@ -1473,7 +1606,9 @@ def test_nhtsa_progress_marker_alone_cannot_reconcile_parent(monkeypatch) -> Non
     assert all("output_text LIKE" not in statement for statement in statements)
 
 
-def test_daemon_retries_with_bounded_exponential_backoff(monkeypatch) -> None:
+def test_daemon_retries_with_bounded_exponential_backoff(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1511,7 +1646,9 @@ def test_daemon_retries_with_bounded_exponential_backoff(monkeypatch) -> None:
     daemon_lock.close.assert_called_once_with()
 
 
-def test_daemon_writes_ready_marker_only_after_lock_is_acquired(tmp_path, monkeypatch) -> None:
+def test_daemon_writes_ready_marker_only_after_lock_is_acquired(
+    tmp_path, monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     stop_event.stopped = True
     daemon_lock = mock.MagicMock()
@@ -1602,7 +1739,9 @@ def test_daemon_does_not_write_ready_marker_without_lock(tmp_path, monkeypatch) 
     assert not marker.exists()
 
 
-def test_daemon_stops_retrying_after_max_consecutive_failures(monkeypatch) -> None:
+def test_daemon_stops_retrying_after_max_consecutive_failures(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1647,7 +1786,9 @@ def test_daemon_stops_retrying_after_max_consecutive_failures(monkeypatch) -> No
     assert schedule_checks == scheduler.MAX_CONSECUTIVE_FAILURES + 1
 
 
-def test_daemon_non_site_failures_do_not_trip_failure_cap(monkeypatch, capsys) -> None:
+def test_daemon_non_site_failures_do_not_trip_failure_cap(
+    monkeypatch, capsys, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1685,7 +1826,9 @@ def test_daemon_non_site_failures_do_not_trip_failure_cap(monkeypatch, capsys) -
     assert "排程連續失敗" not in capsys.readouterr().err
 
 
-def test_catalog_sample_exit_waits_without_immediate_retry(monkeypatch) -> None:
+def test_catalog_sample_exit_waits_without_immediate_retry(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1704,6 +1847,34 @@ def test_catalog_sample_exit_waits_without_immediate_retry(monkeypatch) -> None:
 
     monkeypatch.setattr(scheduler, "_seconds_until_next_run", due_now)
     dispatch = mock.MagicMock(return_value=3)
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+
+    assert scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event) == 0
+    assert stop_event.waits == [0.0, 60.0]
+    dispatch.assert_called_once_with("catalog", "all")
+
+
+def test_catalog_closed_under_target_waits_full_interval_before_new_run(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
+    stop_event = FakeStopEvent()
+    daemon_lock = mock.MagicMock()
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_daemon_lock",
+        lambda _job, _stop_event: daemon_lock,
+    )
+    schedule_checks = 0
+
+    def due_now(_job: str, _interval: int) -> float:
+        nonlocal schedule_checks
+        schedule_checks += 1
+        if schedule_checks == 2:
+            stop_event.stopped = True
+        return 0.0
+
+    monkeypatch.setattr(scheduler, "_seconds_until_next_run", due_now)
+    dispatch = mock.MagicMock(return_value=4)
     monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
 
     assert scheduler.run_daemon("catalog", "all", 60, 10, 100, stop_event=stop_event) == 0
@@ -1763,7 +1934,9 @@ def test_dispatch_forwards_parent_to_nhtsa_child_run(monkeypatch) -> None:
     assert captured["parent_scheduled_job_run_id"] == 501
 
 
-def test_successful_daemon_waits_full_interval_before_next_cycle(monkeypatch) -> None:
+def test_successful_daemon_waits_full_interval_before_next_cycle(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1887,7 +2060,9 @@ def test_interrupted_queue_rows_are_recovered_before_read(monkeypatch) -> None:
     assert events == ["recovered", "read"]
 
 
-def test_database_failure_uses_backoff_instead_of_tight_loop(monkeypatch) -> None:
+def test_database_failure_uses_backoff_instead_of_tight_loop(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1924,7 +2099,9 @@ def test_database_failure_uses_backoff_instead_of_tight_loop(monkeypatch) -> Non
     dispatch.assert_not_called()
 
 
-def test_completion_check_failure_requeries_without_duplicate_work(monkeypatch) -> None:
+def test_completion_check_failure_requeries_without_duplicate_work(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -1963,7 +2140,9 @@ def test_completion_check_failure_requeries_without_duplicate_work(monkeypatch) 
     dispatch.assert_called_once_with("catalog", "all")
 
 
-def test_lock_busy_rechecks_cadence_before_starting_work(monkeypatch) -> None:
+def test_lock_busy_rechecks_cadence_before_starting_work(
+    monkeypatch, catalog_daemon_without_recovery
+) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
     monkeypatch.setattr(
@@ -2002,6 +2181,7 @@ def test_lock_busy_rechecks_cadence_before_starting_work(monkeypatch) -> None:
 
 def test_ambiguous_finish_failure_rechecks_cadence_before_retrying_work(
     monkeypatch,
+    catalog_daemon_without_recovery,
 ) -> None:
     stop_event = FakeStopEvent()
     daemon_lock = mock.MagicMock()
@@ -2473,6 +2653,8 @@ def test_private_rotating_handler_replaces_symlinked_backup_without_touching_tar
     ),
 )
 def test_daemon_rejects_non_positive_cli_seconds(option, value, monkeypatch) -> None:
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "0")
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
     monkeypatch.setattr(
         scheduler.sys,
         "argv",
@@ -2480,6 +2662,85 @@ def test_daemon_rejects_non_positive_cli_seconds(option, value, monkeypatch) -> 
     )
 
     assert scheduler.main() == 2
+
+
+@pytest.mark.parametrize(
+    ("sample_limit", "bounded_target"),
+    (("1", "0"), ("0", "0"), ("0", "9999"), ("invalid", "10000")),
+)
+def test_catalog_scheduler_rejects_non_formal_scope_before_dispatch(
+    sample_limit: str,
+    bounded_target: str,
+    monkeypatch,
+    capsys,
+) -> None:
+    dispatch = mock.MagicMock()
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", sample_limit)
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", bounded_target)
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+    monkeypatch.setattr(
+        scheduler.sys,
+        "argv",
+        ["partsouq-scheduler", "--job", "catalog", "--daemon"],
+    )
+
+    assert scheduler.main() == 2
+    dispatch.assert_not_called()
+    assert "catalog 排程" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("brand", "model", "year_window"),
+    (
+        ("", "TACOMA", "20"),
+        ("   ", "TACOMA", "20"),
+        ("TOYOTA", "", "20"),
+        ("TOYOTA", "   ", "20"),
+        ("TOYOTA", "TACOMA", "0"),
+        ("TOYOTA", "TACOMA", "invalid"),
+    ),
+)
+def test_catalog_scheduler_requires_complete_model_scope_before_dispatch(
+    brand: str,
+    model: str,
+    year_window: str,
+    monkeypatch,
+    capsys,
+) -> None:
+    dispatch = mock.MagicMock()
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "0")
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    monkeypatch.setenv("PSQ_BOUNDED_BRAND", brand)
+    monkeypatch.setenv("PSQ_BOUNDED_MODEL", model)
+    monkeypatch.setenv("PSQ_VEHICLE_YEAR_WINDOW", year_window)
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+    monkeypatch.setattr(
+        scheduler.sys,
+        "argv",
+        ["partsouq-scheduler", "--job", "catalog", "--daemon"],
+    )
+
+    assert scheduler.main() == 2
+    dispatch.assert_not_called()
+    assert "model scope" in capsys.readouterr().err
+
+
+def test_catalog_scheduler_rejects_manual_entry_before_dispatch(monkeypatch, capsys) -> None:
+    dispatch = mock.MagicMock()
+    daemon = mock.MagicMock()
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "0")
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
+    monkeypatch.setenv("PSQ_BOUNDED_BRAND", "TOYOTA")
+    monkeypatch.setenv("PSQ_BOUNDED_MODEL", "TACOMA")
+    monkeypatch.setenv("PSQ_VEHICLE_YEAR_WINDOW", "20")
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+    monkeypatch.setattr(scheduler, "run_daemon", daemon)
+    monkeypatch.setattr(scheduler.sys, "argv", ["partsouq-scheduler", "--job", "catalog"])
+
+    assert scheduler.main() == 2
+    dispatch.assert_not_called()
+    daemon.assert_not_called()
+    assert "--daemon" in capsys.readouterr().err
 
 
 def test_catalog_auto_migration_runs_under_daemon_and_job_locks_before_ready(
@@ -2501,6 +2762,8 @@ def test_catalog_auto_migration_runs_under_daemon_and_job_locks_before_ready(
     try_lock = mock.MagicMock(return_value=job_lock)
     monkeypatch.setattr(scheduler, "_try_lock", try_lock)
     monkeypatch.setattr(scheduler, "CatalogMigrationRunner", mock.MagicMock(return_value=runner))
+    sync_scope = mock.MagicMock(return_value=("toyota", "tacoma", 2006))
+    monkeypatch.setattr(scheduler, "_sync_catalog_desired_bounded_scope", sync_scope)
     monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", recover)
     monkeypatch.setattr(scheduler, "_write_daemon_ready_marker", ready)
 
@@ -2511,6 +2774,7 @@ def test_catalog_auto_migration_runs_under_daemon_and_job_locks_before_ready(
         recover_stale_nhtsa_daemon_seconds=scheduler.RECOVERY_MIN_AGE_SECONDS,
     )
     runner.check.assert_called_once_with()
+    sync_scope.assert_called_once_with()
     recover.assert_called_once_with("catalog")
     ready.assert_called_once_with()
     job_lock.close.assert_called_once_with()

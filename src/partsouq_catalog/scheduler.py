@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -27,6 +27,7 @@ from .admission import (
     catalog_writer_admission,
     release_catalog_writer_admission,
 )
+from .cloak import OWNED_BROWSER_CLEANUP_BUDGET_SECONDS
 from .config import BASE_DIR, DB_CONFIG, LOG_DIR
 from .migrations import (
     STALE_SCHEDULER_EXIT_CODE,
@@ -37,7 +38,11 @@ from .state_files import ensure_private_state_directory, open_private_state_file
 
 MAX_OUTPUT_CHARS = 60_000
 OUTPUT_CHUNK_CHARS = 8_192
-CHILD_TERMINATE_GRACE_SECONDS = 5
+# catalog child 收到 SIGINT 後會先回收
+# detached Chromium，再等待 worker pool 收尾；scheduler 的 KILL timer
+# 必須涵蓋這段明確的清理預算，而不是在同一個 5 秒邊界提前截斷。
+# 多留 1 秒，確保 KILL timer 嚴格晚於 browser 回收。
+CHILD_TERMINATE_GRACE_SECONDS = OWNED_BROWSER_CLEANUP_BUDGET_SECONDS + 1
 CHILD_STALL_TIMEOUT_SECONDS = float(os.getenv("SCHEDULER_CHILD_STALL_TIMEOUT_SECONDS", "600"))
 CHILD_PIPE_DRAIN_TIMEOUT_SECONDS = float(
     os.getenv("SCHEDULER_CHILD_PIPE_DRAIN_TIMEOUT_SECONDS", "5")
@@ -71,6 +76,62 @@ _JOB_CONTEXT = threading.local()
 
 class ActiveDaemonRun(RuntimeError):
     """The database still contains a recent daemon marker for this family."""
+
+
+def _catalog_bounded_scope() -> tuple[str, str, int]:
+    """回傳本次排程的 model scope 與依執行日凍結的年份下限。"""
+
+    brand = os.getenv("PSQ_BOUNDED_BRAND", "").strip().casefold()
+    model = os.getenv("PSQ_BOUNDED_MODEL", "").strip().casefold()
+    try:
+        year_window = int(os.getenv("PSQ_VEHICLE_YEAR_WINDOW", "0"))
+    except ValueError as exc:
+        raise ValueError("PSQ_VEHICLE_YEAR_WINDOW 必須是整數") from exc
+    if not brand or not model:
+        raise ValueError("正式 catalog 排程需要非空白 PSQ_BOUNDED_BRAND 與 PSQ_BOUNDED_MODEL")
+    if year_window <= 0:
+        raise ValueError("正式 catalog 排程需要正整數 PSQ_VEHICLE_YEAR_WINDOW")
+    year_floor = date.today().year - year_window
+    if not 1886 <= year_floor <= 2100:
+        raise ValueError("model scope 的實際年份下限超出 1886–2100")
+    return brand, model, year_floor
+
+
+def _sync_catalog_desired_bounded_scope() -> tuple[str, str, int]:
+    """以單一交易啟用本 daemon 的 canonical bounded scope。"""
+
+    scope_brand, scope_model, scope_vehicle_year_floor = _catalog_bounded_scope()
+    connection = _connect()
+    try:
+        with catalog_writer_admission(connection):
+            connection.begin()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO catalog_desired_bounded_scope "
+                        "(singleton_id,scope_brand,scope_model,"
+                        "scope_vehicle_year_floor,updated_at) "
+                        "VALUES (1,%s,%s,%s,UTC_TIMESTAMP(6)) AS new "
+                        "ON DUPLICATE KEY UPDATE updated_at=IF("
+                        "CAST(catalog_desired_bounded_scope.scope_brand AS BINARY) "
+                        "<> CAST(new.scope_brand AS BINARY) "
+                        "OR CAST(catalog_desired_bounded_scope.scope_model AS BINARY) "
+                        "<> CAST(new.scope_model AS BINARY) "
+                        "OR catalog_desired_bounded_scope.scope_vehicle_year_floor "
+                        "<> new.scope_vehicle_year_floor,UTC_TIMESTAMP(6),"
+                        "catalog_desired_bounded_scope.updated_at),scope_brand=new.scope_brand,"
+                        "scope_model=new.scope_model,"
+                        "scope_vehicle_year_floor=new.scope_vehicle_year_floor",
+                        (scope_brand, scope_model, scope_vehicle_year_floor),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+    finally:
+        if connection.open:
+            connection.close()
+    return scope_brand, scope_model, scope_vehicle_year_floor
 
 
 def _connect() -> pymysql.connections.Connection[pymysql.cursors.DictCursor]:
@@ -144,7 +205,8 @@ def _record_start(job_name: str, parent_scheduled_job_run_id: int | None = None)
             )
             return int(cursor.lastrowid)
     finally:
-        connection.close()
+        if connection.open:
+            connection.close()
 
 
 def _record_finish(
@@ -295,7 +357,8 @@ def _claim_request(request_id: int) -> bool:
             )
             return bool(cursor.rowcount == 1)
     finally:
-        connection.close()
+        if connection.open:
+            connection.close()
 
 
 def _finish_request(
@@ -388,7 +451,8 @@ def _requeue_interrupted_requests() -> None:
                 "WHERE status = 'running'"
             )
     finally:
-        connection.close()
+        if connection.open:
+            connection.close()
 
 
 def _defer_request(request_id: int) -> None:
@@ -719,6 +783,14 @@ def _recover_interrupted_job_runs(job: str) -> bool:
                     "JOIN (SELECT crawl_run_id, COUNT(*) AS snapshot_rows "
                     "FROM bounded_parts GROUP BY crawl_run_id) AS snapshots "
                     "ON snapshots.crawl_run_id = runs.id "
+                    "JOIN catalog_desired_bounded_scope AS desired_scope "
+                    "ON desired_scope.singleton_id = 1 "
+                    "AND CAST(runs.scope_brand AS BINARY) "
+                    "= CAST(desired_scope.scope_brand AS BINARY) "
+                    "AND CAST(runs.scope_model AS BINARY) "
+                    "= CAST(desired_scope.scope_model AS BINARY) "
+                    "AND runs.scope_vehicle_year_floor "
+                    "= desired_scope.scope_vehicle_year_floor "
                     "WHERE (jobs.status = 'running' OR (jobs.status = 'failed' "
                     "AND jobs.finished_at IS NOT NULL AND jobs.exit_code IS NOT NULL "
                     "AND jobs.exit_code <> 0)) AND jobs.job_name = 'catalog' "
@@ -948,7 +1020,8 @@ def _recover_interrupted_job_runs(job: str) -> bool:
             if admission_lock is not None:
                 release_catalog_writer_admission(connection, admission_lock)
         finally:
-            connection.close()
+            if connection.open:
+                connection.close()
 
 
 def dispatch_locked(job: str, scope: str) -> int:
@@ -994,10 +1067,11 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
         with connection.cursor() as cursor:
             if job == "catalog":
                 cursor.execute(
-                    "SELECT jobs.job_name, jobs.status, "
+                    "SELECT jobs.job_name, jobs.status, jobs.exit_code AS scheduler_exit_code, "
                     "TIMESTAMPDIFF(SECOND, jobs.finished_at, UTC_TIMESTAMP()) AS age_seconds, "
                     "runs.id AS crawl_run_id, runs.dataset_kind, "
                     "runs.status AS crawl_status, runs.target_parts, runs.parts_ok, "
+                    "runs.scope_brand, runs.scope_model, runs.scope_vehicle_year_floor, "
                     "runs.evidence_status, runs.evidence_manifest_sha256, "
                     "runs.evidence_dataset_sha256, runs.evidence_artifact_count, "
                     "runs.evidence_record_count, runs.evidence_verified_at, "
@@ -1021,12 +1095,14 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
     finally:
         connection.close()
     expected_success_job = job
-    if (
-        not row
-        or row.get("job_name") != expected_success_job
-        or row.get("status") != "completed"
-        or row.get("age_seconds") is None
-    ):
+    if not row or row.get("job_name") != expected_success_job or row.get("age_seconds") is None:
+        return 0.0
+    under_target_cooldown = (
+        job == "catalog"
+        and row.get("status") == "failed"
+        and int(row.get("scheduler_exit_code") or 0) == 4
+    )
+    if row.get("status") != "completed" and not under_target_cooldown:
         return 0.0
     if job == "catalog":
         try:
@@ -1034,6 +1110,25 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
         except ValueError:
             bounded_target = 0
         if bounded_target > 0:
+            scope_brand, scope_model, scope_vehicle_year_floor = _catalog_bounded_scope()
+            if under_target_cooldown:
+                if (
+                    row.get("dataset_kind") != "bounded"
+                    or row.get("crawl_status") != "error"
+                    or int(row.get("target_parts") or 0) != bounded_target
+                    or row.get("evidence_status") != "rejected"
+                    or str(row.get("scope_brand") or "").strip().casefold() != scope_brand
+                    or str(row.get("scope_model") or "").strip().casefold() != scope_model
+                    or (
+                        int(row["scope_vehicle_year_floor"])
+                        if row.get("scope_vehicle_year_floor") is not None
+                        else None
+                    )
+                    != scope_vehicle_year_floor
+                ):
+                    return 0.0
+                age_seconds = row["age_seconds"]
+                return max(0.0, interval_seconds - max(0, int(age_seconds)))
             if (
                 row.get("dataset_kind") != "bounded"
                 or row.get("crawl_status") != "bounded_success"
@@ -1046,10 +1141,20 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
                 or int(row.get("evidence_artifact_count") or 0) <= 0
                 or int(row.get("evidence_record_count") or 0) != bounded_target
                 or row.get("evidence_verified_at") is None
+                or str(row.get("scope_brand") or "").strip().casefold() != scope_brand
+                or str(row.get("scope_model") or "").strip().casefold() != scope_model
+                or (
+                    int(row["scope_vehicle_year_floor"])
+                    if row.get("scope_vehicle_year_floor") is not None
+                    else None
+                )
+                != scope_vehicle_year_floor
             ):
                 return 0.0
             if not _audit_catalog_evidence(int(row.get("crawl_run_id") or 0), bounded_target):
                 return 0.0
+        elif under_target_cooldown:
+            return 0.0
         elif row.get("crawl_status") not in ("success", "bounded_success"):
             # Sample 是隔離測試資料，不能延後正式 catalog 排程。
             return 0.0
@@ -1107,18 +1212,20 @@ def run_daemon(
     previous_trigger_mode = getattr(_JOB_CONTEXT, "trigger_mode", None)
     _JOB_CONTEXT.trigger_mode = "daemon"
     try:
-        if job == "catalog" and os.getenv("PARTSOUQ_APPLY_MIGRATIONS_ON_START") == "1":
+        if job == "catalog":
             job_lock = _try_lock("scheduler-job", job)
             if job_lock is None:
-                print("catalog 工作仍由另一個程序持有；不可進行啟動升級", file=sys.stderr)
+                print("catalog 工作仍由另一個程序持有；不可進行啟動準備", file=sys.stderr)
                 return LOCK_BUSY_EXIT_CODE
             try:
-                runner = CatalogMigrationRunner()
-                runner.apply(
-                    recover_stale_catalog_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
-                    recover_stale_nhtsa_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
-                )
-                runner.check()
+                if os.getenv("PARTSOUQ_APPLY_MIGRATIONS_ON_START") == "1":
+                    runner = CatalogMigrationRunner()
+                    runner.apply(
+                        recover_stale_catalog_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
+                        recover_stale_nhtsa_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
+                    )
+                    runner.check()
+                _sync_catalog_desired_bounded_scope()
                 _recover_interrupted_job_runs(job)
             except (
                 MigrationError,
@@ -1126,8 +1233,9 @@ def run_daemon(
                 AdmissionLockBusy,
                 pymysql.MySQLError,
                 RuntimeError,
+                ValueError,
             ) as error:
-                print(f"catalog 啟動升級失敗：{type(error).__name__}: {error}", file=sys.stderr)
+                print(f"catalog 啟動準備失敗：{type(error).__name__}: {error}", file=sys.stderr)
                 return SCHEDULER_DB_ERROR_EXIT_CODE
             finally:
                 job_lock.close()
@@ -1143,8 +1251,15 @@ def run_daemon(
         while not stop_event.wait(wait_seconds):
             if needs_schedule_check:
                 try:
+                    if job == "catalog":
+                        _sync_catalog_desired_bounded_scope()
                     wait_seconds = _seconds_until_next_run(job, interval_seconds)
-                except pymysql.MySQLError as error:
+                except (
+                    AdmissionLockBusy,
+                    pymysql.MySQLError,
+                    RuntimeError,
+                    ValueError,
+                ) as error:
                     schedule_read_failures += 1
                     wait_seconds = float(
                         min(
@@ -1216,6 +1331,22 @@ def run_daemon(
                 needs_schedule_check = True
                 print(
                     "catalog 排程收到 sample exit=3；請修正 PSQ_LIMIT_PARTS，"
+                    f"{int(wait_seconds)} 秒後重新檢查",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            if job == "catalog" and return_code == 4:
+                # 目標車款已完整閉合但資料不足 10,000 筆；同一 interval
+                # 內重跑只會重訪相同站方 scope 並提高 Cloudflare 風險。
+                # run 已拒絕 evidence，下一 interval 會建立新的 logical run。
+                failures = 0
+                non_site_failures = 0
+                wait_seconds = float(interval_seconds)
+                needs_schedule_check = True
+                print(
+                    "catalog model scope 已完整閉合但不足 10,000 筆；"
                     f"{int(wait_seconds)} 秒後重新檢查",
                     file=sys.stderr,
                     flush=True,
@@ -1522,6 +1653,24 @@ def dispatch(
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.job == "catalog" and not args.daemon:
+        print("正式 catalog 排程只允許 --daemon 模式", file=sys.stderr)
+        return 2
+    if args.job == "catalog":
+        try:
+            sample_limit = int(os.getenv("PSQ_LIMIT_PARTS", "0"))
+            bounded_target = int(os.getenv("PSQ_BOUNDED_PARTS", "0"))
+            _catalog_bounded_scope()
+        except ValueError:
+            print("catalog 排程的資料上限或 model scope 無效", file=sys.stderr)
+            return 2
+        if sample_limit != 0 or bounded_target != 10_000:
+            print(
+                "catalog 排程只允許 PSQ_LIMIT_PARTS=0 且 PSQ_BOUNDED_PARTS=10000；"
+                "full/sample 不屬於目前正式驗收範圍",
+                file=sys.stderr,
+            )
+            return 2
     if not args.daemon:
         return dispatch_locked(args.job, args.scope)
     if args.job not in DAEMON_JOBS:

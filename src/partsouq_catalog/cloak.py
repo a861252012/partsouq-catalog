@@ -37,9 +37,19 @@ log = logging.getLogger("cloak")
 
 BROWSER_START_TIMEOUT = 60.0
 BROWSER_STOP_GRACE_SECONDS = 5.0
+# _stop_owned_browser(graceful=True) 最壞會先等一次自然關閉，再等
+# process-group TERM 與 wrapper reap；父程序的強制 KILL 必須晚於此預算。
+OWNED_BROWSER_CLEANUP_BUDGET_SECONDS = BROWSER_STOP_GRACE_SECONDS * 3 + 2
 PAGE_LOAD_TIMEOUT_SECONDS = 60.0
 CATALOG_VERIFY_TIMEOUT_SECONDS = 150.0
 COOKIE_SETTLE_SECONDS = 2.0
+PAGE_FETCH_CHALLENGE_TIMEOUT_SECONDS = 60.0
+PAGE_FETCH_TIMEOUT_SECONDS = (
+    PAGE_LOAD_TIMEOUT_SECONDS
+    + PAGE_FETCH_CHALLENGE_TIMEOUT_SECONDS
+    + BROWSER_STOP_GRACE_SECONDS
+    + 30.0
+)
 # ready marker 在 page.goto 之前發布；父程序等待時間必須完整涵蓋子程序
 # 的 navigation、型錄驗證與 cookie settle，再留 30 秒寫檔/排程餘裕。
 COOKIE_EXPORT_TIMEOUT = (
@@ -49,6 +59,7 @@ COOKIE_EXPORT_TIMEOUT = (
 # 只管理本程序親自啟動的 CloakBrowser process group。不得用 pkill 掃描
 # 共用機器上的命令列，否則會誤殺其他專案的 CloakBrowser。
 _BROWSER_LOCK = threading.Lock()
+_BROWSER_SHUTDOWN = threading.Event()
 _browser_proc: subprocess.Popen[bytes] | None = None
 _browser_err_log: TextIO | None = None
 
@@ -249,6 +260,17 @@ def _stop_owned_browser(*, graceful: bool = False) -> None:
         )
         ready_file.unlink(missing_ok=True)
         ready_file.with_name(f"{ready_file.name}.tmp").unlink(missing_ok=True)
+
+
+def _begin_browser_shutdown() -> None:
+    """禁止註冊新瀏覽器，並回收目前已註冊的 owned process group。"""
+    _BROWSER_SHUTDOWN.set()
+    _stop_owned_browser()
+
+
+def _finish_browser_shutdown() -> None:
+    """結束 run_crawl 的 shutdown 臨界區（主要供同程序測試重入）。"""
+    _BROWSER_SHUTDOWN.clear()
 
 
 def _launch_cloak() -> bool:
@@ -476,8 +498,17 @@ def _launch_cloak() -> bool:
         log.error("failed to start CloakBrowser via %s: %s", CLOAK["venv_python"], e)
         return False
     with _BROWSER_LOCK:
-        _browser_proc = proc
-        _browser_err_log = err_log
+        shutdown_requested = _BROWSER_SHUTDOWN.is_set()
+        if not shutdown_requested:
+            _browser_proc = proc
+            _browser_err_log = err_log
+    if shutdown_requested:
+        _terminate_process_group(proc)
+        if err_log is not None:
+            err_log.close()
+        ready_file.unlink(missing_ok=True)
+        ready_tmp.unlink(missing_ok=True)
+        return False
     log.info("CloakBrowser launching (pid=%s), waiting for browser readiness...", proc.pid)
     deadline = time.monotonic() + BROWSER_START_TIMEOUT
     while time.monotonic() < deadline:
@@ -506,19 +537,66 @@ def _launch_cloak() -> bool:
     return False
 
 
+def _process_group_alive(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 群組仍存在，只是目前無權送訊號；不可誤判成已回收。
+        return True
+    return True
+
+
 def _terminate_process_group(proc: "subprocess.Popen[bytes]") -> None:
     """終止以 start_new_session 啟動的瀏覽器子程序 process group。"""
+
+    if not _process_group_alive(proc.pid):
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=BROWSER_STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                log.error("browser wrapper did not exit after its process group disappeared")
+        return
+
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+
+    deadline = time.monotonic() + BROWSER_STOP_GRACE_SECONDS
+    while _process_group_alive(proc.pid) and time.monotonic() < deadline:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        if _process_group_alive(proc.pid):
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    if _process_group_alive(proc.pid):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=BROWSER_STOP_GRACE_SECONDS + 1)
+        except subprocess.TimeoutExpired:
+            log.error("browser wrapper did not exit after process-group SIGKILL")
 
 
 def _is_cloudflare_challenge(text: str) -> bool:
@@ -537,12 +615,11 @@ def _is_cloudflare_challenge(text: str) -> bool:
 
 
 class NonUnitPageError(Exception):
-    """瀏覽器最後落點不是請求的 unit 頁（被轉址到 /locate、首頁或別的組）。
+    """瀏覽器最後落點不是原本請求的 catalog 頁。
 
     fetch_page 的子程序腳本跑在獨立 venv，無法匯入本例外類別，故改用
-    sidecar marker 檔通報；父程序讀到 marker 再轉拋成此例外。HTTP 層會
-    把它轉成 NotFoundError，讓 crawl_group 把該組標成 not_found（terminal），
-    而非靜默 receipt 成 done/0。這是 fail-closed 在瀏覽器路徑上的對應防護。"""
+    sidecar marker 檔通報；父程序讀到 marker 再轉拋成此例外。HTTP 層只
+    會把 unit 頁轉成 NotFoundError，其他 catalog 頁仍維持 fail-closed。"""
 
 
 def _prepare_browser_launch() -> tuple[dict[str, str], Path, Path, str, str] | None:
@@ -640,7 +717,7 @@ def _prepare_browser_launch() -> tuple[dict[str, str], Path, Path, str, str] | N
     return env, free_cache, browser_home, expected_binary, expected_sha256
 
 
-def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
+def fetch_page(url: str, *, timeout_seconds: float = PAGE_FETCH_TIMEOUT_SECONDS) -> str | None:
     """透過真實 CloakBrowser 抓取單一 catalog 頁面 HTML。
 
     requests 傳輸即使帶有效 cf_clearance，仍會被 Cloudflare 以 TLS
@@ -651,6 +728,8 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
     回傳頁面 HTML；若瀏覽器仍拿到挑戰頁、或任何失敗，回傳 None（保留
     fail-closed：HTTP 層會依此決定是否放棄該請求，絕不把挑戰頁當成
     資料寫入）。"""
+    global _browser_err_log, _browser_proc
+
     with _process_refresh_lock() as acquired:
         if not acquired:
             log.error("browser fetch lock held by another process; skip %s", url[:80])
@@ -662,6 +741,8 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
         cookie_file = CLOAK["cookie_file"]
         out_file = CLOAK["state_dir"] / ".cloak-page-fetch.html"
         marker_file = out_file.with_name(out_file.name + ".offunit")
+        out_tmp_file = out_file.with_name(out_file.name + ".tmp")
+        marker_tmp_file = marker_file.with_name(marker_file.name + ".tmp")
         script = (
             "import asyncio, json, os, time\n"
             "from urllib.parse import urlsplit, parse_qs\n"
@@ -670,18 +751,45 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
             f"URL = {url!r}\n"
             f"OUT = {str(out_file)!r}\n"
             f"MARKER = {str(marker_file)!r}\n"
-            "def _unit_uid(u):\n"
-            "    return parse_qs(urlsplit(u).query).get('uid', [None])[0]\n"
-            "def _is_unit(u):\n"
-            "    p = urlsplit(u).path\n"
-            "    return p == '/en/catalog/genuine/unit' or p.startswith('/en/catalog/genuine/unit/')\n"
+            "IDENTITY_KEYS = {\n"
+            "    '/en/catalog/genuine': (),\n"
+            "    '/en/catalog/genuine/locate': ('c',),\n"
+            "    '/en/catalog/genuine/pick': ('c', 'model'),\n"
+            "    '/en/catalog/genuine/vehicle': ('c', 'vid'),\n"
+            "    '/en/catalog/genuine/unit': ('uid',),\n"
+            "}\n"
+            "UNIT_CONTEXT_KEYS = ('c', 'vid', 'cid')\n"
+            "def _same_catalog_page(requested, final):\n"
+            "    requested_parts = urlsplit(requested)\n"
+            "    final_parts = urlsplit(final)\n"
+            "    requested_path = requested_parts.path.rstrip('/')\n"
+            "    final_path = final_parts.path.rstrip('/')\n"
+            "    keys = IDENTITY_KEYS.get(requested_path)\n"
+            "    if (keys is None or final_path != requested_path\n"
+            "            or requested_parts.scheme.lower() != 'https'\n"
+            "            or final_parts.scheme.lower() != 'https'\n"
+            "            or (requested_parts.hostname or '').lower()\n"
+            "               not in ('partsouq.com', 'www.partsouq.com')\n"
+            "            or (final_parts.hostname or '').lower()\n"
+            "               not in ('partsouq.com', 'www.partsouq.com')\n"
+            "            or requested_parts.port not in (None, 443)\n"
+            "            or final_parts.port not in (None, 443)):\n"
+            "        return False\n"
+            "    requested_query = parse_qs(requested_parts.query)\n"
+            "    final_query = parse_qs(final_parts.query)\n"
+            "    if requested_path == '/en/catalog/genuine/unit':\n"
+            "        keys += tuple(key for key in UNIT_CONTEXT_KEYS\n"
+            "                      if requested_query.get(key, [None])[0] is not None)\n"
+            "    return all(requested_query.get(key, [None])[0] is not None\n"
+            "               and requested_query.get(key, [None])[0]\n"
+            "               == final_query.get(key, [None])[0] for key in keys)\n"
             "async def main():\n"
             "    b = await cloakbrowser.launch_async(headless=False)\n"
             "    try:\n"
             "        ctx = await b.new_context(viewport={'width':1366,'height':900})\n"
             "        try:\n"
             "            raw = json.load(open(COOKIE_FILE))\n"
-            "            ctx.add_cookies(\n"
+            "            await ctx.add_cookies(\n"
             "                [{'name': c['name'], 'value': c['value'],\n"
             "                  'domain': c.get('domain', 'partsouq.com'),\n"
             "                  'path': c.get('path', '/')} for c in raw]\n"
@@ -689,8 +797,9 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
             "        except Exception:\n"
             "            pass\n"
             "        page = await ctx.new_page()\n"
-            "        await page.goto(URL, wait_until='domcontentloaded', timeout=60000)\n"
-            "        deadline = time.monotonic() + 60\n"
+            f"        await page.goto(URL, wait_until='domcontentloaded', "
+            f"timeout={int(PAGE_LOAD_TIMEOUT_SECONDS * 1000)})\n"
+            f"        deadline = time.monotonic() + {PAGE_FETCH_CHALLENGE_TIMEOUT_SECONDS!r}\n"
             "        html = ''\n"
             "        while time.monotonic() < deadline:\n"
             "            html = await page.content()\n"
@@ -699,17 +808,19 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
             "                    and '\\u8acb\\u6682\\u5019' not in html and 'cf-mitigated' not in low):\n"
             "                break\n"
             "            await asyncio.sleep(3)\n"
-            "        # 落點不是原本請求的 unit 頁（被轉到 /locate、首頁或別的組）：\n"
+            "        # 落點不是原本請求的 catalog 頁：\n"
             "        # 寫 sidecar marker 而非 HTML，父程序據此拒絕（fail-closed）。\n"
             "        final_url = page.url\n"
-            "        if not (_is_unit(final_url) and _unit_uid(final_url) == _unit_uid(URL)):\n"
-            "            with open(MARKER, 'w') as f:\n"
+            "        out_tmp = OUT + '.tmp'\n"
+            "        marker_tmp = MARKER + '.tmp'\n"
+            "        if not _same_catalog_page(URL, final_url):\n"
+            "            with open(marker_tmp, 'w') as f:\n"
             "                f.write(final_url)\n"
-            "            return\n"
-            "        tmp = OUT + '.tmp'\n"
-            "        with open(tmp, 'w') as f:\n"
-            "            f.write(html)\n"
-            "        os.replace(tmp, OUT)\n"
+            "            os.replace(marker_tmp, MARKER)\n"
+            "        else:\n"
+            "            with open(out_tmp, 'w') as f:\n"
+            "                f.write(html)\n"
+            "            os.replace(out_tmp, OUT)\n"
             "    finally:\n"
             "        await b.close()\n"
             "asyncio.run(main())\n"
@@ -717,6 +828,7 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
         err_fd = _open_state_file_no_follow(
             CLOAK["error_log_file"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         )
+        proc: subprocess.Popen[bytes] | None = None
         try:
             err_log = os.fdopen(err_fd, "w")
         except BaseException:
@@ -726,8 +838,8 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
         with os.fdopen(fd, "w") as f:
             f.write(script)
         try:
-            if out_file.exists():
-                out_file.unlink()
+            for stale_file in (out_file, marker_file, out_tmp_file, marker_tmp_file):
+                stale_file.unlink(missing_ok=True)
             proc = subprocess.Popen(
                 [*CLOAK["launcher"], CLOAK["venv_python"], "-u", tmp_script],
                 stdout=subprocess.DEVNULL,
@@ -735,15 +847,39 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
                 env=env,
                 start_new_session=True,
             )
+            shutdown_requested = False
+            with _BROWSER_LOCK:
+                shutdown_requested = _BROWSER_SHUTDOWN.is_set()
+                if not shutdown_requested:
+                    _browser_proc = proc
+                    _browser_err_log = err_log
+            if shutdown_requested:
+                _terminate_process_group(proc)
+                return None
             deadline = time.monotonic() + timeout_seconds
+            output_ready = False
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     break
-                if out_file.exists():
+                if out_file.exists() or marker_file.exists():
+                    output_ready = True
                     break
                 time.sleep(2)
-            if proc.poll() is None:
+            if output_ready and proc.poll() is None:
+                try:
+                    proc.wait(timeout=BROWSER_STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    log.error(
+                        "browser fetch child did not exit after producing output for %s; "
+                        "terminating",
+                        url[:80],
+                    )
+                    _terminate_process_group(proc)
+            elif proc.poll() is None:
                 log.error("browser fetch timed out for %s; terminating", url[:80])
+            # wrapper 可能已自行結束，但它啟動的 Chromium 仍留在相同
+            # process group；只看 poll()/wait() 會留下孤兒瀏覽器。
+            if _process_group_alive(proc.pid):
                 _terminate_process_group(proc)
             if not out_file.exists() and not marker_file.exists():
                 log.error("browser fetch produced no output for %s", url[:80])
@@ -759,8 +895,14 @@ def fetch_page(url: str, *, timeout_seconds: int = 90) -> str | None:
             finally:
                 out_file.unlink(missing_ok=True)
         finally:
+            with _BROWSER_LOCK:
+                if proc is not None and _browser_proc is proc:
+                    _browser_proc = None
+                    _browser_err_log = None
             err_log.close()
             os.unlink(tmp_script)
+            out_tmp_file.unlink(missing_ok=True)
+            marker_tmp_file.unlink(missing_ok=True)
         if _is_cloudflare_challenge(html):
             log.warning("browser fetch returned a challenge page for %s; refusing", url[:80])
             return None

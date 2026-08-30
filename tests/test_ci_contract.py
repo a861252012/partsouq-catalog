@@ -47,10 +47,11 @@ def test_ci_has_python_312_quality_unit_mysql_and_browser_gates() -> None:
     assert "upload-artifact" not in workflow
     assert "uv run --locked mypy" in quality_job
     assert "--allow-message" in unit_job
-    assert "--expected-count 271" in unit_job
+    assert "--expected-count 272" in unit_job
     assert "-W error" in unit_job
     assert "mysql:8.4.11@sha256:" in e2e_job
     assert 'MYSQL_ROOT_HOST: "%"' in e2e_job
+    assert "command: --log-bin-trust-function-creators=1" in e2e_job
     assert 'NHTSA_TEST_MYSQL: "1"' in e2e_job
     assert 'UNIFIED_TEST_MYSQL: "1"' in e2e_job
     assert 'STATION_ADMIN_E2E: "1"' in e2e_job

@@ -13,7 +13,7 @@
 
 | 範圍 | 主要資料表 |
 | --- | --- |
-| PartSouq 型錄 | `brands`、`models`、`vehicles`、`categories`、`groups_t`、`parts`、`published_parts` |
+| PartSouq 型錄 | 原始正規化資料：`brands`、`models`、`vehicles`、`categories`、`groups_t`、`parts`；正式讀取：`bounded_parts`、`v_current_catalog_parts` |
 | NHTSA | `nhtsa_*`、`nhtsa_current_records`、`nhtsa_vin_decodes` |
 | 站方後台 | `admin_*`、`scheduled_job_runs` |
 
@@ -23,12 +23,12 @@ PartSouq 的舊 SQLite 工具保留在 `partsouq_crawler` 套件中，僅作為�
 
 本機啟動後有兩個角色不同的後台：
 
-- [http://admin.partsouq.localhost:8086/](http://admin.partsouq.localhost:8086/) 是完整站方後台。支援 10 類資料瀏覽、搜尋、明細、新增、修改、停用與復原；預設每頁 30 筆，可選 10／25／30／50／100／200 筆。修改以 overlay 生效，不改寫爬蟲原始資料；每次寫入都保留 actor、reason、revision 與只能追加的 audit event。零件料號／英文名稱的 active overlay 會由 8000 API 與 VIN 零件查詢讀取；也可查看監控與排入已獲授權 VIN 的解碼要求。
+- [http://admin.partsouq.localhost:8086/](http://admin.partsouq.localhost:8086/) 是站方後台。支援 10 類資料的瀏覽、搜尋與明細；可寫類型以 overlay 新增、修改、停用與復原，絕不改寫爬蟲原始資料。VIN 車款對照是唯讀衍生資料，解碼與人工確認請使用 8000 的專用流程。列表預設每頁 30 筆，可選 10／25／30／50／100／200 筆。每次 overlay 寫入都保留 actor、reason、revision 與只能追加的 audit event。
 - [http://partsouq.localhost:8000/admin](http://partsouq.localhost:8000/admin) 是共用 DB 的資料品質與 API mapping dashboard，不是上述 10 類資料的完整 CRUD 後台。
 
 `.localhost` 是保留給本機 loopback 的 domain，已實測兩個 health endpoint，無須修改 `/etc/hosts` 或取得 root 權限。
 
-8086 站方後台可管理的 10 類資料為：車款配置、零件分類、圖表／Group、零件號碼、零件出現位置、適用車款、中英文零件對照、VIN 車款對照、VIN 零件適用性與對帳案件。它透過 view 讀取現有的共用 catalog，不會建第二份空的 catalog。
+8086 站方後台可瀏覽的 10 類資料為：車款配置、零件分類、圖表／Group、零件號碼、零件出現位置、適用車款、中英文零件對照、VIN 車款對照、VIN 零件適用性與對帳案件。它透過正式 view 讀取共用 catalog，不會建第二份空的 catalog，也不會直接曝露未驗證的 raw 列。
 
 8000 資料品質後台可管理：
 
@@ -86,6 +86,12 @@ Compose 只把各服務需要的變數傳入 container：root 密碼只給 MySQL
 只給 admin，8086 的 session／登入密碼只給 station-admin。三個 scheduler、兩套後台、
 NHTSA 與 PartSouq 仍共用同一個 `partsouq_catalog`。
 
+`schema-migrate` 仍只使用 app 帳號。因 migration 033 會建立 deterministic trigger，
+Compose 的 MySQL 已明確設定 `log_bin_trust_function_creators=1`；這不會把 root 密碼
+交給 migration、scheduler 或後台。若使用自行管理的 MySQL，DB 管理者必須以等效的
+server 啟動設定或全域設定啟用此項，再執行 migration；否則 MySQL 開啟 binary log 時
+會以 errno 1419 安全拒絕建立 trigger。
+
 既有 MySQL volume 不要先啟動後台；先只啟動資料庫，再完成下列升級與 health
 check：
 
@@ -94,7 +100,7 @@ docker compose up -d mysql
 ```
 
 runner 會以固定 manifest 從 001 開始檢查並重播尚未記錄的 active migration
-（001–012、015–023），不靠人工猜測既有 volume 的版本。013／014 已被 015
+（001–012、015–035），不靠人工猜測既有 volume 的版本。013／014 已被 015
 取代，不會在新升級執行。
 migration 019 會讓正式 bounded view fail closed：除了精確 10,000 筆與成功的
 daemon provenance，還必須有已 seal 的 live HTTP evidence、六種頁面類型與逐筆
@@ -118,6 +124,24 @@ migration 023 將真正 HTTP 404 與 HTTP 200／零解析的已清洗 HTML
 存在獨立 diagnostics table，不納入正式 evidence；同 run／group／reason
 只保留最新一筆，且持續排除 SSD、cookie 與 headers。只有 transport
 HTTP 404 可寫 `not_found` receipt；HTTP 200 錯誤頁或零解析仍 fail closed。
+migration 028 只更新 `v_vin_part_fitments`。既有 volume 套用後，人工確認的
+partial NHTSA decode 才能產生 VIN 零件適配；年份或車款快照不一致時仍不回傳零件。
+migration 029 讓正式 bounded run 保存單一品牌、型號與執行當下凍結的年份下限；
+舊 run 三欄皆為 `NULL` 時維持既有未限定 scope 的 evidence hash 語意。
+migration 030 將目前啟用的 bounded scope 存成資料庫 singleton，讓 scheduler、
+正式 view 與兩個後台讀取同一份 scope；尚未設定 scope 時正式 bounded 資料為空。
+migration 031 只讓具備已驗證 evidence、精確 scope 與精確 10,000 筆的 bounded
+snapshot 進入 `v_current_catalog_parts`；raw／full candidate 不會被當成正式資料。
+migration 029 前建立的 bounded snapshot 沒有 scope；套用 030／031 後會刻意從
+正式 view 隱藏，不是資料遺失。必須由新的 scoped 10,000 筆 daemon run 重新發布。
+migration 032 將每筆 bounded snapshot 列與接受的 evidence record digest 綁定。
+migration 033 禁止直接更新 `bounded_parts`，避免已發布 snapshot 被事後改寫；新版
+發布仍使用 transaction 內的 delete＋insert。
+migration 034 將 VIN fitment 的一般候選數計算改為 CTE，一次計算 mapping 候選，
+避免對每筆零件重複計數；manual override 的既有語意不變。
+migration 035 只會移除已綁 evidence digest、但 normalized 料號無法由 snapshot
+原始料號重算的 legacy 列；因此受影響的舊 10,000 筆 snapshot 也會 fail closed，
+直到新的 verified run 發布。
 migration 005 若判定舊 vehicle tree 必須重建，仍會在刪除前 fail closed，且只接受
 備份後由操作者明確授權。
 
@@ -341,11 +365,20 @@ scheduler 在完成紀錄前中斷，即使 parent 已被記成 `failed`／非�
 daemon 仍會先重播 live evidence、核對精確筆數與關聯，再以 CAS 補記完成；
 任一驗證不符就拒絕修復，不會把失敗資料冒充成功，也不會重爬已發布的 10,000 筆。
 
-檔案 lock 適用本機單主機，三個 Compose 服務必須共用 `./logs` volume。若改為
-多主機部署，需另外使用跨主機的 DB lease，不能把這套 flock 當成分散式鎖。
+檔案 lock 是本機的第一層快速防線；crawler 同時會用獨立 MySQL 連線持有
+database-scoped named lock，並在每次 commit 前確認 ownership。不同 checkout、
+容器或主機只要共用同一個 MySQL DB，就不能同時改寫 catalog。多主機部署仍要
+另外處理單一排程 owner、macOS Aqua browser 與故障切換，不能只靠檔案 lock。
 
 host catalog scheduler 明確使用 `PSQ_BOUNDED_PARTS=10000` 並覆寫
 `PSQ_LIMIT_PARTS=0`；Compose service 也維持相同資料契約。
+正式 catalog scheduler 必須設定非空白的 `PSQ_BOUNDED_BRAND`、
+`PSQ_BOUNDED_MODEL` 與正整數 `PSQ_VEHICLE_YEAR_WINDOW`；host installer、runner、
+scheduler child 都會在 DB 或瀏覽器啟動前拒絕缺值。Compose 正式預設為
+`TOYOTA`／`TACOMA`／`20`。首頁與 locate 頁仍完整解析及保存 evidence，
+只在其後挑出唯一目標；找不到或重名會停止。續跑與每月 interval 會比對凍結後的
+年份下限，避免跨年沿用不同 scope。`production_to=NULL` 視為仍在產或未封閉，允許；
+只有已知的結束年早於下限才排除。發布前仍會再核對全部 10,000 筆均屬該品牌與型號。
 bounded dataset 必須精確 10,000 筆且通過來源／欄位／關聯品質關卡才會
 `bounded_success` 與 exit `0`；它是可驗證的正式限量資料，不冒充全站完整 snapshot。
 
@@ -402,7 +435,7 @@ MySQL database，啟動真實 HTTP server，再用本機 Chrome 操作 8086 站�
 驗證範圍包含 PartSouq parser／publish、NHTSA artifact／VIN decode、後台 mapping
 API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器到 MySQL 寫入生命週期。
 
-本次實測結果與限制見 [docs/verification-2026-08-15.md](docs/verification-2026-08-15.md)。
+目前的契約、驗證範圍與未完成邊界見 [docs/progress-log-2026-08-30.md](docs/progress-log-2026-08-30.md)。歷史測試紀錄見 [docs/verification-2026-08-15.md](docs/verification-2026-08-15.md)。
 簡報逐項需求邊界見
 [docs/pptx-requirements-audit-2026-08-20.md](docs/pptx-requirements-audit-2026-08-20.md)。
 

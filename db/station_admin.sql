@@ -245,7 +245,7 @@ SELECT
         WHEN source.effective_from IS NOT NULL
          AND source.effective_to IS NOT NULL
          AND source.effective_from > source.effective_to THEN 0
-        WHEN published.part_id IS NOT NULL THEN 1
+        WHEN current_catalog.part_id IS NOT NULL THEN 1
         ELSE 0
     END AS is_verified,
     CASE
@@ -253,14 +253,14 @@ SELECT
          AND source.effective_to IS NOT NULL
          AND source.effective_from > source.effective_to
             THEN 'invalid_date_intersection'
-        WHEN published.part_id IS NOT NULL THEN 'partsouq_published_snapshot'
+        WHEN current_catalog.part_id IS NOT NULL THEN 'verified_current_catalog'
         ELSE 'partsouq_normalized_unpublished'
     END AS derivation,
     CASE
         WHEN source.effective_from IS NOT NULL
          AND source.effective_to IS NOT NULL
          AND source.effective_from > source.effective_to THEN CAST(0.0 AS DECIMAL(4, 3))
-        WHEN published.part_id IS NOT NULL THEN CAST(1.0 AS DECIMAL(4, 3))
+        WHEN current_catalog.part_id IS NOT NULL THEN CAST(1.0 AS DECIMAL(4, 3))
         ELSE CAST(0.5 AS DECIMAL(4, 3))
     END AS confidence,
     source.effective_from,
@@ -289,53 +289,182 @@ FROM (
     JOIN categories AS c ON c.id = g.category_id
     JOIN vehicles AS v ON v.id = c.vehicle_id
 ) AS source
-LEFT JOIN published_parts AS published ON published.part_id = source.id;
+LEFT JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
 
--- Default business lists share the API's current catalog definition: a full
--- published snapshot wins; otherwise use the latest successful bounded snapshot.
+-- Default business lists share the API's verified current catalog definition.
 -- Historical sample rows remain queryable through the explicit history views;
 -- they never become the default source merely because they are present in parts.
 CREATE OR REPLACE VIEW station_admin_formal_vehicle_configurations AS
-SELECT source.*
-FROM station_admin_vehicle_configurations AS source
-JOIN (
-    SELECT DISTINCT vehicle_id
-    FROM v_current_catalog_parts
-) AS current_catalog ON current_catalog.vehicle_id = source.id;
+SELECT
+    current_catalog.vehicle_id AS id,
+    CAST(NULL AS UNSIGNED) AS catalog_brand_id,
+    MIN(current_catalog.model_id) AS catalog_model_id,
+    current_catalog.vehicle_id AS vehicle_configuration_id,
+    MIN(current_catalog.brand) AS catalog_brand,
+    MIN(current_catalog.brand) AS brand_raw,
+    UPPER(TRIM(MIN(current_catalog.brand))) AS brand_normalized,
+    MIN(current_catalog.vehicle_name) AS name_raw,
+    MIN(current_catalog.model) AS model_raw,
+    CAST(NULL AS CHAR(255)) AS description_raw,
+    CAST(NULL AS CHAR(255)) AS options_raw,
+    MIN(current_catalog.prod_period) AS prod_period_raw,
+    MIN(current_catalog.production_from) AS production_from,
+    MAX(current_catalog.production_to) AS production_to,
+    CASE
+        WHEN MIN(current_catalog.production_from) IS NOT NULL
+          OR MAX(current_catalog.production_to) IS NOT NULL THEN 'month'
+        ELSE NULL
+    END AS production_precision,
+    MIN(current_catalog.vehicle_code) AS catalog_code,
+    MIN(current_catalog.vehicle_vid) AS vehicle_external_id,
+    JSON_OBJECT(
+        'model_id', MIN(current_catalog.model_id),
+        'engine', MIN(current_catalog.engine),
+        'trim_name', MIN(current_catalog.trim_name)
+    ) AS metadata_json,
+    MIN(current_catalog.source_url) AS source_url,
+    MIN(current_catalog.snapshot_at) AS created_at,
+    MAX(current_catalog.snapshot_at) AS updated_at
+FROM v_current_catalog_parts AS current_catalog
+GROUP BY current_catalog.vehicle_id;
 
 CREATE OR REPLACE VIEW station_admin_formal_taxonomy_nodes AS
-SELECT source.*
-FROM station_admin_taxonomy_nodes AS source
-JOIN (
-    SELECT DISTINCT CAST(category_id * 2 AS UNSIGNED) AS taxonomy_node_id
-    FROM v_current_catalog_parts
-    UNION
-    SELECT DISTINCT CAST(group_id * 2 + 1 AS UNSIGNED) AS taxonomy_node_id
-    FROM v_current_catalog_parts
-) AS current_catalog ON current_catalog.taxonomy_node_id = source.id;
+SELECT
+    CAST(current_catalog.category_id * 2 AS UNSIGNED) AS id,
+    MIN(current_catalog.vehicle_id) AS vehicle_configuration_id,
+    CAST(NULL AS UNSIGNED) AS parent_id,
+    1 AS depth,
+    COALESCE(MIN(current_catalog.category_cid), '') AS code_raw,
+    MIN(current_catalog.category_main) AS name_raw,
+    MIN(current_catalog.category_main) AS path_raw,
+    MIN(current_catalog.source_url) AS source_url
+FROM v_current_catalog_parts AS current_catalog
+GROUP BY current_catalog.category_id
+UNION ALL
+SELECT
+    CAST(current_catalog.group_id * 2 + 1 AS UNSIGNED) AS id,
+    MIN(current_catalog.vehicle_id) AS vehicle_configuration_id,
+    CAST(MIN(current_catalog.category_id) * 2 AS UNSIGNED) AS parent_id,
+    2 AS depth,
+    MIN(current_catalog.group_code) AS code_raw,
+    COALESCE(MIN(current_catalog.category_group), '') AS name_raw,
+    CONCAT(
+        MIN(current_catalog.category_main),
+        ' / ',
+        COALESCE(MIN(current_catalog.category_group), MIN(current_catalog.group_code))
+    ) AS path_raw,
+    MIN(current_catalog.source_url) AS source_url
+FROM v_current_catalog_parts AS current_catalog
+GROUP BY current_catalog.group_id;
 
 CREATE OR REPLACE VIEW station_admin_formal_diagrams AS
-SELECT source.*
-FROM station_admin_diagrams AS source
-JOIN (
-    SELECT DISTINCT group_id
-    FROM v_current_catalog_parts
-) AS current_catalog ON current_catalog.group_id = source.id;
+SELECT
+    current_catalog.group_id AS id,
+    MIN(current_catalog.vehicle_id) AS vehicle_configuration_id,
+    CAST(current_catalog.group_id * 2 + 1 AS UNSIGNED) AS taxonomy_node_id,
+    MIN(current_catalog.group_code) AS diagram_code_raw,
+    COALESCE(MIN(current_catalog.category_group), '') AS diagram_name_raw,
+    CAST(NULL AS CHAR(64)) AS diagram_range_raw,
+    CAST(NULL AS CHAR(7)) AS diagram_from,
+    CAST(NULL AS CHAR(7)) AS diagram_to,
+    JSON_OBJECT(
+        'category_id', MIN(current_catalog.category_id),
+        'category_cid', MIN(current_catalog.category_cid),
+        'group_uid', MIN(current_catalog.group_uid)
+    ) AS metadata_json,
+    MIN(current_catalog.source_url) AS source_url
+FROM v_current_catalog_parts AS current_catalog
+GROUP BY current_catalog.group_id;
 
 CREATE OR REPLACE VIEW station_admin_formal_part_numbers AS
-SELECT source.*
-FROM station_admin_part_numbers AS source
-JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
+SELECT
+    current_catalog.part_id AS id,
+    current_catalog.model_id AS catalog_model_id,
+    current_catalog.vehicle_id AS vehicle_configuration_id,
+    current_catalog.code AS source_part_code,
+    current_catalog.brand AS part_brand_raw,
+    current_catalog.part_number AS number_raw,
+    current_catalog.part_number_normalized AS number_normalized,
+    current_catalog.part_name AS name_en_raw,
+    0 AS is_assembly_inferred,
+    CAST(NULL AS CHAR(255)) AS assembly_inference_reason,
+    current_catalog.source_url,
+    current_catalog.snapshot_at AS created_at,
+    current_catalog.snapshot_at AS updated_at
+FROM v_current_catalog_parts AS current_catalog;
 
 CREATE OR REPLACE VIEW station_admin_formal_part_occurrences AS
-SELECT source.*
-FROM station_admin_part_occurrences AS source
-JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
+SELECT
+    current_catalog.part_id AS id,
+    current_catalog.part_id AS part_number_id,
+    current_catalog.group_id AS diagram_id,
+    current_catalog.vehicle_id AS vehicle_configuration_id,
+    current_catalog.code AS callout_raw,
+    current_catalog.quantity AS quantity_raw,
+    current_catalog.part_range AS part_range_raw,
+    current_catalog.part_from,
+    current_catalog.part_to,
+    CAST(NULL AS CHAR(255)) AS part_condition_raw,
+    current_catalog.note AS note_raw,
+    JSON_OBJECT(
+        'category_id', current_catalog.category_id,
+        'category_cid', current_catalog.category_cid,
+        'group_code', current_catalog.group_code,
+        'group_uid', current_catalog.group_uid
+    ) AS row_metadata_json,
+    current_catalog.source_url
+FROM v_current_catalog_parts AS current_catalog;
 
 CREATE OR REPLACE VIEW station_admin_formal_fitments AS
-SELECT source.*
-FROM station_admin_fitments AS source
-JOIN v_current_catalog_parts AS current_catalog ON current_catalog.part_id = source.id;
+SELECT
+    source.id,
+    source.part_occurrence_id,
+    source.part_number_id,
+    source.vehicle_configuration_id,
+    source.diagram_id,
+    CASE
+        WHEN source.effective_from IS NOT NULL
+         AND source.effective_to IS NOT NULL
+         AND source.effective_from > source.effective_to THEN 0
+        ELSE 1
+    END AS is_verified,
+    CASE
+        WHEN source.effective_from IS NOT NULL
+         AND source.effective_to IS NOT NULL
+         AND source.effective_from > source.effective_to
+            THEN 'invalid_date_intersection'
+        ELSE 'verified_current_catalog'
+    END AS derivation,
+    CASE
+        WHEN source.effective_from IS NOT NULL
+         AND source.effective_to IS NOT NULL
+         AND source.effective_from > source.effective_to
+            THEN CAST(0.0 AS DECIMAL(4, 3))
+        ELSE CAST(1.0 AS DECIMAL(4, 3))
+    END AS confidence,
+    source.effective_from,
+    source.effective_to,
+    source.source_url
+FROM (
+    SELECT
+        current_catalog.part_id AS id,
+        current_catalog.part_id AS part_occurrence_id,
+        current_catalog.part_id AS part_number_id,
+        current_catalog.vehicle_id AS vehicle_configuration_id,
+        current_catalog.group_id AS diagram_id,
+        CASE
+            WHEN current_catalog.part_from IS NULL THEN current_catalog.production_from
+            WHEN current_catalog.production_from IS NULL THEN current_catalog.part_from
+            ELSE GREATEST(current_catalog.part_from, current_catalog.production_from)
+        END AS effective_from,
+        CASE
+            WHEN current_catalog.part_to IS NULL THEN current_catalog.production_to
+            WHEN current_catalog.production_to IS NULL THEN current_catalog.part_to
+            ELSE LEAST(current_catalog.part_to, current_catalog.production_to)
+        END AS effective_to,
+        current_catalog.source_url
+    FROM v_current_catalog_parts AS current_catalog
+) AS source;
 
 CREATE OR REPLACE VIEW station_admin_historical_sample_part_numbers AS
 SELECT source.*
@@ -413,7 +542,238 @@ SELECT
         AS transmission_style,
     JSON_UNQUOTE(JSON_EXTRACT(d.payload_json, '$.PlantCountry')) AS plant_country,
     m.partsouq_vehicle_id AS partsouq_vehicle_configuration_id,
-    CASE WHEN d.error_code = '0' THEN 'decoded' ELSE 'error' END AS decode_status,
+    CASE
+        WHEN m.partsouq_vehicle_id IS NULL THEN 'unmapped'
+        WHEN published.vehicle_id IS NULL
+          OR (
+              m.source_name = 'manual-sparse-override'
+              AND (
+                  NULLIF(TRIM(m.source_reference), '') IS NULL
+                  OR NOT (m.model_year <=> d.model_year)
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM v_current_catalog_parts AS sparse
+                      WHERE sparse.vehicle_id = m.partsouq_vehicle_id
+                        AND (
+                            sparse.production_from IS NOT NULL
+                            OR sparse.production_to IS NOT NULL
+                        )
+                        AND (
+                            sparse.production_from IS NULL
+                            OR d.model_year >= CAST(
+                                LEFT(sparse.production_from, 4) AS UNSIGNED
+                            )
+                        )
+                        AND (
+                            sparse.production_to IS NULL
+                            OR d.model_year <= CAST(
+                                LEFT(sparse.production_to, 4) AS UNSIGNED
+                            )
+                        )
+                        AND CAST(
+                            REGEXP_REPLACE(UPPER(sparse.brand), '[^A-Z0-9]', '') AS BINARY
+                        ) = CAST(
+                            REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY
+                        )
+                        AND CAST(m.make_name AS BINARY) <=> CAST(d.make_name AS BINARY)
+                        AND CAST(m.model_name AS BINARY) <=> CAST(
+                            COALESCE(NULLIF(TRIM(d.model_name), ''), sparse.model) AS BINARY
+                        )
+                        AND CAST(m.engine AS BINARY) <=> CAST(
+                            COALESCE(NULLIF(TRIM(d.engine_model), ''), sparse.engine) AS BINARY
+                        )
+                        AND CAST(m.trim_name AS BINARY) <=> CAST(
+                            COALESCE(
+                                NULLIF(TRIM(d.trim_name), ''), sparse.trim_name
+                            ) AS BINARY
+                        )
+                        AND (
+                            NULLIF(TRIM(d.model_name), '') IS NULL
+                            OR CAST(
+                                REGEXP_REPLACE(
+                                    UPPER(sparse.model), '[^A-Z0-9]', ''
+                                ) AS BINARY
+                            ) = CAST(
+                                REGEXP_REPLACE(
+                                    UPPER(d.model_name), '[^A-Z0-9]', ''
+                                ) AS BINARY
+                            )
+                        )
+                        AND (
+                            NULLIF(TRIM(d.engine_model), '') IS NULL
+                            OR CAST(
+                                REGEXP_REPLACE(
+                                    UPPER(sparse.engine), '[^A-Z0-9]', ''
+                                ) AS BINARY
+                            ) = CAST(
+                                REGEXP_REPLACE(
+                                    UPPER(d.engine_model), '[^A-Z0-9]', ''
+                                ) AS BINARY
+                            )
+                        )
+                        AND (
+                            NULLIF(TRIM(d.trim_name), '') IS NULL
+                            OR CAST(
+                                REGEXP_REPLACE(
+                                    UPPER(sparse.trim_name), '[^A-Z0-9]', ''
+                                ) AS BINARY
+                            ) = CAST(
+                                REGEXP_REPLACE(
+                                    UPPER(d.trim_name), '[^A-Z0-9]', ''
+                                ) AS BINARY
+                            )
+                        )
+                  )
+              )
+          )
+          OR (
+              m.source_name = 'manual-name-override'
+              AND (
+                  NULLIF(TRIM(m.source_reference), '') IS NULL
+                  OR NOT (m.model_year <=> d.model_year)
+                  OR NOT (CAST(m.make_name AS BINARY) <=> CAST(d.make_name AS BINARY))
+                  OR NOT (CAST(m.model_name AS BINARY) <=> CAST(d.model_name AS BINARY))
+                  OR NOT (CAST(m.engine AS BINARY) <=> CAST(d.engine_model AS BINARY))
+                  OR NOT (CAST(m.trim_name AS BINARY) <=> CAST(d.trim_name AS BINARY))
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM v_current_catalog_parts AS reviewed
+                      WHERE reviewed.vehicle_id = m.partsouq_vehicle_id
+                        AND (
+                            reviewed.production_from IS NOT NULL
+                            OR reviewed.production_to IS NOT NULL
+                        )
+                        AND (
+                            reviewed.production_from IS NULL
+                            OR d.model_year >= CAST(
+                                LEFT(reviewed.production_from, 4) AS UNSIGNED
+                            )
+                        )
+                        AND (
+                            reviewed.production_to IS NULL
+                            OR d.model_year <= CAST(
+                                LEFT(reviewed.production_to, 4) AS UNSIGNED
+                            )
+                        )
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(reviewed.brand), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.make_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                  )
+              )
+          )
+          OR (
+              m.source_name NOT IN ('manual-name-override', 'manual-sparse-override')
+              AND (
+                  NULLIF(TRIM(d.model_name), '') IS NULL
+                  OR NULLIF(TRIM(d.engine_model), '') IS NULL
+                  OR NULLIF(TRIM(d.trim_name), '') IS NULL
+                  OR NOT (m.model_year <=> d.model_year)
+                  OR NOT (
+                      CAST(REGEXP_REPLACE(UPPER(m.make_name), '[^A-Z0-9]', '') AS BINARY)
+                      <=> CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY)
+                  )
+                  OR NOT (
+                      CAST(REGEXP_REPLACE(UPPER(m.model_name), '[^A-Z0-9]', '') AS BINARY)
+                      <=> CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY)
+                  )
+                  OR NOT (
+                      CAST(REGEXP_REPLACE(UPPER(m.engine), '[^A-Z0-9]', '') AS BINARY)
+                      <=> CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY)
+                  )
+                  OR NOT (
+                      CAST(REGEXP_REPLACE(UPPER(m.trim_name), '[^A-Z0-9]', '') AS BINARY)
+                      <=> CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY)
+                  )
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM v_current_catalog_parts AS exact
+                      WHERE exact.vehicle_id = m.partsouq_vehicle_id
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact.brand), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.make_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact.model), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.model_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact.engine), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.engine_model), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact.trim_name), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.trim_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND (
+                            exact.production_from IS NULL
+                            OR d.model_year >= CAST(
+                                LEFT(exact.production_from, 4) AS UNSIGNED
+                            )
+                        )
+                        AND (
+                            exact.production_to IS NULL
+                            OR d.model_year <= CAST(
+                                LEFT(exact.production_to, 4) AS UNSIGNED
+                            )
+                        )
+                  )
+                  OR 1 <> (
+                      SELECT COUNT(DISTINCT exact_candidate.vehicle_id)
+                      FROM v_current_catalog_parts AS exact_candidate
+                      WHERE exact_candidate.vehicle_id IS NOT NULL
+                        AND (
+                            exact_candidate.production_from IS NOT NULL
+                            OR exact_candidate.production_to IS NOT NULL
+                        )
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact_candidate.brand), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.make_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact_candidate.model), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.model_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact_candidate.engine), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.engine_model), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND CAST(REGEXP_REPLACE(
+                            UPPER(exact_candidate.trim_name), '[^A-Z0-9]', ''
+                        ) AS BINARY) = CAST(REGEXP_REPLACE(
+                            UPPER(d.trim_name), '[^A-Z0-9]', ''
+                        ) AS BINARY)
+                        AND (
+                            exact_candidate.production_from IS NULL
+                            OR d.model_year >= CAST(
+                                LEFT(exact_candidate.production_from, 4) AS UNSIGNED
+                            )
+                        )
+                        AND (
+                            exact_candidate.production_to IS NULL
+                            OR d.model_year <= CAST(
+                                LEFT(exact_candidate.production_to, 4) AS UNSIGNED
+                            )
+                        )
+                  )
+              )
+          ) THEN 'stale'
+        WHEN m.source_name IN ('manual-name-override', 'manual-sparse-override')
+            THEN 'confirmed_manual_override'
+        ELSE 'confirmed'
+    END AS mapping_status,
+    CASE
+        WHEN d.error_code = '0' THEN 'decoded'
+        ELSE 'decoded_with_warning'
+    END AS decode_status,
     d.error_code,
     d.error_text,
     'nhtsa_vpic' AS source_kind,
@@ -422,7 +782,12 @@ SELECT
     d.decoded_at AS created_at,
     COALESCE(m.updated_at, d.decoded_at) AS updated_at
 FROM nhtsa_vin_decodes AS d
-LEFT JOIN admin_vehicle_mappings AS m ON m.vin = d.vin;
+LEFT JOIN admin_vehicle_mappings AS m ON m.vin = d.vin
+LEFT JOIN (
+    SELECT DISTINCT vehicle_id
+    FROM v_current_catalog_parts
+    WHERE vehicle_id IS NOT NULL
+) AS published ON published.vehicle_id = m.partsouq_vehicle_id;
 
 CREATE OR REPLACE VIEW station_admin_vin_part_fitments AS
 SELECT

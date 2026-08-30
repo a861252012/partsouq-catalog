@@ -21,6 +21,7 @@ from partsouq_catalog.evidence import (
     assert_no_secret_material,
     brand_natural_key,
     canonical_parser_context,
+    canonical_sha256,
     category_natural_key,
     dataset_sha256,
     group_natural_key,
@@ -267,6 +268,8 @@ def _repository_verification_fixture():
             "vid": vehicle_key["vid"],
             "model_name": "CAMRY",
             "brand_name": "TOYOTA",
+            "source_url": public_url,
+            "evidence_record_sha256": records[-1].record_sha256,
         }
     ]
     database = mock.MagicMock()
@@ -276,6 +279,16 @@ def _repository_verification_fixture():
         normalized = " ".join(sql.split())
         if normalized.startswith("SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts"):
             cursor.fetchone.return_value = {"row_count": 0}
+        elif normalized.startswith("SELECT (SELECT COUNT(*) FROM partsouq_http_artifacts"):
+            referenced_body_hashes = {artifact["body_sha256"] for artifact in artifacts}
+            cursor.fetchone.return_value = {
+                "artifact_count": len(artifacts),
+                "original_bytes": sum(
+                    int(body_row["original_bytes"])
+                    for body_row in bodies
+                    if body_row["body_sha256"] in referenced_body_hashes
+                ),
+            }
         elif normalized.startswith("SELECT artifact.id, artifact.scheduled_job_run_id"):
             cursor.fetchall.return_value = artifacts
         elif normalized.startswith("SELECT body.body_sha256"):
@@ -882,7 +895,7 @@ def test_repository_supersedes_only_the_same_parser_context_slot() -> None:
             }
         elif normalized.startswith("INSERT INTO partsouq_http_artifacts"):
             cursor.lastrowid = 31
-        elif normalized.startswith("SELECT COUNT(*) AS artifact_count"):
+        elif normalized.startswith("SELECT (SELECT COUNT(*) FROM partsouq_http_artifacts"):
             cursor.fetchone.return_value = {"artifact_count": 1, "original_bytes": 1}
         return cursor
 
@@ -925,6 +938,335 @@ def test_repository_verifier_replays_the_stored_cas_body() -> None:
         "parser_version": PARSER_CONTRACT_VERSION,
         "context": {"group_key": _formal_group_key()},
     }
+
+
+def test_completed_evidence_rebuilds_from_immutable_bounded_snapshot() -> None:
+    fixture = _repository_verification_fixture()
+    original_execute = fixture["repository"].db._execute.side_effect
+
+    def execute(sql, params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT p.id, p.part_number"):
+            cursor = mock.MagicMock()
+            cursor.fetchall.return_value = []
+            return cursor
+        if normalized.startswith("SELECT bounded_part.part_id AS id"):
+            cursor = mock.MagicMock()
+            cursor.fetchall.return_value = fixture["source_rows"]
+            return cursor
+        return original_execute(sql, params)
+
+    fixture["repository"].db._execute.side_effect = execute
+    with mock.patch(
+        "partsouq_catalog.repositories.replay_catalog_records",
+        return_value=(fixture["records"], 0, 0),
+    ):
+        summary = fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+            use_bounded_snapshot=True,
+        )
+
+    assert summary.accepted_record_count == 1
+
+
+def test_completed_evidence_rejects_snapshot_source_url_mutation() -> None:
+    fixture = _repository_verification_fixture()
+    fixture["source_rows"][0]["source_url"] = "https://partsouq.com/en/catalog/genuine/unit?uid=11"
+    original_execute = fixture["repository"].db._execute.side_effect
+
+    def execute(sql, params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT bounded_part.part_id AS id"):
+            cursor = mock.MagicMock()
+            cursor.fetchall.return_value = fixture["source_rows"]
+            return cursor
+        return original_execute(sql, params)
+
+    fixture["repository"].db._execute.side_effect = execute
+    with pytest.raises(RuntimeError, match="evidence source URL mismatch"):
+        fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+            use_bounded_snapshot=True,
+        )
+
+
+def test_completed_evidence_rejects_snapshot_record_digest_mutation() -> None:
+    fixture = _repository_verification_fixture()
+    fixture["source_rows"][0]["evidence_record_sha256"] = "f" * 64
+    original_execute = fixture["repository"].db._execute.side_effect
+
+    def execute(sql, params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT bounded_part.part_id AS id"):
+            cursor = mock.MagicMock()
+            cursor.fetchall.return_value = fixture["source_rows"]
+            return cursor
+        return original_execute(sql, params)
+
+    fixture["repository"].db._execute.side_effect = execute
+    with pytest.raises(RuntimeError, match="snapshot evidence digest mismatch"):
+        fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+            use_bounded_snapshot=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("brand_name", "LEXUS"),
+        ("model_name", "TACOMA"),
+        ("production_to", "2005-12"),
+    ),
+)
+def test_repository_verifier_rejects_rows_outside_declared_scope(
+    field_name: str,
+    field_value: str,
+) -> None:
+    fixture = _repository_verification_fixture()
+    fixture["source_rows"][0][field_name] = field_value
+
+    with pytest.raises(RuntimeError, match="declared model scope mismatch"):
+        fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+            scope_brand="TOYOTA",
+            scope_model="CAMRY",
+            scope_vehicle_year_floor=2006,
+        )
+
+
+def test_scope_metadata_changes_manifest_while_legacy_null_scope_keeps_list_hash() -> None:
+    fixture = _repository_verification_fixture()
+    fixed_started_at = datetime(2026, 8, 22, 11, 0, 0)
+    fixed_fetched_at = datetime(2026, 8, 22, 11, 0, 1)
+    fixture["run_started_at"] = fixed_started_at
+    hierarchy_records = fixture["records"][:-1]
+    part_records = fixture["records"][-1:]
+    first_artifact = fixture["artifacts"][0]
+    first_artifact.update(
+        fetched_at=fixed_fetched_at,
+        verified_at=fixed_fetched_at,
+        evidence_job_started_at=fixed_started_at,
+        parsed_record_count=len(hierarchy_records),
+        parsed_records_sha256=_record_set_sha256(hierarchy_records),
+        accepted_record_count=0,
+        accepted_records_sha256=_record_set_sha256([]),
+    )
+    # Keep the accepted part's stored source URL aligned with the artifact
+    # while using a distinct, allowed catalog context for manifest ordering.
+    second_url = "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&uid=10"
+    fixture["source_rows"][0]["source_url"] = second_url
+    second_artifact = {
+        **first_artifact,
+        "id": 2,
+        "public_source_url": second_url,
+        "source_url_sha256": hashlib.sha256(second_url.encode()).hexdigest(),
+        "raw_body_sha256": "b" * 64,
+        "fetched_at": fixed_fetched_at + timedelta(seconds=1),
+        "verified_at": fixed_fetched_at + timedelta(seconds=1),
+        "elapsed_ms": 30,
+        "attempt": 2,
+        "parsed_record_count": len(part_records),
+        "parsed_records_sha256": _record_set_sha256(part_records),
+        "accepted_record_count": 1,
+        "accepted_records_sha256": _record_set_sha256(part_records),
+    }
+    fixture["artifacts"].append(second_artifact)
+    fixture["record_rows"][-1]["artifact_id"] = 2
+    captured_manifests: list[object] = []
+
+    def capture_manifest(value: object) -> str:
+        captured_manifests.append(value)
+        return canonical_sha256(value)
+
+    replay_results = iter(
+        [
+            (hierarchy_records, 0, 0),
+            (part_records, 0, 0),
+        ]
+        * 3
+    )
+    with (
+        mock.patch(
+            "partsouq_catalog.repositories.replay_catalog_records",
+            side_effect=lambda *_args, **_kwargs: next(replay_results),
+        ),
+        mock.patch(
+            "partsouq_catalog.repositories.canonical_sha256",
+            side_effect=capture_manifest,
+        ),
+    ):
+        legacy = fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+        )
+        scoped = fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+            scope_brand="TOYOTA",
+            scope_model="CAMRY",
+            scope_vehicle_year_floor=2006,
+        )
+        moved_floor = fixture["repository"]._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+            scope_brand="TOYOTA",
+            scope_model="CAMRY",
+            scope_vehicle_year_floor=2007,
+        )
+
+    manifest_inputs = [
+        value
+        for value in captured_manifests
+        if (
+            isinstance(value, list)
+            and value
+            and isinstance(value[0], dict)
+            and "capture_kind" in value[0]
+        )
+        or (isinstance(value, dict) and "scope" in value and "artifacts" in value)
+    ]
+    legacy_manifest = [
+        {
+            "capture_kind": "live_http",
+            "scheduled_job_run_id": 23,
+            "page_type": "unit",
+            "source_url_sha256": (
+                "4e5cd1dca803f26bade15e23305fefc208661c44d1f8b327bd9310bf05d6c366"
+            ),
+            "raw_body_sha256": "a" * 64,
+            "body_sha256": "ee8a62862b20ce97f74e2bdba935d141361fee3c543a75ebb9a0214c3edca72e",
+            "sanitizer_version": "partsouq-html-public-v2",
+            "http_status": 200,
+            "content_type": "text/html; charset=utf-8",
+            "fetched_at": "2026-08-22T11:00:01.000000",
+            "elapsed_ms": 25,
+            "attempt": 1,
+            "parser_name": "parse_parts",
+            "parser_version": "partsouq-catalog-parser-v1",
+            "parser_context_sha256": (
+                "6e67f898abf81eea4fa0d62d3ffd867110e8d53c19a7a87cebcc93ebd6988b8a"
+            ),
+            "parsed_record_count": 5,
+            "parsed_records_sha256": (
+                "ecad426511cbe19a83ac239b5b1e1693a90e194d863985ab09e22331dafc1cf4"
+            ),
+            "accepted_record_count": 0,
+            "accepted_records_sha256": (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+        },
+        {
+            "capture_kind": "live_http",
+            "scheduled_job_run_id": 23,
+            "page_type": "unit",
+            "source_url_sha256": (
+                "e846fa4348a66b7e0057001e0495afc534fc58712a958ec426b27604c084e48c"
+            ),
+            "raw_body_sha256": "b" * 64,
+            "body_sha256": "ee8a62862b20ce97f74e2bdba935d141361fee3c543a75ebb9a0214c3edca72e",
+            "sanitizer_version": "partsouq-html-public-v2",
+            "http_status": 200,
+            "content_type": "text/html; charset=utf-8",
+            "fetched_at": "2026-08-22T11:00:02.000000",
+            "elapsed_ms": 30,
+            "attempt": 2,
+            "parser_name": "parse_parts",
+            "parser_version": "partsouq-catalog-parser-v1",
+            "parser_context_sha256": (
+                "6e67f898abf81eea4fa0d62d3ffd867110e8d53c19a7a87cebcc93ebd6988b8a"
+            ),
+            "parsed_record_count": 1,
+            "parsed_records_sha256": (
+                "0d814063349732da13235a872b708fd5f1de2969cd81f1c25e309e0667db8d66"
+            ),
+            "accepted_record_count": 1,
+            "accepted_records_sha256": (
+                "0d814063349732da13235a872b708fd5f1de2969cd81f1c25e309e0667db8d66"
+            ),
+        },
+    ]
+    assert manifest_inputs[0] == legacy_manifest
+    assert canonical_sha256(legacy_manifest) == (
+        "66c51d5f7863473856ec6d9b7190c3f64ea7d8732da70a0bbce1569b938d2ef4"
+    )
+    assert (
+        legacy.manifest_sha256 == "66c51d5f7863473856ec6d9b7190c3f64ea7d8732da70a0bbce1569b938d2ef4"
+    )
+    assert legacy.manifest_sha256 == canonical_sha256(legacy_manifest)
+    assert manifest_inputs[1] == {
+        "scope": {
+            "brand": "toyota",
+            "model": "camry",
+            "vehicle_year_floor": 2006,
+        },
+        "artifacts": legacy_manifest,
+    }
+    assert len({legacy.manifest_sha256, scoped.manifest_sha256, moved_floor.manifest_sha256}) == 3
+
+
+def test_verify_run_evidence_seals_the_persisted_scope() -> None:
+    database = mock.MagicMock()
+    run = {
+        "started_at": datetime.now(UTC).replace(tzinfo=None),
+        "status": "running",
+        "dataset_kind": "bounded",
+        "target_parts": 10_000,
+        "scope_brand": "TOYOTA",
+        "scope_model": "TACOMA",
+        "scope_vehicle_year_floor": 2006,
+        "scheduled_job_run_id": 23,
+        "scheduled_job_name": "catalog",
+        "scheduled_trigger_mode": "daemon",
+        "scheduled_job_status": "running",
+        "scheduled_crawl_count": 1,
+    }
+    select_cursor = mock.MagicMock()
+    select_cursor.fetchone.return_value = run
+    update_cursor = mock.MagicMock()
+    database._execute.side_effect = (select_cursor, update_cursor)
+    repository = CrawlRepository(database, "scope-seal")
+    summary = mock.MagicMock(
+        manifest_sha256="a" * 64,
+        dataset_sha256="b" * 64,
+        artifact_count=7,
+        accepted_record_count=10_000,
+        original_bytes=1_024,
+        stored_bytes=512,
+    )
+
+    with mock.patch.object(repository, "_calculate_run_evidence", return_value=summary) as seal:
+        repository.verify_run_evidence(17)
+
+    select_query = database._execute.call_args_list[0].args[0]
+    assert "cr.scope_brand, cr.scope_model, cr.scope_vehicle_year_floor" in select_query
+    seal.assert_called_once_with(
+        17,
+        23,
+        run["started_at"],
+        10_000,
+        scope_brand="TOYOTA",
+        scope_model="TACOMA",
+        scope_vehicle_year_floor=2006,
+    )
 
 
 def test_repository_verifier_detects_coherent_cas_body_replacement() -> None:
@@ -1297,6 +1639,92 @@ def test_bounded_publish_checks_sealed_evidence_before_snapshot_mutation() -> No
     assert not any(sql.startswith("DELETE FROM bounded_parts") for sql in executed_sql)
 
 
+def test_bounded_publish_revalidates_the_persisted_snapshot_evidence_binding() -> None:
+    database = mock.MagicMock()
+    run = {
+        "run_key": "bounded-snapshot-binding",
+        "dataset_kind": "bounded",
+        "target_parts": 10_000,
+        "status": "running",
+        "started_at": datetime(2026, 8, 22, 12, 0, 0),
+        "scope_brand": "toyota",
+        "scope_model": "tacoma",
+        "scope_vehicle_year_floor": 2006,
+        "scheduled_job_run_id": 23,
+        "scheduled_job_name": "catalog",
+        "scheduled_trigger_mode": "daemon",
+        "scheduled_job_status": "running",
+        "scheduled_crawl_count": 1,
+        "evidence_status": "verified",
+        "evidence_manifest_sha256": "a" * 64,
+        "evidence_dataset_sha256": "b" * 64,
+        "evidence_artifact_count": 1,
+        "evidence_record_count": 10_000,
+        "evidence_original_bytes": 1,
+        "evidence_stored_bytes": 1,
+        "evidence_verified_at": datetime(2026, 8, 22, 12, 1, 0),
+    }
+
+    def execute(sql: str, _params=()):
+        cursor = mock.MagicMock()
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT cr.run_key"):
+            cursor.fetchone.return_value = run
+        elif normalized.startswith("SELECT id FROM crawl_state"):
+            cursor.fetchall.return_value = []
+        elif (
+            normalized == "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s"
+            or normalized.startswith("SELECT COUNT(*) AS row_count FROM parts AS p")
+        ):
+            cursor.fetchone.return_value = {"row_count": 10_000}
+        elif normalized.startswith(
+            "SELECT scope_brand, scope_model, scope_vehicle_year_floor "
+            "FROM catalog_desired_bounded_scope"
+        ):
+            cursor.fetchone.return_value = {
+                "scope_brand": "toyota",
+                "scope_model": "tacoma",
+                "scope_vehicle_year_floor": 2006,
+            }
+        elif normalized == "DELETE FROM bounded_parts":
+            pass
+        elif normalized.startswith("INSERT INTO bounded_parts"):
+            cursor.rowcount = 10_000
+        elif normalized.startswith("SELECT COUNT(*) AS row_count, COUNT(DISTINCT crawl_run_id)"):
+            cursor.fetchone.return_value = {
+                "row_count": 10_000,
+                "run_count": 1,
+                "min_run_id": 17,
+                "max_run_id": 17,
+            }
+        elif normalized.startswith("SELECT COUNT(*) AS invalid_rows FROM bounded_parts"):
+            cursor.fetchone.return_value = {"invalid_rows": 0}
+        else:
+            raise AssertionError(f"unexpected bounded publish query: {normalized}")
+        return cursor
+
+    database._execute.side_effect = execute
+    repository = CrawlRepository(database, "bounded-snapshot-binding")
+    with mock.patch.object(repository, "_assert_verified_run_evidence") as evidence_gate:
+        assert repository.publish_bounded_parts(17, 10_000) == 10_000
+
+    evidence_gate.assert_has_calls(
+        [
+            mock.call(17, run, 10_000),
+            mock.call(17, run, 10_000, use_bounded_snapshot=True),
+        ]
+    )
+    assert evidence_gate.call_count == 2
+    insert_sql = next(
+        " ".join(call.args[0].split())
+        for call in database._execute.call_args_list
+        if "INSERT INTO bounded_parts" in call.args[0]
+    )
+    assert "evidence_record_sha256" in insert_sql
+    assert "evidence_record.record_sha256" in insert_sql
+    assert "JOIN partsouq_artifact_records AS evidence_record" in insert_sql
+
+
 def test_formal_bounded_crawler_seals_evidence_before_publish(monkeypatch) -> None:
     monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
     monkeypatch.setitem(CRAWL, "limit_parts", 0)
@@ -1364,6 +1792,7 @@ def test_completed_evidence_audit_rechecks_sealed_run_without_writing() -> None:
         cursor.fetchone.return_value,
         10_000,
         allow_failed_current_scheduler=False,
+        use_bounded_snapshot=True,
     )
     assert result == {
         "run_id": 17,
@@ -1416,6 +1845,7 @@ def test_interrupted_recovery_evidence_audit_allows_running_scheduler() -> None:
         cursor.fetchone.return_value,
         10_000,
         allow_failed_current_scheduler=False,
+        use_bounded_snapshot=True,
     )
     assert result["verified"] is True
 
@@ -1463,6 +1893,7 @@ def test_interrupted_recovery_evidence_audit_allows_failed_scheduler() -> None:
         cursor.fetchone.return_value,
         10_000,
         allow_failed_current_scheduler=True,
+        use_bounded_snapshot=True,
     )
     assert result["verified"] is True
 

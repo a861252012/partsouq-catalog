@@ -15,12 +15,13 @@
 
 import logging
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Never, Protocol, Self, cast
 
 import pymysql
 from pymysql.cursors import DictCursor
 
+from .admission import CATALOG_RUNTIME_SHUTDOWN_SECONDS
 from .config import DB_CONFIG
 
 log = logging.getLogger("db")
@@ -65,6 +66,7 @@ class Database:
     def __init__(self) -> None:
         self._local = threading.local()
         self.conn: DBConnection | None = None
+        self._commit_guard: Callable[[], None] | None = None
 
     def connect(self) -> Self:
         """初始化（回傳自身以便鏈式呼叫）。
@@ -77,7 +79,7 @@ class Database:
         """
         return self
 
-    def _new_conn(self) -> DBConnection:
+    def _new_conn(self, *, read_timeout: float | None = None) -> DBConnection:
         """建立一條新的 MySQL 連線，並設定合理的交易隔離層級。"""
         conn = pymysql.connect(
             host=cast(str, DB_CONFIG["host"]),
@@ -88,12 +90,21 @@ class Database:
             cursorclass=DictCursor,
             autocommit=False,
             charset="utf8mb4",
+            read_timeout=read_timeout,
         )
         # READ COMMITTED：避免 InnoDB 在共用的唯一索引上產生 gap lock
         # （多個 worker 會同時對同一個 model_id 底下插入車型/零件組）
         with conn.cursor() as cur:
             cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
         return conn
+
+    def open_owner_connection(self) -> DBConnection:
+        """建立由呼叫端自行關閉的專用連線，供 session-scoped lock 使用。"""
+        return self._new_conn(read_timeout=CATALOG_RUNTIME_SHUTDOWN_SECONDS)
+
+    def set_commit_guard(self, guard: Callable[[], None] | None) -> None:
+        """設定每次 transaction commit 前都必須通過的 ownership guard。"""
+        self._commit_guard = guard
 
     def close(self) -> None:
         """關閉主連線與所有執行緒連線，並重置 thread-local 狀態。"""
@@ -222,6 +233,8 @@ class Database:
         if not conn:
             raise RuntimeError("no connection to commit")
         try:
+            if self._commit_guard is not None:
+                self._commit_guard()
             conn.commit()
         except pymysql.err.OperationalError as e:
             code = e.args[0] if e.args else None

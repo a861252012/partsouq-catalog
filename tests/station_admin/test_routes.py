@@ -6,6 +6,7 @@ import pytest
 
 from partsouq_station_admin.app import create_app
 from partsouq_station_admin.config import AdminConfig
+from partsouq_station_admin.db import SqlParams
 from partsouq_station_admin.query_trace import QueryTrace
 from partsouq_station_admin.repository import AdminRepository
 
@@ -110,7 +111,7 @@ def test_health_fails_closed_when_published_provenance_contract_is_stale() -> No
     response = app.test_client().get("/health")
 
     assert response.status_code == 503
-    assert b"migration 019" in response.data
+    assert b"migration 033" in response.data
     assert databases[-1].calls[-1].tag == "health.published-provenance"
 
 
@@ -294,7 +295,7 @@ def test_list_allows_supported_page_size_and_keeps_it_on_next_link() -> None:
     assert response.headers["X-Admin-Query-Count"] == "4"
     assert b'<option value="200" selected>' in response.data
     assert b'<option value="formal" selected>' in response.data
-    assert "目前正式資料（full 優先，否則 bounded）".encode() in response.data
+    assert "目前正式 snapshot（已通過發布閘門）".encode() in response.data
     assert "歷史 sample（非正式）".encode() in response.data
     assert b"pageSize=200" in response.data
     assert "顯示 1 到 200，共 1000 筆記錄".encode() in response.data
@@ -367,6 +368,55 @@ def test_dashboard_separates_sample_published_and_nhtsa_vin_layers() -> None:
     assert "逐 VIN 解碼需由站方輸入合法 VIN".encode() in response.data
 
 
+def test_dashboard_does_not_accept_raw_bounded_rows_without_verified_current_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = AdminRepository.system_data_summary
+
+    def mismatched_current_snapshot(repository: AdminRepository) -> dict[str, object]:
+        summary = original(repository)
+        summary["partsouq_current_crawl_run_id"] = None
+        summary["partsouq_current_rows"] = 0
+        summary["partsouq_current_scope"] = None
+        return summary
+
+    monkeypatch.setattr(AdminRepository, "system_data_summary", mismatched_current_snapshot)
+
+    response = _app([]).test_client().get("/")
+
+    assert response.status_code == 200
+    assert "正式排程限量資料已完成".encode() not in response.data
+    assert "正式排程限量資料尚未通過驗收".encode() in response.data
+
+
+def test_dashboard_explains_bounded_scope_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = AdminRepository.system_data_summary
+
+    def mismatched_scope(repository: AdminRepository) -> dict[str, object]:
+        summary = original(repository)
+        summary["partsouq_current_rows"] = 0
+        summary["partsouq_current_scope"] = None
+        summary["partsouq_bounded_rows"] = 0
+        summary["bounded_scope_matches_desired"] = False
+        summary["bounded_scope_blocking_reason"] = "bounded_scope_mismatch"
+        summary["latest_bounded_run_scope"] = {
+            "brand": "toyota",
+            "model": "1000",
+            "vehicle_year_floor": 1969,
+        }
+        return summary
+
+    monkeypatch.setattr(AdminRepository, "system_data_summary", mismatched_scope)
+
+    response = _app([]).test_client().get("/")
+
+    assert response.status_code == 200
+    assert "正式排程限量資料已完成".encode() not in response.data
+    assert "不符合的 snapshot 已隱藏".encode() in response.data
+
+
 def test_dashboard_does_not_claim_empty_nhtsa_reference_is_synced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -376,6 +426,7 @@ def test_dashboard_does_not_claim_empty_nhtsa_reference_is_synced(
         summary = original(repository)
         summary["nhtsa_current_records"] = 0
         summary["nhtsa_vin_decodes"] = 0
+        summary["nhtsa_terminal_undecodable_vins"] = 0
         return summary
 
     monkeypatch.setattr(AdminRepository, "system_data_summary", empty_nhtsa_reference)
@@ -387,6 +438,26 @@ def test_dashboard_does_not_claim_empty_nhtsa_reference_is_synced(
     assert "目前已有已發布的 NHTSA 參考資料".encode() not in response.data
 
 
+def test_dashboard_does_not_claim_terminal_vin_was_never_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = AdminRepository.system_data_summary
+
+    def terminal_vin(repository: AdminRepository) -> dict[str, object]:
+        summary = original(repository)
+        summary["nhtsa_vin_decodes"] = 0
+        summary["nhtsa_terminal_undecodable_vins"] = 1
+        return summary
+
+    monkeypatch.setattr(AdminRepository, "system_data_summary", terminal_vin)
+    response = _app([]).test_client().get("/")
+
+    assert response.status_code == 200
+    assert "已受理 1 筆 VIN，但 NHTSA 均無法產生可用解碼".encode() in response.data
+    assert "這不代表尚未提供 VIN".encode() in response.data
+    assert "逐 VIN 解碼需由站方輸入合法 VIN".encode() not in response.data
+
+
 def test_part_detail_does_not_present_adapter_metadata_as_raw_http_evidence() -> None:
     databases: list[ScriptedDatabase] = []
     app = _app(databases)
@@ -396,6 +467,148 @@ def test_part_detail_does_not_present_adapter_metadata_as_raw_http_evidence() ->
     assert response.status_code == 200
     assert "零件表 Code／圖號呼叫碼".encode() in response.data
     assert "不代表已保留原始 HTTP 回應或 hash".encode() in response.data
+
+
+def test_unpublished_raw_source_id_is_404_for_all_formal_part_routes() -> None:
+    databases: list[ScriptedDatabase] = []
+
+    def factory(_config: AdminConfig, trace: QueryTrace) -> ScriptedDatabase:
+        database = ScriptedDatabase(trace)
+        original_fetch_one = database.fetch_one
+
+        def unpublished_source(
+            tag: str,
+            sql: str,
+            params: SqlParams = None,
+        ) -> dict[str, object] | None:
+            if tag in {"detail.base.part_numbers", "write.lock-base.part_numbers"}:
+                assert "FROM station_admin_formal_part_numbers" in sql
+                return None
+            return original_fetch_one(tag, sql, params)
+
+        database.fetch_one = unpublished_source  # type: ignore[method-assign]
+        databases.append(database)
+        return database
+
+    app = create_app(
+        AdminConfig(secret_key="test-secret", page_size=25),
+        database_factory=factory,
+    )
+    app.testing = True
+    client = app.test_client()
+    token = _csrf_token(client, "/entities/part_numbers/new")
+
+    responses = (
+        client.get("/entities/part_numbers/source:1"),
+        client.get("/entities/part_numbers/source:1/edit"),
+        client.post(
+            "/entities/part_numbers/source:1/update",
+            data={
+                "csrf_token": token,
+                "revision": "0",
+                "base_sha256": "0" * 64,
+                "actor": "tester",
+                "reason": "unpublished raw row",
+            },
+        ),
+        client.post(
+            "/entities/part_numbers/source:1/retire",
+            data={
+                "csrf_token": token,
+                "revision": "0",
+                "actor": "tester",
+                "reason": "unpublished raw row",
+            },
+        ),
+        client.post(
+            "/entities/part_numbers/source:1/restore",
+            data={
+                "csrf_token": token,
+                "revision": "0",
+                "actor": "tester",
+                "reason": "unpublished raw row",
+            },
+        ),
+    )
+
+    assert all(response.status_code == 404 for response in responses)
+    assert all("找不到來源資料".encode() in response.data for response in responses)
+    assert not any(
+        call.tag.startswith(("write.insert-head", "write.update-head", "write.append-event"))
+        for database in databases
+        for call in database.calls
+    )
+
+
+def test_vin_mapping_pages_only_offer_dedicated_decode_and_confirmation_workflow() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases)
+    client = app.test_client()
+
+    listing = client.get("/entities/vin_vehicle_mappings")
+    assert listing.status_code == 200
+    assert "加入 VIN 解碼".encode() in listing.data
+    assert "新增人工資料".encode() not in listing.data
+
+    detail = client.get("/entities/vin_vehicle_mappings/source:1")
+    assert detail.status_code == 200
+    assert "編輯覆寫".encode() not in detail.data
+    assert b'<section class="actions">' not in detail.data
+
+
+def test_vin_mapping_generic_mutation_routes_fail_closed() -> None:
+    databases: list[ScriptedDatabase] = []
+    app = _app(databases)
+    client = app.test_client()
+    token = _csrf_token(client, "/entities/part_numbers/new")
+
+    responses = (
+        client.get("/entities/vin_vehicle_mappings/new"),
+        client.post(
+            "/entities/vin_vehicle_mappings/new",
+            data={
+                "csrf_token": token,
+                "field__vin": "TEST0000000000000",
+                "actor": "tester",
+                "reason": "must use dedicated workflow",
+            },
+        ),
+        client.get("/entities/vin_vehicle_mappings/source:1/edit"),
+        client.post(
+            "/entities/vin_vehicle_mappings/source:1/update",
+            data={
+                "csrf_token": token,
+                "revision": "0",
+                "base_sha256": "0" * 64,
+                "actor": "tester",
+                "reason": "must use dedicated workflow",
+            },
+        ),
+        client.post(
+            "/entities/vin_vehicle_mappings/source:1/retire",
+            data={
+                "csrf_token": token,
+                "revision": "0",
+                "actor": "tester",
+                "reason": "must use dedicated workflow",
+            },
+        ),
+        client.post(
+            "/entities/vin_vehicle_mappings/source:1/restore",
+            data={
+                "csrf_token": token,
+                "revision": "0",
+                "actor": "tester",
+                "reason": "must use dedicated workflow",
+            },
+        ),
+    )
+
+    assert all(response.status_code == 400 for response in responses)
+    assert all("此資料類型為唯讀".encode() in response.data for response in responses)
+    assert not any(
+        call.tag.startswith("write.") for database in databases for call in database.calls
+    )
 
 
 def test_create_appends_overlay_event_and_vin_request_records_actor() -> None:

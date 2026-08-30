@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from partsouq_station_admin.db import SqlParams
 from partsouq_station_admin.query_trace import QueryTrace
 from partsouq_station_admin.repository import (
     ENTITY_SPECS,
@@ -17,7 +19,7 @@ from partsouq_station_admin.repository import (
     RevisionConflictError,
 )
 
-from .fakes import ScriptedDatabase
+from .fakes import ScriptedDatabase, source_row
 
 
 def test_ten_entities_read_adapter_views_in_the_unified_database() -> None:
@@ -37,6 +39,12 @@ def test_ten_entities_read_adapter_views_in_the_unified_database() -> None:
     assert PAGE_SIZES == (10, 25, 30, 50, 100, 200)
     assert FIELD_LABELS["source_part_code"] == "零件表 Code／圖號呼叫碼"
     assert FIELD_LABELS["part_brand_raw"] == "適用車輛品牌（非零件品牌）"
+    vin_spec = ENTITY_SPECS["vin_vehicle_mappings"]
+    assert vin_spec.title == "VIN 解碼與車型確認"
+    assert "mapping_status" in vin_spec.source_fields
+    assert "mapping_status" in vin_spec.search_fields
+    assert "mapping_status" in vin_spec.display_fields
+    assert vin_spec.editable_fields == ()
 
 
 @pytest.mark.parametrize("entity_type", ENTITY_SPECS)
@@ -88,6 +96,29 @@ def test_catalog_lists_default_to_shared_current_catalog(
     assert formal_view in "\n".join(call.sql for call in database.calls)
 
 
+@pytest.mark.parametrize(
+    ("entity_type", "formal_view"),
+    (
+        ("vehicle_configurations", "station_admin_formal_vehicle_configurations"),
+        ("taxonomy_nodes", "station_admin_formal_taxonomy_nodes"),
+        ("diagrams", "station_admin_formal_diagrams"),
+        ("part_numbers", "station_admin_formal_part_numbers"),
+        ("part_occurrences", "station_admin_formal_part_occurrences"),
+        ("fitments", "station_admin_formal_fitments"),
+    ),
+)
+def test_catalog_source_details_are_limited_to_the_formal_snapshot(
+    entity_type: str,
+    formal_view: str,
+) -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    AdminRepository(database).get_record(entity_type, "source:1")
+
+    detail = next(call for call in database.calls if call.tag == f"detail.base.{entity_type}")
+    assert f"FROM {formal_view}" in detail.sql
+
+
 def test_non_part_entity_rejects_historical_sample_scope() -> None:
     with pytest.raises(AdminDataError, match="沒有歷史 sample"):
         AdminRepository(ScriptedDatabase(QueryTrace())).list_records(
@@ -136,6 +167,43 @@ def test_source_update_only_writes_overlay_and_append_only_event() -> None:
     assert "from parts as p" in lock_source.sql.lower()
     lock_base = next(call for call in database.calls if call.tag == "write.lock-base.part_numbers")
     assert "for share" not in lock_base.sql.lower()
+    assert "FROM station_admin_formal_part_numbers" in lock_base.sql
+
+
+def test_unpublished_raw_part_id_is_rejected_by_detail_and_update() -> None:
+    database = ScriptedDatabase(QueryTrace())
+    original_fetch_one = database.fetch_one
+
+    def unpublished_source(
+        tag: str,
+        sql: str,
+        params: SqlParams = None,
+    ) -> dict[str, Any] | None:
+        if tag in {"detail.base.part_numbers", "write.lock-base.part_numbers"}:
+            assert "FROM station_admin_formal_part_numbers" in sql
+            return None
+        return original_fetch_one(tag, sql, params)
+
+    database.fetch_one = unpublished_source  # type: ignore[method-assign]
+    repository = AdminRepository(database)
+
+    with pytest.raises(RecordNotFoundError, match="來源資料"):
+        repository.get_record("part_numbers", "source:1")
+    with pytest.raises(RecordNotFoundError, match="來源資料"):
+        repository.update_record(
+            "part_numbers",
+            "source:1",
+            {"name_en_raw": "不得寫入"},
+            expected_revision=0,
+            expected_base_sha256="0" * 64,
+            actor="tester",
+            reason="unpublished raw row",
+        )
+
+    assert not any(
+        call.tag.startswith(("write.insert-head", "write.update-head", "write.append-event"))
+        for call in database.calls
+    )
 
 
 def test_part_number_search_normalizes_spaces_and_hyphens() -> None:
@@ -145,8 +213,16 @@ def test_part_number_search_normalizes_spaces_and_hyphens() -> None:
 
     count = next(call for call in database.calls if call.tag == "list.count.part_numbers")
     keys = next(call for call in database.calls if call.tag == "list.keys.part_numbers")
-    assert tuple(count.params[:3]) == ("P-1%", "P1%", "P-1%")
-    assert tuple(keys.params[:3]) == ("P-1%", "P1%", "P-1%")
+    expected_candidates = (42, "P-1%", 42, "P1%", 42, "P-1%")
+    assert tuple(count.params[:6]) == expected_candidates
+    assert tuple(keys.params[:6]) == expected_candidates
+    assert "FROM bounded_parts FORCE INDEX (idx_bounded_part_number_normalized)" in count.sql
+    assert "FROM bounded_parts FORCE INDEX (idx_bounded_part_number_normalized)" in keys.sql
+    assert "JOIN station_admin_formal_part_numbers AS s" in count.sql
+    assert "JOIN station_admin_formal_part_numbers AS s" in keys.sql
+    assert [call.tag for call in database.calls].count("list.snapshot.part_numbers") == 1
+    assert any(call.tag == "list.source-batch.part_numbers" for call in database.calls)
+    assert database.transaction_modes == [True]
 
 
 def test_part_number_search_does_not_turn_only_separators_into_wildcard() -> None:
@@ -156,8 +232,36 @@ def test_part_number_search_does_not_turn_only_separators_into_wildcard() -> Non
 
     count = next(call for call in database.calls if call.tag == "list.count.part_numbers")
     keys = next(call for call in database.calls if call.tag == "list.keys.part_numbers")
-    assert tuple(count.params[:3]) == ("---%", "---%", "---%")
-    assert tuple(keys.params[:3]) == ("---%", "---%", "---%")
+    expected_candidates = (42, "---%", 42, "---%", 42, "---%")
+    assert tuple(count.params[:6]) == expected_candidates
+    assert tuple(keys.params[:6]) == expected_candidates
+
+
+def test_formal_part_search_falls_back_when_current_snapshot_is_not_bounded() -> None:
+    database = ScriptedDatabase(QueryTrace())
+    original_fetch_all = database.fetch_all
+
+    def full_snapshot(
+        tag: str,
+        sql: str,
+        params: SqlParams = None,
+    ) -> list[dict[str, Any]]:
+        if tag == "list.snapshot.part_numbers":
+            return [{"dataset_scope": "full", "source_crawl_run_id": 99}]
+        return original_fetch_all(tag, sql, params)
+
+    database.fetch_all = full_snapshot  # type: ignore[method-assign]
+
+    AdminRepository(database).list_records("part_numbers", query="P-1", limit=10)
+
+    count = next(call for call in database.calls if call.tag == "list.count.part_numbers")
+    keys = next(call for call in database.calls if call.tag == "list.keys.part_numbers")
+    assert tuple(count.params[:3]) == ("P-1%", "P1%", "P-1%")
+    assert tuple(keys.params[:3]) == ("P-1%", "P1%", "P-1%")
+    assert "SELECT id FROM station_admin_formal_part_numbers" in count.sql
+    assert "SELECT id FROM station_admin_formal_part_numbers" in keys.sql
+    assert "FORCE INDEX (idx_bounded_part_number_normalized)" not in count.sql
+    assert "FORCE INDEX (idx_bounded_part_number_normalized)" not in keys.sql
 
 
 def test_dashboard_counts_nhtsa_rows_from_current_artifact_metadata() -> None:
@@ -167,21 +271,42 @@ def test_dashboard_counts_nhtsa_rows_from_current_artifact_metadata() -> None:
 
     call = next(call for call in database.calls if call.tag == "dashboard.system-data-summary")
     assert summary["nhtsa_current_records"] == 137120
+    assert summary["nhtsa_terminal_undecodable_vins"] == 0
     assert "SUM(a.source_rows)" in call.sql
+    assert "terminal_artifact.status = 'undecodable'" in call.sql
+    assert "decoded_artifact.source_key = terminal_artifact.source_key" in call.sql
+    assert "decoded_vin.vin = terminal_artifact.source_key" not in call.sql
     assert "FROM nhtsa_current_records" not in call.sql
-    assert "LEFT JOIN bounded_parts AS bp ON bp.crawl_run_id = r.id" in call.sql
+    assert "bounded_part.source_crawl_run_id = bounded_metadata.id" in call.sql
+    assert "bounded_part.dataset_scope = 'bounded'" in call.sql
+    assert "LEFT JOIN bounded_parts AS bounded_part" not in call.sql
     assert "FROM v_current_catalog_parts" in call.sql
     assert call.sql.count("FROM crawl_runs") == 2
     assert summary["partsouq_current_scope"] == "bounded"
+    assert summary["partsouq_current_crawl_run_id"] == 42
     assert summary["partsouq_current_rows"] == 10000
     assert summary["partsouq_bounded_rows"] == 10000
     assert summary["bounded_scheduled_job_run_id"] == 77
     assert summary["bounded_scheduler_trigger_mode"] == "daemon"
-    assert "MAX(jobs.trigger_mode)" in call.sql
+    assert "scheduled_job.trigger_mode AS scheduler_trigger_mode" in call.sql
+    assert "MAX(bounded_metadata.non_live_data_marker)" in call.sql
     assert "DATABASE() <> 'partsouq_catalog'" in call.sql
     assert summary["bounded_scheduler_linked_crawl_runs"] == 1
     assert summary["bounded_non_live_data_marker"] == 0
     assert summary["bounded_active_override_rows"] == 0
+    assert summary["desired_bounded_scope"] == {
+        "brand": "toyota",
+        "model": "tacoma",
+        "vehicle_year_floor": 2006,
+        "updated_at": "2026-08-30 00:00:00",
+    }
+    assert summary["latest_bounded_run_scope"] == {
+        "brand": "toyota",
+        "model": "tacoma",
+        "vehicle_year_floor": 2006,
+    }
+    assert summary["bounded_scope_matches_desired"] is True
+    assert summary["bounded_scope_blocking_reason"] is None
 
 
 def test_dashboard_source_counts_use_formal_part_views() -> None:
@@ -196,6 +321,39 @@ def test_dashboard_source_counts_use_formal_part_views() -> None:
     assert "station_admin_formal_vehicle_configurations" in call.sql
     assert "station_admin_formal_taxonomy_nodes" in call.sql
     assert "station_admin_formal_diagrams" in call.sql
+
+
+def test_dashboard_summary_fails_closed_when_bounded_scope_does_not_match() -> None:
+    database = ScriptedDatabase(QueryTrace())
+    original_fetch_one = database.fetch_one
+
+    def mismatched_scope(
+        tag: str,
+        sql: str,
+        params: SqlParams = None,
+    ) -> dict[str, Any] | None:
+        row = original_fetch_one(tag, sql, params)
+        if tag != "dashboard.system-data-summary" or row is None:
+            return row
+        return {
+            **row,
+            "partsouq_current_scope": None,
+            "partsouq_current_crawl_run_id": None,
+            "partsouq_current_rows": 0,
+            "partsouq_current_distinct_part_numbers": 0,
+            "partsouq_bounded_rows": 0,
+            "partsouq_bounded_distinct_part_numbers": 0,
+            "bounded_scope_model": "1000",
+        }
+
+    database.fetch_one = mismatched_scope  # type: ignore[method-assign]
+
+    summary = AdminRepository(database).system_data_summary()
+
+    assert summary["bounded_scope_matches_desired"] is False
+    assert summary["bounded_scope_blocking_reason"] == "bounded_scope_mismatch"
+    assert summary["partsouq_current_rows"] == 0
+    assert summary["partsouq_bounded_rows"] == 0
 
 
 @pytest.mark.parametrize(
@@ -273,7 +431,7 @@ def test_fitment_adapter_uses_date_intersection_and_marks_unpublished_rows() -> 
     assert "GREATEST(p.part_from, v.production_from)" in schema
     assert "LEAST(p.part_to, v.production_to)" in schema
     assert "partsouq_normalized_unpublished" in schema
-    assert "WHEN published.part_id IS NOT NULL THEN 1" in schema
+    assert "WHEN current_catalog.part_id IS NOT NULL THEN 1" in schema
     assert "REGEXP_REPLACE(p.part_number, '[[:space:]-]+', '')" in schema
     assert "CREATE OR REPLACE VIEW station_admin_effective_parts" in schema
     assert "JSON_TYPE(JSON_EXTRACT(h.payload_json, '$.number_raw')) = 'NULL'" in schema
@@ -282,14 +440,21 @@ def test_fitment_adapter_uses_date_intersection_and_marks_unpublished_rows() -> 
     assert "FROM admin_override_heads AS h" in schema
     assert "CREATE OR REPLACE VIEW station_admin_formal_part_numbers" in schema
     assert "CREATE OR REPLACE VIEW station_admin_historical_sample_part_numbers" in schema
-    assert schema.count("JOIN v_current_catalog_parts AS current_catalog") == 3
+    assert "FROM v_current_catalog_parts AS current_catalog" in schema
+    assert "current_catalog.part_number_normalized AS number_normalized" in schema
     for view_name in (
         "station_admin_formal_vehicle_configurations",
         "station_admin_formal_taxonomy_nodes",
         "station_admin_formal_diagrams",
     ):
         assert f"CREATE OR REPLACE VIEW {view_name}" in schema
-    assert schema.count("FROM v_current_catalog_parts") >= 4
+    formal_schema = schema.split(
+        "CREATE OR REPLACE VIEW station_admin_formal_vehicle_configurations", 1
+    )[1].split("CREATE OR REPLACE VIEW station_admin_historical_sample_part_numbers", 1)[0]
+    assert formal_schema.count("FROM v_current_catalog_parts AS current_catalog") == 7
+    for mutable_table in ("parts", "groups_t", "categories", "vehicles", "models", "brands"):
+        assert f"FROM {mutable_table} " not in formal_schema
+        assert f"JOIN {mutable_table} " not in formal_schema
     assert "SELECT id FROM crawl_runs WHERE status = 'sample'" in schema
 
 
@@ -363,6 +528,7 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
         "published_parts",
         "published_parts_previous",
         "bounded_parts",
+        "catalog_desired_bounded_scope",
         "crawl_runs",
         "v_current_catalog_parts",
         "part_quarantine",
@@ -378,30 +544,35 @@ def test_readiness_exercises_indexes_and_backoffice_schema() -> None:
         "idx_published_crawl_run",
         "fk_published_crawl_run",
         "fk_published_previous_crawl_run",
-        "qualified_full_runs",
-        "formal_current_parts",
-        "formal_previous_parts",
-        "published_parts_previous",
-        "formal_full_parts",
-        "full_scheduler_run",
-        "linked_crawl_runs",
         "bounded_parts",
         "verified_bounded_evidence",
         "verified_bounded_records",
+        "evidence_record_sha256",
         "partsouq_http_artifacts",
         "partsouq_artifact_records",
         "evidence_status",
         "live_http",
         "dataset_scope",
         "source_crawl_run_id",
+        "catalog_desired_bounded_scope",
+        "desired_scope",
+        "scope_brand",
+        "scope_model",
+        "scope_vehicle_year_floor",
+        "prevent_bounded_parts_update",
+        "bounded_snapshot_immutable_ready",
     ):
         assert marker in contract_sql
+    assert "LOCATE('formal_full_parts', LOWER(VIEW_DEFINITION)) = 0" in contract_sql
+    assert "LOCATE('published_parts', LOWER(VIEW_DEFINITION)) = 0" in contract_sql
+    assert "qualified_full_runs" not in contract_sql
+    assert "full_scheduler_run" not in contract_sql
 
 
 def test_readiness_rejects_incomplete_published_provenance_contract() -> None:
     database = ScriptedDatabase(QueryTrace(), readiness_contract_ready=False)
 
-    with pytest.raises(AdminReadinessError, match="migration 019"):
+    with pytest.raises(AdminReadinessError, match="migration 033"):
         AdminRepository(database).check_readiness()
 
 
@@ -478,7 +649,7 @@ def test_quarantine_resolve_unknown_row_raises_record_not_found() -> None:
         ("vehicle_configurations", {"production_to": "2101-01"}),
         ("vehicle_configurations", {"production_precision": "quarter"}),
         ("part_term_mappings", {"mapping_status": "maybe"}),
-        ("vin_vehicle_mappings", {"decode_status": "pending"}),
+        ("vin_vehicle_mappings", {"decode_status": "decoded"}),
         ("reconciliation_cases", {"severity": "critical"}),
         ("reconciliation_cases", {"status": "resolved"}),
         ("vin_vehicle_mappings", {"engine_cylinders": "4"}),
@@ -493,25 +664,110 @@ def test_clean_payload_rejects_invalid_vin_date_enum_and_types(
         AdminRepository._clean_payload(ENTITY_SPECS[entity_type], payload)
 
 
-def test_clean_payload_normalizes_vin_and_text() -> None:
-    cleaned = AdminRepository._clean_payload(
-        ENTITY_SPECS["vin_vehicle_mappings"],
+def test_clean_payload_rejects_every_vin_mapping_field() -> None:
+    spec = ENTITY_SPECS["vin_vehicle_mappings"]
+    for field in spec.source_fields:
+        with pytest.raises(AdminDataError, match="不可編輯"):
+            AdminRepository._clean_payload(spec, {field: "decoded"})
+
+
+def test_vin_mapping_repository_rejects_generic_mutations_before_database_access() -> None:
+    database = ScriptedDatabase(QueryTrace())
+    repository = AdminRepository(database)
+
+    with pytest.raises(AdminDataError, match="唯讀"):
+        repository.create_manual(
+            "vin_vehicle_mappings",
+            {"vin": "TEST0000000000000"},
+            actor="tester",
+            reason="must use dedicated workflow",
+        )
+    with pytest.raises(AdminDataError, match="唯讀"):
+        repository.update_record(
+            "vin_vehicle_mappings",
+            "source:1",
+            {"make_name": "Toyota"},
+            expected_revision=0,
+            expected_base_sha256="0" * 64,
+            actor="tester",
+            reason="must use dedicated workflow",
+        )
+    with pytest.raises(AdminDataError, match="唯讀"):
+        repository.retire_record(
+            "vin_vehicle_mappings",
+            "source:1",
+            expected_revision=0,
+            actor="tester",
+            reason="must use dedicated workflow",
+        )
+    with pytest.raises(AdminDataError, match="唯讀"):
+        repository.restore_record(
+            "vin_vehicle_mappings",
+            "source:1",
+            expected_revision=0,
+            actor="tester",
+            reason="must use dedicated workflow",
+        )
+
+    assert database.calls == []
+
+
+def test_vin_mapping_display_ignores_legacy_overlay_payload() -> None:
+    spec = ENTITY_SPECS["vin_vehicle_mappings"]
+    row = source_row("vin_vehicle_mappings", 1)
+    row.update(
         {
-            "vin": " test0000000000000 ",
-            "make_name": " Toyota ",
-            "model_year": 2020,
-            "engine_cylinders": 4,
-            "decode_status": "decoded",
-        },
+            "make_name": "NHTSA Make",
+            "mapping_status": "confirmed",
+            "override_payload_json": '{"make_name":"Legacy Make","mapping_status":"unmapped"}',
+            "override_status": "retired",
+            "override_revision": 7,
+            "override_updated_at": "2099-01-01 00:00:00",
+            "updated_at": "2026-08-30 00:00:00",
+        }
     )
 
-    assert cleaned == {
-        "vin": "TEST0000000000000",
-        "make_name": "Toyota",
-        "model_year": 2020,
-        "engine_cylinders": 4,
-        "decode_status": "decoded",
-    }
+    record = AdminRepository._source_record(spec, row)
+
+    assert record.payload["make_name"] == "NHTSA Make"
+    assert record.payload["mapping_status"] == "confirmed"
+    assert record.status == "active"
+    assert record.revision == 0
+    assert record.updated_at == "2026-08-30 00:00:00"
+
+
+def test_vin_mapping_list_ignores_legacy_source_and_manual_overlays() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    page = AdminRepository(database).list_records(
+        "vin_vehicle_mappings",
+        query="NHTSA Make",
+        include_retired=True,
+        limit=10,
+    )
+
+    assert page.total == 1
+    for tag in (
+        "list.count.vin_vehicle_mappings",
+        "list.keys.vin_vehicle_mappings",
+        "list.source-batch.vin_vehicle_mappings",
+    ):
+        call = next(call for call in database.calls if call.tag == tag)
+        assert "admin_override_heads" not in call.sql
+    assert not any(call.tag.startswith("list.manual-batch.") for call in database.calls)
+    assert database.transaction_modes == [True]
+
+
+def test_vin_mapping_legacy_manual_identity_is_not_a_derived_record() -> None:
+    database = ScriptedDatabase(QueryTrace())
+
+    with pytest.raises(RecordNotFoundError, match="來源資料"):
+        AdminRepository(database).get_record(
+            "vin_vehicle_mappings",
+            "manual:00000000-0000-0000-0000-000000000001",
+        )
+
+    assert database.calls == []
 
 
 def test_clean_payload_rejects_reversed_month_range() -> None:

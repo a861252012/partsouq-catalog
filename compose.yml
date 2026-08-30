@@ -10,6 +10,9 @@ x-scheduler-environment: &scheduler-environment
   PARTSOUQ_HOME: /app
   PSQ_LIMIT_PARTS: "0"
   PSQ_BOUNDED_PARTS: "10000"
+  PSQ_BOUNDED_BRAND: ${PSQ_BOUNDED_BRAND:-TOYOTA}
+  PSQ_BOUNDED_MODEL: ${PSQ_BOUNDED_MODEL:-TACOMA}
+  PSQ_VEHICLE_YEAR_WINDOW: ${PSQ_VEHICLE_YEAR_WINDOW:-20}
   PSQ_EVIDENCE_MAX_BODY_BYTES: "8388608"
   PSQ_EVIDENCE_MAX_RUN_BYTES: "1073741824"
   PSQ_EVIDENCE_MAX_ARTIFACTS: "50000"
@@ -33,6 +36,9 @@ x-scheduler-base: &scheduler-base
 services:
   mysql:
     image: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+    # migration 033 以低權限 app 帳號建立 deterministic trigger；MySQL 開啟
+    # binary log 時必須顯式信任該類 trigger，否則會在 errno 1419 停住。
+    command: ["--log-bin-trust-function-creators=1"]
     environment:
       MYSQL_DATABASE: ${PARTSOUQ_DB_NAME:-partsouq_catalog}
       MYSQL_USER: ${PARTSOUQ_DB_USER:-partsouq}

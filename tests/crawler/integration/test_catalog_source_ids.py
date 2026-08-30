@@ -22,7 +22,7 @@ VIN = "ZZZTEST00X0000003"
 NHTSA_SOURCE_KEY = "source_id_view_fixture"
 
 
-def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
+def test_full_candidate_archive_preserves_source_ids_without_formal_mapping() -> None:
     if not str(DB_CONFIG["database"]).endswith("_test"):
         raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
 
@@ -33,6 +33,10 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
             "bounded_parts",
             "published_parts_previous",
             "published_parts",
+            "partsouq_artifact_records",
+            "partsouq_http_diagnostics",
+            "partsouq_http_artifacts",
+            "partsouq_response_bodies",
             "crawl_state",
             "crawl_runs",
             "scheduled_job_runs",
@@ -100,13 +104,19 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
             ],
             run_id=run_id,
         )
+        crawl.mark_group_fetched(
+            group_id,
+            crawl.run_key,
+            status="done",
+            row_count=1,
+        )
         source_part = database._execute(
             "SELECT id FROM parts WHERE group_id = %s AND part_number = %s",
             (group_id, "TEST-PART-001"),
         ).fetchone()
         assert source_part is not None
         part_id = source_part["id"]
-        assert crawl.publish_success_parts(run_id) == 1
+        assert crawl.archive_full_candidate_parts(run_id) == 1
         crawl.finish_run(run_id, "success", {"parts": 1})
         database._execute(
             "UPDATE scheduled_job_runs SET status = 'completed', exit_code = 0, "
@@ -205,19 +215,21 @@ def test_publish_preserves_normalized_source_ids_in_snapshot_and_view() -> None:
         ).fetchone()
 
         assert snapshot is not None
-        assert current_view is not None
-        assert mapping_view is not None
         for key, value in expected.items():
             assert snapshot[key] == value
-            assert current_view[key] == value
-            assert mapping_view[key] == value
-        assert mapping_view["partsouq_vehicle_id"] == vehicle_id
+        assert current_view is None
+        assert mapping_view is None
     finally:
         database.rollback()
         for table in (
             "admin_vehicle_mappings",
             "bounded_parts",
+            "published_parts_previous",
             "published_parts",
+            "partsouq_artifact_records",
+            "partsouq_http_diagnostics",
+            "partsouq_http_artifacts",
+            "partsouq_response_bodies",
             "crawl_state",
             "crawl_runs",
             "scheduled_job_runs",

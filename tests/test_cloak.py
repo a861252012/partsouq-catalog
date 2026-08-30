@@ -8,6 +8,7 @@
 import errno
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import shlex
@@ -64,6 +65,7 @@ def _reset_session_state(monkeypatch, tmp_path, request):
         }
     )
     cloak._rejected_versions.clear()
+    cloak._BROWSER_SHUTDOWN.clear()
     monkeypatch.setitem(cloak.CLOAK, "lock_file", tmp_path / "cloak.lock")
     monkeypatch.setitem(cloak.CLOAK, "cookie_file", tmp_path / "cookies.json")
     monkeypatch.setitem(cloak.CLOAK, "cookie_export_file", tmp_path / ".cloak-export.json")
@@ -73,6 +75,7 @@ def _reset_session_state(monkeypatch, tmp_path, request):
         cloak._browser_err_log.close()
     cloak._browser_err_log = None
     cloak._browser_proc = None
+    cloak._BROWSER_SHUTDOWN.clear()
     cloak._rejected_versions.clear()
     cloak._session_state.update(
         {
@@ -684,6 +687,48 @@ def test_launch_cloak_closes_error_descriptor_when_fdopen_fails(monkeypatch, tmp
     assert error.value.errno == errno.EBADF
 
 
+def test_launch_cloak_shutdown_between_spawn_and_registration_reaps_child(
+    monkeypatch,
+) -> None:
+    spawned = threading.Event()
+    release_spawn = threading.Event()
+    error_logs: list[StringIO] = []
+
+    class FakeProc:
+        pid = 43209
+        returncode = None
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    process = FakeProc()
+    terminate = mock.Mock()
+
+    def fake_popen(*_args, **kwargs):
+        error_logs.append(kwargs["stderr"])
+        spawned.set()
+        assert release_spawn.wait(timeout=10)
+        return process
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cloak, "_terminate_process_group", terminate)
+    result: list[bool] = []
+    thread = threading.Thread(target=lambda: result.append(cloak._launch_cloak()))
+    thread.start()
+    assert spawned.wait(timeout=10)
+
+    cloak._begin_browser_shutdown()
+    release_spawn.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert result == [False]
+    terminate.assert_called_once_with(process)
+    assert cloak._browser_proc is None
+    assert error_logs and error_logs[0].closed
+
+
 def test_stop_owned_browser_signals_group_even_after_wrapper_exits(monkeypatch) -> None:
     class ExitedWrapper:
         pid = 43210
@@ -811,6 +856,39 @@ def test_stop_owned_browser_forces_shutdown_after_graceful_timeout(monkeypatch) 
     assert any(event == "wait" for event, _value in events[:first_term])
     assert ("signal", 0) in events[:first_term]
     assert terminating_signals == [cloak.signal.SIGTERM, cloak.signal.SIGKILL]
+
+
+def test_terminate_process_group_escalates_when_wrapper_already_exited(monkeypatch) -> None:
+    class ExitedWrapper:
+        pid = 43214
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    group_alive = True
+    signals: list[int] = []
+
+    def killpg(_pid: int, child_signal: int) -> None:
+        nonlocal group_alive
+        signals.append(child_signal)
+        if child_signal == 0 and not group_alive:
+            raise ProcessLookupError
+        if child_signal == cloak.signal.SIGKILL:
+            group_alive = False
+
+    monkeypatch.setattr(cloak, "BROWSER_STOP_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(cloak.os, "killpg", killpg)
+
+    cloak._terminate_process_group(ExitedWrapper())
+
+    assert signals == [
+        0,
+        cloak.signal.SIGTERM,
+        0,
+        0,
+        cloak.signal.SIGKILL,
+    ]
 
 
 def test_launch_cloak_keeps_server_args_as_single_argv(monkeypatch, tmp_path) -> None:
@@ -1334,6 +1412,415 @@ def test_fetch_page_returns_html_when_browser_produces_page(monkeypatch, tmp_pat
         cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") == real_html
     )
     assert not out_file.exists()
+
+
+def test_fetch_page_waits_for_normal_child_exit_after_output(monkeypatch, tmp_path) -> None:
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    out_file = tmp_path / ".cloak-page-fetch.html"
+    real_html = "<html><body>real catalog page</body></html>"
+    terminate = mock.Mock()
+
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+    monkeypatch.setattr(cloak, "_terminate_process_group", terminate)
+
+    class FakeProc:
+        pid = 12345
+        exited = False
+        waited = False
+
+        def poll(self) -> int | None:
+            return 0 if self.exited else None
+
+        def wait(self, timeout: float) -> int:
+            assert timeout == cloak.BROWSER_STOP_GRACE_SECONDS
+            self.waited = True
+            self.exited = True
+            return 0
+
+    process = FakeProc()
+
+    def fake_popen(_argv, **_kwargs):
+        out_file.write_text(real_html, encoding="utf-8")
+        return process
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+
+    assert (
+        cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") == real_html
+    )
+    assert process.waited is True
+    terminate.assert_not_called()
+
+
+def test_fetch_page_removes_stale_offunit_marker(monkeypatch, tmp_path) -> None:
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    out_file = tmp_path / ".cloak-page-fetch.html"
+    marker_file = tmp_path / ".cloak-page-fetch.html.offunit"
+    real_html = "<html><body>real catalog page</body></html>"
+    marker_file.write_text("https://partsouq.com/en/catalog/genuine/locate", encoding="utf-8")
+
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self) -> int:
+            return 0
+
+    def fake_popen(_argv, **_kwargs):
+        assert not marker_file.exists()
+        out_file.write_text(real_html, encoding="utf-8")
+        return FakeProc()
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", fake_popen)
+
+    assert (
+        cloak.fetch_page("https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid=1") == real_html
+    )
+    assert not marker_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("requested_url", "final_url", "accepted"),
+    [
+        (
+            "https://partsouq.com/en/catalog/genuine/locate?c=Toyota",
+            "https://partsouq.com/en/catalog/genuine/locate?c=Toyota&ssd=rotated",
+            True,
+        ),
+        (
+            "https://partsouq.com/en/catalog/genuine/pick?c=Toyota&model=CAMRY&ssd=old",
+            "https://partsouq.com/en/catalog/genuine/pick?c=Toyota&model=COROLLA&ssd=new",
+            False,
+        ),
+        (
+            "https://partsouq.com/en/catalog/genuine/unit?c=Toyota&vid=7&cid=1&uid=1",
+            "https://partsouq.com/en/catalog/genuine/unit?c=Toyota&vid=7&cid=1&uid=1&ssd=new",
+            True,
+        ),
+        (
+            "https://partsouq.com/en/catalog/genuine/unit?c=Toyota&vid=7&cid=1&uid=1",
+            "https://partsouq.com/en/catalog/genuine/unit?c=Nissan&vid=7&cid=1&uid=1",
+            False,
+        ),
+        (
+            "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+            "https://partsouq.com/en/catalog/genuine/unit?uid=11",
+            False,
+        ),
+        (
+            "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+            "http://partsouq.com/en/catalog/genuine/unit?uid=1",
+            False,
+        ),
+        (
+            "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+            "https://partsouq.com:8443/en/catalog/genuine/unit?uid=1",
+            False,
+        ),
+        (
+            "https://www.partsouq.com/en/catalog/genuine/unit?uid=1",
+            "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+            True,
+        ),
+    ],
+)
+def test_fetch_page_child_validates_catalog_context(
+    monkeypatch,
+    tmp_path,
+    requested_url: str,
+    final_url: str,
+    accepted: bool,
+) -> None:
+    """以假的 cloakbrowser 模組執行真正的子程序腳本，釘住落點判斷。"""
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES), encoding="utf-8")
+    cookie_marker = tmp_path / "cookies-applied"
+    fake_module = tmp_path / "cloakbrowser.py"
+    fake_module.write_text(
+        """
+import os
+
+class Page:
+    url = os.environ["FAKE_FINAL_URL"]
+
+    async def goto(self, _url, **_kwargs):
+        return None
+
+    async def content(self):
+        if not os.path.exists(os.environ["FAKE_COOKIE_MARKER"]):
+            raise RuntimeError("browser context did not apply cookies")
+        return "<html><body>real catalog page</body></html>"
+
+class Context:
+    async def add_cookies(self, cookies):
+        if not any(cookie.get("name") == "cf_clearance" for cookie in cookies):
+            raise RuntimeError("missing cf_clearance")
+        with open(os.environ["FAKE_COOKIE_MARKER"], "w") as marker:
+            marker.write("ok")
+
+    async def new_page(self):
+        return Page()
+
+class Browser:
+    async def new_context(self, **_kwargs):
+        return Context()
+
+    async def close(self):
+        return None
+
+async def launch_async(**_kwargs):
+    return Browser()
+""".strip(),
+        encoding="utf-8",
+    )
+    child_env = {
+        "FAKE_COOKIE_MARKER": str(cookie_marker),
+        "FAKE_FINAL_URL": final_url,
+        "PYTHONPATH": str(tmp_path),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    monkeypatch.setitem(cloak.CLOAK, "launcher", [])
+    monkeypatch.setitem(cloak.CLOAK, "venv_python", sys.executable)
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(
+        cloak,
+        "_prepare_browser_launch",
+        lambda: (child_env, tmp_path / "cache", tmp_path / "home", "", ""),
+    )
+
+    if accepted:
+        assert cloak.fetch_page(requested_url, timeout_seconds=5) == (
+            "<html><body>real catalog page</body></html>"
+        )
+    else:
+        with pytest.raises(cloak.NonUnitPageError):
+            cloak.fetch_page(requested_url, timeout_seconds=5)
+
+
+def test_fetch_page_keeps_complete_child_output_when_browser_close_hangs(
+    monkeypatch, tmp_path
+) -> None:
+    """瀏覽器關閉卡住時，父程序仍可取得已原子發布的完整 HTML。"""
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES), encoding="utf-8")
+    close_marker = tmp_path / "close-started"
+    fake_module = tmp_path / "cloakbrowser.py"
+    real_html = "<html><body>complete catalog page</body></html>"
+    fake_module.write_text(
+        f"""
+import asyncio
+import os
+
+class Page:
+    url = "https://partsouq.com/en/catalog/genuine/unit?uid=1"
+
+    async def goto(self, _url, **_kwargs):
+        return None
+
+    async def content(self):
+        return {real_html!r}
+
+class Context:
+    async def add_cookies(self, _cookies):
+        return None
+
+    async def new_page(self):
+        return Page()
+
+class Browser:
+    async def new_context(self, **_kwargs):
+        return Context()
+
+    async def close(self):
+        with open(os.environ["FAKE_CLOSE_MARKER"], "w") as marker:
+            marker.write("started")
+        await asyncio.Event().wait()
+
+async def launch_async(**_kwargs):
+    return Browser()
+""".strip(),
+        encoding="utf-8",
+    )
+    child_env = {
+        "FAKE_CLOSE_MARKER": str(close_marker),
+        "PYTHONPATH": str(tmp_path),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    monkeypatch.setitem(cloak.CLOAK, "launcher", [])
+    monkeypatch.setitem(cloak.CLOAK, "venv_python", sys.executable)
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(
+        cloak,
+        "_prepare_browser_launch",
+        lambda: (child_env, tmp_path / "cache", tmp_path / "home", "", ""),
+    )
+    monkeypatch.setattr(cloak, "BROWSER_STOP_GRACE_SECONDS", 0.1)
+
+    assert (
+        cloak.fetch_page(
+            "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+            timeout_seconds=5,
+        )
+        == real_html
+    )
+    assert close_marker.read_text(encoding="utf-8") == "started"
+    assert not (tmp_path / ".cloak-page-fetch.html").exists()
+    assert not (tmp_path / ".cloak-page-fetch.html.tmp").exists()
+
+
+def test_fetch_page_reaps_descendant_after_browser_wrapper_exits(monkeypatch, tmp_path) -> None:
+    """真實子群組回歸：wrapper 先退，仍在同 PG 的孫程序也必須被回收。"""
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps(COOKIES), encoding="utf-8")
+    descendant_pid_file = tmp_path / "descendant.pid"
+    fake_module = tmp_path / "cloakbrowser.py"
+    fake_module.write_text(
+        """
+import os
+import subprocess
+import sys
+
+class Page:
+    url = "https://partsouq.com/en/catalog/genuine/unit?uid=1"
+
+    async def goto(self, _url, **_kwargs):
+        return None
+
+    async def content(self):
+        return "<html><body>real catalog page</body></html>"
+
+class Context:
+    async def add_cookies(self, _cookies):
+        return None
+
+    async def new_page(self):
+        return Page()
+
+class Browser:
+    async def new_context(self, **_kwargs):
+        return Context()
+
+    async def close(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        with open(os.environ["FAKE_DESCENDANT_PID"], "w") as marker:
+            marker.write(str(os.getpgrp()))
+
+async def launch_async(**_kwargs):
+    return Browser()
+""".strip(),
+        encoding="utf-8",
+    )
+    child_env = {
+        "FAKE_DESCENDANT_PID": str(descendant_pid_file),
+        "PYTHONPATH": str(tmp_path),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    monkeypatch.setitem(cloak.CLOAK, "launcher", [])
+    monkeypatch.setitem(cloak.CLOAK, "venv_python", sys.executable)
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(
+        cloak,
+        "_prepare_browser_launch",
+        lambda: (child_env, tmp_path / "cache", tmp_path / "home", "", ""),
+    )
+    monkeypatch.setattr(cloak, "BROWSER_STOP_GRACE_SECONDS", 0.2)
+
+    process_group_id: int | None = None
+    try:
+        assert (
+            cloak.fetch_page(
+                "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+                timeout_seconds=5,
+            )
+            == "<html><body>real catalog page</body></html>"
+        )
+        process_group_id = int(descendant_pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if not cloak._process_group_alive(process_group_id):
+                break
+            time.sleep(0.05)
+        assert not cloak._process_group_alive(process_group_id)
+    finally:
+        if process_group_id is not None:
+            try:
+                os.killpg(process_group_id, cloak.signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_fetch_page_shutdown_between_spawn_and_registration_reaps_child(
+    monkeypatch, tmp_path
+) -> None:
+    """shutdown 若落在 Popen 返回前，子程序不得在關閉閘門後漏註冊。"""
+    monkeypatch.setitem(cloak.CLOAK, "state_dir", tmp_path)
+    monkeypatch.setattr(cloak, "_process_refresh_lock", _fake_browser_lock)
+    monkeypatch.setattr(cloak, "_prepare_browser_launch", lambda: _fake_prepare(tmp_path))
+    barrier = threading.Barrier(2)
+    terminate = mock.Mock()
+    results: list[str | None] = []
+    errors: list[BaseException] = []
+
+    class FakeProc:
+        pid = 43215
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    process = FakeProc()
+
+    def popen(_argv, **_kwargs):
+        barrier.wait(timeout=2)
+        barrier.wait(timeout=2)
+        return process
+
+    def fetch() -> None:
+        try:
+            results.append(
+                cloak.fetch_page(
+                    "https://partsouq.com/en/catalog/genuine/unit?uid=1",
+                    timeout_seconds=1,
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(cloak.subprocess, "Popen", popen)
+    monkeypatch.setattr(cloak, "_terminate_process_group", terminate)
+    thread = threading.Thread(target=fetch)
+    thread.start()
+    try:
+        barrier.wait(timeout=2)
+        cloak._begin_browser_shutdown()
+        barrier.wait(timeout=2)
+        thread.join(timeout=2)
+    finally:
+        cloak._finish_browser_shutdown()
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert results == [None]
+    terminate.assert_called_once_with(process)
+    assert cloak._browser_proc is None
+
+
+def test_fetch_page_default_timeout_covers_child_work() -> None:
+    default_timeout = inspect.signature(cloak.fetch_page).parameters["timeout_seconds"].default
+    child_budget = (
+        cloak.PAGE_LOAD_TIMEOUT_SECONDS
+        + cloak.PAGE_FETCH_CHALLENGE_TIMEOUT_SECONDS
+        + cloak.BROWSER_STOP_GRACE_SECONDS
+    )
+
+    assert default_timeout == cloak.PAGE_FETCH_TIMEOUT_SECONDS
+    assert default_timeout > child_budget
 
 
 def test_fetch_page_returns_none_on_challenge_page(monkeypatch, tmp_path) -> None:

@@ -14,14 +14,22 @@
       <div><strong>{{ system_summary.partsouq_current_distinct_part_numbers }}</strong><span> 目前正式不重複料號</span></div>
       <div><strong>{{ system_summary.partsouq_bounded_rows }}</strong><span> 正式排程限量資料列（未發布全量）</span></div>
       <div><strong>{{ system_summary.partsouq_bounded_distinct_part_numbers }}</strong><span> 限量資料不重複料號</span></div>
+      <div><strong>{{ system_summary.desired_bounded_scope.brand or '尚未設定' }}</strong><span> 目前指定品牌／{{ system_summary.desired_bounded_scope.model or '—' }}／年份下限 {{ system_summary.desired_bounded_scope.vehicle_year_floor or '—' }}</span></div>
+      <div><strong>{{ system_summary.latest_bounded_run_scope.brand or '尚無' }}</strong><span> 最新 run 品牌／{{ system_summary.latest_bounded_run_scope.model or '—' }}／年份下限 {{ system_summary.latest_bounded_run_scope.vehicle_year_floor or '—' }}</span></div>
       <div><strong>{{ system_summary.partsouq_published_rows }}</strong><span> PartSouq published snapshot rows</span></div>
       <div><strong>{{ system_summary.nhtsa_current_records }}</strong><span> NHTSA current reference records</span></div>
       <div><strong>{{ system_summary.nhtsa_vin_decodes }}</strong><span> NHTSA VIN decodes（需站方提供合法 VIN）</span></div>
+      <div><strong>{{ system_summary.nhtsa_terminal_undecodable_vins }}</strong><span> NHTSA 已受理但無法解碼 VIN</span></div>
       <div><strong>{{ system_summary.partsouq_normalized_rows }}</strong><span> normalized 歷史總列數（含 sample／失敗 run）</span></div>
       <div><strong>{{ quarantine_summary.unresolved }}</strong><span> Quarantine 未處置列（<a href="{{ url_for('admin.quarantine_list') }}">檢視</a>）／共 {{ quarantine_summary.total }} 列</span></div>
     </div>
     {% if system_summary.bounded_status == 'bounded_success'
+          and system_summary.bounded_scope_matches_desired
           and system_summary.partsouq_bounded_rows == system_summary.bounded_target_parts
+          and system_summary.partsouq_current_scope == 'bounded'
+          and system_summary.partsouq_current_rows == system_summary.bounded_target_parts
+          and system_summary.partsouq_current_crawl_run_id
+              == system_summary.bounded_crawl_run_id
           and system_summary.bounded_scheduler_trigger_mode == 'daemon'
           and system_summary.bounded_scheduler_status == 'completed'
           and system_summary.bounded_scheduler_exit_code == 0
@@ -31,13 +39,22 @@
       <p>正式排程限量資料已完成 {{ system_summary.partsouq_bounded_rows }} / {{ system_summary.bounded_target_parts }} 筆；crawl run {{ system_summary.bounded_crawl_run_id }}，scheduler run {{ system_summary.bounded_scheduled_job_run_id }}。這不是完整全量 snapshot。</p>
     {% else %}
       <p class="warning">正式排程限量資料尚未通過驗收：{{ system_summary.partsouq_bounded_rows }} / {{ system_summary.bounded_target_parts or 10000 }} 筆；crawl={{ system_summary.bounded_status or '尚無' }}，scheduler={{ system_summary.bounded_scheduler_trigger_mode or '尚無' }}/{{ system_summary.bounded_scheduler_status or '尚無' }}，非正式標記={{ system_summary.bounded_non_live_data_marker }}，人工覆寫={{ system_summary.bounded_active_override_rows }}。</p>
+      {% if system_summary.bounded_scope_blocking_reason == 'bounded_desired_scope_not_configured' %}
+        <p class="warning">尚未設定目前正式 bounded 品牌、型號與年份下限；服務保持可用，但不顯示 bounded 正式資料。</p>
+      {% elif system_summary.bounded_scope_blocking_reason == 'bounded_scope_mismatch' %}
+        <p class="warning">最新 bounded run 的品牌、型號或年份下限與目前指定範圍不一致；不符合的 snapshot 已隱藏。</p>
+      {% endif %}
     {% endif %}
     {% if system_summary.partsouq_normalized_rows > system_summary.partsouq_current_rows %}<p class="warning">normalized 總數含歷史 sample／失敗或未完成 run，不列入目前正式資料與 10,000 筆驗收。</p>{% endif %}
     {% if system_summary.partsouq_published_rows == 0 %}<p class="warning">完整全量 snapshot 尚未發布；正式限量資料不會冒充全量發布。</p>{% endif %}
     {% if system_summary.nhtsa_current_records == 0 %}
-      <p class="warning">目前沒有已發布的 NHTSA 參考資料；逐 VIN 解碼也需由站方輸入合法 VIN，不能列舉 VIN。</p>
+      <p class="warning">目前沒有已發布的 NHTSA 參考資料。</p>
+    {% endif %}
+    {% if system_summary.nhtsa_vin_decodes == 0
+          and system_summary.nhtsa_terminal_undecodable_vins == 0 %}
+      <p>{% if system_summary.nhtsa_current_records > 0 %}目前已有已發布的 NHTSA 參考資料；{% endif %}逐 VIN 解碼需由站方輸入合法 VIN，不能列舉 VIN。</p>
     {% elif system_summary.nhtsa_vin_decodes == 0 %}
-      <p>目前已有已發布的 NHTSA 參考資料；逐 VIN 解碼需由站方輸入合法 VIN，不能列舉 VIN。</p>
+      <p class="warning">已受理 {{ system_summary.nhtsa_terminal_undecodable_vins }} 筆 VIN，但 NHTSA 均無法產生可用解碼；這不代表尚未提供 VIN。</p>
     {% endif %}
     <p>PartSouq 目前可證明大分類與中分類；站方頁面沒有獨立小分類來源，後台不會捏造小分類。</p>
   </section>

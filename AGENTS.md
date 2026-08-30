@@ -68,11 +68,9 @@ PARTSOUQ_DB_NAME=partsouq_catalog_test NHTSA_TEST_MYSQL=1 UNIFIED_TEST_MYSQL=1 \
 
 新增 migration 或環境閘控測試時，以下項目必須同步更新並核對：
 
-- `.github/workflows/ci.yml` 與 `tests/test_ci_contract.py` 的 skip 總數
-  （目前 271＝206 環境閘控＋56 macOS 閘控＋9 站方瀏覽器 E2E 閘控；本機
-  裸環境實測 215 加 darwin-only AST 盤點 56。新增 env-gated 測試時以
-  同法重盤）。新增一個 env-gated 測試
-  就要 +1。
+- `.github/workflows/ci.yml` 與 `tests/test_ci_contract.py` 的 skip 總數。每次
+  新增或移除 env-gated 測試，都要以 CI 的 JUnit 輸出重新盤點並同步更新兩處；
+  不得沿用舊文件的固定數字。
 - `tests/e2e/test_catalog_migration_runner.py` 內各降級輔助函式的
   ledger 刪除清單：刪除範圍必須「從目標版本一路涵蓋到最新版」，
   只刪中間會觸發 gap 檢查（`ledger skips an active migration`），
@@ -198,21 +196,23 @@ PARTSOUQ_DB_NAME=partsouq_catalog_test NHTSA_TEST_MYSQL=1 UNIFIED_TEST_MYSQL=1 \
   uv run --locked pytest -W error -q --strict-config --strict-markers
 
 # Migration 套用／檢查（正式資料庫）
-uv run --locked python -m partsouq_catalog.migrations apply --retry 0
+uv run --locked python -m partsouq_catalog.migrations apply
 ```
 
 ### 營運備忘
 
-- 全量 crawl 一律以 daemon 模式啟動：
+- 目前正式 PartSouq 排程只接受精確 10,000 筆 bounded crawl，請用
+  LaunchAgent installer 啟動：
   ```zsh
-  PSQ_BOUNDED_PARTS=0 PSQ_VEHICLE_YEAR_WINDOW=20 \
-    caffeinate -is uv run --locked python -m partsouq_catalog.scheduler \
-      --job catalog --daemon --interval-seconds 3600
+  deploy/install-macos-catalog-scheduler.zsh
   ```
+- Full crawl 尚未具備與 bounded 相同的 HTTP evidence 驗收鏈，不能當成
+  正式發布路徑。`scheduler` 與其 child 會在資料庫或瀏覽器啟動前拒絕
+  非 `PSQ_LIMIT_PARTS=0`、`PSQ_BOUNDED_PARTS=10000` 的 catalog 排程。
 - LaunchAgent（`com.partsouq.catalog-scheduler`）與手動 daemon 不可
   並存（job lock 互斥）；切換前先 `launchctl bootout`，恢復用
   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.partsouq.catalog-scheduler.plist`。
 - 排程間隔判定看「最後一筆 daemon 模式的 catalog 記錄」；manual 模式
   的殘留記錄不影響判定，但會留在 `scheduled_job_runs` 供稽核。
-- 完整歷程見 `docs/progress-log-2026-08-23.md`（含毒組驗屍、
-  解碼契約放寬、ledger 回歸事件）。
+- 現行契約與驗證邊界見 `docs/progress-log-2026-08-30.md`；較早日期的
+  progress／handoff 文件一律視為歷史紀錄。

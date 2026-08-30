@@ -212,10 +212,9 @@ DELIMITER ;
 CALL ensure_published_snapshot_foreign_keys();
 DROP PROCEDURE ensure_published_snapshot_foreign_keys;
 
--- Full snapshot is authoritative only after both the crawl and its sole
--- daemon scheduler run have completed successfully. Legacy snapshots without
--- crawl_run_id stay hidden; a qualified bounded 10,000-row snapshot remains
--- visible until a traceable full snapshot is ready.
+-- Full snapshots are retained only as raw candidates. The formal catalog must
+-- expose a verified desired bounded snapshot and must never fall back to a
+-- full candidate.
 CREATE OR REPLACE VIEW v_current_catalog_parts AS
 WITH verified_bounded_evidence AS (
 SELECT
@@ -289,86 +288,27 @@ STRAIGHT_JOIN partsouq_http_artifacts AS artifact
 STRAIGHT_JOIN bounded_parts AS evidence_part
   ON evidence_part.crawl_run_id = record.crawl_run_id
  AND evidence_part.part_id = record.part_id
+ AND evidence_part.evidence_record_sha256 = record.record_sha256
 WHERE record.record_type = 'part'
 GROUP BY record.crawl_run_id
-),
-qualified_full_runs AS (
-SELECT full_run.id AS crawl_run_id
-FROM crawl_runs AS full_run
-JOIN scheduled_job_runs AS full_scheduler_run
-  ON full_scheduler_run.id = full_run.scheduled_job_run_id
- AND full_scheduler_run.job_name = 'catalog'
- AND full_scheduler_run.trigger_mode = 'daemon'
- AND full_scheduler_run.status = 'completed'
- AND full_scheduler_run.finished_at IS NOT NULL
- AND full_scheduler_run.exit_code = 0
-JOIN (
-    SELECT scheduled_job_run_id, COUNT(*) AS linked_crawl_runs
-    FROM crawl_runs
-    WHERE scheduled_job_run_id IS NOT NULL
-    GROUP BY scheduled_job_run_id
-) AS full_scheduler_links
-  ON full_scheduler_links.scheduled_job_run_id = full_scheduler_run.id
- AND full_scheduler_links.linked_crawl_runs = 1
-WHERE full_run.dataset_kind = 'full'
-  AND full_run.target_parts IS NULL
-  AND full_run.status = 'success'
-  AND full_run.finished_at IS NOT NULL
-  AND full_run.error_msg IS NULL
-),
-formal_current_parts AS (
-SELECT
-    'full' AS dataset_scope,
-    p.crawl_run_id AS source_crawl_run_id,
-    p.part_id, p.vehicle_id, p.model_id, p.vehicle_vid, p.brand, p.model,
-    p.vehicle_name, p.vehicle_code, p.prod_period, p.production_from,
-    p.production_to, p.engine, p.trim_name, p.part_name, p.part_number,
-    p.part_number_normalized, p.category_id, p.category_cid, p.category_main,
-    p.category_group, p.group_id, p.group_code, p.group_uid, p.part_range,
-    p.part_from, p.part_to, p.source_url, p.note, p.quantity, p.code, p.snapshot_at
-FROM published_parts AS p
-JOIN qualified_full_runs ON qualified_full_runs.crawl_run_id = p.crawl_run_id
-),
-formal_previous_parts AS (
-SELECT
-    'full' AS dataset_scope,
-    previous.crawl_run_id AS source_crawl_run_id,
-    previous.part_id, previous.vehicle_id, previous.model_id, previous.vehicle_vid,
-    previous.brand, previous.model, previous.vehicle_name, previous.vehicle_code,
-    previous.prod_period, previous.production_from, previous.production_to,
-    previous.engine, previous.trim_name, previous.part_name, previous.part_number,
-    previous.part_number_normalized, previous.category_id, previous.category_cid,
-    previous.category_main, previous.category_group, previous.group_id,
-    previous.group_code, previous.group_uid, previous.part_range, previous.part_from,
-    previous.part_to, previous.source_url, previous.note, previous.quantity,
-    previous.code, previous.snapshot_at
-FROM published_parts_previous AS previous
-JOIN qualified_full_runs ON qualified_full_runs.crawl_run_id = previous.crawl_run_id
-),
-formal_full_parts AS (
-SELECT formal_current_parts.*
-FROM formal_current_parts
-UNION ALL
-SELECT formal_previous_parts.*
-FROM formal_previous_parts
-WHERE NOT EXISTS (SELECT 1 FROM formal_current_parts)
 )
 SELECT
-    formal_full_parts.*
-FROM formal_full_parts
-UNION ALL
-SELECT
     'bounded' AS dataset_scope,
-    b.crawl_run_id AS source_crawl_run_id,
-    b.part_id, b.vehicle_id, b.model_id, b.vehicle_vid, b.brand, b.model,
-    b.vehicle_name, b.vehicle_code, b.prod_period, b.production_from,
-    b.production_to, b.engine, b.trim_name, b.part_name, b.part_number,
-    b.part_number_normalized, b.category_id, b.category_cid, b.category_main,
-    b.category_group, b.group_id, b.group_code, b.group_uid, b.part_range,
-    b.part_from, b.part_to, b.source_url, b.note, b.quantity, b.code, b.snapshot_at
-FROM bounded_parts AS b
+    bounded_parts.crawl_run_id AS source_crawl_run_id,
+    bounded_parts.part_id, bounded_parts.vehicle_id, bounded_parts.model_id,
+    bounded_parts.vehicle_vid, bounded_parts.brand, bounded_parts.model,
+    bounded_parts.vehicle_name, bounded_parts.vehicle_code, bounded_parts.prod_period,
+    bounded_parts.production_from, bounded_parts.production_to, bounded_parts.engine,
+    bounded_parts.trim_name, bounded_parts.part_name, bounded_parts.part_number,
+    bounded_parts.part_number_normalized, bounded_parts.category_id,
+    bounded_parts.category_cid, bounded_parts.category_main,
+    bounded_parts.category_group, bounded_parts.group_id, bounded_parts.group_code,
+    bounded_parts.group_uid, bounded_parts.part_range, bounded_parts.part_from,
+    bounded_parts.part_to, bounded_parts.source_url, bounded_parts.note,
+    bounded_parts.quantity, bounded_parts.code, bounded_parts.snapshot_at
+FROM bounded_parts
 JOIN crawl_runs AS current_run
-  ON current_run.id = b.crawl_run_id
+  ON current_run.id = bounded_parts.crawl_run_id
  AND current_run.dataset_kind = 'bounded'
  AND current_run.status = 'bounded_success'
  AND current_run.target_parts = 10000
@@ -383,6 +323,11 @@ JOIN crawl_runs AS current_run
  AND current_run.evidence_original_bytes > 0
  AND current_run.evidence_stored_bytes > 0
  AND current_run.evidence_verified_at IS NOT NULL
+JOIN catalog_desired_bounded_scope AS desired_scope
+  ON desired_scope.singleton_id = 1
+ AND CAST(current_run.scope_brand AS BINARY) = CAST(desired_scope.scope_brand AS BINARY)
+ AND CAST(current_run.scope_model AS BINARY) = CAST(desired_scope.scope_model AS BINARY)
+ AND current_run.scope_vehicle_year_floor = desired_scope.scope_vehicle_year_floor
 JOIN verified_bounded_evidence AS verified_evidence
   ON verified_evidence.crawl_run_id = current_run.id
  AND verified_evidence.artifact_count = current_run.evidence_artifact_count
@@ -418,8 +363,7 @@ JOIN (
 ) AS snapshot
   ON snapshot.row_count = 10000
  AND snapshot.min_crawl_run_id = current_run.id
- AND snapshot.max_crawl_run_id = current_run.id
-WHERE NOT EXISTS (SELECT 1 FROM formal_full_parts);
+ AND snapshot.max_crawl_run_id = current_run.id;
 
 -- Compatibility readers must obey the same provenance gate; direct access to
 -- published_parts would expose a scheduler-running or failed candidate.
@@ -434,109 +378,232 @@ SELECT
     part_range, part_from, part_to, source_url, note, quantity, code
 FROM v_current_catalog_parts;
 
+-- Exact mapping 的候選車款數必須先依 mapping 算一次。若把相同的
+-- COUNT(DISTINCT vehicle_id) 關聯子查詢放在每個零件列，10,000 筆
+-- snapshot 會反覆掃描 current catalog，讓 VIN fitment API 退化成 N×N。
 CREATE OR REPLACE VIEW v_vin_part_fitments AS
-SELECT mapped.*
+WITH strict_vehicle_counts AS (
+    SELECT
+        vehicle_mapping.id AS mapping_id,
+        COUNT(DISTINCT exact_candidate.vehicle_id) AS strict_vehicle_count
+    FROM admin_vehicle_mappings AS vehicle_mapping
+    JOIN nhtsa_vin_decodes AS vin_decode ON vin_decode.vin = vehicle_mapping.vin
+    JOIN v_current_catalog_parts AS exact_candidate
+      ON exact_candidate.vehicle_id IS NOT NULL
+     AND (
+         exact_candidate.production_from IS NOT NULL
+         OR exact_candidate.production_to IS NOT NULL
+     )
+     AND CAST(REGEXP_REPLACE(UPPER(exact_candidate.brand), '[^A-Z0-9]', '') AS BINARY)
+         = CAST(REGEXP_REPLACE(UPPER(vin_decode.make_name), '[^A-Z0-9]', '') AS BINARY)
+     AND CAST(REGEXP_REPLACE(UPPER(exact_candidate.model), '[^A-Z0-9]', '') AS BINARY)
+         = CAST(REGEXP_REPLACE(UPPER(vin_decode.model_name), '[^A-Z0-9]', '') AS BINARY)
+     AND CAST(REGEXP_REPLACE(UPPER(exact_candidate.engine), '[^A-Z0-9]', '') AS BINARY)
+         = CAST(REGEXP_REPLACE(UPPER(vin_decode.engine_model), '[^A-Z0-9]', '') AS BINARY)
+     AND CAST(REGEXP_REPLACE(UPPER(exact_candidate.trim_name), '[^A-Z0-9]', '') AS BINARY)
+         = CAST(REGEXP_REPLACE(UPPER(vin_decode.trim_name), '[^A-Z0-9]', '') AS BINARY)
+     AND (
+         exact_candidate.production_from IS NULL
+         OR vin_decode.model_year >= CAST(LEFT(exact_candidate.production_from, 4) AS UNSIGNED)
+     )
+     AND (
+         exact_candidate.production_to IS NULL
+         OR vin_decode.model_year <= CAST(LEFT(exact_candidate.production_to, 4) AS UNSIGNED)
+     )
+    WHERE vehicle_mapping.vin IS NOT NULL
+      AND vehicle_mapping.partsouq_vehicle_id IS NOT NULL
+      AND vehicle_mapping.source_name NOT IN ('manual-name-override', 'manual-sparse-override')
+      AND vehicle_mapping.model_year <=> vin_decode.model_year
+      AND NULLIF(TRIM(vin_decode.model_name), '') IS NOT NULL
+      AND NULLIF(TRIM(vin_decode.engine_model), '') IS NOT NULL
+      AND NULLIF(TRIM(vin_decode.trim_name), '') IS NOT NULL
+      AND CAST(REGEXP_REPLACE(UPPER(vehicle_mapping.make_name), '[^A-Z0-9]', '') AS BINARY)
+          = CAST(REGEXP_REPLACE(UPPER(vin_decode.make_name), '[^A-Z0-9]', '') AS BINARY)
+      AND CAST(REGEXP_REPLACE(UPPER(vehicle_mapping.model_name), '[^A-Z0-9]', '') AS BINARY)
+          = CAST(REGEXP_REPLACE(UPPER(vin_decode.model_name), '[^A-Z0-9]', '') AS BINARY)
+      AND CAST(REGEXP_REPLACE(UPPER(vehicle_mapping.engine), '[^A-Z0-9]', '') AS BINARY)
+          = CAST(REGEXP_REPLACE(UPPER(vin_decode.engine_model), '[^A-Z0-9]', '') AS BINARY)
+      AND CAST(REGEXP_REPLACE(UPPER(vehicle_mapping.trim_name), '[^A-Z0-9]', '') AS BINARY)
+          = CAST(REGEXP_REPLACE(UPPER(vin_decode.trim_name), '[^A-Z0-9]', '') AS BINARY)
+    GROUP BY vehicle_mapping.id
+)
+SELECT mapped_fitment.*
 FROM (
     SELECT
-        d.vin,
-        d.make_name,
-        d.model_name,
-        d.model_year,
-        d.engine_configuration,
-        d.engine_model,
-        d.displacement_l,
-        d.trim_name AS nhtsa_trim_name,
-        d.source_url AS nhtsa_source_url,
-        d.source_artifact_id AS nhtsa_source_artifact_id,
-        p.part_id,
-        p.dataset_scope AS catalog_dataset_scope,
-        p.source_crawl_run_id AS catalog_crawl_run_id,
-        p.model_id,
-        p.vehicle_id,
-        p.vehicle_vid,
-        p.category_id,
-        p.category_cid,
-        p.group_id,
-        p.group_uid,
-        p.code,
-        p.group_code,
-        p.vehicle_id AS partsouq_vehicle_id,
-        p.brand AS partsouq_brand,
-        p.model AS partsouq_model,
-        p.vehicle_name,
-        p.vehicle_code,
-        p.engine AS partsouq_engine,
-        p.trim_name AS partsouq_trim_name,
-        p.part_number,
-        p.part_name,
-        p.category_main,
-        p.category_group,
-        p.prod_period,
-        p.part_range,
+        vin_decode.vin,
+        vin_decode.make_name,
+        vin_decode.model_name,
+        vin_decode.model_year,
+        vin_decode.engine_configuration,
+        vin_decode.engine_model,
+        vin_decode.displacement_l,
+        vin_decode.trim_name AS nhtsa_trim_name,
+        vin_decode.source_url AS nhtsa_source_url,
+        vin_decode.source_artifact_id AS nhtsa_source_artifact_id,
+        catalog_part.part_id,
+        catalog_part.dataset_scope AS catalog_dataset_scope,
+        catalog_part.source_crawl_run_id AS catalog_crawl_run_id,
+        catalog_part.model_id,
+        catalog_part.vehicle_id,
+        catalog_part.vehicle_vid,
+        catalog_part.category_id,
+        catalog_part.category_cid,
+        catalog_part.group_id,
+        catalog_part.group_uid,
+        catalog_part.code,
+        catalog_part.group_code,
+        catalog_part.vehicle_id AS partsouq_vehicle_id,
+        catalog_part.brand AS partsouq_brand,
+        catalog_part.model AS partsouq_model,
+        catalog_part.vehicle_name,
+        catalog_part.vehicle_code,
+        catalog_part.engine AS partsouq_engine,
+        catalog_part.trim_name AS partsouq_trim_name,
+        catalog_part.part_number,
+        catalog_part.part_name,
+        catalog_part.category_main,
+        catalog_part.category_group,
+        catalog_part.prod_period,
+        catalog_part.part_range,
         CASE
-            WHEN p.production_from IS NULL THEN p.part_from
-            WHEN p.part_from IS NULL THEN p.production_from
-            ELSE GREATEST(p.production_from, p.part_from)
+            WHEN catalog_part.production_from IS NULL THEN catalog_part.part_from
+            WHEN catalog_part.part_from IS NULL THEN catalog_part.production_from
+            ELSE GREATEST(catalog_part.production_from, catalog_part.part_from)
         END AS fitment_from,
         CASE
-            WHEN p.production_to IS NULL THEN p.part_to
-            WHEN p.part_to IS NULL THEN p.production_to
-            ELSE LEAST(p.production_to, p.part_to)
+            WHEN catalog_part.production_to IS NULL THEN catalog_part.part_to
+            WHEN catalog_part.part_to IS NULL THEN catalog_part.production_to
+            ELSE LEAST(catalog_part.production_to, catalog_part.part_to)
         END AS fitment_to,
-        p.source_url,
-        m.id AS mapping_id,
-        m.source_name AS mapping_source_name,
-        m.source_reference AS mapping_source_reference,
+        catalog_part.source_url,
+        vehicle_mapping.id AS mapping_id,
+        vehicle_mapping.source_name AS mapping_source_name,
+        vehicle_mapping.source_reference AS mapping_source_reference,
         CASE
-            WHEN m.source_name = 'manual-name-override' THEN 'confirmed_manual_override'
+            WHEN vehicle_mapping.source_name IN ('manual-name-override', 'manual-sparse-override')
+                THEN 'confirmed_manual_override'
             ELSE 'confirmed'
         END AS vehicle_mapping_status,
         CASE
-            WHEN m.source_name = 'manual-name-override' THEN 'manual_vehicle_override'
+            WHEN vehicle_mapping.source_name IN ('manual-name-override', 'manual-sparse-override')
+                THEN 'manual_vehicle_override'
             ELSE 'compatible_by_model_year_engine_trim'
         END AS fitment_status
-    FROM admin_vehicle_mappings AS m
-    JOIN nhtsa_vin_decodes AS d ON d.vin = m.vin
-    JOIN v_current_catalog_parts AS p ON p.vehicle_id = m.partsouq_vehicle_id
-    WHERE m.vin IS NOT NULL AND m.partsouq_vehicle_id IS NOT NULL
-      AND p.vehicle_id IS NOT NULL
-      AND CAST(m.make_name AS BINARY) = CAST(d.make_name AS BINARY)
-      AND CAST(m.model_name AS BINARY) = CAST(d.model_name AS BINARY)
-      AND m.model_year <=> d.model_year
-      AND CAST(m.engine AS BINARY)
-          <=> CAST(CONCAT_WS(' / ', d.engine_configuration, d.engine_model) AS BINARY)
-      AND CAST(m.trim_name AS BINARY) <=> CAST(d.trim_name AS BINARY)
-      AND NULLIF(TRIM(d.engine_configuration), '') IS NOT NULL
-      AND d.displacement_l IS NOT NULL
-      AND NULLIF(TRIM(d.trim_name), '') IS NOT NULL
+    FROM admin_vehicle_mappings AS vehicle_mapping
+    JOIN nhtsa_vin_decodes AS vin_decode ON vin_decode.vin = vehicle_mapping.vin
+    JOIN v_current_catalog_parts AS catalog_part ON catalog_part.vehicle_id = vehicle_mapping.partsouq_vehicle_id
+    LEFT JOIN strict_vehicle_counts ON strict_vehicle_counts.mapping_id = vehicle_mapping.id
+    WHERE vehicle_mapping.vin IS NOT NULL AND vehicle_mapping.partsouq_vehicle_id IS NOT NULL
+      AND catalog_part.vehicle_id IS NOT NULL
       AND (
-          m.source_name = 'manual-name-override'
+          (
+              vehicle_mapping.source_name = 'manual-sparse-override'
+              AND NULLIF(TRIM(vehicle_mapping.source_reference), '') IS NOT NULL
+              AND vehicle_mapping.model_year <=> vin_decode.model_year
+              AND CAST(REGEXP_REPLACE(UPPER(catalog_part.brand), '[^A-Z0-9]', '') AS BINARY)
+                  = CAST(REGEXP_REPLACE(UPPER(vin_decode.make_name), '[^A-Z0-9]', '') AS BINARY)
+              AND CAST(vehicle_mapping.make_name AS BINARY) <=> CAST(vin_decode.make_name AS BINARY)
+              AND CAST(vehicle_mapping.model_name AS BINARY) <=> CAST(
+                  COALESCE(NULLIF(TRIM(vin_decode.model_name), ''), catalog_part.model) AS BINARY
+              )
+              AND CAST(vehicle_mapping.engine AS BINARY) <=> CAST(
+                  COALESCE(NULLIF(TRIM(vin_decode.engine_model), ''), catalog_part.engine) AS BINARY
+              )
+              AND CAST(vehicle_mapping.trim_name AS BINARY) <=> CAST(
+                  COALESCE(NULLIF(TRIM(vin_decode.trim_name), ''), catalog_part.trim_name) AS BINARY
+              )
+              AND (
+                  NULLIF(TRIM(vin_decode.model_name), '') IS NULL
+                  OR CAST(REGEXP_REPLACE(UPPER(catalog_part.model), '[^A-Z0-9]', '') AS BINARY)
+                      = CAST(REGEXP_REPLACE(UPPER(vin_decode.model_name), '[^A-Z0-9]', '') AS BINARY)
+              )
+              AND (
+                  NULLIF(TRIM(vin_decode.engine_model), '') IS NULL
+                  OR CAST(REGEXP_REPLACE(UPPER(catalog_part.engine), '[^A-Z0-9]', '') AS BINARY)
+                      = CAST(REGEXP_REPLACE(UPPER(vin_decode.engine_model), '[^A-Z0-9]', '') AS BINARY)
+              )
+              AND (
+                  NULLIF(TRIM(vin_decode.trim_name), '') IS NULL
+                  OR CAST(REGEXP_REPLACE(UPPER(catalog_part.trim_name), '[^A-Z0-9]', '') AS BINARY)
+                      = CAST(REGEXP_REPLACE(UPPER(vin_decode.trim_name), '[^A-Z0-9]', '') AS BINARY)
+              )
+          )
           OR (
-              CAST(REGEXP_REPLACE(UPPER(p.brand), '[^A-Z0-9]', '') AS BINARY)
-                  = CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY)
-              AND CAST(REGEXP_REPLACE(UPPER(p.model), '[^A-Z0-9]', '') AS BINARY)
-                  = CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY)
-              AND NULLIF(TRIM(d.engine_model), '') IS NOT NULL
-              AND CAST(REGEXP_REPLACE(UPPER(p.engine), '[^A-Z0-9]', '') AS BINARY)
-                  = CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY)
-              AND CAST(REGEXP_REPLACE(UPPER(p.trim_name), '[^A-Z0-9]', '') AS BINARY)
-                  = CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY)
+              vehicle_mapping.source_name = 'manual-name-override'
+              AND NULLIF(TRIM(vehicle_mapping.source_reference), '') IS NOT NULL
+              AND CAST(vehicle_mapping.make_name AS BINARY) = CAST(vin_decode.make_name AS BINARY)
+              AND CAST(vehicle_mapping.model_name AS BINARY) = CAST(vin_decode.model_name AS BINARY)
+              AND vehicle_mapping.model_year <=> vin_decode.model_year
+              AND CAST(vehicle_mapping.engine AS BINARY)
+                  <=> CAST(vin_decode.engine_model AS BINARY)
+              AND CAST(vehicle_mapping.trim_name AS BINARY) <=> CAST(vin_decode.trim_name AS BINARY)
+              AND CAST(REGEXP_REPLACE(UPPER(catalog_part.brand), '[^A-Z0-9]', '') AS BINARY)
+                  = CAST(REGEXP_REPLACE(
+                      UPPER(vin_decode.make_name), '[^A-Z0-9]', ''
+                  ) AS BINARY)
+          )
+          OR (
+              vehicle_mapping.source_name NOT IN (
+                  'manual-name-override', 'manual-sparse-override'
+              )
+              AND vehicle_mapping.model_year <=> vin_decode.model_year
+              AND NULLIF(TRIM(vin_decode.model_name), '') IS NOT NULL
+              AND NULLIF(TRIM(vin_decode.engine_model), '') IS NOT NULL
+              AND NULLIF(TRIM(vin_decode.trim_name), '') IS NOT NULL
+              AND CAST(REGEXP_REPLACE(
+                  UPPER(vehicle_mapping.make_name), '[^A-Z0-9]', ''
+              ) AS BINARY) = CAST(REGEXP_REPLACE(
+                  UPPER(vin_decode.make_name), '[^A-Z0-9]', ''
+              ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(
+                  UPPER(vehicle_mapping.model_name), '[^A-Z0-9]', ''
+              ) AS BINARY) = CAST(REGEXP_REPLACE(
+                  UPPER(vin_decode.model_name), '[^A-Z0-9]', ''
+              ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(
+                  UPPER(vehicle_mapping.engine), '[^A-Z0-9]', ''
+              ) AS BINARY) = CAST(REGEXP_REPLACE(
+                  UPPER(vin_decode.engine_model), '[^A-Z0-9]', ''
+              ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(
+                  UPPER(vehicle_mapping.trim_name), '[^A-Z0-9]', ''
+              ) AS BINARY) = CAST(REGEXP_REPLACE(
+                  UPPER(vin_decode.trim_name), '[^A-Z0-9]', ''
+              ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(UPPER(catalog_part.brand), '[^A-Z0-9]', '') AS BINARY)
+                  = CAST(REGEXP_REPLACE(
+                      UPPER(vin_decode.make_name), '[^A-Z0-9]', ''
+                  ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(UPPER(catalog_part.model), '[^A-Z0-9]', '') AS BINARY)
+                  = CAST(REGEXP_REPLACE(
+                      UPPER(vin_decode.model_name), '[^A-Z0-9]', ''
+                  ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(UPPER(catalog_part.engine), '[^A-Z0-9]', '') AS BINARY)
+                  = CAST(REGEXP_REPLACE(
+                      UPPER(vin_decode.engine_model), '[^A-Z0-9]', ''
+                  ) AS BINARY)
+              AND CAST(REGEXP_REPLACE(
+                  UPPER(catalog_part.trim_name), '[^A-Z0-9]', ''
+              ) AS BINARY) = CAST(REGEXP_REPLACE(
+                  UPPER(vin_decode.trim_name), '[^A-Z0-9]', ''
+              ) AS BINARY)
+              AND COALESCE(strict_vehicle_counts.strict_vehicle_count, 0) = 1
           )
       )
-      AND (p.production_from IS NOT NULL OR p.production_to IS NOT NULL)
+      AND (catalog_part.production_from IS NOT NULL OR catalog_part.production_to IS NOT NULL)
       AND (
-          NULLIF(TRIM(p.part_range), '') IS NULL
-          OR p.part_from IS NOT NULL
-          OR p.part_to IS NOT NULL
+          NULLIF(TRIM(catalog_part.part_range), '') IS NULL
+          OR catalog_part.part_from IS NOT NULL
+          OR catalog_part.part_to IS NOT NULL
       )
-      AND NULLIF(TRIM(p.part_name), '') IS NOT NULL
-) AS mapped
-WHERE (mapped.fitment_from IS NULL OR mapped.model_year >= CAST(LEFT(mapped.fitment_from, 4) AS UNSIGNED))
-  AND (mapped.fitment_to IS NULL OR mapped.model_year <= CAST(LEFT(mapped.fitment_to, 4) AS UNSIGNED))
+      AND NULLIF(TRIM(catalog_part.part_name), '') IS NOT NULL
+) AS mapped_fitment
+WHERE (mapped_fitment.fitment_from IS NULL OR mapped_fitment.model_year >= CAST(LEFT(mapped_fitment.fitment_from, 4) AS UNSIGNED))
+  AND (mapped_fitment.fitment_to IS NULL OR mapped_fitment.model_year <= CAST(LEFT(mapped_fitment.fitment_to, 4) AS UNSIGNED))
   AND (
-      mapped.fitment_from IS NULL
-      OR mapped.fitment_to IS NULL
-      OR mapped.fitment_from <= mapped.fitment_to
+      mapped_fitment.fitment_from IS NULL
+      OR mapped_fitment.fitment_to IS NULL
+      OR mapped_fitment.fitment_from <= mapped_fitment.fitment_to
   );
 
 CREATE TABLE IF NOT EXISTS admin_category_labels (

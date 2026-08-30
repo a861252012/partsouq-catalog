@@ -34,7 +34,7 @@ class Database(Protocol):
 
     def execute(self, tag: str, sql: str, params: SqlParams = None) -> ExecutionResult: ...
 
-    def transaction(self) -> AbstractContextManager[Database]: ...
+    def transaction(self, *, read_only: bool = False) -> AbstractContextManager[Database]: ...
 
 
 class RequestDatabase(Database, Protocol):
@@ -66,7 +66,10 @@ class AdminDatabase:
         self.connection.close()
 
     @contextmanager
-    def transaction(self) -> Iterator[AdminDatabase]:
+    def transaction(self, *, read_only: bool = False) -> Iterator[AdminDatabase]:
+        if read_only:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         self.connection.begin()
         try:
             yield self

@@ -316,6 +316,8 @@ def entity_list(entity_type: str) -> str:
 @bp.route("/entities/<entity_type>/new", methods=["GET", "POST"])
 def entity_create(entity_type: str) -> ResponseReturnValue:
     spec = entity_spec(entity_type)
+    if not spec.editable_fields:
+        raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
     if request.method == "GET":
         return render_template(
             "edit.html",
@@ -356,6 +358,8 @@ def entity_detail(entity_type: str, identity_key: str) -> str:
 @bp.get("/entities/<entity_type>/<identity_key>/edit")
 def entity_edit(entity_type: str, identity_key: str) -> str:
     spec = entity_spec(entity_type)
+    if not spec.editable_fields:
+        raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
     detail = _repository().get_record(entity_type, identity_key)
     editable = {
         field: detail.record.payload.get(field)
@@ -376,10 +380,13 @@ def entity_edit(entity_type: str, identity_key: str) -> str:
 
 @bp.post("/entities/<entity_type>/<identity_key>/update")
 def entity_update(entity_type: str, identity_key: str) -> ResponseReturnValue:
+    spec = entity_spec(entity_type)
+    if not spec.editable_fields:
+        raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
     _repository().update_record(
         entity_type,
         identity_key,
-        _payload_from_form(entity_spec(entity_type)),
+        _payload_from_form(spec),
         expected_revision=_revision_from_form(),
         expected_base_sha256=_base_sha256_from_form(),
         actor=_audit_actor(request.form.get("actor", "")),
@@ -416,6 +423,8 @@ def vin_decode_request() -> ResponseReturnValue:
 
 @bp.post("/entities/<entity_type>/<identity_key>/retire")
 def entity_retire(entity_type: str, identity_key: str) -> ResponseReturnValue:
+    if not entity_spec(entity_type).editable_fields:
+        raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
     _repository().retire_record(
         entity_type,
         identity_key,
@@ -431,6 +440,8 @@ def entity_retire(entity_type: str, identity_key: str) -> ResponseReturnValue:
 
 @bp.post("/entities/<entity_type>/<identity_key>/restore")
 def entity_restore(entity_type: str, identity_key: str) -> ResponseReturnValue:
+    if not entity_spec(entity_type).editable_fields:
+        raise AdminDataError("此資料類型為唯讀；請使用專用確認流程")
     _repository().restore_record(
         entity_type,
         identity_key,

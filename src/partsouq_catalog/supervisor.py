@@ -42,6 +42,7 @@ from .admission import (
 from .cloak import COOKIE_TTL
 from .config import COOKIE_FILE, CRAWL, LOG_DIR
 from .db import Database
+from .scheduler import CHILD_TERMINATE_GRACE_SECONDS
 from .state_files import (
     PrivateRotatingFileHandler,
     ensure_private_state_directory,
@@ -303,6 +304,18 @@ class Supervisor:
                     crawler_pids.append((pid_i, ppid_i))
             mine: set[int] = {self.proc.pid} if self.proc else set()
             others = [pid for pid, _ in crawler_pids if pid not in mine]
+
+            def crawler_is_running(pid: int) -> bool:
+                confirm = subprocess.run(
+                    ["ps", "-o", "args=", "-p", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                return confirm.returncode == 0 and bool(
+                    CRAWLER_CMDLINE_RE.search(confirm.stdout.strip())
+                )
+
             for pid in others:
                 # 診斷：被殺的進程是什麼（完整命令 + PPID）
                 try:
@@ -314,43 +327,36 @@ class Supervisor:
                     ).stdout.strip()[:200]
                 except Exception:
                     diag = "?"
-                log.warning("killing stray crawler pid=%d (%s)", pid, diag)
-                killed = subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+                log.warning("stopping stray crawler pid=%d (%s)", pid, diag)
+                killed = subprocess.run(["kill", "-TERM", str(pid)], capture_output=True)
                 kill_rc = getattr(killed, "returncode", 0)
                 if isinstance(kill_rc, int) and kill_rc != 0:
-                    # ps 與 kill 間的自然退出是正常 race。kill -9 失敗後
-                    # 重查 ps；只有 PID 已消失或該 PID 已非 crawler 才能
-                    # 視為清理完成。kill -0 的 rc=1 也可能是 EPERM，
-                    # 不能當成 ESRCH 放行新 crawler。
-                    confirm = subprocess.run(
-                        ["ps", "-o", "args=", "-p", str(pid)],
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                    )
-                    current_args = confirm.stdout.strip()
-                    if confirm.returncode != 0 or not CRAWLER_CMDLINE_RE.search(current_args):
+                    # ps 與 kill 間的自然退出是正常 race；若仍是 crawler，
+                    # 失敗可能是權限問題，不可放行另一個 writer。
+                    if not crawler_is_running(pid):
                         continue
                     log.error(
-                        "failed to kill live stray crawler pid=%d (rc=%s)",
+                        "failed to terminate live stray crawler pid=%d (rc=%s)",
                         pid,
                         killed.returncode,
                     )
                     return False
-            if others:
-                time.sleep(2)
-                for pid in others:
-                    confirm = subprocess.run(
-                        ["ps", "-o", "args=", "-p", str(pid)],
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                    )
-                    if confirm.returncode == 0 and CRAWLER_CMDLINE_RE.search(
-                        confirm.stdout.strip()
-                    ):
-                        log.error("stray crawler pid=%d is still alive", pid)
-                        return False
+                deadline = time.monotonic() + CHILD_TERMINATE_GRACE_SECONDS
+                while crawler_is_running(pid) and time.monotonic() < deadline:
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+                if not crawler_is_running(pid):
+                    continue
+                log.warning("stray crawler pid=%d ignored SIGTERM; sending SIGKILL", pid)
+                killed = subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+                if getattr(killed, "returncode", 0) != 0 and crawler_is_running(pid):
+                    log.error("failed to kill live stray crawler pid=%d", pid)
+                    return False
+                deadline = time.monotonic() + 5
+                while crawler_is_running(pid) and time.monotonic() < deadline:
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+                if crawler_is_running(pid):
+                    log.error("stray crawler pid=%d is still alive", pid)
+                    return False
             return True
         except Exception as e:
             log.warning("stray-crawler check failed: %s", e)
@@ -433,7 +439,7 @@ class Supervisor:
     def _kill_current(self, reason: str) -> bool:
         """強制結束目前的爬蟲子程序。
 
-        SIGTERM → 等 15 秒 → SIGKILL。回傳 True 代表程序已確認終止
+        SIGTERM → 等待完整 browser 清理預算 → SIGKILL。回傳 True 代表程序已確認終止
         或本來就不存在；False 代表程序可能仍在執行（D-state 或例外）。
 
         P1 修復：回傳值讓呼叫端決定是否應啟動新 child —— 舊 PID 無法
@@ -446,7 +452,7 @@ class Supervisor:
             if self.proc.poll() is None:
                 self.proc.terminate()
                 try:
-                    self.proc.wait(timeout=15)
+                    self.proc.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
                     log.warning("child %s didn't exit after SIGTERM; SIGKILL", pid)
                     self.proc.kill()

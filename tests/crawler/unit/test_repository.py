@@ -1,10 +1,14 @@
 import asyncio
+import errno
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+import pytest
 
+from partsouq_crawler.db import backup
 from partsouq_crawler.db.repository import Repository
 from partsouq_crawler.models.crawl import FetchResult
 
@@ -204,6 +208,46 @@ def test_snapshot_publish_rejects_live_database_as_output(tmp_path: Path) -> Non
         else:
             raise AssertionError("live database was accepted as snapshot output")
         await repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_publish_second_temp_failure_cleans_fd_temp_and_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        repository = await Repository.create(tmp_path / "source.sqlite3")
+        destination = tmp_path / "partsouq-current.sqlite3"
+        real_mkstemp = backup.tempfile.mkstemp
+        first_descriptor: int | None = None
+        calls = 0
+
+        def fail_second_mkstemp(*args, **kwargs):
+            nonlocal calls, first_descriptor
+            calls += 1
+            if calls == 2:
+                raise OSError(errno.EMFILE, "too many open files")
+            first_descriptor, name = real_mkstemp(*args, **kwargs)
+            return first_descriptor, name
+
+        monkeypatch.setattr(backup.tempfile, "mkstemp", fail_second_mkstemp)
+        before_fd_count = len(os.listdir("/dev/fd"))
+        try:
+            with pytest.raises(OSError, match="too many open files"):
+                await repository.publish_snapshot(destination)
+            assert first_descriptor is not None
+            with pytest.raises(OSError) as error:
+                os.fstat(first_descriptor)
+            assert error.value.errno == errno.EBADF
+            assert len(os.listdir("/dev/fd")) == before_fd_count
+            assert not destination.with_name(f"{destination.name}.publishing").exists()
+            assert not [
+                name
+                for name in os.listdir(tmp_path)
+                if name.startswith(".") and name.endswith(".tmp")
+            ]
+        finally:
+            await repository.close()
 
     asyncio.run(scenario())
 

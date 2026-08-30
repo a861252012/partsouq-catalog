@@ -44,7 +44,8 @@ class VncsMySQLRepository:
         return cls(connection)
 
     def close(self) -> None:
-        self.connection.close()
+        if self.connection.open:
+            self.connection.close()
 
     def ensure_schema(self) -> None:
         """套用模組 schema（CREATE TABLE IF NOT EXISTS，與 migration 025 同構）。"""

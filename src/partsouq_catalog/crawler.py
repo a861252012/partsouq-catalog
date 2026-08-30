@@ -26,7 +26,7 @@ import re
 import threading
 import time
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import date
 from functools import partial
@@ -38,6 +38,7 @@ from .admission import catalog_writer_admission
 from .config import CRAWL, SITE
 from .db import ConnectionLost, Database
 from .evidence import (
+    OFFICIAL_HOSTS,
     PARSER_CONTRACT_VERSION,
     CatalogHttpResponse,
     RecordEvidence,
@@ -220,9 +221,12 @@ class Crawler:
         workers: int = 8,
         governor: RequestGovernor | None = None,
         fresh: bool = False,
+        runtime_guard: Callable[[], None] | None = None,
     ) -> None:
         self.http = http
         self.db = db
+        if runtime_guard is not None:
+            self.db.set_commit_guard(runtime_guard)
         # Repository 層：SQL 全部封裝在這些物件裡
         self.brands = BrandRepository(db)
         self.vehicles = VehicleRepository(db)
@@ -230,12 +234,23 @@ class Crawler:
         self.crawl = CrawlRepository(db)
         sample_limit = int(CRAWL["limit_parts"])
         bounded_limit = int(CRAWL["bounded_parts"])
+        bounded_brand = str(CRAWL["bounded_brand"]).strip().casefold()
+        bounded_model = str(CRAWL["bounded_model"]).strip().casefold()
+        vehicle_year_window = int(CRAWL["vehicle_year_window"])
         if sample_limit < 0:
             raise ValueError("PSQ_LIMIT_PARTS must be zero or a positive integer")
         if bounded_limit < 0:
             raise ValueError("PSQ_BOUNDED_PARTS must be zero or a positive integer")
+        if vehicle_year_window < 0:
+            raise ValueError("PSQ_VEHICLE_YEAR_WINDOW must be zero or a positive integer")
         if sample_limit and bounded_limit:
             raise ValueError("PSQ_LIMIT_PARTS and PSQ_BOUNDED_PARTS are mutually exclusive")
+        if bool(bounded_brand) != bool(bounded_model):
+            raise ValueError("PSQ_BOUNDED_BRAND and PSQ_BOUNDED_MODEL must be set together")
+        if bounded_brand and bounded_limit != 10_000:
+            raise ValueError("model-aligned scope requires PSQ_BOUNDED_PARTS=10000")
+        if bounded_brand and vehicle_year_window <= 0:
+            raise ValueError("model-aligned scope requires a positive PSQ_VEHICLE_YEAR_WINDOW")
         if bounded_limit and any(
             bool(CRAWL.get(key))
             for key in (
@@ -261,6 +276,11 @@ class Crawler:
         self.bounded_mode = bool(bounded_limit)
         self.evidence_mode = bounded_limit == 10_000
         self.part_limit = bounded_limit or sample_limit
+        self.scope_brand = bounded_brand or None
+        self.scope_model = bounded_model or None
+        self.scope_vehicle_year_floor = (
+            _vehicle_year_window_floor() if self.scope_brand is not None else None
+        )
         self.scheduled_job_run_id = scheduled_job_run_id or None
         if self.part_limit and workers != 1:
             log.warning("part row limit mode forces workers=1 for an exact row cap")
@@ -505,27 +525,68 @@ class Crawler:
         )
 
     def _assert_expected_unit(self, html: str, group: ParsedRecord) -> None:
-        """身分斷言：抓回的頁面必須屬於預期的 unit（uid 出現在頁面中）。
+        """身分斷言：抓回的頁面必須屬於預期的 unit。
 
         防範「同 URL 回傳錯誤內容」（站方快取／負載均衡異常把別的組的
         頁面送到本組的 URL）—— 這種情況沒有轉址，URL 層的 off-unit 檢查
-        （fetch_page 的 NonUnitPageError、get_response 的 unit 轉址 NotFound）
+        （fetch_page 的 NonUnitPageError、get_response 的 HTTP 轉址檢查）
         抓不到，只有頁面內容本身能驗證。
 
-        實測（subAgent 以真實瀏覽器抽查 30 組存證）：genuine 頁面（含合法
-        空組）全部含 uid、/locate 轉址頁全部不含，故以 uid 出現與否斷言
-        是安全的，不會誤殺合法空組。斷言失敗一律拋錯（fail-closed，該組
-        不寫任何 receipt，由續爬重試），絕不靜默寫入錯誤資料。"""
+        正式頁以官方 HTTPS canonical link 為準；測試與舊版頁面可退回
+        讀取 hidden input。uid 與請求中既有的 c／vid／cid 都做完整值
+        比對，不能只搜尋字串。斷言失敗時不寫 receipt，留給續爬重試。"""
         expected_uid = str(group.get("uid") or "")
-        if expected_uid and expected_uid in html:
-            return
+        soup = _soup(html)
+        canonical_link = soup.find("link", rel="canonical", href=True)
+        if canonical_link is not None:
+            canonical_url = str(canonical_link.get("href") or "")
+            parsed_url = urllib.parse.urlsplit(canonical_url)
+            actual_query = urllib.parse.parse_qs(parsed_url.query)
+            actual_uid = actual_query.get("uid", [None])[0]
+            requested_query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(str(group.get("url") or "")).query
+            )
+            context_matches = all(
+                actual_query.get(key, [None])[0] == expected_value
+                for key in ("c", "vid", "cid")
+                if (expected_value := requested_query.get(key, [None])[0]) is not None
+            )
+            if (
+                expected_uid
+                and parsed_url.scheme.lower() == "https"
+                and (parsed_url.hostname or "").lower() in OFFICIAL_HOSTS
+                and parsed_url.port in (None, 443)
+                and parsed_url.path.rstrip("/") == "/en/catalog/genuine/unit"
+                and actual_uid == expected_uid
+                and context_matches
+            ):
+                return
+        elif expected_uid:
+            hidden_values = {
+                str(node.get("name") or "").lower(): str(node.get("value") or "")
+                for node in soup.find_all("input")
+                if node.get("name")
+            }
+            requested_query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(str(group.get("url") or "")).query
+            )
+            required_context = {"uid": expected_uid}
+            required_context.update(
+                {
+                    key: expected_value
+                    for key in ("c", "vid", "cid")
+                    if (expected_value := requested_query.get(key, [None])[0]) is not None
+                }
+            )
+            if all(hidden_values.get(key) == value for key, value in required_context.items()):
+                return
         raise RuntimeError(
-            f"[group={group.get('group_code')}] fetched page does not contain expected "
+            f"[group={group.get('group_code')}] fetched page does not identify expected "
             f"unit uid={expected_uid!r}; refusing receipt (wrong content at same URL?)"
         )
 
     def _brands(self) -> list[ParsedRecord]:
-        """從首頁取得 18 個品牌的清單。"""
+        """從首頁取得品牌清單。"""
         # 首頁是唯一直接使用主 SessionManager 的請求；其餘頁面都走
         # _get_response。lazy cookie bootstrap 後，這裡也必須先檢查
         # freshness，且此時 Crawler.run 已提交 running marker。
@@ -605,6 +666,19 @@ class Crawler:
                 malformed_rows=malformed,
             )
         log.info("[%s] %d models", brand, len(models))
+
+        if self.scope_model is not None:
+            scoped_models = [
+                model
+                for model in models
+                if str(model.get("name") or "").casefold() == self.scope_model.casefold()
+            ]
+            if len(scoped_models) != 1:
+                raise RuntimeError(
+                    f"model-aligned scope requires exactly one {self.scope_model!r} model "
+                    f"under {brand!r}; found {len(scoped_models)}"
+                )
+            models = scoped_models
 
         brand_id = self.brands.upsert_brand(brand, locate_url)
         self.db.commit()
@@ -777,7 +851,7 @@ class Crawler:
 
         pending: list[ParsedRecord] = []
         skipped_by_year = 0
-        year_floor = _vehicle_year_window_floor()
+        year_floor = self.scope_vehicle_year_floor or _vehicle_year_window_floor()
         for vehicle in vehicles:
             key = self._vehicle_key(model_id, vehicle)
             # F1b：見即記錄（見 crawl_brand 的說明）—— 車型層縮水
@@ -1806,48 +1880,88 @@ class Crawler:
         # run_id 已存在，不重複初始化、也不代為 finish（由 run() 負責）。
         # 收斂本質是「全站維護」動作，一律以 full 語意記錄，不沾 bounded /
         # evidence 發布語意。
-        if self.run_id is None:
-            run_key = f"recover-{datetime.now():%Y%m%dT%H%M%S}"
-            self.crawl.run_key = run_key
-            self.run_id = self.crawl.start_run(
-                run_key,
-                fresh=self.fresh,
-                dataset_kind="full",
-                target_parts=None,
-                scheduled_job_run_id=self.scheduled_job_run_id,
-            )
-            self.db.commit()
-            initialized_here = True
-        else:
-            initialized_here = False
+        initialized_here = False
+        terminal_error: str | None = None
         try:
-            rows = self.crawl.list_null_groups(limit)
-            if not rows:
-                return 0
+            if self.run_id is None:
+                run_key = f"recover-{datetime.now():%Y%m%dT%H%M%S}"
+                self.crawl.run_key = run_key
+                with catalog_writer_admission(self.db._thread_conn()):
+                    self.run_id = self.crawl.start_run(
+                        run_key,
+                        fresh=self.fresh,
+                        dataset_kind="full",
+                        target_parts=None,
+                        scheduled_job_run_id=self.scheduled_job_run_id,
+                    )
+                    try:
+                        self.db.commit()
+                    except Exception:
+                        self.db.rollback()
+                        raise
+                    # 先記下 durable marker，再離開 context。如此
+                    # RELEASE_LOCK 失敗時 finally 仍會把本 run 關閉。
+                    initialized_here = True
             recovered = 0
-            for row in rows:
-                brand = _brand_from_url(row["url"]) or "Toyota"
-                vehicle_id = int(cast(int, row["vehicle_id"]))
-                group: ParsedRecord = {
-                    "category_name": row["category_name"],
-                    "cid": row["cid"],
-                    "group_code": row["code"],
-                    "group_name": row["name"],
-                    "uid": row["uid"],
-                    "url": row["url"],
-                }
-                try:
-                    # skip_if_fetched=False：即使已標 done 也強制重抓；NULL 組
-                    # 的 fetched_status 為 NULL，不會被 skip 分支漏掉。
-                    self.crawl_group(brand, vehicle_id, group, skip_if_fetched=False)
-                    recovered += 1
-                except Exception:  # noqa: BLE001
-                    log.exception("recover_null_groups: 組 %s 重抓失敗", row["id"])
-            log.info("recover_null_groups: 處理 %d 組, 收斂 %d 組", len(rows), recovered)
+            failed = 0
+            attempted = 0
+            after_id = 0
+            while True:
+                rows = self.crawl.list_null_groups(
+                    limit,
+                    run_key=self.crawl.run_key if not initialized_here else None,
+                    run_id=self.run_id if not initialized_here else None,
+                    after_id=after_id,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    after_id = max(after_id, int(cast(int, row["id"])))
+                    attempted += 1
+                    brand = _brand_from_url(row["url"]) or "Toyota"
+                    vehicle_id = int(cast(int, row["vehicle_id"]))
+                    group: ParsedRecord = {
+                        "category_name": row["category_name"],
+                        "cid": row["cid"],
+                        "group_code": row["code"],
+                        "group_name": row["name"],
+                        "uid": row["uid"],
+                        "url": row["url"],
+                    }
+                    try:
+                        # 既有 receipt 也可能與本 run membership 不一致；
+                        # recovery 一律強制重抓，由下一次排程重試失敗列。
+                        truncated = self.crawl_group(
+                            brand,
+                            vehicle_id,
+                            group,
+                            skip_if_fetched=False,
+                        )
+                        if truncated:
+                            raise RuntimeError("recover group was truncated by a part limit")
+                        recovered += 1
+                    except Exception:  # noqa: BLE001
+                        failed += 1
+                        log.exception("recover_null_groups: 組 %s 重抓失敗", row["id"])
+                if len(rows) < limit:
+                    break
+            log.info("recover_null_groups: 處理 %d 組, 收斂 %d 組", attempted, recovered)
+            if failed:
+                raise RuntimeError(
+                    f"recover-only incomplete: recovered={recovered}/{attempted}, failed={failed}"
+                )
             return recovered
+        except Exception as error:
+            terminal_error = str(error)
+            raise
         finally:
             if initialized_here and self.run_id is not None:
-                self.crawl.finish_run(self.run_id, "success", self.counts, "recover-only")
+                self.crawl.finish_run(
+                    self.run_id,
+                    "error" if terminal_error else "success",
+                    self.counts,
+                    terminal_error or "recover-only",
+                )
                 self.db.commit()
 
     def run(self) -> dict[str, int]:
@@ -1887,68 +2001,90 @@ class Crawler:
         # Direct CLI 沒有 scheduler marker；先取得與 migration 相同的短鎖，
         # 並在 running crawl marker 與 fresh reset 一起 commit 後立即釋放。
         # 取得前不能查任何業務表，避免 metadata lock 反向等待。
-        with catalog_writer_admission(self.db._thread_conn()):
-            if bounded_mode:
-                resumable_run_key = self.crawl.resumable_bounded_run_key(
-                    self.part_limit,
-                    scheduled_job_run_id=self.scheduled_job_run_id,
-                )
-                # 不相容的最新 run 會在 resolver 內標成 rejected。
-                # 先獨立提交，避免後續新 marker 建立失敗時把拒絕狀態
-                # 一併 rollback，舊 run 又在下一輪被重新考慮。
-                self.db.commit()
-                run_key = resumable_run_key or ""
-                if not run_key:
-                    run_key = (
-                        f"bounded-{self.part_limit}-"
-                        f"{'s' if self.scheduled_job_run_id else 'd'}"
-                        f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
+        run_id: int | None = None
+        started_status: str | None = None
+        running_marker_committed = False
+        try:
+            with catalog_writer_admission(self.db._thread_conn()):
+                if bounded_mode:
+                    resumable_run_key = self.crawl.resumable_bounded_run_key(
+                        self.part_limit,
+                        scheduled_job_run_id=self.scheduled_job_run_id,
+                        scope_brand=self.scope_brand,
+                        scope_model=self.scope_model,
+                        scope_vehicle_year_floor=self.scope_vehicle_year_floor,
                     )
-            elif sample_mode:
-                run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f")
-            elif partial:
-                # 局部修補不得沿用已成功的月 run。start_run 會刻意保留
-                # success，因此沿用 YYYY-MM 會在 admission 釋放後沒有
-                # running marker，migration 可能與後續 normalized writes
-                # 交錯。排程重試沿用 scheduler id；直接 CLI 每次使用
-                # 獨立、32 字元內的 logical run。
-                run_key = (
-                    f"partial-s{self.scheduled_job_run_id}"
-                    if self.scheduled_job_run_id
-                    else datetime.now().strftime("partial-%y%m%dT%H%M%S%f")
-                )
-            else:
-                run_key = datetime.now().strftime("%Y-%m")
-            self.crawl.run_key = run_key
-            dataset_kind = "bounded" if bounded_mode else "sample" if sample_mode else "full"
-            try:
-                run_id = self.crawl.start_run(
-                    run_key,
-                    fresh=self.fresh,
-                    dataset_kind=dataset_kind,
-                    target_parts=self.part_limit or None,
-                    scheduled_job_run_id=self.scheduled_job_run_id,
-                )
-                self.run_id = run_id
-                # start_run 會保留既有 terminal row；在 admission 交易內
-                # 先讀回狀態，才能區分「新 running marker」與「既有已發布
-                # run」。讀取失敗會連同新 marker rollback，不會留下半套。
-                started_status = self.crawl.run_status(run_id)
-                # --fresh 的 run 邊界、state、receipt 與 membership reset 必須在
-                # 同一交易。若程序在初始化後崩潰，DB 會保留 running，下一次
-                # 普通啟動可繼續，而不會因舊 success 被靜默跳過。
-                if self.fresh:
-                    self.crawl.reset_run_state(run_key)
-                    self.crawl.reset_group_receipts(run_key)
-                    self.crawl.reset_part_markers(run_id)
-                # running marker durable 後立即釋放 admission；整趟爬取仍由
-                # scheduler／crawler flock 保護，不把 DB mutex 當 job lease。
-                self.db.commit()
-            except Exception:
-                # 先回滾初始化交易再釋放 schema admission，避免 migration
-                # 拿到 mutex 後仍被本連線尚未提交的 DML/metadata lock 卡住。
+                    # 不相容的最新 run 會在 resolver 內標成 rejected。
+                    # 先獨立提交，避免後續新 marker 建立失敗時把拒絕狀態
+                    # 一併 rollback，舊 run 又在下一輪被重新考慮。
+                    self.db.commit()
+                    run_key = resumable_run_key or ""
+                    if not run_key:
+                        run_key = (
+                            f"bounded-{self.part_limit}-"
+                            f"{'s' if self.scheduled_job_run_id else 'd'}"
+                            f"{datetime.now().strftime('%y%m%d%H%M%S%f')[:-3]}"
+                        )
+                elif sample_mode:
+                    run_key = datetime.now().strftime("sample-%Y%m%dT%H%M%S%f")
+                elif partial:
+                    # 局部修補不得沿用已成功的月 run。start_run 會刻意保留
+                    # success，因此沿用 YYYY-MM 會在 admission 釋放後沒有
+                    # running marker，migration 可能與後續 normalized writes
+                    # 交錯。排程重試沿用 scheduler id；直接 CLI 每次使用
+                    # 獨立、32 字元內的 logical run。
+                    run_key = (
+                        f"partial-s{self.scheduled_job_run_id}"
+                        if self.scheduled_job_run_id
+                        else datetime.now().strftime("partial-%y%m%dT%H%M%S%f")
+                    )
+                else:
+                    run_key = datetime.now().strftime("%Y-%m")
+                self.crawl.run_key = run_key
+                dataset_kind = "bounded" if bounded_mode else "sample" if sample_mode else "full"
+                try:
+                    run_id = self.crawl.start_run(
+                        run_key,
+                        fresh=self.fresh,
+                        dataset_kind=dataset_kind,
+                        target_parts=self.part_limit or None,
+                        scheduled_job_run_id=self.scheduled_job_run_id,
+                        scope_brand=self.scope_brand,
+                        scope_model=self.scope_model,
+                        scope_vehicle_year_floor=self.scope_vehicle_year_floor,
+                    )
+                    self.run_id = run_id
+                    # start_run 會保留既有 terminal row；在 admission 交易內
+                    # 先讀回狀態，才能區分「新 running marker」與「既有已發布
+                    # run」。讀取失敗會連同新 marker rollback，不會留下半套。
+                    started_status = self.crawl.run_status(run_id)
+                    # --fresh 的 run 邊界、state、receipt 與 membership reset 必須在
+                    # 同一交易。若程序在初始化後崩潰，DB 會保留 running，下一次
+                    # 普通啟動可繼續，而不會因舊 success 被靜默跳過。
+                    if self.fresh:
+                        self.crawl.reset_run_state(run_key)
+                        self.crawl.reset_group_receipts(run_key)
+                        self.crawl.reset_part_markers(run_id)
+                    # running marker durable 後立即釋放 admission；整趟爬取仍由
+                    # scheduler／crawler flock 保護，不把 DB mutex 當 job lease。
+                    self.db.commit()
+                    running_marker_committed = started_status == "running"
+                except Exception:
+                    # 先回滾初始化交易再釋放 schema admission，避免 migration
+                    # 拿到 mutex 後仍被本連線尚未提交的 DML/metadata lock 卡住。
+                    self.db.rollback()
+                    raise
+        except Exception as error:
+            if running_marker_committed and run_id is not None:
                 self.db.rollback()
-                raise
+                try:
+                    self.crawl.finish_run(run_id, "error", self.counts, str(error))
+                    self.db.commit()
+                except Exception:
+                    log.exception("failed to persist crawl admission release error status")
+            raise
+        if run_id is None:
+            raise RuntimeError("crawl run marker was not initialized")
         if not self.fresh and bounded_mode and started_status == "bounded_success":
             self.last_status = "bounded_success"
             log.info("bounded run %s already published; skipping duplicate crawl", run_key)
@@ -1962,10 +2098,38 @@ class Crawler:
                 # 排程重試沿用穩定 run_key。配額必須從持久化 membership
                 # 恢復，不能從 0 重算，否則中斷後會再爬 target 筆。
                 self.counts["parts"] = self.crawl.count_run_parts(run_id)
-                discarded = self.crawl.discard_invalid_bounded_membership(run_id)
+                discarded = self.crawl.discard_invalid_bounded_membership(
+                    run_id,
+                    scope_brand=self.scope_brand,
+                    scope_model=self.scope_model,
+                    scope_vehicle_year_floor=self.scope_vehicle_year_floor,
+                )
                 if discarded:
-                    self.db.commit()
                     self.counts["parts"] = self.crawl.count_run_parts(run_id)
+                    if self.evidence_mode:
+                        # 移除 membership 後，舊 artifact/accepted record 與
+                        # done receipt 已不再描述同一份資料集。同一 logical
+                        # run 繼續補量一定會在 evidence coverage 對帳失敗；
+                        # 直接拒絕，讓下一個 interval 建立全新 run。
+                        self.crawl.reject_run_evidence(run_id)
+                        self.crawl.finish_run(
+                            run_id,
+                            "error",
+                            self.counts,
+                            f"bounded run discarded {discarded} invalid membership row(s); "
+                            "a new logical run is required",
+                        )
+                        self.db.commit()
+                        self.last_status = "bounded_under_target"
+                        log.error(
+                            "discarded %d invalid formal bounded membership row(s); "
+                            "current logical run rejected at %d/%d",
+                            discarded,
+                            self.counts["parts"],
+                            self.part_limit,
+                        )
+                        return self.counts
+                    self.db.commit()
                     log.warning(
                         "discarded %d invalid bounded membership row(s); continuing from %d/%d",
                         discarded,
@@ -2047,6 +2211,18 @@ class Crawler:
                     f"brand index shrank: {len(brands)} < min_brands={CRAWL['min_brands']}"
                 )
             log.info("brand list: %s", [b["name"] for b in brands])
+            if self.scope_brand is not None:
+                scoped_brands = [
+                    brand
+                    for brand in brands
+                    if str(brand.get("name") or "").casefold() == self.scope_brand.casefold()
+                ]
+                if len(scoped_brands) != 1:
+                    raise RuntimeError(
+                        f"model-aligned scope requires exactly one {self.scope_brand!r} brand; "
+                        f"found {len(scoped_brands)}"
+                    )
+                brands = scoped_brands
             start = CRAWL["start_brand"]
             limit = CRAWL["limit_brands"]
             if start:
@@ -2121,6 +2297,11 @@ class Crawler:
                 )
                 self.db.commit()
             elif bounded_mode and self.counts["parts"] != self.part_limit:
+                # scope 已完整閉合且沒有 crawl error，卻仍不足 10k，表示
+                # 這個 logical run 不可能靠 resume 增加資料。先拒絕其
+                # evidence，讓下一個 scheduler attempt 建立新 run_key，
+                # 重新走訪已標 done 的品牌／型號。
+                self.crawl.reject_run_evidence(run_id)
                 self.crawl.finish_run(
                     run_id,
                     "error",
@@ -2129,6 +2310,7 @@ class Crawler:
                     f"{self.counts['parts']}/{self.part_limit}",
                 )
                 self.db.commit()
+                self.last_status = "bounded_under_target"
             elif bounded_mode:
                 # bounded snapshot 與 terminal status 必須是同一個交易。
                 # Repository 會再次核對 target、來源關聯與必填欄位；
@@ -2236,14 +2418,17 @@ class Crawler:
                     quarantined = self.crawl.count_quarantined(run_key)
                     if quarantined:
                         log.warning(
-                            "publishing full snapshot with %d quarantined row(s) "
+                            "archiving full candidate with %d quarantined row(s) "
                             "(part_quarantine, unresolved)",
                             quarantined,
                         )
                     else:
-                        log.info("publishing full snapshot with 0 quarantined row(s)")
+                        log.info("archiving full candidate with 0 quarantined row(s)")
                     finalizing = True
-                    self.crawl.publish_success_parts(run_id)
+                    self.crawl.archive_full_candidate_parts(
+                        run_id,
+                        expected_scheduled_job_run_id=self.scheduled_job_run_id,
+                    )
                     self.crawl.finish_run(run_id, "success", self.counts)
                     self.db.commit()
                     finalizing = False

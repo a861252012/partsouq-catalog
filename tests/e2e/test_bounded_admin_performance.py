@@ -8,7 +8,7 @@ import statistics
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,9 @@ from partsouq_catalog.repositories import (
 )
 from partsouq_station_admin.app import create_app
 from partsouq_station_admin.config import AdminConfig
+from partsouq_station_admin.db import AdminDatabase
+from partsouq_station_admin.query_trace import QueryTrace
+from partsouq_station_admin.repository import ENTITY_SPECS, AdminRepository
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRESH_SCHEMA_PATHS = (
@@ -435,6 +438,27 @@ def test_admin_schema_repairs_published_snapshot_foreign_key_contract(
             ]
     finally:
         connection.close()
+
+
+def test_fresh_admin_schema_current_view_is_verified_bounded_only(
+    performance_database: PerformanceDatabase,
+) -> None:
+    _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:3])
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW CREATE VIEW v_current_catalog_parts")
+            view_sql = str(cursor.fetchone()["Create View"]).lower()
+    finally:
+        connection.close()
+
+    assert "bounded_parts" in view_sql
+    assert "verified_bounded_evidence" in view_sql
+    assert "verified_bounded_records" in view_sql
+    assert "evidence_record_sha256" in view_sql
+    assert "catalog_desired_bounded_scope" in view_sql
+    assert "formal_full_parts" not in view_sql
+    assert "published_parts" not in view_sql
 
 
 @pytest.fixture
@@ -1012,7 +1036,6 @@ def test_data_admin_health_fails_closed_when_backoffice_schema_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure_catalog_database(monkeypatch, performance_database)
-
     with pytest.raises(pymysql.MySQLError) as error:
         data_admin_app.health()
 
@@ -1332,11 +1355,15 @@ def _seed_synthetic_bounded_dataset(database: PerformanceDatabase) -> dict[str, 
     _validate_test_database_name(database.database)
     catalog_database = Database().connect()
     try:
+        scheduler_output = (
+            "catalog receipt accepted without fixture marker\n" * 20_000
+            + "SYNTHETIC PERFORMANCE FIXTURE; NOT LIVE CRAWL EVIDENCE"
+        )
         scheduler_run_id = catalog_database._execute(
             "INSERT INTO scheduled_job_runs("
             "job_name, trigger_mode, status, started_at, output_text"
             ") VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP(), %s)",
-            ("SYNTHETIC PERFORMANCE FIXTURE; NOT LIVE CRAWL EVIDENCE",),
+            (scheduler_output,),
         ).lastrowid
         crawl = CrawlRepository(catalog_database, "bounded-10000-synthetic-perf")
         crawl_run_id = crawl.start_run(
@@ -1497,11 +1524,15 @@ def _seed_synthetic_bounded_dataset(database: PerformanceDatabase) -> dict[str, 
         catalog_database.close()
 
 
-def _fetch_one(database: PerformanceDatabase, sql: str) -> dict[str, Any]:
+def _fetch_one(
+    database: PerformanceDatabase,
+    sql: str,
+    params: tuple[object, ...] = (),
+) -> dict[str, Any]:
     connection = database.connect(autocommit=True)
     try:
         with connection.cursor() as cursor:
-            cursor.execute(sql)
+            cursor.execute(sql, params)
             return dict(cursor.fetchone() or {})
     finally:
         connection.close()
@@ -1577,6 +1608,8 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         (*FRESH_SCHEMA_PATHS[1:], MIGRATION_009_PATH, MIGRATION_019_PATH),
     )
     _configure_catalog_database(monkeypatch, performance_database)
+    monkeypatch.setenv("PARTSOUQ_ADMIN_TOKEN", "performance-admin-token")
+    data_admin_headers = {"X-Admin-Token": "performance-admin-token"}
     setup_started = time.perf_counter()
     seeded = _seed_synthetic_bounded_dataset(performance_database)
     setup_ms = round((time.perf_counter() - setup_started) * 1_000, 2)
@@ -1613,6 +1646,85 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         "vehicles": SHARED_PART_FITMENTS,
         "year_ranges": 5,
     }
+    formal_part_spec = replace(
+        ENTITY_SPECS["part_numbers"],
+        table="station_admin_formal_part_numbers",
+    )
+    candidate_sql, candidate_params = AdminRepository._source_search_candidates(
+        formal_part_spec,
+        [f"{SHARED_PART_NORMALIZED}%"] * 3,
+        seeded["crawl_run_id"],
+    )
+    connection = performance_database.connect(autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(candidate_sql, candidate_params)
+            candidate_ids = {int(row["id"]) for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT part_id AS id FROM bounded_parts "
+                "WHERE crawl_run_id = %s AND (brand LIKE %s "
+                "OR part_number_normalized LIKE %s OR part_name LIKE %s)",
+                (
+                    seeded["crawl_run_id"],
+                    f"{SHARED_PART_NORMALIZED}%",
+                    f"{SHARED_PART_NORMALIZED}%",
+                    f"{SHARED_PART_NORMALIZED}%",
+                ),
+            )
+            expected_ids = {int(row["id"]) for row in cursor.fetchall()}
+    finally:
+        connection.close()
+    assert candidate_ids == expected_ids
+    assert len(candidate_ids) == SHARED_PART_FITMENTS
+    station_candidate_explain = _explain_plan(
+        performance_database,
+        candidate_sql,
+        tuple(candidate_params),
+    )
+    assert any(
+        table.get("key") == "idx_bounded_part_number_normalized"
+        and int(table.get("rows_examined_per_scan") or TARGET_PARTS) <= SHARED_PART_FITMENTS
+        for table in station_candidate_explain["tables"]
+    )
+
+    snapshot_target = _fetch_one(
+        performance_database,
+        "SELECT part_id, part_name FROM bounded_parts "
+        "WHERE part_number_normalized = %s ORDER BY part_id LIMIT 1",
+        (SHARED_PART_NORMALIZED,),
+    )
+    switched_name = f"{snapshot_target['part_name']} SWITCHED"
+    reader_connection = performance_database.connect(autocommit=True)
+    writer_connection = performance_database.connect(autocommit=True)
+    reader = AdminDatabase(reader_connection, QueryTrace())
+    try:
+        with reader.transaction(read_only=True):
+            before_switch = reader.fetch_one(
+                "test.snapshot.before",
+                "SELECT part_name FROM bounded_parts WHERE part_id = %s",
+                (snapshot_target["part_id"],),
+            )
+            with writer_connection.cursor() as cursor:
+                with pytest.raises(pymysql.MySQLError) as error:
+                    cursor.execute(
+                        "UPDATE bounded_parts SET part_name = %s WHERE part_id = %s",
+                        (switched_name, snapshot_target["part_id"]),
+                    )
+                assert error.value.args[0] == 1644
+            during_switch = reader.fetch_one(
+                "test.snapshot.during",
+                "SELECT part_name FROM bounded_parts WHERE part_id = %s",
+                (snapshot_target["part_id"],),
+            )
+        assert before_switch == during_switch == {"part_name": snapshot_target["part_name"]}
+        assert reader.fetch_one(
+            "test.snapshot.after",
+            "SELECT part_name FROM bounded_parts WHERE part_id = %s",
+            (snapshot_target["part_id"],),
+        ) == {"part_name": snapshot_target["part_name"]}
+    finally:
+        writer_connection.close()
+        reader_connection.close()
 
     data_queries: list[tuple[str, tuple[object, ...]]] = []
     original_fetch_all = data_admin_app._fetch_all
@@ -1638,18 +1750,18 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
         "data_admin": data_admin_report,
         "station_admin": station_admin_report,
     }
+    station_admin_report["bounded_candidate_explain"] = station_candidate_explain
     with TestClient(data_admin_app.app) as data_client:
         data_queries.clear()
-        summary = data_client.get("/api/database-summary")
+        summary = data_client.get("/api/database-summary", headers=data_admin_headers)
         _assert_data_response(summary, 8, data_queries)
         summary_json = summary.json()
         assert summary_json["bounded_ready"] is False
         assert "bounded_non_live_data_marker" in summary_json["bounded"]["blocking_reasons"]
-        assert summary_json["bounded"]["fitment_rows"] == TARGET_PARTS
-        assert summary_json["bounded"]["unique_part_numbers"] == (
-            TARGET_PARTS - SHARED_PART_FITMENTS + 1
-        )
-        assert summary_json["bounded"]["unique_vehicles"] == seeded["vehicles"]
+        assert summary_json["bounded"]["fitment_rows"] == 0
+        assert summary_json["bounded"]["unique_part_numbers"] == 0
+        assert summary_json["bounded"]["unique_vehicles"] == 0
+        assert summary_json["current_catalog"]["fitment_rows"] == 0
         assert summary_json["bounded"]["crawl_run_id"] == seeded["crawl_run_id"]
         assert summary_json["bounded"]["scheduler"]["run_id"] == seeded["scheduler_run_id"]
         assert summary_json["bounded"]["source_provenance"]["raw_http_artifact_status"] == (
@@ -1664,65 +1776,65 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
 
         def summary_request() -> None:
             data_queries.clear()
-            response = data_client.get("/api/database-summary")
+            response = data_client.get("/api/database-summary", headers=data_admin_headers)
             _assert_data_response(response, 8, data_queries)
 
         data_admin_report["summary"] = _measure(summary_request)
 
         for page_size in PAGE_SIZES:
-            total_pages = math.ceil(TARGET_PARTS / page_size)
-            for page_name, page in (("first", 1), ("last", total_pages)):
+            for page_name, page in (("first", 1), ("out_of_range", 2)):
                 path = f"/api/bounded-parts?page={page}&pageSize={page_size}"
 
                 def bounded_request(path: str = path) -> None:
                     data_queries.clear()
-                    response = data_client.get(path)
+                    response = data_client.get(path, headers=data_admin_headers)
                     _assert_data_response(response, 2, data_queries)
 
                 data_queries.clear()
-                response = data_client.get(path)
+                response = data_client.get(path, headers=data_admin_headers)
                 _assert_data_response(response, 2, data_queries)
                 payload = response.json()
-                assert payload["total"] == TARGET_PARTS
+                assert payload["total"] == 0
                 assert payload["pageSize"] == page_size
-                assert len(payload["items"]) == min(
-                    page_size,
-                    TARGET_PARTS - ((page - 1) * page_size),
-                )
+                assert payload["items"] == []
                 if page_size == 200:
-                    data_admin_report[f"bounded_200_{page_name}_explain"] = [
+                    data_admin_report[f"formal_fail_closed_200_{page_name}_explain"] = [
                         _explain_plan(performance_database, sql, params)
                         for sql, params in data_queries
                     ]
-                data_admin_report[f"bounded_{page_size}_{page_name}"] = _measure(bounded_request)
+                data_admin_report[f"formal_fail_closed_{page_size}_{page_name}"] = _measure(
+                    bounded_request
+                )
 
         data_queries.clear()
         exact = data_client.get(
             "/api/bounded-parts",
             params={"part_number": SHARED_PART_NORMALIZED, "pageSize": 30},
+            headers=data_admin_headers,
         )
         _assert_data_response(exact, 2, data_queries)
-        assert exact.json()["total"] == SHARED_PART_FITMENTS
-        assert len(exact.json()["items"]) == 30
-        assert exact.json()["items"][0]["part_number"] == SHARED_PART_NUMBER
+        assert exact.json()["total"] == 0
+        assert exact.json()["items"] == []
         exact_queries = tuple(data_queries)
         data_queries.clear()
         exact_last = data_client.get(
             "/api/bounded-parts",
             params={"part_number": SHARED_PART_NORMALIZED, "pageSize": 30, "page": 4},
+            headers=data_admin_headers,
         )
         _assert_data_response(exact_last, 2, data_queries)
-        assert exact_last.json()["total"] == SHARED_PART_FITMENTS
-        assert len(exact_last.json()["items"]) == 10
+        assert exact_last.json()["total"] == 0
+        assert exact_last.json()["items"] == []
 
         def exact_request() -> None:
             data_queries.clear()
             response = data_client.get(
                 "/api/bounded-parts",
                 params={"part_number": SHARED_PART_NORMALIZED, "pageSize": 30},
+                headers=data_admin_headers,
             )
             _assert_data_response(response, 2, data_queries)
-            assert response.json()["total"] == SHARED_PART_FITMENTS
+            assert response.json()["total"] == 0
 
         data_admin_report["bounded_exact_normalized"] = _measure(exact_request)
 
@@ -1754,7 +1866,7 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
             f"/entities/part_numbers?dataset=formal&q={SHARED_PART_NORMALIZED}&pageSize=30"
         )
         assert response.status_code == 200
-        assert response.headers["X-Admin-Query-Count"] == "4"
+        assert response.headers["X-Admin-Query-Count"] == "5"
         assert SHARED_PART_NUMBER.encode() not in response.data
         assert "共 0 筆記錄".encode() in response.data
 
@@ -1770,13 +1882,3 @@ def test_synthetic_bounded_dataset_admin_performance_gate(
             assert float(metrics["p95_ms"]) < PAGE_P95_LIMIT_MS, f"{name}: {metrics}"
 
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-    assert all(
-        any(
-            table.get("table") == "candidate"
-            and table.get("key") == "idx_bounded_part_number_normalized"
-            and table.get("access_type") == "ref"
-            and int(table.get("rows_examined_per_scan") or TARGET_PARTS) <= SHARED_PART_FITMENTS
-            for table in plan["tables"]
-        )
-        for plan in exact_explain
-    )

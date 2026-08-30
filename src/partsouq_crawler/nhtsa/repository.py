@@ -88,7 +88,8 @@ class NhtsaMySQLRepository:
         return cls(connection)
 
     def close(self) -> None:
-        self.connection.close()
+        if self.connection.open:
+            self.connection.close()
 
     @contextmanager
     def transaction(self) -> Iterator[Connection[DictCursor]]:

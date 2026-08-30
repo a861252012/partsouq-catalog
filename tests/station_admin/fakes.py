@@ -33,13 +33,15 @@ class ScriptedDatabase:
         self.provenance_count = provenance_count
         self.readiness_contract_ready = readiness_contract_ready
         self.calls: list[SqlCall] = []
+        self.transaction_modes: list[bool] = []
         self.closed = False
 
     def close(self) -> None:
         self.closed = True
 
     @contextmanager
-    def transaction(self) -> Iterator[ScriptedDatabase]:
+    def transaction(self, *, read_only: bool = False) -> Iterator[ScriptedDatabase]:
+        self.transaction_modes.append(read_only)
         yield self
 
     def fetch_one(
@@ -84,6 +86,8 @@ class ScriptedDatabase:
                 "previous_foreign_key_ready": ready,
                 "formal_view_ready": ready,
                 "formal_view_columns_ready": ready,
+                "desired_scope_columns_ready": ready,
+                "bounded_snapshot_immutable_ready": ready,
             }
         if tag == "dashboard.system-data-summary":
             return {
@@ -91,6 +95,7 @@ class ScriptedDatabase:
                 "partsouq_distinct_part_numbers": 923,
                 "partsouq_published_rows": 0,
                 "partsouq_current_scope": "bounded",
+                "partsouq_current_crawl_run_id": 42,
                 "partsouq_current_rows": 10000,
                 "partsouq_current_distinct_part_numbers": 9234,
                 "partsouq_bounded_rows": 10000,
@@ -105,8 +110,16 @@ class ScriptedDatabase:
                 "bounded_scheduler_linked_crawl_runs": 1,
                 "bounded_non_live_data_marker": 0,
                 "bounded_active_override_rows": 0,
+                "desired_scope_brand": "toyota",
+                "desired_scope_model": "tacoma",
+                "desired_scope_vehicle_year_floor": 2006,
+                "desired_scope_updated_at": "2026-08-30 00:00:00",
+                "bounded_scope_brand": "toyota",
+                "bounded_scope_model": "tacoma",
+                "bounded_scope_vehicle_year_floor": 2006,
                 "nhtsa_current_records": 137120,
                 "nhtsa_vin_decodes": 0,
+                "nhtsa_terminal_undecodable_vins": 0,
             }
         if tag.startswith("list.count."):
             return {"total": self.dataset_size}
@@ -119,6 +132,8 @@ class ScriptedDatabase:
         params: Sequence[object] | Mapping[str, object] | None = None,
     ) -> list[dict[str, Any]]:
         self._record(tag, sql, params)
+        if tag == "list.snapshot.part_numbers":
+            return [{"dataset_scope": "bounded", "source_crawl_run_id": 42}]
         if tag.startswith("list.keys."):
             assert isinstance(params, Sequence)
             requested = int(params[-2])
@@ -135,7 +150,8 @@ class ScriptedDatabase:
         if tag.startswith("list.source-batch."):
             assert isinstance(params, Sequence)
             entity = tag.rsplit(".", 1)[-1]
-            return [source_row(entity, int(value)) for value in params[1:] if int(value) > 0]
+            source_ids = params if entity == "vin_vehicle_mappings" else params[1:]
+            return [source_row(entity, int(value)) for value in source_ids if int(value) > 0]
         if tag.startswith("list.manual-batch."):
             return []
         if tag.startswith("detail.events."):

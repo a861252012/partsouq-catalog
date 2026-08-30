@@ -36,6 +36,7 @@ SCHEMA_PATHS = tuple(
     PROJECT_ROOT / "db" / filename
     for filename in ("catalog.sql", "nhtsa.sql", "admin.sql", "station_admin.sql")
 )
+RECOVERY_MIGRATION_VERSIONS = tuple(version for version in ACTIVE_VERSIONS if version >= 24)
 DATABASE_PATTERN = re.compile(r"^partsouq_migration_[0-9a-f]{12}_test$")
 LOCAL_DATABASE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -566,6 +567,632 @@ def test_fresh_schema_replay_is_repeatable_and_fail_closed(
         connection.close()
 
 
+def test_migration_028_upgrades_sparse_fitments_from_027_and_is_repeatable(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    vin = "ZZZTEST00X0000001"
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT VIEW_DEFINITION FROM information_schema.VIEWS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='v_vin_part_fitments'"
+            )
+            current_view = cursor.fetchone()
+            assert current_view is not None
+            current_definition = str(current_view["VIEW_DEFINITION"])
+            legacy_definition = current_definition.replace(
+                "manual-sparse-override",
+                "legacy-sparse-disabled",
+            )
+            assert legacy_definition != current_definition
+
+            cursor.execute(
+                "CREATE TABLE migration_028_catalog_fixture AS "
+                "SELECT * FROM v_current_catalog_parts WHERE FALSE"
+            )
+            cursor.execute(
+                "CREATE OR REPLACE VIEW v_current_catalog_parts AS "
+                "SELECT * FROM migration_028_catalog_fixture"
+            )
+            cursor.execute(
+                "INSERT INTO brands(name,code,url) VALUES "
+                "('TOYOTA','MIGRATION-028','https://example.invalid/toyota')"
+            )
+            brand_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO models(brand_id,name,ssd,url) VALUES "
+                "(%s,'CAMRY',NULL,'https://example.invalid/camry')",
+                (brand_id,),
+            )
+            model_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO vehicles("
+                "model_id,identity_hash,name,model_code,prod_period,production_from,"
+                "production_to,grade,engine,vid,url) VALUES "
+                "(%s,%s,'CAMRY','AXVA70','01.2018 - 12.2019','2018-01','2019-12',"
+                "'XLE','A25A-FXS','VID-028','https://example.invalid/vehicle')",
+                (model_id, "a" * 64),
+            )
+            vehicle_id = int(cursor.lastrowid)
+            fixture_columns = (
+                "dataset_scope,source_crawl_run_id,part_id,vehicle_id,model_id,"
+                "vehicle_vid,brand,model,vehicle_name,vehicle_code,prod_period,"
+                "production_from,production_to,engine,trim_name,part_name,part_number,"
+                "part_number_normalized,category_id,category_cid,category_main,"
+                "category_group,group_id,group_code,group_uid,part_range,part_from,part_to,"
+                "source_url,note,quantity,code,snapshot_at"
+            )
+            cursor.execute(
+                f"INSERT INTO migration_028_catalog_fixture({fixture_columns}) VALUES "
+                "('full',1,101,%s,%s,'VID-028','TOYOTA','CAMRY','CAMRY','AXVA70',"
+                "'01.2018 - 12.2019','2018-01','2019-12','A25A-FXS','XLE',"
+                "'OIL FILTER','MIGRATION-028-PART','MIGRATION028PART',1,'CID-028',"
+                "'ENGINE','OIL FILTER',1,'1502','UID-028','01.2018 - 12.2019',"
+                "'2018-01','2019-12','https://example.invalid/part',NULL,'01','15601',NOW(6)),"
+                "('full',1,102,%s,%s,'VID-028','TOYOTA','CAMRY','CAMRY','AXVA70',"
+                "'01.2018 - 12.2019','2018-01','2019-12','SPLIT-ROW-ENGINE','XLE',"
+                "'SPLIT FILTER','MIGRATION-028-SPLIT','MIGRATION028SPLIT',1,'CID-028',"
+                "'ENGINE','OIL FILTER',1,'1502','UID-028','01.2018 - 12.2019',"
+                "'2018-01','2019-12','https://example.invalid/split',NULL,'01','15602',NOW(6))",
+                (vehicle_id, model_id, vehicle_id, model_id),
+            )
+            cursor.execute(
+                "INSERT INTO nhtsa_source_artifacts("
+                "dataset_name,source_key,source_url,http_status,response_headers_json,sha256,"
+                "stored_path,byte_count,parser_name,parser_version,status,downloaded_at) VALUES "
+                "('vpic_vin_decodes','migration-028-vin','https://example.invalid/vin',200,"
+                "JSON_OBJECT(),%s,'/tmp/migration-028.json',1,'migration_test','1','imported',"
+                "NOW(6))",
+                ("b" * 64,),
+            )
+            artifact_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO nhtsa_vin_decodes("
+                "vin,make_name,model_name,model_year,engine_configuration,engine_model,"
+                "displacement_l,trim_name,series_name,error_code,error_text,payload_json,"
+                "source_url,source_artifact_id,decoded_at) VALUES "
+                "(%s,'TOYOTA',NULL,2018,NULL,NULL,NULL,NULL,NULL,'0',NULL,JSON_OBJECT(),"
+                "'https://example.invalid/vin',%s,NOW(6))",
+                (vin, artifact_id),
+            )
+            cursor.execute(
+                "INSERT INTO admin_vehicle_mappings("
+                "vin_prefix,vin,partsouq_vehicle_id,make_name,model_name,model_year,engine,"
+                "trim_name,source_name,source_reference) VALUES "
+                "(%s,%s,%s,'TOYOTA','CAMRY',2018,'A25A-FXS','XLE',"
+                "'manual-sparse-override','migration 028 fixture')",
+                (vin[:11], vin, vehicle_id),
+            )
+            cursor.execute("CREATE OR REPLACE VIEW v_vin_part_fitments AS " + legacy_definition)
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (28,29,30,31,32,33,34,35)"
+            )
+            cursor.execute(
+                "SELECT MAX(version) AS latest_version FROM catalog_schema_ledger "
+                "WHERE kind='migration'"
+            )
+            assert cursor.fetchone() == {"latest_version": 27}
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM v_vin_part_fitments WHERE vin=%s",
+                (vin,),
+            )
+            assert cursor.fetchone() == {"row_count": 0}
+
+        assert runner.apply() == (28, 29, 30, 31, 32, 33, 34, 35)
+        runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CREATE OR REPLACE VIEW v_current_catalog_parts AS "
+                "SELECT * FROM migration_028_catalog_fixture"
+            )
+            cursor.execute(
+                "SELECT VIEW_DEFINITION FROM information_schema.VIEWS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='v_vin_part_fitments'"
+            )
+            upgraded_view = cursor.fetchone()
+            assert upgraded_view == {"VIEW_DEFINITION": current_definition}
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM v_vin_part_fitments WHERE vin=%s",
+                (vin,),
+            )
+            assert cursor.fetchone() == {"row_count": 1}
+
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_configuration='In-Line' WHERE vin=%s",
+                (vin,),
+            )
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM v_vin_part_fitments WHERE vin=%s",
+                (vin,),
+            )
+            assert cursor.fetchone() == {"row_count": 1}
+            cursor.execute(
+                "UPDATE nhtsa_vin_decodes SET engine_configuration=NULL WHERE vin=%s",
+                (vin,),
+            )
+            cursor.execute(
+                "UPDATE migration_028_catalog_fixture "
+                "SET production_from='2020-01',production_to='2020-12' WHERE part_id=101"
+            )
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM v_vin_part_fitments WHERE vin=%s",
+                (vin,),
+            )
+            assert cursor.fetchone() == {"row_count": 0}
+
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (28,29,30,31,32,33,34,35)"
+            )
+        assert runner.apply() == (28, 29, 30, 31, 32, 33, 34, 35)
+        runner.check()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CREATE OR REPLACE VIEW v_current_catalog_parts AS "
+                "SELECT * FROM migration_028_catalog_fixture"
+            )
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM v_vin_part_fitments WHERE vin=%s",
+                (vin,),
+            )
+            assert cursor.fetchone() == {"row_count": 0}
+    finally:
+        connection.close()
+
+
+def test_migration_029_adds_repeatable_model_scope_contract(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_model_scope")
+            cursor.execute(
+                "ALTER TABLE crawl_runs DROP COLUMN scope_vehicle_year_floor, "
+                "DROP COLUMN scope_model, DROP COLUMN scope_brand"
+            )
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (29,30,31,32,33,34,35)"
+            )
+
+        assert runner.apply() == (29, 30, 31, 32, 33, 34, 35)
+        runner.check()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='crawl_runs' "
+                "AND COLUMN_NAME IN "
+                "('scope_brand','scope_model','scope_vehicle_year_floor') "
+                "ORDER BY ORDINAL_POSITION"
+            )
+            assert list(cursor.fetchall()) == [
+                {
+                    "COLUMN_NAME": "scope_brand",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "YES",
+                },
+                {
+                    "COLUMN_NAME": "scope_model",
+                    "COLUMN_TYPE": "varchar(128)",
+                    "IS_NULLABLE": "YES",
+                },
+                {
+                    "COLUMN_NAME": "scope_vehicle_year_floor",
+                    "COLUMN_TYPE": "smallint unsigned",
+                    "IS_NULLABLE": "YES",
+                },
+            ]
+            cursor.execute(
+                "INSERT INTO crawl_runs "
+                "(run_key,started_at,status,dataset_kind,target_parts) "
+                "VALUES ('migration-029-legacy',NOW(),'error','bounded',10000)"
+            )
+            cursor.execute(
+                "INSERT INTO crawl_runs "
+                "(run_key,started_at,status,dataset_kind,target_parts,scope_brand,"
+                "scope_model,scope_vehicle_year_floor) VALUES "
+                "('migration-029-scoped',NOW(),'error','bounded',10000,"
+                "'TOYOTA','TACOMA',2006)"
+            )
+            with pytest.raises(pymysql.MySQLError) as error:
+                cursor.execute(
+                    "INSERT INTO crawl_runs "
+                    "(run_key,started_at,status,dataset_kind,target_parts,scope_brand,"
+                    "scope_model) VALUES "
+                    "('migration-029-partial',NOW(),'error','bounded',10000,"
+                    "'TOYOTA','TACOMA')"
+                )
+            assert error.value.args[0] == 3819
+            for run_key, brand, model, year_floor in (
+                ("migration-029-blank-brand", " ", "TACOMA", 2006),
+                ("migration-029-blank-model", "TOYOTA", " ", 2006),
+                ("migration-029-floor-low", "TOYOTA", "TACOMA", 1885),
+                ("migration-029-floor-high", "TOYOTA", "TACOMA", 2101),
+            ):
+                with pytest.raises(pymysql.MySQLError) as error:
+                    cursor.execute(
+                        "INSERT INTO crawl_runs "
+                        "(run_key,started_at,status,dataset_kind,target_parts,scope_brand,"
+                        "scope_model,scope_vehicle_year_floor) "
+                        "VALUES (%s,NOW(),'error','bounded',10000,%s,%s,%s)",
+                        (run_key, brand, model, year_floor),
+                    )
+                assert error.value.args[0] == 3819
+
+            cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_model_scope")
+            cursor.execute(
+                "ALTER TABLE crawl_runs ADD CONSTRAINT chk_crawl_run_model_scope "
+                "CHECK (scope_brand IS NULL OR scope_brand IS NOT NULL)"
+            )
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (29,30,31,32,33,34,35)"
+            )
+
+        assert runner.apply() == (29, 30, 31, 32, 33, 34, 35)
+        runner.check()
+        with connection.cursor() as cursor:
+            with pytest.raises(pymysql.MySQLError) as error:
+                cursor.execute(
+                    "INSERT INTO crawl_runs "
+                    "(run_key,started_at,status,dataset_kind,target_parts,scope_brand,"
+                    "scope_model,scope_vehicle_year_floor) VALUES "
+                    "('migration-029-repaired-check',NOW(),'error','bounded',10000,"
+                    "'TOYOTA','TACOMA',1885)"
+                )
+            assert error.value.args[0] == 3819
+    finally:
+        connection.close()
+
+
+def test_migration_032_backfills_only_unchanged_unique_snapshot_evidence(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CREATE TABLE migration_032_catalog_fixture AS "
+                "SELECT * FROM v_current_catalog_parts WHERE FALSE"
+            )
+            cursor.execute(
+                "CREATE OR REPLACE VIEW v_current_catalog_parts AS "
+                "SELECT * FROM migration_032_catalog_fixture"
+            )
+            cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_parts_update")
+            cursor.execute("ALTER TABLE bounded_parts DROP COLUMN evidence_record_sha256")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35)")
+            cursor.execute(
+                "INSERT INTO brands(name,code,url) VALUES "
+                "('TOYOTA','MIGRATION-032','https://example.invalid/toyota')"
+            )
+            brand_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO models(brand_id,name,ssd,url) VALUES "
+                "(%s,'TACOMA',NULL,'https://example.invalid/tacoma')",
+                (brand_id,),
+            )
+            model_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO vehicles("
+                "model_id,identity_hash,name,model_code,prod_period,production_from,"
+                "production_to,grade,engine,vid,url) VALUES "
+                "(%s,%s,'TACOMA','N300','01.2018 - 12.2019','2018-01','2019-12',"
+                "'TRD','2GR','VID-032','https://example.invalid/vehicle')",
+                (model_id, "a" * 64),
+            )
+            vehicle_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO categories(vehicle_id,name,cid) VALUES (%s,'ENGINE','C-032')",
+                (vehicle_id,),
+            )
+            category_id = int(cursor.lastrowid)
+            source_url = (
+                "https://partsouq.com/en/catalog/genuine/unit?cid=C-032&uid=UID-032&vid=VID-032"
+            )
+            cursor.execute(
+                "INSERT INTO groups_t(category_id,code,name,uid,url) "
+                "VALUES (%s,'1101','GROUP','UID-032',%s)",
+                (category_id, source_url),
+            )
+            group_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO scheduled_job_runs("
+                "job_name,trigger_mode,status,started_at,finished_at,exit_code) "
+                "VALUES ('catalog','daemon','completed',NOW(6),NOW(6),0)"
+            )
+            scheduled_job_run_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO crawl_runs("
+                "run_key,started_at,finished_at,status,dataset_kind,target_parts,"
+                "scheduled_job_run_id) VALUES "
+                "('migration-032-backfill',NOW(6),NOW(6),'interrupted','bounded',10000,%s)",
+                (scheduled_job_run_id,),
+            )
+            crawl_run_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO parts("
+                "group_id,part_number,name,code,note,quantity,range_str,part_from,part_to,"
+                "seen_run_id) VALUES "
+                "(%s,'P-032','PART-032','11000','NOTE','01','01.2018 - 12.2019',"
+                "'2018-01','2019-12',%s)",
+                (group_id, crawl_run_id),
+            )
+            part_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO bounded_parts("
+                "part_id,crawl_run_id,vehicle_id,model_id,vehicle_vid,brand,model,"
+                "vehicle_name,vehicle_code,prod_period,production_from,production_to,"
+                "engine,trim_name,part_name,part_number,part_number_normalized,category_id,"
+                "category_cid,category_main,category_group,group_id,group_code,group_uid,"
+                "part_range,part_from,part_to,source_url,note,quantity,code,snapshot_at) VALUES "
+                "(%s,%s,%s,%s,'VID-032','TOYOTA','TACOMA','TACOMA','N300',"
+                "'01.2018 - 12.2019','2018-01','2019-12','2GR','TRD','PART-032',"
+                "'P-032','P032',%s,'C-032','ENGINE','GROUP',%s,'1101','UID-032',"
+                "'01.2018 - 12.2019','2018-01','2019-12',%s,'NOTE','01','11000',NOW())",
+                (part_id, crawl_run_id, vehicle_id, model_id, category_id, group_id, source_url),
+            )
+            cursor.execute(
+                "INSERT INTO partsouq_response_bodies("
+                "body_sha256,compression,body_blob,original_bytes,stored_bytes,"
+                "sanitizer_version) VALUES (%s,'zlib',%s,1,1,%s)",
+                ("b" * 64, b"x", "partsouq-html-public-v2"),
+            )
+            cursor.execute(
+                "INSERT INTO partsouq_http_artifacts("
+                "crawl_run_id,scheduled_job_run_id,capture_kind,page_type,public_source_url,"
+                "source_url_sha256,raw_body_sha256,body_sha256,sanitizer_version,http_status,"
+                "content_type,challenge_detected,fetched_at,elapsed_ms,attempt,parser_name,"
+                "parser_version,parser_context_json,parser_context_sha256,malformed_row_count,"
+                "skipped_record_count,parsed_record_count,parsed_records_sha256,"
+                "accepted_record_count,accepted_records_sha256,verification_status,verified_at) "
+                "VALUES (%s,%s,'live_http','unit',%s,%s,%s,%s,%s,200,'text/html',0,NOW(6),"
+                "1,1,'parse_parts','partsouq-catalog-parser-v1',JSON_OBJECT(),%s,0,0,1,%s,"
+                "1,%s,'verified',NOW(6))",
+                (
+                    crawl_run_id,
+                    scheduled_job_run_id,
+                    source_url,
+                    "c" * 64,
+                    "d" * 64,
+                    "b" * 64,
+                    "partsouq-html-public-v2",
+                    "e" * 64,
+                    "f" * 64,
+                    "0" * 64,
+                ),
+            )
+            first_artifact_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO partsouq_artifact_records("
+                "artifact_id,crawl_run_id,record_type,natural_key_sha256,"
+                "parent_natural_key_sha256,record_sha256,accepted,part_id) VALUES "
+                "(%s,%s,'part',%s,%s,%s,1,%s)",
+                (first_artifact_id, crawl_run_id, "1" * 64, "2" * 64, "3" * 64, part_id),
+            )
+
+        assert runner.apply() == (32, 33, 34, 35)
+        runner.check()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT evidence_record_sha256 FROM bounded_parts WHERE part_id=%s",
+                (part_id,),
+            )
+            assert cursor.fetchone() == {"evidence_record_sha256": "3" * 64}
+
+            for statement, params in (
+                (
+                    "UPDATE bounded_parts SET part_name='MUTATED' WHERE part_id=%s",
+                    (part_id,),
+                ),
+                (
+                    "UPDATE bounded_parts SET vehicle_id=vehicle_id + 1 WHERE part_id=%s",
+                    (part_id,),
+                ),
+                (
+                    "UPDATE bounded_parts SET evidence_record_sha256=NULL WHERE part_id=%s",
+                    (part_id,),
+                ),
+            ):
+                with pytest.raises(pymysql.MySQLError) as error:
+                    cursor.execute(statement, params)
+                assert error.value.args[0] == 1644
+            cursor.execute(
+                "SELECT part_name,vehicle_id,evidence_record_sha256 "
+                "FROM bounded_parts WHERE part_id=%s",
+                (part_id,),
+            )
+            assert cursor.fetchone() == {
+                "part_name": "PART-032",
+                "vehicle_id": vehicle_id,
+                "evidence_record_sha256": "3" * 64,
+            }
+
+            # 後續 raw crawl 改寫原列，migration 不得把舊 snapshot 猜測重綁。
+            cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_parts_update")
+            cursor.execute(
+                "UPDATE bounded_parts SET evidence_record_sha256=NULL WHERE part_id=%s",
+                (part_id,),
+            )
+            cursor.execute(
+                "UPDATE parts SET name='RAW-REWRITTEN',seen_run_id=NULL WHERE id=%s",
+                (part_id,),
+            )
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35)")
+
+        assert runner.apply() == (32, 33, 34, 35)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT evidence_record_sha256 FROM bounded_parts WHERE part_id=%s",
+                (part_id,),
+            )
+            assert cursor.fetchone() == {"evidence_record_sha256": None}
+
+            # 即使 raw row 恢復，若有兩筆 accepted evidence，仍不可任選其一。
+            cursor.execute(
+                "UPDATE parts SET name='PART-032',seen_run_id=%s WHERE id=%s",
+                (crawl_run_id, part_id),
+            )
+            cursor.execute(
+                "INSERT INTO partsouq_response_bodies("
+                "body_sha256,compression,body_blob,original_bytes,stored_bytes,"
+                "sanitizer_version) VALUES (%s,'zlib',%s,1,1,%s)",
+                ("4" * 64, b"y", "partsouq-html-public-v2"),
+            )
+            cursor.execute(
+                "INSERT INTO partsouq_http_artifacts("
+                "crawl_run_id,scheduled_job_run_id,capture_kind,page_type,public_source_url,"
+                "source_url_sha256,raw_body_sha256,body_sha256,sanitizer_version,http_status,"
+                "content_type,challenge_detected,fetched_at,elapsed_ms,attempt,parser_name,"
+                "parser_version,parser_context_json,parser_context_sha256,malformed_row_count,"
+                "skipped_record_count,parsed_record_count,parsed_records_sha256,"
+                "accepted_record_count,accepted_records_sha256,verification_status,verified_at) "
+                "VALUES (%s,%s,'live_http','unit',%s,%s,%s,%s,%s,200,'text/html',0,NOW(6),"
+                "1,2,'parse_parts','partsouq-catalog-parser-v1',JSON_OBJECT(),%s,0,0,1,%s,"
+                "1,%s,'verified',NOW(6))",
+                (
+                    crawl_run_id,
+                    scheduled_job_run_id,
+                    source_url,
+                    "5" * 64,
+                    "6" * 64,
+                    "4" * 64,
+                    "partsouq-html-public-v2",
+                    "7" * 64,
+                    "8" * 64,
+                    "9" * 64,
+                ),
+            )
+            second_artifact_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO partsouq_artifact_records("
+                "artifact_id,crawl_run_id,record_type,natural_key_sha256,"
+                "parent_natural_key_sha256,record_sha256,accepted,part_id) VALUES "
+                "(%s,%s,'part',%s,%s,%s,1,%s)",
+                (second_artifact_id, crawl_run_id, "a" * 64, "b" * 64, "c" * 64, part_id),
+            )
+            cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_parts_update")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35)")
+
+        assert runner.apply() == (32, 33, 34, 35)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT evidence_record_sha256 FROM bounded_parts WHERE part_id=%s",
+                (part_id,),
+            )
+            assert cursor.fetchone() == {"evidence_record_sha256": None}
+
+            # 035 不重寫 immutable snapshot；它只剔除無法由原始料號重算
+            # normalized number 的 legacy 列，讓整份 10,000 筆 snapshot fail closed。
+            cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_parts_update")
+            cursor.execute(
+                "UPDATE bounded_parts SET part_number_normalized='CORRUPTED', "
+                "evidence_record_sha256=%s WHERE part_id=%s",
+                ("d" * 64, part_id),
+            )
+            cursor.execute(
+                "CREATE TRIGGER prevent_bounded_parts_update "
+                "BEFORE UPDATE ON bounded_parts FOR EACH ROW "
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+                "'bounded_parts snapshot is immutable; publish a replacement snapshot'"
+            )
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version=35")
+
+        assert runner.apply() == (35,)
+        runner.check()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM bounded_parts WHERE part_id=%s", (part_id,)
+            )
+            assert cursor.fetchone() == {"row_count": 0}
+            cursor.execute(
+                "SELECT COUNT(*) AS row_count FROM information_schema.TRIGGERS "
+                "WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='prevent_bounded_parts_update'"
+            )
+            assert cursor.fetchone() == {"row_count": 1}
+    finally:
+        connection.close()
+
+
+def test_catalog_desired_scope_sync_is_canonical_and_does_not_touch_same_scope(
+    migration_database: MigrationDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    monkeypatch.setattr(scheduler, "_connect", migration_database.connect)
+    monkeypatch.setattr(scheduler, "_catalog_bounded_scope", lambda: ("toyota", "tacoma", 2006))
+
+    assert scheduler._sync_catalog_desired_bounded_scope() == ("toyota", "tacoma", 2006)
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT scope_brand,scope_model,scope_vehicle_year_floor,updated_at "
+                "FROM catalog_desired_bounded_scope"
+            )
+            first = cursor.fetchone()
+            assert first is not None
+            assert first["scope_brand"] == "toyota"
+            assert first["scope_model"] == "tacoma"
+            assert first["scope_vehicle_year_floor"] == 2006
+
+        assert scheduler._sync_catalog_desired_bounded_scope() == ("toyota", "tacoma", 2006)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT scope_brand,scope_model,scope_vehicle_year_floor,updated_at "
+                "FROM catalog_desired_bounded_scope"
+            )
+            same_scope = cursor.fetchone()
+            assert same_scope == first
+            cursor.execute(
+                "UPDATE catalog_desired_bounded_scope SET updated_at='2000-01-01 00:00:00'"
+            )
+
+        monkeypatch.setattr(
+            scheduler, "_catalog_bounded_scope", lambda: ("toyota", "corolla", 2006)
+        )
+        assert scheduler._sync_catalog_desired_bounded_scope() == ("toyota", "corolla", 2006)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT scope_brand,scope_model,scope_vehicle_year_floor,updated_at "
+                "FROM catalog_desired_bounded_scope"
+            )
+            changed = cursor.fetchone()
+            assert changed is not None
+            assert changed["scope_brand"] == "toyota"
+            assert changed["scope_model"] == "corolla"
+            assert changed["scope_vehicle_year_floor"] == 2006
+            assert changed["updated_at"] > datetime(2000, 1, 1)
+            with pytest.raises(pymysql.MySQLError):
+                cursor.execute("UPDATE catalog_desired_bounded_scope SET scope_brand='TOYOTA'")
+    finally:
+        connection.close()
+
+
 def test_apply_recovers_one_stale_catalog_daemon_after_ledger_validation(
     migration_database: MigrationDatabase,
 ) -> None:
@@ -594,6 +1221,43 @@ def test_apply_recovers_one_stale_catalog_daemon_after_ledger_validation(
             cursor.execute("SELECT status,finished_at FROM crawl_runs WHERE id=%s", (run_id,))
             run = cursor.fetchone()
             assert run and run["status"] == "interrupted"
+            assert run["finished_at"] is not None
+    finally:
+        connection.close()
+
+
+def test_apply_recovers_stale_catalog_daemon_after_terminal_full_success(
+    migration_database: MigrationDatabase,
+) -> None:
+    runner = CatalogMigrationRunner(
+        migrations_dir=PROJECT_ROOT / "migrations" / "catalog",
+        station_schema_path=PROJECT_ROOT / "db" / "station_admin.sql",
+        connection_factory=migration_database.connect,
+    )
+    assert runner.apply() == ACTIVE_VERSIONS
+    job_id, run_id = _insert_running_daemon(
+        migration_database,
+        "terminal-full-success",
+        crawl_status="success",
+    )
+
+    assert runner.apply(recover_stale_catalog_daemon_seconds=900) == ()
+    runner.check()
+
+    connection = migration_database.connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status,exit_code,finished_at FROM scheduled_job_runs WHERE id=%s",
+                (job_id,),
+            )
+            job = cursor.fetchone()
+            assert job and job["status"] == "failed"
+            assert job["exit_code"] == catalog_migrations.STALE_SCHEDULER_EXIT_CODE
+            assert job["finished_at"] is not None
+            cursor.execute("SELECT status,finished_at FROM crawl_runs WHERE id=%s", (run_id,))
+            run = cursor.fetchone()
+            assert run and run["status"] == "success"
             assert run["finished_at"] is not None
     finally:
         connection.close()
@@ -700,12 +1364,31 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24,25,26,27)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35)"
             )
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
 
-        assert runner.apply() == (18, 19, 20, 21, 22, 23, 24, 25, 26, 27)
+        assert runner.apply() == (
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+        )
         runner.check()
 
         with connection.cursor() as cursor:
@@ -732,7 +1415,9 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
     connection = migration_database.connect()
     try:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24,25,26,27)")
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24,25,26,27,28,29,30,31,32,33,34,35)"
+            )
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_verified_evidence")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_evidence_status")
             cursor.execute(
@@ -915,7 +1600,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
                     (category_id, code, code, url, run_key),
                 )
 
-        assert runner.apply() == (22, 23, 24, 25, 26, 27)
+        assert runner.apply() == (22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35)
         runner.check()
         assert runner.apply() == ()
 
@@ -1092,10 +1777,10 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             )
             cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35)"
             )
 
-        assert runner.apply() == (20, 21, 22, 23, 24, 25, 26, 27)
+        assert runner.apply() == (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1158,7 +1843,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 ("partsouq-html-public-v1", crawl_run_id),
             )
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35)"
             )
             cursor.execute(
                 "INSERT INTO catalog_schema_ledger "
@@ -1173,7 +1858,24 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
 
         with pytest.raises(MigrationError, match="retry that exact version"):
             runner.apply()
-        assert runner.apply(retry_version=20) == (20, 21, 22, 23, 24, 25, 26, 27)
+        assert runner.apply(retry_version=20) == (
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+        )
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1292,8 +1994,10 @@ def test_migration_023_creates_http_diagnostics_from_missing_table(
     try:
         with connection.cursor() as cursor:
             cursor.execute("DROP TABLE partsouq_http_diagnostics")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27)")
-        assert runner.apply() == (23, 24, 25, 26, 27)
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35)"
+            )
+        assert runner.apply() == (23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1342,7 +2046,9 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
             cursor.execute(
                 "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27)")
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35)"
+            )
         with pytest.raises(MigrationError, match="migration:023 failed"):
             runner.apply()
         with connection.cursor() as cursor:
@@ -1352,7 +2058,21 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
                 "ALTER TABLE partsouq_http_diagnostics "
                 "MODIFY COLUMN content_type VARCHAR(128) NOT NULL"
             )
-        assert runner.apply(retry_version=23) == (23, 24, 25, 26, 27)
+        assert runner.apply(retry_version=23) == (
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+        )
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute("SELECT state,attempt_count FROM catalog_schema_ledger WHERE version=23")
@@ -1375,12 +2095,14 @@ def test_migration_024_upgrades_legacy_nhtsa_schema_and_is_repeatable(
         with connection.cursor() as cursor:
             _downgrade_nhtsa_024_schema(cursor)
 
-        assert runner.apply() == (24, 25, 26, 27)
+        assert runner.apply() == (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35)
         runner.check()
 
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (24, 25, 26, 27)")
-        assert runner.apply() == (24, 25, 26, 27)
+            cursor.execute(
+                "DELETE FROM catalog_schema_ledger WHERE version IN (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35)"
+            )
+        assert runner.apply() == (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35)
         runner.check()
     finally:
         connection.close()
@@ -1419,7 +2141,7 @@ def test_migration_024_recovers_one_unique_cross_second_legacy_nhtsa_run(
             )
             run_id = int(cursor.lastrowid)
 
-        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24, 25, 26, 27)
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == RECOVERY_MIGRATION_VERSIONS
         runner.check()
 
         with connection.cursor() as cursor:
@@ -1471,7 +2193,7 @@ def test_migration_024_legacy_recovery_tolerates_child_second_precision(
             )
             run_id = int(cursor.lastrowid)
 
-        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24, 25, 26, 27)
+        assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == RECOVERY_MIGRATION_VERSIONS
         with connection.cursor() as cursor:
             cursor.execute("SELECT status FROM nhtsa_sync_runs WHERE id=%s", (run_id,))
             assert cursor.fetchone() == {"status": "interrupted"}
@@ -1564,7 +2286,9 @@ def test_migration_024_legacy_link_window_stops_after_five_seconds(
             run_id = int(cursor.lastrowid)
 
         if should_recover:
-            assert runner.apply(recover_stale_nhtsa_daemon_seconds=60) == (24, 25, 26, 27)
+            assert (
+                runner.apply(recover_stale_nhtsa_daemon_seconds=60) == RECOVERY_MIGRATION_VERSIONS
+            )
         else:
             with pytest.raises(MigrationError, match="one unique recoverable scheduler child"):
                 runner.apply(recover_stale_nhtsa_daemon_seconds=60)
@@ -2314,6 +3038,13 @@ def test_migration_runner_operates_with_compose_application_user(
     granted_host: str | None = None
     try:
         with root.cursor() as cursor:
+            cursor.execute(
+                "SELECT @@GLOBAL.log_bin_trust_function_creators AS trust_function_creators"
+            )
+            trust_row = cursor.fetchone()
+            assert trust_row == {"trust_function_creators": 1}, (
+                "the application-user migration gate requires log_bin_trust_function_creators=1"
+            )
             cursor.execute("SELECT Host FROM mysql.user WHERE User=%s ORDER BY Host", (user,))
             account = cursor.fetchone()
             assert account is not None, f"MySQL account {user!r} does not exist"
@@ -2372,6 +3103,9 @@ def test_migration_lock_defers_every_writer_before_running_marker(
     catalog_db._local.conn = catalog_connection
     monkeypatch.setitem(CRAWL, "bounded_parts", 0)
     monkeypatch.setitem(CRAWL, "limit_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_brand", "")
+    monkeypatch.setitem(CRAWL, "bounded_model", "")
+    monkeypatch.setitem(CRAWL, "vehicle_year_window", 0)
     crawler = Crawler(mock.MagicMock(), catalog_db, workers=1)
     nhtsa = NhtsaMySQLRepository(migration_database.connect())
     try:
@@ -2523,7 +3257,12 @@ def _insert_linked_run(
         connection.close()
 
 
-def _insert_running_daemon(database: MigrationDatabase, suffix: str) -> tuple[int, int]:
+def _insert_running_daemon(
+    database: MigrationDatabase,
+    suffix: str,
+    *,
+    crawl_status: str = "running",
+) -> tuple[int, int]:
     connection = database.connect()
     try:
         with connection.cursor() as cursor:
@@ -2536,9 +3275,15 @@ def _insert_running_daemon(database: MigrationDatabase, suffix: str) -> tuple[in
             assert job_id is not None
             cursor.execute(
                 "INSERT INTO crawl_runs "
-                "(run_key,started_at,status,dataset_kind,target_parts,scheduled_job_run_id) "
-                "VALUES (%s,'2026-01-01 00:00:00','running','bounded',10000,%s)",
-                (f"migration-{suffix}", job_id),
+                "(run_key,started_at,finished_at,status,dataset_kind,target_parts,"
+                "scheduled_job_run_id) VALUES (%s,'2026-01-01 00:00:00',%s,%s,"
+                "'full',NULL,%s)",
+                (
+                    f"migration-{suffix}",
+                    "2026-01-01 00:01:00" if crawl_status == "success" else None,
+                    crawl_status,
+                    job_id,
+                ),
             )
             run_id = cursor.lastrowid
             assert run_id is not None

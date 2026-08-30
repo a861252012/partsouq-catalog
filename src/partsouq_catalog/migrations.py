@@ -55,6 +55,14 @@ CATALOG_MANIFEST = (
     (25, "025_tw_vncs_vehicles.sql", "dbe9d714c90da6d1ad56911ca31f3ba2fa02582a4d50fee9ca017b9307d329f0"),
     (26, "026_vin_decode_nullable_model.sql", "3fc054b17c8194a9b298a414ef15710cafadb5d973642ec168b85669dd19ab5e"),
     (27, "027_partsouq_empty_unit_evidence.sql", "773295d258f82ba9620720155458f51d4533d5ca79763cfd31982391d63193fd"),
+    (28, "028_sparse_vin_part_fitments.sql", "6342c8b24eff14484cc7f972a73434a740a68f122cbfa00c4f6b8eedcd18ccdf"),
+    (29, "029_model_aligned_bounded_scope.sql", "829d0041fe328f3fcf2ff7f2d22504efe9763d0ff005c53dbfda459ab8b8189b"),
+    (30, "030_current_bounded_scope_contract.sql", "33263b30a414ec1aeeb247c31e0521ebd841b02e3574efd04e81cee3bec350cd"),
+    (31, "031_verified_bounded_current_view.sql", "445406e39dac2c4c2702c6389358625654b366b8a4b1f5302801a8294cd238ab"),
+    (32, "032_bounded_snapshot_evidence_binding.sql", "8eb4c7cb652080f0f9b35d6315ffbaefa70d2416d14fc5a7c315345e1e7a781a"),
+    (33, "033_bounded_snapshot_immutable.sql", "7b366aa536a155cc552547ed2553cdd6fad98daf0d51262eca98b63616d2d61f"),
+    (34, "034_vin_fitment_strict_count.sql", "01d4131332cb49080dcf9687bc70e4c7af3194e1306e04653614dfb706726c9e"),
+    (35, "035_revoke_invalid_legacy_snapshot_rows.sql", "d728ab56b7ca6c5f4838a48e41c43d240cb3b64a64733b4d93ccdb5f19c94357"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(
@@ -64,6 +72,14 @@ STATION_ADMIN_ASSET_HASHES = (
     "5e566d9b931be3d658a78dbf2636fad53500dcbb33641671dd85b12ad7c4fd02",
     "4745c64212cb9cd3d0c7a7bd2579dd443d6183fc906558efa05c857d67a754c1",
     "a42990b80a047f4ae94e211050c0bfd9bdd5fc7078aaf0b2b7d6effdcc2fdda7",
+    "e21e60e351d49c97f4f3b83d68bb8464cb1adcedc5b2156662459a572ffeb50e",
+    "ebbfe574c7352e1fd7d82469c31a6e37a6248b735b5228e248b0564e2c480ac3",
+    "a61c613e39b8347419bd094ba6f9311953954d8e4332a581c7546c353b4aa0a0",
+    "8e5d44311baf9e5d64f9030cbf6e373d806ab2bd59f0dea238e45694ac206825",
+    "b93deb7e99ec0ab4911cdbacc096c645943f40821850ee83dbb9abf6aa2d47cf",
+    "915a656a1db64d724434fe728e4d3d4521c8dad902bedcf47cb3e23a339bd6ea",
+    "496b6b02360537573fd1d3f6910dccd0564f2371a07f7ab91f0ebb1152c6224d",
+    "78ca6f42d5ddf0421d666530f6a5db3de159c6602cf713b3bc0bd5247a056456",
 )
 STATION_ADMIN_ASSET = (
     "asset:station-admin",
@@ -157,7 +173,12 @@ _HTTP_DIAGNOSTIC_CHECK_CLAUSES = {
 
 def _normalize_http_diagnostic_check_clause(clause: str) -> str:
     normalized = clause.strip().lower()
-    normalized = re.sub(r"_(?:ascii|utf8mb4)(?=\\')", "", normalized)
+    normalized = re.sub(r"_(?:ascii|latin1|utf8mb4)(?=\\')", "", normalized)
+    normalized = re.sub(
+        r"charset (?:latin1|utf8mb4)",
+        "charset text",
+        normalized,
+    )
     return re.sub(r"\s+", " ", normalized)
 
 
@@ -812,7 +833,8 @@ def _repairable_stale_catalog_daemon_id(
             "AS stale_catalog_daemon, "
             "COUNT(runs.id) AS linked_runs, "
             "COALESCE(SUM(CASE WHEN runs.id IS NOT NULL "
-            "AND BINARY runs.status NOT IN (BINARY 'running', BINARY 'bounded_success') "
+            "AND BINARY runs.status NOT IN (BINARY 'running', BINARY 'bounded_success', "
+            "BINARY 'success', BINARY 'error', BINARY 'interrupted') "
             "THEN 1 ELSE 0 END),0) AS incompatible_runs "
             "FROM scheduled_job_runs AS jobs "
             "LEFT JOIN crawl_runs AS runs ON runs.scheduled_job_run_id=jobs.id "
@@ -1981,3 +2003,7 @@ def main() -> None:
     )
     applied_text = ",".join(f"{version:03d}" for version in applied) or "none"
     print(f"catalog schema migrations applied: {applied_text}")
+
+
+if __name__ == "__main__":
+    main()
