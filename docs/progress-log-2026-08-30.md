@@ -161,3 +161,51 @@ migration 036 的後台 health 契約驗證索引缺失。fixture 改為載入�
 資料何時升級，仍必須先依既有流程處理 station-admin asset，再走排程與 migration。VIN 與
 PartSouq 的 confirmed mapping、嚴格 VIN fitment，以及真正三層零件分類，仍不能從目前
 來源資料自動補造。
+
+## 08-31 正式機套用 036 與後台重建
+
+交接查核先把三件事查清楚。asset drift 的成因很單純：`ed7f12c` 改了
+`db/station_admin.sql`（`78ca6f...` → `28b8d6...`），而 ledger 還記著 `057acb5`
+時代的值；新 checksum 已經登記在 `STATION_ADMIN_ASSET_HASHES`，`apply` 會自動
+重套 asset，不需要任何手動改 ledger 的動作。其次，先前說「host migration
+runner 會 1045 Access denied」其實不是帳號問題——runner 沒載 `.env` 憑證，
+`config.py` 預設密碼對不上而已；source `.env` 之後直連 127.0.0.1:3308 完全
+正常。第三，兩個後台 503 來自 08-24 建立的舊 image，rebuild 即解，不必為舊
+verifier 做相容。
+
+套用前先用唯讀查詢模擬 036 的 receipt 回填：403 個 bounded 群組全部能從
+artifact 證據唯一對應，402 群 done、1 群 partial、0 群 fail closed。這表示
+套用後正式 view 不會清空。模擬過程中自己犯了一次查詢錯誤（漏掉
+`skipped_record_count` 條件），第一次得到 74 群的錯誤分佈，重跑正確版本才
+確認 403/403。
+
+執行順序：先 `launchctl bootout` 停掉 057acb5 的正式 daemon（舊 code，036
+之後本來就要重裝），`check` 確認 drift 後直接 `apply`，一次完成 asset 重套
+與 036。事後核對：asset ledger 更新為 `28b8d6...`、`bounded_group_receipts`
+回填 402 done（9,967 筆）＋1 partial（33 筆）、`v_current_catalog_parts`
+維持 10,000 筆，`check` 全綠。
+
+接著以 `ed7f12c` rebuild 並 recreate `admin`、`station-admin`、
+`queue-scheduler`。`:8000/api/health` 回 `{"status":"ok"}`，
+`:8086/health` 回 `{"entities":10,"status":"ok"}`，兩者都是 200。
+`tests/e2e/test_station_admin_browser.py` 真實瀏覽器 E2E 9 案全過。
+
+原本計畫套用後立即 recovery 重爬，讓全部群組變 done。這個計畫是錯的，查
+證後放棄。partial 的那群（group 74796）unit 頁解析出 36 筆料號，33 筆收錄、
+3 筆品質閘門排除，另有 5 筆無品名（quarantine reason 全是 `nameless`）。
+排除來自站方資料本身，重爬結果仍是 33/36，receipt 還是 partial；partial
+語意本來就是為這種情況設計的。而且新版 crawler 的續爬會跳過 receipt 已
+完成的車款，新 run 湊不滿 10,000 筆會被 under-target 閘門拒絕發布。要「全
+done」只剩清收據全量重爬一條路，那會換掉整份快照又違反禁止手動改 DB 的
+原則，不做。
+
+最後重裝 LaunchAgent（ed7f12c release，間隔維持 30 天）。daemon 依間隔判定
+不會立即觸發——最後一筆 daemon catalog job 5831 距今不到 30 天，下次排程在
+09-29 前後。啟動後 `scheduled_job_runs` 無新記錄、無 running、stderr 無新
+錯誤。stdout 是 Python 緩衝所以暫時看不到新行，process 持續運行即可確認
+沒有 crash loop。
+
+本輪結束時的正式狀態：migration 036 已套用、receipt 契約生效（402 done＋
+1 partial，view gate 全綠）、兩個後台與 queue-scheduler 跑 ed7f12c image、
+正式 daemon 跑 ed7f12c release。交接清單裡剩下的 VIN mapping／fitment、三
+層分類，仍需另定 PartSouq scope 與人工確認流程，不是這輪能解的。
