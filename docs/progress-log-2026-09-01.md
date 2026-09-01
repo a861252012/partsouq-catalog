@@ -101,3 +101,27 @@
   證據預算放大（100GiB／300 萬 artifacts），速率 4 req/s token bucket、8 workers、
   1-2s 隨機延遲。啟動 10 分鐘：1,037 artifacts 全 200、零 challenge。
   觀察點：block 偵測（0 groups 大頁呼吸退避）偶發屬正常防禦，若密集出現需降速。
+
+## 全量爬取首日：receipt bug 與站方 /locate 語意（commits 5dd2ae3、6c568bf）
+
+- **receipt bug（自傷）**：group completion 會寫 `bounded_group_receipts`，其驗證
+  只接受 active formal bounded run——full run 每台車完成時都爆 RuntimeError，
+  20 分鐘累積 884 台車 error。修正：收據只在 bounded 模式寫入，full 的覆蓋性
+  由 `verify_run_evidence_full` 的 part 對帳保證。受害者 724 台，重訪自癒中。
+- **站方 /locate 語意（既有長尾，非回歸）**：部分 vehicle/category 頁被站方
+  302 回 `locate?c=Toyota&psq=lb`（錯誤訊息補上 Location 後才看清）。8 月
+  run 18 就有 211 台同類失敗，一直沒有收斂機制。新政策：轉址目標為 /locate
+  時改拋 NotFoundError，既有零件組依 404 組語意收斂
+  （`mark_vehicle_groups_not_found`：清 membership＋標 not_found），車輛以
+  空資料或其餘分類完成。其餘轉址維持 fail-closed。
+- **vid=0 是常態**：全站車輛 vid 都是 0（bounded 10k 也是），車輛身分靠
+  name＋model_code，不是 vid。
+- **待查**：23 台車出現「fetched page does not identify expected unit uid」
+  ——站端 uid 與 8 月記錄不同，身分守衛拒收。量小，先觀察。
+- 重啟語意實測有效：同月 run_key 重用 run id、done 車輛跳過、receipt 已標
+  的組跳過。車輛 done 標記在品牌邊界才 commit（外部查詢看不到未提交列，
+  既有設計，非資料遺失）。
+- 測試隔離教訓：daemon 退避測試沒 mock job lock，本機正式 daemon 一跑就撞
+  真實 flock。fixture 統一 mock。
+- 現況：crawl_run 44 走到 Lexus，15,931 組 done、256,476 parts current、
+  18,644 artifacts、零 challenge。
