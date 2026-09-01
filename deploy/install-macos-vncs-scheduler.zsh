@@ -170,6 +170,9 @@ if "$LAUNCHCTL_BIN" print "$SERVICE_TARGET" >/dev/null 2>&1; then
   "$LAUNCHCTL_BIN" bootout "$SERVICE_TARGET"
 fi
 
+/bin/mv -f "$TEMP_AGENT" "$AGENT_PATH"
+/bin/chmod 600 "$AGENT_PATH"
+
 if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN_TARGET" "$AGENT_PATH"; then
   print -u2 "failed to bootstrap $SERVICE_TARGET"
   exit 1
