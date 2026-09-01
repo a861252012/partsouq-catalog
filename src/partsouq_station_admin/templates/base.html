@@ -16,6 +16,7 @@
       <a href="{{ url_for('admin.monitoring') }}">爬蟲監控</a>
       <a href="{{ url_for('admin.quarantine_list') }}">Quarantine 紀錄</a>
       <a href="{{ url_for('admin.vin_decode_request') }}">新增 VIN 解碼</a>
+      <a href="{{ url_for('admin.vin_vehicle_candidates') }}">VIN 車款候選確認</a>
       {% if session.get('admin_authenticated') %}
         <form class="nav-form" method="post" action="{{ url_for('admin.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">登出</button></form>
       {% endif %}

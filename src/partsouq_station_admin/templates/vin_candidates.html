@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}VIN 車款候選確認｜汽車資料站方後台{% endblock %}
+{% block content %}
+  <div class="page-title">
+    <div><h1>VIN 車款候選確認</h1><p>查詢 NHTSA 解碼結果與目前發布型錄的相容車款，人工核對後建立對應。同一 VIN 只能建立一筆對應。</p></div>
+  </div>
+  <form class="filters" method="get" action="{{ url_for('admin.vin_vehicle_candidates') }}">
+    <label>17 碼 VIN<input type="search" name="vin" minlength="17" maxlength="17" pattern="[A-HJ-NPR-Z0-9]{17}" value="{{ vin or '' }}" autocomplete="off"></label>
+    <button type="submit">查詢候選</button>
+  </form>
+  {% if vin %}
+    {% if decode is none %}
+      <div class="notice error">這組 VIN 尚無 NHTSA 解碼記錄；請先用「新增 VIN 解碼」排入佇列，待解碼完成後再回來確認。</div>
+    {% else %}
+      <div class="table-wrap record-list"><table>
+        <thead><tr><th>解碼欄位</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><th>Make／Model</th><td>{{ decode.make_name or '—' }}／{{ decode.model_name or '—' }}</td></tr>
+          <tr><th>年份</th><td>{{ decode.model_year or '—' }}</td></tr>
+          <tr><th>Engine（NHTSA）</th><td>{{ decode.engine_model or '—' }}{% if decode.engine_configuration %}（{{ decode.engine_configuration }}{% if decode.displacement_l_raw %}、{{ decode.displacement_l_raw }}L{% endif %}）{% endif %}</td></tr>
+          <tr><th>Trim（NHTSA）</th><td>{{ decode.trim_name or '—' }}</td></tr>
+          <tr><th>解碼狀態</th><td>{{ decode.decode_status }}／{{ decode.decode_completeness }}</td></tr>
+          <tr><th>對應狀態</th><td>
+            {% if decode.partsouq_vehicle_configuration_id %}
+              <span class="badge">{{ decode.mapping_status }}</span>（已對應車款 ID {{ decode.partsouq_vehicle_configuration_id }}）
+            {% else %}
+              <span class="badge">{{ decode.mapping_status }}</span>
+            {% endif %}
+          </td></tr>
+        </tbody>
+      </table></div>
+      {% if decode.partsouq_vehicle_configuration_id %}
+        <div class="notice success">這組 VIN 已建立車款對應；如需改對應請聯繫工程端以 API 調整。</div>
+      {% else %}
+        <h2>候選車款</h2>
+        <div class="table-wrap record-list"><table>
+          <thead><tr><th>車款 ID</th><th>品牌／型號</th><th>Code</th><th>生產區間</th><th>Engine／Trim（型錄）</th><th>判定</th><th>確認</th></tr></thead>
+          <tbody>
+            {% for candidate in candidates %}
+              <tr>
+                <td>{{ candidate.partsouq_vehicle_id }}</td>
+                <td>{{ candidate.partsouq_brand }}／{{ candidate.partsouq_model }}<br>{{ candidate.vehicle_name or '—' }}</td>
+                <td><code>{{ candidate.vehicle_code or '—' }}</code></td>
+                <td>{{ candidate.prod_period or '—' }}<br><small>{{ candidate.production_from or '—' }}～{{ candidate.production_to or '—' }}</small></td>
+                <td>{{ candidate.engine or '—' }}／{{ candidate.trim_name or '—' }}<br><small>NHTSA：{{ candidate.nhtsa_engine_model or '—' }}／{{ candidate.nhtsa_trim_name or '—' }}</small></td>
+                <td>
+                  <span class="badge">{{ candidate.candidate_status }}</span>
+                  <br><small>{{ candidate.candidate_reason }}</small>
+                </td>
+                <td>
+                  <form class="inline-form" method="post" action="{{ url_for('admin.vin_vehicle_confirm') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="vin" value="{{ vin }}">
+                    <input type="hidden" name="partsouq_vehicle_id" value="{{ candidate.partsouq_vehicle_id }}">
+                    <label class="check"><input type="checkbox" name="allow_name_override"> 人工確認</label>
+                    <input type="text" name="source_reference" maxlength="1024" placeholder="人工確認依據（URL／文件）">
+                    <button type="submit">建立對應</button>
+                  </form>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td class="empty" colspan="7">目前發布型錄中沒有品牌、型號、年份相容的車款。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table></div>
+        <p class="warning">判定為 exact 且解碼完整時，可直接建立對應；其餘情況必須勾選「人工確認」並填寫依據。依據會寫入對應紀錄（source_reference）供稽核。</p>
+      {% endif %}
+    {% endif %}
+  {% endif %}
+{% endblock %}

@@ -20,7 +20,51 @@ from partsouq_station_admin.repository import (
     RevisionConflictError,
 )
 
-from .fakes import ScriptedDatabase, source_row
+from .fakes import ScriptedDatabase, VinWorkflowScriptedDatabase, source_row
+
+COMPLETE_DECODE = {
+    "vin": "ZZZTEST00X0000001",
+    "make_name": "TOYOTA",
+    "model_name": "CAMRY",
+    "model_year": 2020,
+    "engine_model": "A25A-FKS",
+    "trim_name": "LE",
+}
+
+SPARSE_DECODE = {
+    "vin": "ZZZTEST00X0000001",
+    "make_name": "TOYOTA",
+    "model_name": None,
+    "model_year": 2020,
+    "engine_model": None,
+    "trim_name": None,
+}
+
+CANDIDATE_EXACT = {
+    "partsouq_vehicle_id": 5,
+    "partsouq_brand": "TOYOTA",
+    "partsouq_model": "CAMRY",
+    "vehicle_code": "AXVA70",
+    "candidate_strict_match": 1,
+    "candidate_sparse": 0,
+    "candidate_status": "exact",
+}
+
+CANDIDATE_SPARSE = {
+    "partsouq_vehicle_id": 5,
+    "partsouq_brand": "TOYOTA",
+    "partsouq_model": "CAMRY",
+    "vehicle_code": "AXVA70",
+    "candidate_strict_match": 0,
+    "candidate_sparse": 1,
+    "candidate_status": "manual_review_required",
+    "partsouq_engine": "A25A-FKS",
+    "partsouq_trim_name": "LE",
+}
+
+
+def _vin_database(**kwargs: object) -> VinWorkflowScriptedDatabase:
+    return VinWorkflowScriptedDatabase(QueryTrace(), **kwargs)
 
 
 def test_ten_entities_read_adapter_views_in_the_unified_database() -> None:
@@ -836,3 +880,201 @@ def test_quarantine_resolve_rejects_stale_or_already_resolved_occurrence() -> No
             "checked again",
             expected_run_key="bounded-1",
         )
+
+
+def test_confirm_vin_mapping_requires_decoded_vin_first() -> None:
+    database = _vin_database()
+    with pytest.raises(AdminDataError, match="請先完成這組 VIN 的 NHTSA 解碼"):
+        AdminRepository(database).confirm_vin_vehicle_mapping(
+            "ZZZTEST00X0000001",
+            5,
+            allow_name_override=False,
+            source_reference=None,
+        )
+    assert [call.tag for call in database.calls] == ["write.lock-vin-decode"]
+    assert database.transaction_modes == [False]
+
+
+def test_confirm_vin_mapping_rejects_sparse_decode_without_manual_confirmation() -> None:
+    database = _vin_database(decode_row=SPARSE_DECODE)
+    with pytest.raises(AdminDataError, match="解碼資料不完整"):
+        AdminRepository(database).confirm_vin_vehicle_mapping(
+            "ZZZTEST00X0000001",
+            5,
+            allow_name_override=False,
+            source_reference=None,
+        )
+    assert "write.insert-vin-mapping" not in [call.tag for call in database.calls]
+
+
+def test_confirm_vin_mapping_requires_reason_for_manual_confirmation() -> None:
+    database = _vin_database()
+    with pytest.raises(AdminDataError, match="人工確認必須填寫依據"):
+        AdminRepository(database).confirm_vin_vehicle_mapping(
+            "ZZZTEST00X0000001",
+            5,
+            allow_name_override=True,
+            source_reference="   ",
+        )
+    assert database.calls == []
+
+
+def test_confirm_vin_mapping_rejects_review_required_candidate_without_override() -> None:
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[CANDIDATE_SPARSE],
+    )
+    with pytest.raises(AdminDataError, match="仍需人工審查"):
+        AdminRepository(database).confirm_vin_vehicle_mapping(
+            "ZZZTEST00X0000001",
+            5,
+            allow_name_override=False,
+            source_reference=None,
+        )
+    assert "write.insert-vin-mapping" not in [call.tag for call in database.calls]
+
+
+def test_confirm_vin_mapping_exact_candidate_records_manual_confirmed() -> None:
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[CANDIDATE_EXACT],
+    )
+    AdminRepository(database).confirm_vin_vehicle_mapping(
+        "ZZZTEST00X0000001",
+        5,
+        allow_name_override=False,
+        source_reference=None,
+    )
+    insert = database.calls[-1]
+    assert insert.tag == "write.insert-vin-mapping"
+    assert insert.params == (
+        "ZZZTEST00X0",
+        "ZZZTEST00X0000001",
+        5,
+        "TOYOTA",
+        "CAMRY",
+        2020,
+        "A25A-FKS",
+        "LE",
+        "manual-confirmed",
+        None,
+    )
+
+
+def test_confirm_vin_mapping_sparse_override_fills_fields_from_candidate() -> None:
+    database = _vin_database(
+        decode_row=SPARSE_DECODE,
+        candidate_rows=[CANDIDATE_SPARSE],
+    )
+    AdminRepository(database).confirm_vin_vehicle_mapping(
+        "ZZZTEST00X0000001",
+        5,
+        allow_name_override=True,
+        source_reference="station manual check note",
+    )
+    insert = database.calls[-1]
+    assert insert.tag == "write.insert-vin-mapping"
+    assert insert.params == (
+        "ZZZTEST00X0",
+        "ZZZTEST00X0000001",
+        5,
+        "TOYOTA",
+        "CAMRY",
+        2020,
+        "A25A-FKS",
+        "LE",
+        "manual-sparse-override",
+        "station manual check note",
+    )
+
+
+def test_confirm_vin_mapping_unknown_vehicle_falls_back_to_override_lookup() -> None:
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[],
+        override_row={
+            "vehicle_id": 9,
+            "partsouq_brand": "TOYOTA",
+            "partsouq_model": "CAMRY",
+            "partsouq_engine": "A25A-FKS",
+            "partsouq_trim_name": "LE",
+        },
+    )
+    AdminRepository(database).confirm_vin_vehicle_mapping(
+        "ZZZTEST00X0000001",
+        9,
+        allow_name_override=True,
+        source_reference="printed catalog page 12",
+    )
+    lookup = database.calls[-2]
+    assert lookup.tag == "vin.override-candidate"
+    insert = database.calls[-1]
+    assert insert.tag == "write.insert-vin-mapping"
+    assert insert.params[8] == "manual-name-override"
+    assert insert.params[9] == "printed catalog page 12"
+
+
+def test_confirm_vin_mapping_unknown_vehicle_without_compatibility_is_rejected() -> None:
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[],
+        override_row=None,
+    )
+    with pytest.raises(AdminDataError, match="不在目前已發布型錄"):
+        AdminRepository(database).confirm_vin_vehicle_mapping(
+            "ZZZTEST00X0000001",
+            9,
+            allow_name_override=True,
+            source_reference="printed catalog page 12",
+        )
+
+
+def test_confirm_vin_mapping_duplicate_is_reported_as_data_error() -> None:
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[CANDIDATE_EXACT],
+        insert_error=pymysql.err.IntegrityError(1062, "Duplicate entry"),
+    )
+    with pytest.raises(AdminDataError, match="已建立車款對應"):
+        AdminRepository(database).confirm_vin_vehicle_mapping(
+            "ZZZTEST00X0000001",
+            5,
+            allow_name_override=False,
+            source_reference=None,
+        )
+
+
+def test_vin_vehicle_candidates_deduplicate_by_vehicle_preferring_strict_match() -> None:
+    sparse_first = dict(CANDIDATE_SPARSE)
+    strict_second = dict(CANDIDATE_EXACT)
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[sparse_first, strict_second],
+    )
+    candidates = AdminRepository(database).vin_vehicle_candidates("ZZZTEST00X0000001")
+    assert [candidate["candidate_status"] for candidate in candidates] == ["exact"]
+    assert candidates[0]["candidate_reason"] == (
+        "normalized_make_model_year_engine_trim_in_current_range"
+    )
+
+
+def test_vin_vehicle_candidates_labels_sparse_and_ambiguous_matches() -> None:
+    second_strict = dict(CANDIDATE_EXACT, partsouq_vehicle_id=6)
+    sparse_only = dict(CANDIDATE_SPARSE, partsouq_vehicle_id=7, candidate_sparse=1)
+    database = _vin_database(
+        decode_row=COMPLETE_DECODE,
+        candidate_rows=[
+            CANDIDATE_EXACT,
+            second_strict,
+            sparse_only,
+        ],
+    )
+    candidates = AdminRepository(database).vin_vehicle_candidates("ZZZTEST00X0000001")
+    statuses = {
+        candidate["partsouq_vehicle_id"]: candidate["candidate_status"] for candidate in candidates
+    }
+    assert statuses == {
+        5: "ambiguous_manual_review_required",
+        6: "ambiguous_manual_review_required",
+        7: "manual_review_required",
+    }

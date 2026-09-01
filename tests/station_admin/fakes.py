@@ -290,3 +290,65 @@ def source_row(entity_type: str, source_id: int) -> dict[str, Any]:
             }
         )
     return row
+
+
+class VinWorkflowScriptedDatabase(ScriptedDatabase):
+    """提供 VIN 候選→確認流程所需的自訂列，其餘行為與 ScriptedDatabase 相同。"""
+
+    def __init__(
+        self,
+        trace: QueryTrace,
+        *,
+        decode_row: dict[str, Any] | None = None,
+        mapping_row: dict[str, Any] | None = None,
+        candidate_rows: Sequence[dict[str, Any]] = (),
+        override_row: dict[str, Any] | None = None,
+        insert_error: Exception | None = None,
+    ) -> None:
+        super().__init__(trace)
+        self.decode_row = decode_row
+        self.mapping_row = mapping_row
+        self.candidate_rows = [dict(row) for row in candidate_rows]
+        self.override_row = override_row
+        self.insert_error = insert_error
+
+    def fetch_one(
+        self,
+        tag: str,
+        sql: str,
+        params: Sequence[object] | Mapping[str, object] | None = None,
+    ) -> dict[str, Any] | None:
+        if tag in (
+            "vin.mapping-status",
+            "write.lock-vin-decode",
+            "vin.override-candidate",
+        ):
+            self._record(tag, sql, params)
+            if tag == "vin.mapping-status":
+                return dict(self.mapping_row) if self.mapping_row else None
+            if tag == "write.lock-vin-decode":
+                return dict(self.decode_row) if self.decode_row else None
+            return dict(self.override_row) if self.override_row else None
+        return super().fetch_one(tag, sql, params)
+
+    def fetch_all(
+        self,
+        tag: str,
+        sql: str,
+        params: Sequence[object] | Mapping[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        if tag == "vin.vehicle-candidates":
+            self._record(tag, sql, params)
+            return [dict(row) for row in self.candidate_rows]
+        return super().fetch_all(tag, sql, params)
+
+    def execute(
+        self,
+        tag: str,
+        sql: str,
+        params: Sequence[object] | Mapping[str, object] | None = None,
+    ) -> ExecutionResult:
+        self._record(tag, sql, params)
+        if self.insert_error is not None:
+            raise self.insert_error
+        return ExecutionResult(lastrowid=77, rowcount=1)

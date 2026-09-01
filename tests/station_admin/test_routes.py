@@ -10,7 +10,7 @@ from partsouq_station_admin.db import SqlParams
 from partsouq_station_admin.query_trace import QueryTrace
 from partsouq_station_admin.repository import AdminRepository
 
-from .fakes import ScriptedDatabase
+from .fakes import ScriptedDatabase, VinWorkflowScriptedDatabase
 
 
 def _app(
@@ -744,3 +744,182 @@ def test_quarantine_rejects_unsupported_page_size_before_query() -> None:
 
     assert response.status_code == 400
     assert not databases[-1].calls
+
+
+def _vin_workflow_app(
+    databases: list[VinWorkflowScriptedDatabase],
+    *,
+    decode_row: dict[str, object] | None = None,
+    mapping_row: dict[str, object] | None = None,
+    candidate_rows: list[dict[str, object]] | None = None,
+) -> object:
+    def factory(_config: AdminConfig, trace: QueryTrace) -> VinWorkflowScriptedDatabase:
+        database = VinWorkflowScriptedDatabase(
+            trace,
+            decode_row=decode_row,
+            mapping_row=mapping_row,
+            candidate_rows=candidate_rows or [],
+        )
+        databases.append(database)
+        return database
+
+    app = create_app(
+        AdminConfig(secret_key="test-secret", page_size=25),
+        database_factory=factory,
+    )
+    app.testing = True
+    return app
+
+
+def test_vin_candidates_page_renders_decode_and_confirmation_forms() -> None:
+    databases: list[VinWorkflowScriptedDatabase] = []
+    app = _vin_workflow_app(
+        databases,
+        mapping_row={
+            "vin": "ZZZTEST00X0000001",
+            "make_name": "TOYOTA",
+            "model_name": "CAMRY",
+            "model_year": 2020,
+            "engine_model": "A25A-FKS",
+            "engine_configuration": "INLINE",
+            "displacement_l_raw": "2.0",
+            "trim_name": "LE",
+            "decode_status": "decoded",
+            "decode_completeness": "decoded_complete",
+            "mapping_status": "unmapped",
+            "partsouq_vehicle_configuration_id": None,
+        },
+        candidate_rows=[
+            {
+                "partsouq_vehicle_id": 5,
+                "partsouq_brand": "TOYOTA",
+                "partsouq_model": "CAMRY",
+                "vehicle_name": "CAMRY",
+                "vehicle_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "engine": "A25A-FKS",
+                "trim_name": "LE",
+                "nhtsa_engine_model": "A25A-FKS",
+                "nhtsa_trim_name": "LE",
+                "candidate_strict_match": 1,
+                "candidate_sparse": 0,
+                "candidate_status": "exact",
+                "candidate_reason": "normalized_make_model_year_engine_trim_in_current_range",
+            }
+        ],
+    )
+    client = app.test_client()
+
+    response = client.get("/station/vins/candidates?vin=ZZZTEST00X0000001")
+
+    assert response.status_code == 200
+    assert "VIN 車款候選確認".encode() in response.data
+    assert b"decoded_complete" in response.data
+    assert b"manual_review_required" not in response.data
+    assert "建立對應".encode() in response.data
+    tags = [call.tag for call in databases[-1].calls]
+    assert tags == ["vin.mapping-status", "vin.vehicle-candidates"]
+
+
+def test_vin_candidates_page_prompts_decode_when_record_is_missing() -> None:
+    databases: list[VinWorkflowScriptedDatabase] = []
+    app = _vin_workflow_app(databases)
+    client = app.test_client()
+
+    response = client.get("/station/vins/candidates?vin=ZZZTEST00X0000001")
+
+    assert response.status_code == 200
+    assert "這組 VIN 尚無 NHTSA 解碼記錄".encode() in response.data
+    assert "候選車款".encode() not in response.data
+    assert b'class="inline-form"' not in response.data
+    assert [call.tag for call in databases[-1].calls] == ["vin.mapping-status"]
+
+
+def test_vin_confirm_route_writes_mapping_and_redirects_to_list() -> None:
+    databases: list[VinWorkflowScriptedDatabase] = []
+    app = _vin_workflow_app(
+        databases,
+        decode_row={
+            "vin": "ZZZTEST00X0000001",
+            "make_name": "TOYOTA",
+            "model_name": "CAMRY",
+            "model_year": 2020,
+            "engine_model": "A25A-FKS",
+            "trim_name": "LE",
+        },
+        mapping_row={"mapping_status": "unmapped", "partsouq_vehicle_configuration_id": None},
+        candidate_rows=[
+            {
+                "partsouq_vehicle_id": 5,
+                "candidate_strict_match": 1,
+                "candidate_sparse": 0,
+                "candidate_status": "exact",
+            }
+        ],
+    )
+    client = app.test_client()
+    token = _csrf_token(client, "/station/vins/candidates?vin=ZZZTEST00X0000001")
+
+    response = client.post(
+        "/station/vins/confirm",
+        data={
+            "csrf_token": token,
+            "vin": "ZZZTEST00X0000001",
+            "partsouq_vehicle_id": "5",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/entities/vin_vehicle_mappings")
+    database = databases[-1]
+    assert database.transaction_modes == [False]
+    assert "write.insert-vin-mapping" in [call.tag for call in database.calls]
+    assert "write.lock-vin-decode" in [call.tag for call in database.calls]
+
+
+def test_vin_confirm_route_rejects_invalid_vin_and_vehicle_id() -> None:
+    databases: list[VinWorkflowScriptedDatabase] = []
+    app = _vin_workflow_app(
+        databases,
+        decode_row={
+            "vin": "ZZZTEST00X0000001",
+            "make_name": "TOYOTA",
+            "model_name": "CAMRY",
+            "model_year": 2020,
+            "engine_model": "A25A-FKS",
+            "trim_name": "LE",
+        },
+        mapping_row={"mapping_status": "unmapped", "partsouq_vehicle_configuration_id": None},
+        candidate_rows=[
+            {
+                "partsouq_vehicle_id": 5,
+                "candidate_strict_match": 1,
+                "candidate_sparse": 0,
+                "candidate_status": "exact",
+            }
+        ],
+    )
+    client = app.test_client()
+    token = _csrf_token(client, "/station/vins/candidates?vin=ZZZTEST00X0000001")
+
+    invalid_vin = client.post(
+        "/station/vins/confirm",
+        data={"csrf_token": token, "vin": "INVALID", "partsouq_vehicle_id": "5"},
+    )
+    invalid_vehicle = client.post(
+        "/station/vins/confirm",
+        data={
+            "csrf_token": token,
+            "vin": "ZZZTEST00X0000001",
+            "partsouq_vehicle_id": "not-a-number",
+        },
+    )
+
+    assert invalid_vin.status_code == 400
+    assert invalid_vehicle.status_code == 400
+    assert all(
+        "write.insert-vin-mapping" not in [call.tag for call in database.calls]
+        for database in databases
+    )

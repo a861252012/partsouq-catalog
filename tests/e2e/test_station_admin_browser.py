@@ -65,6 +65,7 @@ OVERRIDE_PART_NUMBER = "E2E OVERRIDE-000200"
 OVERRIDE_PART_NUMBER_NORMALIZED = "E2EOVERRIDE000200"
 UPDATED_SOURCE_CODE = "C0200-UPDATED"
 VIN = "ZZZTEST00X0000003"
+VIN_CONFIRM = "ZZZTEST00X0000007"
 ACTOR = "station-admin-e2e"
 ADMIN_PASSWORD = "station-admin-e2e-password"
 
@@ -313,6 +314,27 @@ def _seed_parts(database: E2EDatabase) -> None:
             ") VALUES (%s, %s, %s, 'TOYOTA', 'CAMRY', 2020, "
             "'A25A-FKS', 'LE', 'e2e')",
             (VIN[:11], VIN, vehicle_id),
+        )
+        confirm_artifact_id = int(
+            catalog_database._execute(
+                "INSERT INTO nhtsa_source_artifacts("
+                "dataset_name, source_key, source_url, http_status, response_headers_json, "
+                "sha256, stored_path, byte_count, parser_name, parser_version, status, "
+                "downloaded_at, verified_at, imported_at, source_rows, new_versions"
+                ") VALUES ('vpic_vin_decodes', 'e2e-vin-confirm', %s, 200, '{}', %s, %s, 2, "
+                "'e2e', '1', 'imported', UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP(), 1, 1)",
+                ("https://vpic.example/e2e", "c" * 64, "e2e-vin-confirm.json"),
+            ).lastrowid
+            or 0
+        )
+        catalog_database._execute(
+            "INSERT INTO nhtsa_vin_decodes("
+            "vin, make_name, model_name, model_year, engine_configuration, engine_model, "
+            "displacement_l, trim_name, error_code, payload_json, source_url, "
+            "source_artifact_id, decoded_at"
+            ") VALUES (%s, 'TOYOTA', 'CAMRY', 2020, 'INLINE', 'A25A-FKS', "
+            "2.0, 'LE', '0', '{}', %s, %s, UTC_TIMESTAMP())",
+            (VIN_CONFIRM, "https://vpic.example/e2e", confirm_artifact_id),
         )
         catalog_database.commit()
     except BaseException:
@@ -854,6 +876,26 @@ def test_station_admin_part_lifecycle_through_real_browser_and_mysql(
                     fail_on_status_code=False,
                 )
                 assert rejected_vin_editor.status == 400
+
+                # 已建立對應的 VIN：候選頁顯示既有對應，不提供確認表單。
+                page.goto(f"{base_url}/station/vins/candidates?vin={VIN}")
+                expect(page.get_by_text("這組 VIN 已建立車款對應", exact=False)).to_be_visible()
+                expect(page.get_by_role("button", name="建立對應")).to_have_count(0)
+
+                # 完整解碼＋唯一嚴格候選 → exact，不需勾人工確認即可建立。
+                page.goto(f"{base_url}/station/vins/candidates?vin={VIN_CONFIRM}")
+                expect(page.get_by_role("heading", name="候選車款")).to_be_visible()
+                expect(page.get_by_text("exact", exact=True)).to_be_visible()
+                page.get_by_role("button", name="建立對應").click()
+                expect(page).to_have_url(re.compile(r"/entities/vin_vehicle_mappings$"))
+                expect(
+                    page.get_by_text("車款對應已建立；VIN 零件適配會即時生效。", exact=True)
+                ).to_be_visible()
+                expect(page.get_by_text(VIN_CONFIRM, exact=True)).to_be_visible()
+
+                fitments = data_client.get(f"/api/vins/{VIN_CONFIRM}/parts", headers=headers)
+                assert fitments.status_code == 200
+                assert fitments.json(), "確認後 VIN 零件適配應立即出現"
 
                 page.goto(base_url)
                 current_card = page.locator(".summary-grid > div").filter(has_text="目前正式資料列")

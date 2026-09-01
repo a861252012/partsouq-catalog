@@ -421,6 +421,49 @@ def vin_decode_request() -> ResponseReturnValue:
     return redirect(url_for("admin.entity_list", entity_type="vin_vehicle_mappings"))
 
 
+@bp.get("/station/vins/candidates")
+def vin_vehicle_candidates() -> ResponseReturnValue:
+    vin_input = request.args.get("vin", "").strip()
+    vin: str | None = None
+    decode: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] | None = None
+    if vin_input:
+        try:
+            vin = normalize_vin(vin_input)
+        except ValueError as error:
+            raise AdminDataError(str(error)) from error
+        decode = _repository().vin_decode_mapping_status(vin)
+        if decode is not None:
+            candidates = _repository().vin_vehicle_candidates(vin)
+    return render_template(
+        "vin_candidates.html",
+        vin=vin,
+        decode=decode,
+        candidates=candidates,
+    )
+
+
+@bp.post("/station/vins/confirm")
+def vin_vehicle_confirm() -> ResponseReturnValue:
+    try:
+        vin = normalize_vin(request.form.get("vin", ""))
+    except ValueError as error:
+        raise AdminDataError(str(error)) from error
+    vehicle_input = request.form.get("partsouq_vehicle_id", "")
+    try:
+        partsouq_vehicle_id = int(vehicle_input)
+    except ValueError as error:
+        raise AdminDataError("車款 ID 不合法") from error
+    _repository().confirm_vin_vehicle_mapping(
+        vin,
+        partsouq_vehicle_id,
+        allow_name_override=request.form.get("allow_name_override") == "on",
+        source_reference=request.form.get("source_reference", ""),
+    )
+    flash("車款對應已建立；VIN 零件適配會即時生效。", "success")
+    return redirect(url_for("admin.entity_list", entity_type="vin_vehicle_mappings"))
+
+
 @bp.post("/entities/<entity_type>/<identity_key>/retire")
 def entity_retire(entity_type: str, identity_key: str) -> ResponseReturnValue:
     if not entity_spec(entity_type).editable_fields:

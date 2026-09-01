@@ -715,6 +715,90 @@ def canonical_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# 候選查詢語意與 8000 admin 的 list_vin_vehicle_candidates 一致：
+# 品牌、型號以正規化英數大寫 binary 相等，引擎三方「任一為空或相等」，
+# 車款需在正式目錄且年份落在生產區間內；strict 與 sparse 由 SQL 標記。
+_VIN_VEHICLE_CANDIDATE_SQL = """
+SELECT DISTINCT catalog_part.vehicle_id AS partsouq_vehicle_id,
+       catalog_part.brand AS partsouq_brand,
+       catalog_part.model AS partsouq_model,
+       catalog_part.vehicle_name, catalog_part.vehicle_code,
+       catalog_part.dataset_scope AS catalog_dataset_scope,
+       catalog_part.source_crawl_run_id AS catalog_crawl_run_id,
+       catalog_part.prod_period, catalog_part.production_from,
+       catalog_part.production_to, catalog_part.engine, catalog_part.trim_name,
+       vin_decode.engine_configuration AS nhtsa_engine_configuration,
+       vin_decode.engine_model AS nhtsa_engine_model,
+       vin_decode.displacement_l AS nhtsa_displacement_l,
+       vin_decode.trim_name AS nhtsa_trim_name,
+       CASE WHEN NULLIF(TRIM(vin_decode.engine_model), '') IS NOT NULL
+            AND NULLIF(TRIM(vin_decode.trim_name), '') IS NOT NULL
+            AND NULLIF(TRIM(catalog_part.engine), '') IS NOT NULL
+            AND NULLIF(TRIM(catalog_part.trim_name), '') IS NOT NULL
+            AND CAST(REGEXP_REPLACE(UPPER(catalog_part.engine), '[^A-Z0-9]', '') AS BINARY) =
+                CAST(REGEXP_REPLACE(UPPER(vin_decode.engine_model), '[^A-Z0-9]', '') AS BINARY)
+            AND CAST(REGEXP_REPLACE(UPPER(catalog_part.trim_name), '[^A-Z0-9]', '') AS BINARY) =
+                CAST(REGEXP_REPLACE(UPPER(vin_decode.trim_name), '[^A-Z0-9]', '') AS BINARY)
+            THEN 1 ELSE 0 END AS candidate_strict_match,
+       CASE WHEN NULLIF(TRIM(vin_decode.engine_model), '') IS NULL
+            OR NULLIF(TRIM(vin_decode.trim_name), '') IS NULL
+            OR NULLIF(TRIM(catalog_part.engine), '') IS NULL
+            OR NULLIF(TRIM(catalog_part.trim_name), '') IS NULL
+            THEN 1 ELSE 0 END AS candidate_sparse
+FROM nhtsa_vin_decodes AS vin_decode
+JOIN v_current_catalog_parts AS catalog_part ON
+     CAST(REGEXP_REPLACE(UPPER(catalog_part.brand), '[^A-Z0-9]', '') AS BINARY) =
+     CAST(REGEXP_REPLACE(UPPER(vin_decode.make_name), '[^A-Z0-9]', '') AS BINARY)
+ AND CAST(REGEXP_REPLACE(UPPER(catalog_part.model), '[^A-Z0-9]', '') AS BINARY) =
+     CAST(REGEXP_REPLACE(UPPER(vin_decode.model_name), '[^A-Z0-9]', '') AS BINARY)
+ AND (NULLIF(TRIM(vin_decode.engine_model), '') IS NULL
+      OR NULLIF(TRIM(catalog_part.engine), '') IS NULL
+      OR CAST(REGEXP_REPLACE(UPPER(catalog_part.engine), '[^A-Z0-9]', '') AS BINARY) =
+         CAST(REGEXP_REPLACE(UPPER(vin_decode.engine_model), '[^A-Z0-9]', '') AS BINARY))
+WHERE vin_decode.vin = %s
+  AND catalog_part.vehicle_id IS NOT NULL
+  AND (catalog_part.production_from IS NOT NULL OR catalog_part.production_to IS NOT NULL)
+  AND (catalog_part.production_from IS NULL OR vin_decode.model_year >=
+       CAST(LEFT(catalog_part.production_from, 4) AS UNSIGNED))
+  AND (catalog_part.production_to IS NULL OR vin_decode.model_year <=
+       CAST(LEFT(catalog_part.production_to, 4) AS UNSIGNED))
+ORDER BY partsouq_brand, partsouq_model, vehicle_code
+"""
+
+
+def _VIN_OVERRIDE_CANDIDATE_SQL(*, sparse: bool) -> str:
+    compatibility = ""
+    if sparse:
+        compatibility = (
+            "AND (NULLIF(TRIM(d.model_name), '') IS NULL OR "
+            "CAST(REGEXP_REPLACE(UPPER(p.model), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.model_name), '[^A-Z0-9]', '') AS BINARY)) "
+            "AND (NULLIF(TRIM(d.engine_model), '') IS NULL OR "
+            "CAST(REGEXP_REPLACE(UPPER(p.engine), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.engine_model), '[^A-Z0-9]', '') AS BINARY)) "
+            "AND (NULLIF(TRIM(d.trim_name), '') IS NULL OR "
+            "CAST(REGEXP_REPLACE(UPPER(p.trim_name), '[^A-Z0-9]', '') AS BINARY) = "
+            "CAST(REGEXP_REPLACE(UPPER(d.trim_name), '[^A-Z0-9]', '') AS BINARY)) "
+        )
+    return f"""
+SELECT DISTINCT p.vehicle_id, p.brand AS partsouq_brand, p.model AS partsouq_model,
+       p.engine AS partsouq_engine, p.trim_name AS partsouq_trim_name
+FROM v_current_catalog_parts AS p
+JOIN nhtsa_vin_decodes AS d ON d.vin = %s
+WHERE p.vehicle_id = %s
+  AND NULLIF(TRIM(p.brand), '') IS NOT NULL
+  AND NULLIF(TRIM(p.model), '') IS NOT NULL
+  AND (p.production_from IS NOT NULL OR p.production_to IS NOT NULL)
+  AND (p.production_from IS NULL OR d.model_year >=
+       CAST(LEFT(p.production_from, 4) AS UNSIGNED))
+  AND (p.production_to IS NULL OR d.model_year <=
+       CAST(LEFT(p.production_to, 4) AS UNSIGNED))
+  AND CAST(REGEXP_REPLACE(UPPER(p.brand), '[^A-Z0-9]', '') AS BINARY) =
+      CAST(REGEXP_REPLACE(UPPER(d.make_name), '[^A-Z0-9]', '') AS BINARY)
+  {compatibility}LIMIT 1
+"""
+
+
 def _json_default(value: object) -> str:
     if isinstance(value, datetime | date):
         return value.isoformat()
@@ -749,6 +833,183 @@ class AdminRepository:
                 """,
                 (result.lastrowid, actor, reason),
             )
+
+    def vin_decode_mapping_status(self, vin: str) -> dict[str, Any] | None:
+        row = self.database.fetch_one(
+            "vin.mapping-status",
+            """
+            SELECT *
+            FROM station_admin_vin_vehicle_mappings
+            WHERE vin = %s
+            """,
+            (vin,),
+        )
+        return dict(row) if row else None
+
+    def vin_vehicle_candidates(self, vin: str) -> list[dict[str, Any]]:
+        candidate_rows = self.database.fetch_all(
+            "vin.vehicle-candidates",
+            _VIN_VEHICLE_CANDIDATE_SQL,
+            (vin,),
+        )
+        candidates_by_vehicle_id: dict[int, dict[str, Any]] = {}
+        for candidate in candidate_rows:
+            vehicle_id = int(candidate["partsouq_vehicle_id"])
+            current = candidates_by_vehicle_id.get(vehicle_id)
+            if current is None or (
+                bool(candidate["candidate_strict_match"])
+                and not bool(current["candidate_strict_match"])
+            ):
+                candidates_by_vehicle_id[vehicle_id] = dict(candidate)
+        strict_vehicle_count = sum(
+            1
+            for candidate in candidates_by_vehicle_id.values()
+            if bool(candidate["candidate_strict_match"])
+        )
+        candidates: list[dict[str, Any]] = []
+        for candidate in candidates_by_vehicle_id.values():
+            strict_match = bool(candidate.pop("candidate_strict_match"))
+            sparse = bool(candidate.pop("candidate_sparse"))
+            if strict_match and strict_vehicle_count == 1:
+                candidate["candidate_status"] = "exact"
+                candidate["candidate_reason"] = (
+                    "normalized_make_model_year_engine_trim_in_current_range"
+                )
+            elif strict_match:
+                candidate["candidate_status"] = "ambiguous_manual_review_required"
+                candidate["candidate_reason"] = (
+                    "multiple_normalized_make_model_year_engine_trim_matches"
+                )
+            else:
+                candidate["candidate_status"] = "manual_review_required"
+                candidate["candidate_reason"] = (
+                    "normalized_make_model_year_sparse_optional_fields"
+                    if sparse
+                    else "normalized_make_model_year_engine_trim_manual_review"
+                )
+            candidates.append(candidate)
+        return candidates
+
+    def confirm_vin_vehicle_mapping(
+        self,
+        vin: str,
+        partsouq_vehicle_id: int,
+        *,
+        allow_name_override: bool,
+        source_reference: str | None,
+    ) -> None:
+        if partsouq_vehicle_id < 1:
+            raise AdminDataError("車款 ID 不合法")
+        reference = (source_reference or "").strip()
+        if allow_name_override and not reference:
+            raise AdminDataError("人工確認必須填寫依據（來源或備註）")
+        with self.database.transaction():
+            decoded = self.database.fetch_one(
+                "write.lock-vin-decode",
+                """
+                SELECT vin, make_name, model_name, model_year, engine_model, trim_name
+                FROM nhtsa_vin_decodes
+                WHERE vin = %s
+                FOR SHARE
+                """,
+                (vin,),
+            )
+            if decoded is None:
+                raise AdminDataError("請先完成這組 VIN 的 NHTSA 解碼")
+            required_decode_fields = (
+                "make_name",
+                "model_name",
+                "model_year",
+                "engine_model",
+                "trim_name",
+            )
+            sparse_decode = any(
+                value is None or (isinstance(value, str) and not value.strip())
+                for value in (decoded.get(field) for field in required_decode_fields)
+            )
+            if sparse_decode and not allow_name_override:
+                raise AdminDataError("這組 VIN 的 NHTSA 解碼資料不完整，需勾選人工確認並填寫依據")
+            candidates = self.vin_vehicle_candidates(vin)
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if int(candidate["partsouq_vehicle_id"]) == partsouq_vehicle_id
+                ),
+                None,
+            )
+            is_exact_candidate = (
+                selected_candidate is not None
+                and selected_candidate.get("candidate_status") == "exact"
+            )
+            if not is_exact_candidate and not allow_name_override:
+                raise AdminDataError(
+                    "這個候選仍需人工審查；請勾選人工確認並填寫依據"
+                    if selected_candidate is not None
+                    else "這個 PartSouq 車款不在品牌、型號、年份與引擎相容的候選內"
+                )
+            override_candidate: dict[str, Any] | None = (
+                selected_candidate if not is_exact_candidate else None
+            )
+            if not is_exact_candidate:
+                if override_candidate is None:
+                    override_candidate = self.database.fetch_one(
+                        "vin.override-candidate",
+                        _VIN_OVERRIDE_CANDIDATE_SQL(sparse=sparse_decode),
+                        (vin, partsouq_vehicle_id),
+                    )
+                if override_candidate is None:
+                    raise AdminDataError(
+                        "人工指定的車款不在目前已發布型錄、年份區間內，或與已有的 NHTSA 欄位不符"
+                        if sparse_decode
+                        else "人工指定的車款不在目前已發布型錄或年份區間內"
+                    )
+            model_name: Any = decoded.get("model_name")
+            engine: Any = decoded.get("engine_model")
+            trim_name: Any = decoded.get("trim_name")
+            if sparse_decode and override_candidate is not None:
+                model_name = model_name or override_candidate.get("partsouq_model")
+                candidate_engine = override_candidate.get("partsouq_engine") or (
+                    override_candidate.get("engine")
+                )
+                if not engine and isinstance(candidate_engine, str):
+                    engine = candidate_engine
+                trim_name = (
+                    trim_name
+                    or override_candidate.get("partsouq_trim_name")
+                    or override_candidate.get("trim_name")
+                )
+            source_name = (
+                "manual-sparse-override"
+                if sparse_decode
+                else "manual-name-override"
+                if not is_exact_candidate
+                else "manual-confirmed"
+            )
+            try:
+                self.database.execute(
+                    "write.insert-vin-mapping",
+                    """
+                    INSERT INTO admin_vehicle_mappings(
+                        vin_prefix, vin, partsouq_vehicle_id, make_name, model_name,
+                        model_year, engine, trim_name, source_name, source_reference
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        vin[:11],
+                        vin,
+                        partsouq_vehicle_id,
+                        decoded["make_name"],
+                        model_name,
+                        decoded["model_year"],
+                        engine or None,
+                        trim_name,
+                        source_name,
+                        reference or None,
+                    ),
+                )
+            except pymysql.err.IntegrityError as error:
+                raise AdminDataError("這組 VIN 已建立車款對應") from error
 
     def quarantine_summary(self) -> dict[str, int]:
         row = (
