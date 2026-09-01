@@ -144,7 +144,7 @@ print -r -- "$CONFIG_EXPORTS" > "$TEMP_CONFIG"
 
 TEMP_AGENT="$WORK_DIR/$LABEL.plist"
 /bin/cp "$TEMPLATE" "$TEMP_AGENT"
-/bin/sed \
+/usr/bin/sed \
   -e "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
   -e "s|__STDOUT_PATH__|$STDOUT_PATH|g" \
   -e "s|__STDERR_PATH__|$STDERR_PATH|g" \
