@@ -63,3 +63,41 @@
 - migration ledger：001-038 全部 applied、asset `station-admin` 最新、`check` 綠。
 - 測試庫同步到 038。
 - 全套關卡：ruff／mypy strict／pytest（含真 MySQL 與瀏覽器 E2E）1319 passed。
+
+## NHTSA vPIC 目錄全量與 VIN 缺口收斂
+
+- `nhtsa-api` 加入 daemon 白名單（預設 7 天）：composite `nhtsa` 會連帶抓需求敘述外的
+  bulk 資料集，vPIC 全量另走獨立排程。manual 派發會被 lineage 閘控擋下
+  （`NhtsaLeaseLostError`），屬設計行為。
+- vPIC 全量實測：12,727 artifacts、137,422 列全部 import、0 拒收，約 82 分鐘。
+  目錄現況：makes 12,351、models 31,979、manufacturers 22,979、variables 144、
+  variable_values 69,969。增量重跑多數請求會命中 ETag／304 快走。
+- VNCS VIN 缺口 1,016 碼重新 enqueue（pending 佇列逐筆消化，約 40 分鐘收斂）。
+  結果：11 碼新增解碼（2,153 → 2,164），1,005 碼由 vPIC 判定無可用解碼、以
+  undecodable 終局。抽樣其 WMI（TMB Škoda、WMA MAN、JM7 Mazda、JTH Lexus、
+  RH9 Skyline 等）皆非美規——vPIC 是美國市場資料庫，這些車本來就查不到，
+  fail-closed 分類正確。所謂「1,000 碼缺口」的天花板本來就不是 100%。
+
+## 全量模式導入正式證據驗收（commit 1666cc7）
+
+- 正式 full run（daemon 派發）與 bounded 同規格記錄 parser 輸入證據；
+  手動 one-shot 維持不記證據、不得發布。
+- 既有 `verify_run_evidence` 會把全部 artifact／body 載進記憶體且寫死 target=10,000，
+  百萬頁規模不可行。新增串流版：artifact×record 以單一 LEFT JOIN 串流讀取、
+  body 走獨立連線主鍵查找、part 對帳用第二條串流（筆數相等＋逐列比對），
+  manifest 與 dataset 雜湊增量計算，格式與 bounded 版完全一致。
+- 測試的關鍵一筆：同一份資料，串流版與 bounded 版必須算出相同的 manifest／dataset
+  雜湊。踩坑兩件：brand record 沒有 parent 是合法的（漏了 bounded 版的特例）；
+  `closing(...)` 包住串流產生器，避免中途失敗時 unbuffered cursor 殘列污染連線。
+- `archive_full_candidate_parts` 從「僅供診斷」轉正：先封存證據、發布交易內二次
+  整算比對，任一步失敗整筆 rollback，線上仍讀上一份 snapshot。
+- scheduler：catalog 閘控放行 full 排程（0/0、無 model scope，殘留 scope 即拒絕）；
+  run_crawl 子程序的同名閘同步更新；daemon 迴圈僅在 bounded 模式同步 desired scope。
+- 全套關卡 1,367 passed（含真 MySQL 與瀏覽器 E2E）。
+
+## 全量爬取啟動
+
+- crawl_run 44、run_key `2026-09`、dataset_kind full、daemon lineage。
+  證據預算放大（100GiB／300 萬 artifacts），速率 4 req/s token bucket、8 workers、
+  1-2s 隨機延遲。啟動 10 分鐘：1,037 artifacts 全 200、零 challenge。
+  觀察點：block 偵測（0 groups 大頁呼吸退避）偶發屬正常防禦，若密集出現需降速。

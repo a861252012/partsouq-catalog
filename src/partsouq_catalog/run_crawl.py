@@ -81,18 +81,31 @@ def main() -> int:
         CRAWL["start_brand"] = args.brand
 
     scheduled_job_run_id = int(CRAWL["scheduled_job_run_id"])
-    scheduled_scope_invalid = scheduled_job_run_id > 0 and (
-        int(CRAWL["limit_parts"]) != 0
-        or int(CRAWL["bounded_parts"]) != 10_000
-        or not str(CRAWL["bounded_brand"]).strip()
-        or not str(CRAWL["bounded_model"]).strip()
-        or int(CRAWL["vehicle_year_window"]) <= 0
-    )
+    if scheduled_job_run_id > 0:
+        # 正式排程兩種模式：bounded（model-aligned 10k）或 full（全量，
+        # 不得殘留 model scope）。sample 與部分範圍一律拒絕。
+        full_scope = (
+            int(CRAWL["limit_parts"]) == 0
+            and int(CRAWL["bounded_parts"]) == 0
+            and not str(CRAWL["bounded_brand"]).strip()
+            and not str(CRAWL["bounded_model"]).strip()
+        )
+        bounded_scope = (
+            int(CRAWL["limit_parts"]) == 0
+            and int(CRAWL["bounded_parts"]) == 10_000
+            and bool(str(CRAWL["bounded_brand"]).strip())
+            and bool(str(CRAWL["bounded_model"]).strip())
+            and int(CRAWL["vehicle_year_window"]) > 0
+        )
+        scheduled_scope_invalid = not (full_scope or bounded_scope)
+    else:
+        scheduled_scope_invalid = False
     if scheduled_scope_invalid:
         log.error(
-            "scheduled catalog crawl requires PSQ_LIMIT_PARTS=0, "
-            "PSQ_BOUNDED_PARTS=10000, non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL, "
-            "and positive PSQ_VEHICLE_YEAR_WINDOW"
+            "scheduled catalog crawl requires either bounded scope "
+            "(PSQ_LIMIT_PARTS=0, PSQ_BOUNDED_PARTS=10000, non-empty "
+            "PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL, positive PSQ_VEHICLE_YEAR_WINDOW) "
+            "or full scope (PSQ_LIMIT_PARTS=0, PSQ_BOUNDED_PARTS=0, no model scope)"
         )
         root_logger = logging.getLogger()
         for handler in handlers:
