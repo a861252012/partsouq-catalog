@@ -2,6 +2,10 @@
 
 # 啟用/更新 com.partsouq.vncs-scheduler LaunchAgent（VNCS 汽柴油車籍同步）。
 # 與 catalog scheduler 各自持有不同 job 的鎖，兩者可並存。
+#
+# launchd 沒有使用者的 Desktop／文件夾 TCC 權限，因此 runtime 以 git archive
+# stage 到 ~/Library/Application Support 下的 release 目錄執行，不直接跑
+# repo 工作樹；Playwright 瀏覽器續用 ~/Library/Caches/ms-playwright。
 
 set -euo pipefail
 umask 077
@@ -38,10 +42,10 @@ HOST_STATE_DIR="$HOME/Library/Application Support/partsouq-vncs-scheduler"
 LOG_DIR="$HOST_STATE_DIR/logs"
 STDOUT_PATH="$LOG_DIR/vncs-scheduler.stdout.log"
 STDERR_PATH="$LOG_DIR/vncs-scheduler.stderr.log"
+REPO_RUNTIME_PYTHON=${PARTSOUQ_RUNTIME_PYTHON:-$PROJECT_ROOT/.venv/bin/python}
 LAUNCHCTL_BIN=${PARTSOUQ_LAUNCHCTL_BIN:-/bin/launchctl}
 GIT_BIN=${PARTSOUQ_GIT_BIN:-/usr/bin/git}
 UV_BIN=${PARTSOUQ_UV_BIN:-${commands[uv]:-}}
-RUNTIME_PYTHON=${PARTSOUQ_RUNTIME_PYTHON:-$PROJECT_ROOT/.venv/bin/python}
 SERVICE_TARGET="gui/$(/usr/bin/id -u)/$LABEL"
 DOMAIN_TARGET="gui/$(/usr/bin/id -u)"
 READY_TIMEOUT=${PARTSOUQ_LAUNCH_READY_TIMEOUT_SECONDS:-30}
@@ -66,12 +70,8 @@ if [[ -z "$UV_BIN" || ! -x "$UV_BIN" ]]; then
   print -u2 "missing uv executable"
   exit 2
 fi
-if [[ ! -x "$RUNTIME_PYTHON" ]]; then
-  print -u2 "missing runtime Python: $RUNTIME_PYTHON"
-  exit 2
-fi
-if [[ ! -x "$PROJECT_ROOT/.venv/bin/partsouq-scheduler" ]]; then
-  print -u2 "missing runtime scheduler entrypoint: $PROJECT_ROOT/.venv/bin/partsouq-scheduler"
+if [[ ! -x "$REPO_RUNTIME_PYTHON" ]]; then
+  print -u2 "missing runtime Python: $REPO_RUNTIME_PYTHON"
   exit 2
 fi
 
@@ -134,18 +134,112 @@ CONFIG_EXPORTS=$(/usr/bin/env -i "${CONFIG_INPUT_ENV[@]}" /bin/zsh -c '
   done
 ' partsouq-env "$PROJECT_ROOT/.env" "${CONFIG_ENV[@]}")
 
-/bin/mkdir -p "$LAUNCH_AGENTS_DIR" "$HOST_STATE_DIR" "$LOG_DIR"
-/bin/chmod 700 "$HOST_STATE_DIR" "$LOG_DIR"
-WORK_DIR=$(/usr/bin/mktemp -d "$HOST_STATE_DIR/.install.XXXXXX")
-trap 'if [[ -d "$WORK_DIR" ]]; then /bin/rm -rf "$WORK_DIR"; fi' EXIT
-TEMP_CONFIG="$WORK_DIR/vncs-scheduler.env"
+/bin/mkdir -p "$LAUNCH_AGENTS_DIR" "$HOST_STATE_DIR" "$LOG_DIR" "$HOST_STATE_DIR/releases"
+/bin/chmod 700 "$HOST_STATE_DIR" "$LOG_DIR" "$HOST_STATE_DIR/releases"
+
+TEMP_CONFIG=$(/usr/bin/mktemp "$HOST_STATE_DIR/.vncs-env.XXXXXX")
 print -r -- "$CONFIG_EXPORTS" > "$TEMP_CONFIG"
 /bin/chmod 600 "$TEMP_CONFIG"
 
+# ---- release staging -----------------------------------------------------
+
+SAFE_INSTALL_ENV=(
+  "HOME=$HOME"
+  "PATH=$PATH"
+  "TMPDIR=${TMPDIR:-/tmp}"
+  "LANG=${LANG:-en_US.UTF-8}"
+  "PYTHONDONTWRITEBYTECODE=1"
+)
+
+release_is_valid() {
+  CANDIDATE=$1
+  [[ -d "$CANDIDATE/app/src" \
+      && -d "$CANDIDATE/app/.venv" \
+      && -f "$CANDIDATE/vncs-scheduler.env" \
+      && -f "$CANDIDATE/.install-complete" \
+      && -x "$CANDIDATE/app/deploy/run-macos-vncs-scheduler.zsh" \
+      && -x "$CANDIDATE/app/.venv/bin/partsouq-scheduler" ]]
+}
+
+RUNTIME_RELEASE=""
+for CANDIDATE in "$HOST_STATE_DIR/releases/$COMMIT_SHA-"*(N/); do
+  if ! release_is_valid "$CANDIDATE"; then
+    continue
+  fi
+  # 環境檔內容不同（例如 DB 密碼輪替）就重建 release。
+  if /usr/bin/cmp -s "$TEMP_CONFIG" "$CANDIDATE/vncs-scheduler.env"; then
+    RUNTIME_RELEASE=$CANDIDATE
+    break
+  fi
+done
+
+if [[ -z "$RUNTIME_RELEASE" ]]; then
+  RELEASE_DIR=$(/usr/bin/mktemp -d "$HOST_STATE_DIR/releases/$COMMIT_SHA-XXXXXX")
+  /bin/chmod 700 "$RELEASE_DIR"
+  APP_DIR="$RELEASE_DIR/app"
+  /bin/mkdir -p "$APP_DIR"
+  SOURCE_ARCHIVE=$(/usr/bin/mktemp "$HOST_STATE_DIR/.vncs-src.XXXXXX")
+  "$GIT_BIN" -C "$PROJECT_ROOT" archive --format=tar --output="$SOURCE_ARCHIVE" \
+    "$COMMIT_SHA" -- pyproject.toml uv.lock README.md src db migrations deploy
+  /usr/bin/tar -xf "$SOURCE_ARCHIVE" -C "$APP_DIR"
+  /bin/rm -f "$SOURCE_ARCHIVE"
+  if [[ -e "$APP_DIR/.git" || -e "$APP_DIR/.env" ]]; then
+    print -u2 "committed runtime unexpectedly contains repository identity or local secrets"
+    /bin/rm -rf "$RELEASE_DIR"
+    exit 2
+  fi
+  /bin/cp "$TEMP_CONFIG" "$RELEASE_DIR/vncs-scheduler.env"
+  /bin/chmod 600 "$RELEASE_DIR/vncs-scheduler.env"
+
+  BASE_PYTHON=$(/usr/bin/env -i "${SAFE_INSTALL_ENV[@]}" \
+    "$REPO_RUNTIME_PYTHON" -c 'import sys; print(sys._base_executable)')
+  if [[ -z "$BASE_PYTHON" || ! -x "$BASE_PYTHON" ]]; then
+    print -u2 "could not resolve the runtime base Python"
+    /bin/rm -rf "$RELEASE_DIR"
+    exit 2
+  fi
+  case "${BASE_PYTHON:A}" in
+    "$PROJECT_ROOT"/*)
+      print -u2 "runtime base Python must not live inside the repository"
+      /bin/rm -rf "$RELEASE_DIR"
+      exit 2
+      ;;
+  esac
+
+  if ! /usr/bin/env -i "${SAFE_INSTALL_ENV[@]}" "$UV_BIN" sync \
+      --locked \
+      --no-dev \
+      --no-editable \
+      --python "$BASE_PYTHON" \
+      --project "$APP_DIR"; then
+    print -u2 "failed to build the VNCS runtime virtualenv"
+    /bin/rm -rf "$RELEASE_DIR"
+    exit 2
+  fi
+  if ! /usr/bin/env -i "${SAFE_INSTALL_ENV[@]}" \
+      "$APP_DIR/.venv/bin/python" -c 'import playwright'; then
+    print -u2 "runtime virtualenv is missing the playwright package"
+    /bin/rm -rf "$RELEASE_DIR"
+    exit 2
+  fi
+  print -r -- "$COMMIT_SHA" > "$RELEASE_DIR/.install-complete"
+  /bin/chmod 600 "$RELEASE_DIR/.install-complete"
+  /bin/chmod -R go-rwx "$RELEASE_DIR"
+  RUNTIME_RELEASE=$RELEASE_DIR
+  print "staged VNCS runtime release: $RUNTIME_RELEASE"
+fi
+
+APP_RUNTIME="$RUNTIME_RELEASE/app"
+ENV_FILE="$RUNTIME_RELEASE/vncs-scheduler.env"
+
+# ---- LaunchAgent ---------------------------------------------------------
+
+WORK_DIR=$(/usr/bin/mktemp -d "$HOST_STATE_DIR/.install.XXXXXX")
+trap 'if [[ -d "$WORK_DIR" ]]; then /bin/rm -rf "$WORK_DIR"; fi' EXIT
 TEMP_AGENT="$WORK_DIR/$LABEL.plist"
 /bin/cp "$TEMPLATE" "$TEMP_AGENT"
 /usr/bin/sed \
-  -e "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
+  -e "s|__PROJECT_ROOT__|$APP_RUNTIME|g" \
   -e "s|__STDOUT_PATH__|$STDOUT_PATH|g" \
   -e "s|__STDERR_PATH__|$STDERR_PATH|g" \
   -i '' "$TEMP_AGENT"
@@ -160,7 +254,7 @@ if (( NO_START )); then
   /bin/mv -f "$TEMP_AGENT" "$AGENT_PATH"
   /bin/chmod 600 "$AGENT_PATH"
   print "LaunchAgent installed without starting: $AGENT_PATH"
-  print "Runtime: $PROJECT_ROOT"
+  print "Runtime: $APP_RUNTIME"
   exit 0
 fi
 
@@ -193,4 +287,5 @@ if (( ! CHILD_RUNNING )); then
   exit 1
 fi
 print "LaunchAgent installed and started: $SERVICE_TARGET (commit $COMMIT_SHA)"
+print "Runtime: $APP_RUNTIME"
 print "Logs: $LOG_DIR"

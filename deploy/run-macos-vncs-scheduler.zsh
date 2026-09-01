@@ -9,8 +9,9 @@ umask 077
 
 SCRIPT_DIR=${0:A:h}
 PROJECT_ROOT=${SCRIPT_DIR:h}
+RELEASE_DIR=${PROJECT_ROOT:h}
 HOST_STATE_DIR="$HOME/Library/Application Support/partsouq-vncs-scheduler"
-ENV_FILE="$HOST_STATE_DIR/vncs-scheduler.env"
+ENV_FILE="$RELEASE_DIR/vncs-scheduler.env"
 RUNTIME_LOG_DIR="$HOST_STATE_DIR/logs"
 PSQ_SCHEDULER_STATE_DIR="$HOST_STATE_DIR/scheduler"
 RUNTIME_PYTHON=${PARTSOUQ_RUNTIME_PYTHON:-$PROJECT_ROOT/.venv/bin/python}
