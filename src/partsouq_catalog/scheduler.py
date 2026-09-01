@@ -63,10 +63,11 @@ RECOVERY_MIN_AGE_SECONDS = 900
 MAX_CONSECUTIVE_FAILURES = 5
 NHTSA_BULK_COMPLETED = "stage=bulk_completed"
 NHTSA_API_COMPLETED = "stage=api_completed"
-DAEMON_JOBS = ("catalog", "nhtsa", "pending", "vncs")
+DAEMON_JOBS = ("catalog", "nhtsa", "nhtsa-api", "pending", "vncs")
 DEFAULT_INTERVAL_SECONDS = {
     "catalog": 30 * 24 * 60 * 60,
     "nhtsa": 24 * 60 * 60,
+    "nhtsa-api": 7 * 24 * 60 * 60,
     "pending": 30,
     "vncs": 30 * 24 * 60 * 60,
 }
@@ -1509,7 +1510,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--daemon",
         action="store_true",
-        help="常駐並依 interval 自動執行；僅支援 catalog、nhtsa、pending、vncs。",
+        help="常駐並依 interval 自動執行；僅支援 catalog、nhtsa、nhtsa-api、pending、vncs。",
     )
     parser.add_argument("--interval-seconds", type=int, default=None)
     parser.add_argument("--retry-base-seconds", type=int, default=None)
@@ -1674,7 +1675,7 @@ def main() -> int:
     if not args.daemon:
         return dispatch_locked(args.job, args.scope)
     if args.job not in DAEMON_JOBS:
-        print("daemon 僅支援 catalog、nhtsa、pending、vncs", file=sys.stderr)
+        print("daemon 僅支援 catalog、nhtsa、nhtsa-api、pending、vncs", file=sys.stderr)
         return 2
     try:
         interval_seconds = (

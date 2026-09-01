@@ -977,6 +977,30 @@ def test_nhtsa_daemon_uses_last_completed_api_run(monkeypatch) -> None:
     connection.close.assert_called_once_with()
 
 
+def test_nhtsa_api_daemon_uses_last_completed_run(monkeypatch) -> None:
+    """vPIC 目錄全量以獨立 daemon 排程；間隔判定與其他 daemon job 一致。"""
+
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = {
+        "job_name": "nhtsa-api",
+        "status": "completed",
+        "age_seconds": 10,
+    }
+    connection = mock.MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(scheduler.pymysql, "connect", lambda **_kwargs: connection)
+
+    assert scheduler._seconds_until_next_run("nhtsa-api", 100) == 90
+    assert cursor.execute.call_args.args[1] == ("nhtsa-api",)
+    connection.close.assert_called_once_with()
+
+
+def test_nhtsa_api_is_a_daemon_job() -> None:
+    assert "nhtsa-api" in scheduler.DAEMON_JOBS
+    assert scheduler.DEFAULT_INTERVAL_SECONDS["nhtsa-api"] > 0
+
+
 def test_failed_latest_run_is_due_immediately(monkeypatch) -> None:
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
