@@ -416,9 +416,18 @@ class SessionManager:
                             f"catalog unit redirected away at {safe_url} -> {location}",
                             _response_envelope(r, url, text, attempt),
                         )
-                    # 其他 catalog 頁面（索引等）的轉址維持 fail-closed：
-                    # 不跟隨、不猜測語意。錯誤訊息附上 Location 供運維
-                    # 判讀站方正規化行為。
+                    if self._redirects_to_brand_locate(url, location):
+                        # 站方對「不存在的 vehicle/category 組合」會 302 回
+                        # 品牌索引（實證 run 44：vehicle?cid=2 ->
+                        # locate?c=Toyota&psq=lb），與 unit 過期同語意：
+                        # terminal not_found，由呼叫端收斂，不重試。
+                        raise NotFoundError(
+                            f"catalog page redirected to brand locate at {safe_url} -> {location}",
+                            _response_envelope(r, url, text, attempt),
+                        )
+                    # 其餘 catalog 頁面轉址維持 fail-closed：不跟隨、不猜
+                    # 測語意。錯誤訊息附上 Location 供運維判讀站方正規化
+                    # 行為。
                     raise RobotsPolicyError(f"catalog redirect refused at {safe_url} -> {location}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
@@ -640,6 +649,19 @@ class SessionManager:
         只有 unit 頁的 3xx 才賦予「組已 gone」語意；索引頁等其他
         catalog 頁面的轉址維持 fail-closed（RobotsPolicyError）。"""
         return urlsplit(url).path.rstrip("/") == "/en/catalog/genuine/unit"
+
+    @staticmethod
+    def _redirects_to_brand_locate(requested_url: str, location: str) -> bool:
+        """判斷轉址目標是否為品牌索引頁（/en/catalog/genuine/locate）。
+
+        站方以 302 回 /locate 代表「該頁在站端不存在」（實證：
+        vehicle?cid=2 -> locate?c=Toyota&psq=lb），與 unit 過期同語意，
+        屬 terminal not_found 而非可疑轉址。location 允許相對路徑，
+        以 urljoin 對齊請求 URL 後比對。"""
+        if not location:
+            return False
+        target = urlsplit(urljoin(requested_url, location))
+        return target.path.rstrip("/") == "/en/catalog/genuine/locate"
 
     @staticmethod
     def _redirect_keeps_unit(requested_url: str, location: str) -> bool:

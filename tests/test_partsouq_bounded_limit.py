@@ -4968,3 +4968,109 @@ def _clear_mysql_fixture(database: Database) -> None:
     ):
         database._execute(f"DELETE FROM {table}")
     database.commit()
+
+
+@pytest.mark.skipif(
+    os.getenv("UNIFIED_TEST_MYSQL") != "1",
+    reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL full snapshot tests",
+)
+def test_mysql_mark_vehicle_groups_not_found_clears_membership_and_marks() -> None:
+    """vehicle/category 頁被站方 302 回 /locate 時，既有零件組依 404 組
+    語意收斂：membership 清除＋not_found 標記，closure 才有機會閉合。"""
+    if not str(DB_CONFIG["database"]).endswith("_test"):
+        raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
+
+    database = Database().connect()
+    try:
+        _clear_mysql_fixture(database)
+        brands = BrandRepository(database)
+        vehicles = VehicleRepository(database)
+        parts = PartRepository(database)
+        brand_id = brands.upsert_brand("TOYOTA", None)
+        model_id = brands.upsert_model(brand_id, "CAMRY", "MODEL-SSD", None)
+        vehicle_id = vehicles.upsert_vehicle(
+            model_id,
+            {
+                "name": "CAMRY",
+                "model_code": "AXVA70",
+                "prod_period": "01.2018 - 12.2020",
+                "production_from": "2018-01",
+                "production_to": "2020-12",
+                "vid": "SITE-VID-1",
+                "ssd": "VEHICLE-SSD",
+            },
+        )
+        category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
+        other_category_id = vehicles.upsert_category(vehicle_id, "BODY/INTERIOR", "2")
+        group_id = vehicles.upsert_group(
+            category_id,
+            "1101",
+            "PARTIAL ENGINE ASSEMBLY",
+            "10001",
+            "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&cid=1&uid=10001&vid=SITE-VID-1",
+        )
+        other_group_id = vehicles.upsert_group(
+            other_category_id,
+            "1102",
+            "BODY PART",
+            "10002",
+            "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&cid=2&uid=10002&vid=SITE-VID-1",
+        )
+        job_id = database._execute(
+            "INSERT INTO scheduled_job_runs (job_name, trigger_mode, status, started_at) "
+            "VALUES ('catalog', 'daemon', 'running', UTC_TIMESTAMP())"
+        ).lastrowid
+        repository = CrawlRepository(database, "not-found-reconcile")
+        run_id = repository.start_run(
+            "not-found-reconcile",
+            fresh=True,
+            dataset_kind="full",
+            scheduled_job_run_id=job_id,
+        )
+        parts.upsert_parts(group_id, _parts(1), run_id)
+        parts.upsert_parts(other_group_id, _parts(1), run_id)
+        database.commit()
+
+        marked = repository.mark_vehicle_groups_not_found(
+            vehicle_id,
+            run_key=repository.run_key,
+            run_id=run_id,
+            cid="1",
+        )
+        database.commit()
+
+        assert marked == 1
+        assert database._execute(
+            "SELECT fetched_status, fetched_row_count FROM groups_t WHERE id = %s",
+            (group_id,),
+        ).fetchone() == {"fetched_status": "not_found", "fetched_row_count": 0}
+        # 其他分類不受影響
+        assert database._execute(
+            "SELECT fetched_status FROM groups_t WHERE id = %s",
+            (other_group_id,),
+        ).fetchone() == {"fetched_status": None}
+        assert database._execute(
+            "SELECT COUNT(*) AS n FROM parts WHERE group_id = %s AND seen_run_id = %s",
+            (group_id, run_id),
+        ).fetchone() == {"n": 0}
+        assert database._execute(
+            "SELECT COUNT(*) AS n FROM parts WHERE group_id = %s AND seen_run_id = %s",
+            (other_group_id, run_id),
+        ).fetchone() == {"n": 1}
+
+        # 整車層級（不帶 cid）：全部收斂
+        marked_all = repository.mark_vehicle_groups_not_found(
+            vehicle_id,
+            run_key=repository.run_key,
+            run_id=run_id,
+        )
+        database.commit()
+        assert marked_all == 1
+        assert database._execute(
+            "SELECT fetched_status FROM groups_t WHERE id = %s",
+            (other_group_id,),
+        ).fetchone() == {"fetched_status": "not_found"}
+    finally:
+        database.rollback()
+        _clear_mysql_fixture(database)
+        database.close()

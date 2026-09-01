@@ -1082,7 +1082,26 @@ class Crawler:
             ssd=urllib.parse.quote(ssd),
             vid=urllib.parse.quote(base_vid),
         )
-        html, response = self._fetch(vehicle_url)
+        try:
+            html, response = self._fetch(vehicle_url)
+        except NotFoundError:
+            # 站方把此車的 vehicle 頁 302 回品牌索引（與 unit 過期同語意
+            # 的「此頁不存在」）：整台車沒有站端資料，既有零件組依 404
+            # 組語意收斂為 not_found，車輛以空資料完成（terminal），不
+            # 讓 closure 卡死。
+            marked = self.crawl.mark_vehicle_groups_not_found(
+                vehicle_id, run_key=self.crawl.run_key or "", run_id=cast(int, self.run_id)
+            )
+            self.db.commit()
+            if marked:
+                log.warning(
+                    "[%s vehicle=%s] vehicle page absent (redirect to locate); "
+                    "%d group(s) marked not_found",
+                    brand,
+                    vehicle_id,
+                    marked,
+                )
+            return
         soup = _soup(html)
         category_links, malformed_categories, skipped_category_links = parse_category_links(
             html,
@@ -1171,7 +1190,28 @@ class Crawler:
                     category["url"],
                     "/en/catalog/genuine/vehicle",
                 )
-                category_html, category_response = self._fetch(category_url)
+                try:
+                    category_html, category_response = self._fetch(category_url)
+                except NotFoundError:
+                    # 站方把此 vehicle+category 組合 302 回品牌索引（頁面
+                    # 不存在）：該分類 terminal not_found，既有零件組依
+                    # 404 組語意收斂，車輛照常以其餘分類完成。
+                    marked = self.crawl.mark_vehicle_groups_not_found(
+                        vehicle_id,
+                        run_key=self.crawl.run_key or "",
+                        run_id=cast(int, self.run_id),
+                        cid=cast(str, category["cid"]),
+                    )
+                    self.db.commit()
+                    log.warning(
+                        "[%s vehicle=%s cid=%s] category absent (redirect to locate); "
+                        "%d group(s) marked not_found",
+                        brand,
+                        vehicle_id,
+                        category["cid"],
+                        marked,
+                    )
+                    continue
                 category_soup = _soup(category_html)
                 truncated += self.crawl_groups(
                     brand,
@@ -1519,8 +1559,10 @@ class Crawler:
             # 404 = 此 group 在網站端沒有資料（合法狀態）：視為完成，
             # 不讓整台車失敗（實際發生：部分車型的某些 group 頁 404）。
             # F1b：404 也是合法的 terminal state，照樣標記本 run 已抓；
-            # F5：status='not_found'，續爬不再重抓 404 組。
-            if self.evidence_mode and (error.response is None or error.response.status_code != 404):
+            # F5：status='not_found'，續爬不再重抓 404 組。302 回 /locate
+            # 的轉址（站方「此頁不存在」語意）同樣帶 response envelope，
+            # 一體適用；正式模式只要求 envelope 存在。
+            if self.evidence_mode and error.response is None:
                 raise RuntimeError("formal HTTP 404 is missing its response envelope") from error
             if error.response is not None and source_group_key is not None:
                 self._capture_http_diagnostic(

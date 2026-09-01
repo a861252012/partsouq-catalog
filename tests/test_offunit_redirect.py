@@ -111,3 +111,35 @@ def test_non_unit_catalog_3xx_redirect_stays_fail_closed() -> None:
     )
     with pytest.raises(RobotsPolicyError, match="catalog redirect refused"):
         manager.get_response(url)
+
+
+def test_non_unit_redirect_to_locate_is_not_found() -> None:
+    """站方把不存在的 vehicle/category 頁 302 回 /locate（實證 run 44）：
+    與 unit 過期同語意，terminal not_found，不得當成可疑轉址重試。"""
+    url = "https://partsouq.com/en/catalog/genuine/vehicle?c=Toyota&cid=2&vid=0"
+    manager = SessionManager()
+    manager._ensure_catalog_allowed = lambda _u: None
+    manager.session.get = Mock(
+        return_value=_resp(
+            302,
+            {"Location": "/en/catalog/genuine/locate?c=Toyota&psq=lb"},
+            url,
+        )
+    )
+    with pytest.raises(NotFoundError, match="redirected to brand locate"):
+        manager.get_response(url)
+
+
+def test_non_unit_redirect_to_locate_with_absolute_location_is_not_found() -> None:
+    url = "https://partsouq.com/en/catalog/genuine/vehicle?c=Toyota&cid=2&vid=0"
+    manager = SessionManager()
+    manager._ensure_catalog_allowed = lambda _u: None
+    manager.session.get = Mock(
+        return_value=_resp(
+            302,
+            {"Location": "https://partsouq.com/en/catalog/genuine/locate?c=Toyota"},
+            url,
+        )
+    )
+    with pytest.raises(NotFoundError, match="redirected to brand locate"):
+        manager.get_response(url)

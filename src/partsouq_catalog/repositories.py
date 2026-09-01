@@ -1040,6 +1040,52 @@ class CrawlRepository:
                 (run_key, status, row_count, group_id),
             )
 
+    def mark_vehicle_groups_not_found(
+        self,
+        vehicle_id: int,
+        run_key: str,
+        run_id: int,
+        *,
+        cid: str | None = None,
+    ) -> int:
+        """站方對 vehicle/category 頁回 /locate 時，將其零件組收斂為 not_found。
+
+        站方以 302 回品牌索引代表「此頁在站端不存在」，與 group 404 同為
+        terminal 語意。不清標會讓 closure 的 remaining_group_count 永遠
+        清不完、發布閘卡死。與 404 組一致：清除本 run membership（這些
+        零件不再屬於本 run 的 current 集合）並標記 not_found。回傳標記
+        的 group 數。本方法不 commit：交易邊界由服務層決定。
+        """
+        if not run_key:
+            raise ValueError("mark_vehicle_groups_not_found requires a run key")
+        category_filter = "AND category.cid = %s" if cid is not None else ""
+        membership_params: tuple[object, ...]
+        marked_params: tuple[object, ...]
+        if cid is not None:
+            membership_params = (vehicle_id, cid, run_id)
+            marked_params = (run_key, vehicle_id, cid, run_key)
+        else:
+            membership_params = (vehicle_id, run_id)
+            marked_params = (run_key, vehicle_id, run_key)
+        self.db._execute(
+            "UPDATE parts AS part "
+            "JOIN groups_t AS source_group ON source_group.id = part.group_id "
+            "JOIN categories AS category ON category.id = source_group.category_id "
+            "SET part.seen_run_id = NULL "
+            f"WHERE category.vehicle_id = %s {category_filter} AND part.seen_run_id = %s",
+            membership_params,
+        )
+        marked = self.db._execute(
+            "UPDATE groups_t AS source_group "
+            "JOIN categories AS category ON category.id = source_group.category_id "
+            "SET source_group.fetched_run_key = %s, source_group.fetched_status = 'not_found', "
+            "source_group.fetched_row_count = 0 "
+            f"WHERE category.vehicle_id = %s {category_filter} "
+            "AND (source_group.fetched_run_key IS NULL OR source_group.fetched_run_key <> %s)",
+            marked_params,
+        )
+        return marked.rowcount
+
     def record_bounded_group_receipt(
         self,
         run_id: int,

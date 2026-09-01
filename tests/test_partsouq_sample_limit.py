@@ -539,9 +539,8 @@ def test_cli_has_distinct_exit_codes(monkeypatch, tmp_path, status, expected):
     load_cookies.assert_called_once_with()
 
 
-def test_cli_rejects_non_formal_scheduled_catalog_before_database_or_browser(
-    monkeypatch, tmp_path
-) -> None:
+def test_cli_rejects_full_scope_with_leftover_model_scope(monkeypatch, tmp_path) -> None:
+    """正式 full 排程與 model scope 互斥；殘留 bounded 設定必須被拒絕。"""
     database = mock.MagicMock()
     load_cookies = mock.MagicMock(return_value={})
     monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path)
@@ -550,11 +549,35 @@ def test_cli_rejects_non_formal_scheduled_catalog_before_database_or_browser(
     monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 5830)
     monkeypatch.setitem(CRAWL, "limit_parts", 0)
     monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_brand", "TOYOTA")
+    monkeypatch.setitem(CRAWL, "bounded_model", "TACOMA")
     monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
 
     assert run_crawl.main() == 64
     database.assert_not_called()
     load_cookies.assert_not_called()
+
+
+def test_cli_accepts_full_scope_without_model_scope(monkeypatch, tmp_path) -> None:
+    """正式 full 排程（0/0、無 model scope）通過啟動閘，進入資料庫初始化。"""
+    database = mock.MagicMock()
+    load_cookies = mock.MagicMock(return_value={})
+    monkeypatch.setattr(run_crawl, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(run_crawl, "Database", database)
+    monkeypatch.setattr(run_crawl, "load_cookies", load_cookies)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 5830)
+    monkeypatch.setitem(CRAWL, "limit_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_brand", "")
+    monkeypatch.setitem(CRAWL, "bounded_model", "")
+    monkeypatch.setattr("sys.argv", ["partsouq-catalog-crawl", "--workers", "1"])
+
+    try:
+        run_crawl.main()
+    except Exception:  # noqa: BLE001 - mock 之後的初始化本就會失敗
+        pass
+    database.assert_called()
+    load_cookies.assert_called()
 
 
 @pytest.mark.parametrize(

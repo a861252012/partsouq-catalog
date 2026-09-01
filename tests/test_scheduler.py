@@ -48,8 +48,17 @@ def isolate_scheduler_admission(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def catalog_daemon_without_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
-    """讓純退避測試不連線資料庫；recovery 行為由專屬測試覆蓋。"""
+    """讓純退避測試不連線資料庫；recovery 行為由專屬測試覆蓋。
+
+    job lock 一併 mock：本機若同時跑著正式 catalog daemon，真實
+    flock 會被持有，退避測試會拿到 LOCK_BUSY 而非走預期路徑。
+    """
     monkeypatch.setattr(scheduler, "_recover_interrupted_job_runs", lambda _job: False)
+    monkeypatch.setattr(
+        scheduler,
+        "_try_lock",
+        mock.MagicMock(return_value=mock.MagicMock()),
+    )
 
 
 def test_record_start_persists_trigger_mode(monkeypatch) -> None:
