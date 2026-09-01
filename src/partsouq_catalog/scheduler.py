@@ -79,6 +79,16 @@ class ActiveDaemonRun(RuntimeError):
     """The database still contains a recent daemon marker for this family."""
 
 
+def _catalog_schedule_mode() -> str:
+    """catalog 排程模式：bounded（model-aligned 10k）或 full（全量）。"""
+
+    sample_limit = os.getenv("PSQ_LIMIT_PARTS", "0").strip()
+    bounded_target = os.getenv("PSQ_BOUNDED_PARTS", "0").strip()
+    if sample_limit == "0" and bounded_target == "0":
+        return "full"
+    return "bounded"
+
+
 def _catalog_bounded_scope() -> tuple[str, str, int]:
     """回傳本次排程的 model scope 與依執行日凍結的年份下限。"""
 
@@ -1155,10 +1165,24 @@ def _seconds_until_next_run(job: str, interval_seconds: int) -> float:
             if not _audit_catalog_evidence(int(row.get("crawl_run_id") or 0), bounded_target):
                 return 0.0
         elif under_target_cooldown:
+            # bounded 模式收到非「under target」的 failed 結果不在此冷卻，
+            # 直接視為待辦（見下方 crawl_status 檢查）。
             return 0.0
         elif row.get("crawl_status") not in ("success", "bounded_success"):
             # Sample 是隔離測試資料，不能延後正式 catalog 排程。
             return 0.0
+        elif _catalog_schedule_mode() == "full":
+            # 全量正式排程：只有 full run 且證據已封存的成功結果才算完成。
+            # 不在此重跑整份證據重算（百萬頁規模成本過高）；發布當下已
+            # 於 archive 交易內二次整算比對。
+            if (
+                row.get("dataset_kind") != "full"
+                or row.get("evidence_status") != "verified"
+                or not row.get("evidence_manifest_sha256")
+                or not row.get("evidence_dataset_sha256")
+                or row.get("evidence_verified_at") is None
+            ):
+                return 0.0
     age_seconds = row["age_seconds"]
     return max(0.0, interval_seconds - max(0, int(age_seconds)))
 
@@ -1226,7 +1250,8 @@ def run_daemon(
                         recover_stale_nhtsa_daemon_seconds=RECOVERY_MIN_AGE_SECONDS,
                     )
                     runner.check()
-                _sync_catalog_desired_bounded_scope()
+                if _catalog_schedule_mode() == "bounded":
+                    _sync_catalog_desired_bounded_scope()
                 _recover_interrupted_job_runs(job)
             except (
                 MigrationError,
@@ -1252,7 +1277,7 @@ def run_daemon(
         while not stop_event.wait(wait_seconds):
             if needs_schedule_check:
                 try:
-                    if job == "catalog":
+                    if job == "catalog" and _catalog_schedule_mode() == "bounded":
                         _sync_catalog_desired_bounded_scope()
                     wait_seconds = _seconds_until_next_run(job, interval_seconds)
                 except (
@@ -1661,14 +1686,21 @@ def main() -> int:
         try:
             sample_limit = int(os.getenv("PSQ_LIMIT_PARTS", "0"))
             bounded_target = int(os.getenv("PSQ_BOUNDED_PARTS", "0"))
-            _catalog_bounded_scope()
+            if sample_limit == 0 and bounded_target == 0:
+                # 全量正式排程：不得殘留 model scope（full 與 bounded 互斥）
+                brand = os.getenv("PSQ_BOUNDED_BRAND", "").strip()
+                model = os.getenv("PSQ_BOUNDED_MODEL", "").strip()
+                if brand or model:
+                    raise ValueError
+            else:
+                _catalog_bounded_scope()
         except ValueError:
             print("catalog 排程的資料上限或 model scope 無效", file=sys.stderr)
             return 2
-        if sample_limit != 0 or bounded_target != 10_000:
+        if sample_limit != 0 or bounded_target not in (0, 10_000):
             print(
-                "catalog 排程只允許 PSQ_LIMIT_PARTS=0 且 PSQ_BOUNDED_PARTS=10000；"
-                "full/sample 不屬於目前正式驗收範圍",
+                "catalog 排程只允許 bounded（PSQ_LIMIT_PARTS=0 且 "
+                "PSQ_BOUNDED_PARTS=10000）或 full（兩者皆為 0）；sample 不屬於正式驗收範圍",
                 file=sys.stderr,
             )
             return 2

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import os
+from datetime import UTC, datetime
 
 import pytest
 
 from partsouq_catalog.config import DB_CONFIG
 from partsouq_catalog.db import Database
+from partsouq_catalog.evidence import (
+    PARSER_CONTRACT_VERSION,
+    public_source_url,
+    replay_catalog_records,
+    sanitize_parser_html,
+)
 from partsouq_catalog.repositories import (
     BrandRepository,
     CrawlRepository,
@@ -117,6 +125,136 @@ def test_full_candidate_archive_preserves_source_ids_without_formal_mapping() ->
         ).fetchone()
         assert source_part is not None
         part_id = source_part["id"]
+
+        # 正式 full archive 需先封存可重放的 live HTTP 證據；fixture 的
+        # 識別欄位（vehicle／group／part）必須與上述 upsert 一致。
+        vehicle_key = {
+            "brand": "TOYOTA",
+            "model": "CAMRY",
+            "name": "CAMRY",
+            "model_code": "AXVA70",
+            "prod_period": "01.2018 - 12.2020",
+            "production_from": "2018-01",
+            "production_to": "2020-12",
+            "engine": "A25A-FKS",
+            "trim_name": "LE",
+            "vid": "SITE-VID-1",
+        }
+        group_key = {
+            "category": {
+                "vehicle": vehicle_key,
+                "cid": "1",
+                "category_name": "ENGINE/FUEL/TOOL",
+            },
+            "group_code": "1502",
+            "uid": "SITE-UID-1",
+        }
+        unit_url = "https://partsouq.com/en/catalog/genuine/unit?uid=SITE-UID-1"
+        unit_html = (
+            '<input type="hidden" name="uid" value="SITE-UID-1">'
+            "<table><tbody><tr>"
+            '<td><a href="/en/search/all?q=TEST-PART-001">TEST-PART-001</a></td>'
+            "<td>FILTER ASSY, OIL</td><td>15601</td><td></td><td>01</td>"
+            "<td>01.2018 - 12.2019</td>"
+            "</tr></tbody></table>"
+        )
+        pages = (
+            (
+                "genuine",
+                "parse_brands",
+                "https://partsouq.com/en/catalog/genuine",
+                {},
+                '<li><a href="/en/catalog/genuine/locate?c=TOYOTA">TOYOTA</a></li>',
+            ),
+            (
+                "locate",
+                "parse_brand_index",
+                "https://partsouq.com/en/catalog/genuine/locate?c=TOYOTA",
+                {"brand": "TOYOTA"},
+                '<a href="/en/catalog/genuine/pick?c=TOYOTA&model=CAMRY&ssd=token">CAMRY</a>',
+            ),
+            (
+                "pick",
+                "parse_vehicles",
+                "https://partsouq.com/en/catalog/genuine/pick?c=TOYOTA&model=CAMRY",
+                {"brand": "TOYOTA", "model": "CAMRY"},
+                "<table><tr><th class='n_name'>Name</th><th class='__model'>Model</th>"
+                "<th class='__prodPeriod'>Prod Period</th><th class='__engine'>Engine</th>"
+                "<th class='__grade'>Grade</th></tr><tr>"
+                "<td><a href='/en/catalog/genuine/vehicle?c=TOYOTA&ssd=token&vid=SITE-VID-1'>"
+                "CAMRY</a></td><td>AXVA70</td><td>01.2018 - 12.2020</td>"
+                "<td>A25A-FKS</td><td>LE</td></tr></table>",
+            ),
+            (
+                "vehicle",
+                "parse_category_links",
+                "https://partsouq.com/en/catalog/genuine/vehicle?c=TOYOTA&vid=SITE-VID-1",
+                {
+                    "brand": "TOYOTA",
+                    "vehicle_key": vehicle_key,
+                    "expected_vid": "SITE-VID-1",
+                    "source_url": (
+                        "https://partsouq.com/en/catalog/genuine/vehicle?c=TOYOTA&vid=SITE-VID-1"
+                    ),
+                },
+                "<html><body>ENGINE/FUEL/TOOL</body></html>",
+            ),
+            (
+                "category",
+                "parse_groups",
+                ("https://partsouq.com/en/catalog/genuine/vehicle?c=TOYOTA&vid=SITE-VID-1&cid=1"),
+                {
+                    "brand": "TOYOTA",
+                    "vehicle_key": vehicle_key,
+                    "default_cid": "1",
+                    "expected_vid": "SITE-VID-1",
+                },
+                "<a href='/en/catalog/genuine/unit?c=TOYOTA&ssd=token&vid=SITE-VID-1"
+                "&cid=1&uid=SITE-UID-1&q='>1502: OIL FILTER</a>",
+            ),
+            (
+                "unit",
+                "parse_parts",
+                unit_url,
+                {"group_key": group_key},
+                unit_html,
+            ),
+        )
+        for page_type, parser_name, public_url, context, html in pages:
+            sanitized = sanitize_parser_html(html)
+            records, malformed_rows, skipped_rows = replay_catalog_records(
+                sanitized.body,
+                parser_name=parser_name,
+                parser_version=PARSER_CONTRACT_VERSION,
+                context=context,
+            )
+            accepted_records: list[tuple[int, object]] = []
+            if page_type == "unit":
+                assert len(records) == 1
+                accepted_records = [(part_id, records[0])]
+            crawl.record_http_evidence(
+                run_id,
+                scheduled_job_run_id,
+                page_type=page_type,
+                public_url=public_source_url(public_url),
+                raw_body_sha256=hashlib.sha256(html.encode()).hexdigest(),
+                status_code=200,
+                content_type="text/html",
+                fetched_at=datetime.now(UTC).replace(tzinfo=None),
+                elapsed_ms=1,
+                attempt=1,
+                sanitized_body=sanitized,
+                parser_name=parser_name,
+                parser_version=PARSER_CONTRACT_VERSION,
+                parser_context=context,
+                parsed_records=records,
+                replayed_records=records,
+                accepted_records=accepted_records,
+                malformed_rows=malformed_rows,
+                skipped_record_count=skipped_rows,
+            )
+        database.commit()
+        crawl.verify_run_evidence_full(run_id)
         assert crawl.archive_full_candidate_parts(run_id) == 1
         crawl.finish_run(run_id, "success", {"parts": 1})
         database._execute(

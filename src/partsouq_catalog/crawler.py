@@ -274,7 +274,13 @@ class Crawler:
             raise ValueError("SCHEDULED_JOB_RUN_ID must be zero or a positive integer")
         self.sample_mode = bool(sample_limit)
         self.bounded_mode = bool(bounded_limit)
-        self.evidence_mode = bounded_limit == 10_000
+        # 證據語意：正式 bounded（model-aligned 10k）與正式全量（daemon
+        # 派發的 full run）都必須留下可重放的 parser 輸入證據。手動
+        # one-shot 觸發（無 scheduler lineage）不符合 provenance 要求，
+        # 維持不記證據，也不得作為發布來源。
+        self.evidence_mode = bounded_limit == 10_000 or (
+            not sample_limit and not bounded_limit and scheduled_job_run_id > 0
+        )
         self.part_limit = bounded_limit or sample_limit
         self.scope_brand = bounded_brand or None
         self.scope_model = bounded_model or None
@@ -2078,7 +2084,7 @@ class Crawler:
             )
         )
         if self.evidence_mode and self.scheduled_job_run_id is None:
-            raise ValueError("formal 10000-part bounded run requires the daemon scheduler")
+            raise ValueError("formal evidence runs (bounded or full) require the daemon scheduler")
         # explicit key 一律禁止（scheduled 與 direct 皆同）：resume 一律由
         # resumable_bounded_run_key 依相容性檢查挑選；操作者不得繞過
         # exhausted_with_failures／evidence／receipt gate 重開特定 run。
@@ -2511,6 +2517,10 @@ class Crawler:
                     else:
                         log.info("archiving full candidate with 0 quarantined row(s)")
                     finalizing = True
+                    # 與 bounded 相同的三段式：先封存證據，再於同一交易
+                    # 重建 snapshot、寫 terminal status；任一步失敗整筆
+                    # rollback，線上仍讀得到上一份 snapshot。
+                    self.crawl.verify_run_evidence_full(run_id)
                     self.crawl.archive_full_candidate_parts(
                         run_id,
                         expected_scheduled_job_run_id=self.scheduled_job_run_id,

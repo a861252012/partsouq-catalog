@@ -15,11 +15,11 @@
 
 import logging
 import threading
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from typing import Never, Protocol, Self, cast
 
 import pymysql
-from pymysql.cursors import DictCursor
+from pymysql.cursors import DictCursor, SSDictCursor
 
 from .admission import CATALOG_RUNTIME_SHUTDOWN_SECONDS
 from .config import DB_CONFIG
@@ -170,6 +170,39 @@ class Database:
             # DataError / IntegrityError 等一般 SQL 錯誤也可能發生在
             # 多語句 transaction 中。若只把例外往上拋，thread-local
             # connection 會保留前面尚未提交的寫入，下一個工作可能誤提交。
+            self.rollback()
+            raise
+
+    def _stream(self, sql: str, params: SQLParams = None) -> Generator[Row, None, None]:
+        """以 server-side cursor 逐列串流查詢結果。
+
+        全量證據驗收會掃數百萬列 artifact／record／part；fetchall 會把
+        整個結果集載進記憶體，必須改用 SSDictCursor 串流。串流期間該
+        連線被占用，且不可與其他查詢交錯（同一 thread-local 連線），
+        呼叫端必須在產生器收尾前完成所有列的消費。錯誤處理與
+        _execute 相同：死結/斷線一律向上拋，由服務層重跑整個驗收。
+        """
+        try:
+            conn = self._thread_conn()
+            cursor = conn.cursor(SSDictCursor)
+            try:
+                cursor.execute(sql, params)
+                yield from cursor
+            finally:
+                cursor.close()
+        except pymysql.err.OperationalError as e:
+            code = e.args[0] if e.args else None
+            if code in (1213, 1205):
+                log.warning("db contention (%s); rolling back, service layer retries", code)
+                self.rollback()
+                raise
+            if code in (2006, 2013):
+                self._raise_connection_lost(code)
+            self.rollback()
+            raise
+        except pymysql.err.InterfaceError:
+            self._raise_connection_lost("InterfaceError")
+        except pymysql.MySQLError:
             self.rollback()
             raise
 

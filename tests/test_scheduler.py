@@ -28,6 +28,8 @@ class FakeStopEvent:
 
 @pytest.fixture(autouse=True)
 def isolate_scheduler_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "0")
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "10000")
     monkeypatch.setenv("PSQ_BOUNDED_BRAND", "TOYOTA")
     monkeypatch.setenv("PSQ_BOUNDED_MODEL", "TACOMA")
     monkeypatch.setenv("PSQ_VEHICLE_YEAR_WINDOW", "20")
@@ -2690,7 +2692,7 @@ def test_daemon_rejects_non_positive_cli_seconds(option, value, monkeypatch) -> 
 
 @pytest.mark.parametrize(
     ("sample_limit", "bounded_target"),
-    (("1", "0"), ("0", "0"), ("0", "9999"), ("invalid", "10000")),
+    (("1", "0"), ("0", "9999"), ("invalid", "10000")),
 )
 def test_catalog_scheduler_rejects_non_formal_scope_before_dispatch(
     sample_limit: str,
@@ -2711,6 +2713,43 @@ def test_catalog_scheduler_rejects_non_formal_scope_before_dispatch(
     assert scheduler.main() == 2
     dispatch.assert_not_called()
     assert "catalog 排程" in capsys.readouterr().err
+
+
+def test_catalog_scheduler_rejects_full_scope_with_model_scope(monkeypatch, capsys) -> None:
+    """full 排程與 model scope 互斥：殘留 bounded 設定必須被拒絕。"""
+
+    dispatch = mock.MagicMock()
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "0")
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "0")
+    monkeypatch.setattr(scheduler, "dispatch_locked", dispatch)
+    monkeypatch.setattr(
+        scheduler.sys,
+        "argv",
+        ["partsouq-scheduler", "--job", "catalog", "--daemon"],
+    )
+
+    assert scheduler.main() == 2
+    dispatch.assert_not_called()
+    assert "catalog 排程" in capsys.readouterr().err
+
+
+def test_catalog_scheduler_accepts_full_scope_before_dispatch(monkeypatch) -> None:
+    """全量正式排程（0/0，無 model scope）放行。"""
+
+    daemon = mock.MagicMock(return_value=0)
+    monkeypatch.setenv("PSQ_LIMIT_PARTS", "0")
+    monkeypatch.setenv("PSQ_BOUNDED_PARTS", "0")
+    monkeypatch.delenv("PSQ_BOUNDED_BRAND", raising=False)
+    monkeypatch.delenv("PSQ_BOUNDED_MODEL", raising=False)
+    monkeypatch.setattr(scheduler, "run_daemon", daemon)
+    monkeypatch.setattr(
+        scheduler.sys,
+        "argv",
+        ["partsouq-scheduler", "--job", "catalog", "--daemon"],
+    )
+
+    assert scheduler.main() == 0
+    daemon.assert_called_once()
 
 
 @pytest.mark.parametrize(

@@ -225,13 +225,13 @@ def _parts(count: int) -> list[dict]:
     ]
 
 
-def _parts_html(count: int) -> str:
+def _parts_html(count: int, part_name: str | None = None) -> str:
     # 真實 unit 頁會渲染所屬 uid（身分斷言依據）；fixture 同步含
     # uid=10001（與 _group() 一致），模擬 genuine 頁面。
     rows = "".join(
         "<tr>"
         f'<td><a href="/en/search/all?q=P-{index:05d}">P-{index:05d}</a></td>'
-        f"<td>Part {index}</td><td>11000</td><td></td><td>01</td><td></td>"
+        f"<td>{part_name or f'Part {index}'}</td><td>11000</td><td></td><td>01</td><td></td>"
         "</tr>"
         for index in range(count)
     )
@@ -278,6 +278,7 @@ def _record_verified_live_evidence(
     vehicle_engine: str | None = None,
     vehicle_trim_name: str | None = None,
     unit_part_count: int = 10_000,
+    unit_part_name: str | None = None,
     record_group_receipt: bool = True,
 ) -> None:
     vehicle_key = {
@@ -294,7 +295,7 @@ def _record_verified_live_evidence(
         "trim_name": vehicle_trim_name or "",
         "vid": "SITE-VID-1",
     }
-    unit_html = _parts_html(unit_part_count)
+    unit_html = _parts_html(unit_part_count, unit_part_name)
     pages: tuple[tuple[str, str, str, dict[str, object], str], ...] = (
         (
             "genuine",
@@ -386,7 +387,6 @@ def _record_verified_live_evidence(
                 "SELECT id FROM parts WHERE seen_run_id = %s ORDER BY part_number",
                 (run_id,),
             ).fetchall()
-            assert len(part_rows) == 10_000
             assert len(records) == unit_part_count
             accepted_records = [
                 (int(row["id"]), record) for row, record in zip(part_rows, records, strict=False)
@@ -1734,7 +1734,7 @@ def test_formal_bounded_run_requires_scheduler_before_db_writes(monkeypatch, run
     try:
         with pytest.raises(
             ValueError,
-            match="formal 10000-part bounded run requires the daemon scheduler",
+            match=r"formal evidence runs \(bounded or full\) require the daemon scheduler",
         ):
             instance.run()
     finally:
@@ -3372,7 +3372,7 @@ def test_mysql_bounded_publish_is_atomic_and_does_not_touch_full_snapshot() -> N
     os.getenv("UNIFIED_TEST_MYSQL") != "1",
     reason="set UNIFIED_TEST_MYSQL=1 to run shared MySQL full snapshot tests",
 )
-def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_formal() -> None:
+def test_mysql_full_candidate_archive_requires_verified_evidence() -> None:
     if not str(DB_CONFIG["database"]).endswith("_test"):
         raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
 
@@ -3394,6 +3394,8 @@ def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_forma
                 "production_to": "2020-12",
                 "vid": "SITE-VID-1",
                 "ssd": "VEHICLE-SSD",
+                "engine": "",
+                "grade": "",
             },
         )
         category_id = vehicles.upsert_category(vehicle_id, "ENGINE/FUEL/TOOL", "1")
@@ -3402,7 +3404,7 @@ def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_forma
             "1101",
             "PARTIAL ENGINE ASSEMBLY",
             "10001",
-            "https://partsouq.com/en/catalog/genuine/unit?uid=10001",
+            "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&cid=1&uid=10001&vid=SITE-VID-1",
         )
 
         unscheduled = CrawlRepository(database, "full-publish-unscheduled")
@@ -3484,6 +3486,19 @@ def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_forma
             status="done",
             row_count=1,
         )
+        # 正式 full snapshot 必須先封存可重放的 live HTTP 證據。
+        _record_verified_live_evidence(
+            database,
+            first,
+            run_id=first_run_id,
+            scheduled_job_run_id=scheduled_job_run_id,
+            record_group_receipt=False,
+            verify=False,
+            unit_part_count=1,
+        )
+        # 證據必須先 commit：驗收的 body 副連線讀不到未提交寫入。
+        database.commit()
+        first.verify_run_evidence_full(first_run_id)
         with pytest.raises(RuntimeError, match="scheduler owner changed"):
             first.archive_full_candidate_parts(
                 first_run_id,
@@ -3581,7 +3596,10 @@ def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_forma
 
         database._execute(
             "UPDATE groups_t SET url = %s WHERE id = %s",
-            ("https://partsouq.com/en/catalog/genuine/unit?uid=10001", group_id),
+            (
+                "https://partsouq.com/en/catalog/genuine/unit?c=TOYOTA&cid=1&uid=10001&vid=SITE-VID-1",
+                group_id,
+            ),
         )
         database._execute(
             "UPDATE parts SET part_from = NULL, part_to = '2017-12' WHERE seen_run_id = %s",
@@ -3626,6 +3644,19 @@ def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_forma
             status="done",
             row_count=1,
         )
+        _record_verified_live_evidence(
+            database,
+            failed_replacement,
+            run_id=failed_replacement_run_id,
+            scheduled_job_run_id=failed_replacement_job_id,
+            record_group_receipt=False,
+            verify=False,
+            unit_part_count=1,
+            unit_part_name="FAILED REPLACEMENT",
+        )
+        # 證據必須先 commit：驗收的 body 副連線讀不到未提交寫入。
+        database.commit()
+        failed_replacement.verify_run_evidence_full(failed_replacement_run_id)
         assert failed_replacement.archive_full_candidate_parts(failed_replacement_run_id) == 1
         failed_replacement.finish_run(
             failed_replacement_run_id,
@@ -3678,6 +3709,19 @@ def test_mysql_full_candidate_archive_rejects_invalid_source_and_stays_non_forma
             status="done",
             row_count=1,
         )
+        _record_verified_live_evidence(
+            database,
+            resumed,
+            run_id=resumed_run_id,
+            scheduled_job_run_id=resumed_job_id,
+            record_group_receipt=False,
+            verify=False,
+            unit_part_count=1,
+            unit_part_name="RESUMED SNAPSHOT",
+        )
+        # 證據必須先 commit：驗收的 body 副連線讀不到未提交寫入。
+        database.commit()
+        resumed.verify_run_evidence_full(resumed_run_id)
         assert resumed.archive_full_candidate_parts(resumed_run_id) == 1
         resumed.finish_run(resumed_run_id, "success", {"parts": 999})
         database.commit()

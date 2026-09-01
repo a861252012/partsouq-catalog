@@ -2011,3 +2011,304 @@ def test_evidence_cli_rejects_non_production_database_before_connect(monkeypatch
         "error": "formal evidence audit requires database partsouq_catalog",
     }
     database_factory.assert_not_called()
+
+
+class _BodyCursor:
+    def __init__(self, bodies_by_sha: dict[str, dict[str, object]]) -> None:
+        self._bodies = bodies_by_sha
+        self._row: dict[str, object] | None = None
+
+    def execute(self, _sql: str, params: object) -> None:
+        sha = params[0] if isinstance(params, tuple) else list(params)[0]  # type: ignore[index]
+        self._row = self._bodies.get(str(sha))
+
+    def fetchone(self) -> dict[str, object] | None:
+        return self._row
+
+    def __enter__(self) -> _BodyCursor:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        pass
+
+
+class _BodyConnection:
+    def __init__(self, bodies_by_sha: dict[str, dict[str, object]]) -> None:
+        self._bodies = bodies_by_sha
+        self.closed = False
+
+    def cursor(self) -> _BodyCursor:
+        return _BodyCursor(self._bodies)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _full_stream_fixture():
+    """以 bounded 驗收 fixture 的同一份資料，組出全量串流版輸入。
+
+    回傳（fixture、artifact 列、artifact×record 串流列、part 對帳列、
+    body 依 sha 索引）。串流列的 record 欄位與 bounded fixture 的
+    record_rows 一致，以便對同一份資料比較兩版實作的雜湊。
+    """
+    fixture = _repository_verification_fixture()
+    artifact = dict(fixture["artifacts"][0])
+    artifact["artifact_id"] = artifact.pop("id")
+    artifact["artifact_scheduler_id"] = artifact.pop("scheduled_job_run_id")
+    record_fields = ("record_type", "natural_key_sha256", "parent_natural_key_sha256")
+    stream_rows = [
+        {
+            **artifact,
+            **{name: row[name] for name in record_fields},
+            "record_sha256": row["record_sha256"],
+            "accepted": row["accepted"],
+            "part_id": row["part_id"],
+        }
+        for row in fixture["record_rows"]
+    ]
+    part_source = fixture["source_rows"][0]
+    part_row = {key: value for key, value in part_source.items() if key != "evidence_record_sha256"}
+    part_row["part_id"] = part_row.pop("id")
+    part_row["accepted_key"] = fixture["records"][-1].natural_key_sha256
+    part_row["accepted_parent"] = fixture["records"][-1].parent_natural_key_sha256
+    part_row["accepted_sha"] = fixture["records"][-1].record_sha256
+    part_row["accepted_url"] = artifact["public_source_url"]
+    bodies_by_sha = {fixture["bodies"][0]["body_sha256"]: fixture["bodies"][0]}
+    return fixture, artifact, stream_rows, part_row, bodies_by_sha
+
+
+def _full_repository(fixture, stream_rows, part_rows, bodies_by_sha):
+    """把串流版輸入掛上 fixture 的 mock database。
+
+    _execute 先處理全量版查詢（incomplete 計數、storage 用量），其餘
+    委派回 bounded fixture 原本的 dispatcher，讓同一個 mock 同時支援
+    兩版實作。
+    """
+    database = fixture["repository"].db
+    original_execute = database._execute.side_effect
+
+    def stream(sql, _params=None):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT artifact.id AS artifact_id"):
+            return (row for row in stream_rows)
+        if normalized.startswith("SELECT part.id AS part_id"):
+            return (row for row in part_rows)
+        raise AssertionError(f"unexpected evidence stream: {normalized}")
+
+    database._stream.side_effect = stream
+
+    def execute(sql, _params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts"):
+            cursor = mock.MagicMock()
+            cursor.fetchone.return_value = {"row_count": 0}
+            return cursor
+        if normalized.startswith("SELECT (SELECT COUNT(*) FROM partsouq_http_artifacts"):
+            cursor = mock.MagicMock()
+            cursor.fetchone.return_value = {
+                "artifact_count": 1,
+                "original_bytes": bodies_by_sha[next(iter(bodies_by_sha))]["original_bytes"],
+            }
+            return cursor
+        if original_execute is not None:
+            return original_execute(sql, _params)
+        raise AssertionError(f"unexpected evidence query: {normalized}")
+
+    database._execute.side_effect = execute
+    repository = fixture["repository"]
+    repository._open_evidence_body_connection = (  # type: ignore[method-assign]
+        lambda: _BodyConnection(bodies_by_sha)
+    )
+    return repository
+
+
+def _replay_returns(records):
+    """全量驗收的 replay 對帳在 fixture 中以固定輸出替代真實解析。"""
+
+    return mock.patch(
+        "partsouq_catalog.repositories.replay_catalog_records",
+        side_effect=lambda *_args, **_kwargs: (list(records), 0, 0),
+    )
+
+
+def test_full_evidence_calculation_matches_bounded_manifest_and_dataset() -> None:
+    """同一份資料：全量串流版必須與 bounded 版算出相同的雜湊。"""
+
+    fixture, _artifact, stream_rows, part_row, bodies_by_sha = _full_stream_fixture()
+    repository = _full_repository(fixture, stream_rows, [part_row], bodies_by_sha)
+
+    with _replay_returns(fixture["records"]):
+        bounded = repository._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+        )
+        full = repository._calculate_run_evidence_full(
+            17,
+            23,
+            fixture["run_started_at"],
+        )
+    assert full.manifest_sha256 == bounded.manifest_sha256
+    assert full.dataset_sha256 == bounded.dataset_sha256
+    assert full.artifact_count == bounded.artifact_count == 1
+    assert full.accepted_record_count == bounded.accepted_record_count == 1
+    assert full.original_bytes == bounded.original_bytes
+    assert full.stored_bytes == bounded.stored_bytes
+
+
+def test_verify_run_evidence_full_seals_the_full_run() -> None:
+    fixture, _artifact, stream_rows, part_row, bodies_by_sha = _full_stream_fixture()
+    repository = _full_repository(fixture, stream_rows, [part_row], bodies_by_sha)
+    run = {
+        "started_at": fixture["run_started_at"],
+        "status": "running",
+        "dataset_kind": "full",
+        "target_parts": None,
+        "scheduled_job_run_id": 23,
+        "scheduled_job_name": "catalog",
+        "scheduled_trigger_mode": "daemon",
+        "scheduled_job_status": "running",
+        "scheduled_crawl_count": 1,
+    }
+
+    with _replay_returns(fixture["records"]):
+        bounded = repository._calculate_run_evidence(
+            17,
+            23,
+            fixture["run_started_at"],
+            1,
+        )
+
+    database = fixture["repository"].db
+
+    def execute(sql, _params=()):
+        normalized = " ".join(sql.split())
+        cursor = mock.MagicMock()
+        if normalized.startswith("SELECT cr.started_at, cr.status, cr.dataset_kind"):
+            cursor.fetchone.return_value = run
+        elif normalized.startswith("SELECT COUNT(*) AS row_count FROM partsouq_http_artifacts"):
+            cursor.fetchone.return_value = {"row_count": 0}
+        elif normalized.startswith("SELECT (SELECT COUNT(*) FROM partsouq_http_artifacts"):
+            cursor.fetchone.return_value = {
+                "artifact_count": 1,
+                "original_bytes": bodies_by_sha[next(iter(bodies_by_sha))]["original_bytes"],
+            }
+        elif normalized.startswith("UPDATE crawl_runs SET evidence_status"):
+            cursor.rowcount = 1
+        else:
+            raise AssertionError(f"unexpected evidence query: {normalized}")
+        return cursor
+
+    database._execute.side_effect = execute
+
+    with _replay_returns(fixture["records"]):
+        manifest_sha, dataset_sha = repository.verify_run_evidence_full(17)
+
+    assert manifest_sha == bounded.manifest_sha256
+    assert dataset_sha == bounded.dataset_sha256
+    update_call = database._execute.call_args_list[-1]
+    assert "evidence_status = 'verified'" in " ".join(update_call.args[0].split())
+    assert update_call.args[1][-1] == 17
+
+
+def test_full_evidence_rejects_part_without_accepted_evidence() -> None:
+    fixture, _artifact, stream_rows, part_row, bodies_by_sha = _full_stream_fixture()
+    part_row["accepted_key"] = None
+    part_row["accepted_parent"] = None
+    part_row["accepted_sha"] = None
+    part_row["accepted_url"] = None
+    repository = _full_repository(fixture, stream_rows, [part_row], bodies_by_sha)
+
+    with (
+        _replay_returns(fixture["records"]),
+        pytest.raises(RuntimeError, match="no accepted part evidence"),
+    ):
+        repository._calculate_run_evidence_full(
+            17,
+            23,
+            fixture["run_started_at"],
+        )
+
+
+def test_full_evidence_rejects_broken_parent_chain() -> None:
+    fixture, _artifact, stream_rows, part_row, bodies_by_sha = _full_stream_fixture()
+    repository = _full_repository(fixture, stream_rows, [part_row], bodies_by_sha)
+    # 竄改 model record 的父鏈：replay 輸出同步竄改以通過逐頁對帳，
+    # 但 parent 檢查必須在串流後 fail closed。
+    corrupted_parent = "f" * 64
+    corrupted_records = [
+        replace(record, parent_natural_key_sha256=corrupted_parent)
+        if record.record_type == "model"
+        else record
+        for record in fixture["records"]
+    ]
+    corrupted_rows = [
+        {**row, "parent_natural_key_sha256": corrupted_parent}
+        if row["record_type"] == "model"
+        else row
+        for row in stream_rows
+    ]
+    # artifact 上的集合雜湊同步竄改，讓失敗落在 parent 檢查而非逐頁對帳。
+    corrupted_parsed_sha = _record_set_sha256(corrupted_records)
+    corrupted_rows = [
+        {**row, "parsed_records_sha256": corrupted_parsed_sha} for row in corrupted_rows
+    ]
+
+    def stream(sql, _params=None):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT artifact.id AS artifact_id"):
+            return (row for row in corrupted_rows)
+        if normalized.startswith("SELECT part.id AS part_id"):
+            return (row for row in [part_row])
+        raise AssertionError(f"unexpected evidence stream: {normalized}")
+
+    repository.db._stream.side_effect = stream
+
+    with (
+        _replay_returns(corrupted_records),
+        pytest.raises(RuntimeError, match="broken evidence chain"),
+    ):
+        repository._calculate_run_evidence_full(
+            17,
+            23,
+            fixture["run_started_at"],
+        )
+
+
+def test_full_evidence_rejects_empty_dataset() -> None:
+    fixture, _artifact, stream_rows, _part_row, bodies_by_sha = _full_stream_fixture()
+    repository = _full_repository(fixture, stream_rows, [], bodies_by_sha)
+
+    with (
+        _replay_returns(fixture["records"]),
+        pytest.raises(RuntimeError, match="empty full candidate dataset"),
+    ):
+        repository._calculate_run_evidence_full(
+            17,
+            23,
+            fixture["run_started_at"],
+        )
+
+
+def test_verify_run_evidence_full_rejects_bounded_run() -> None:
+    database = mock.MagicMock()
+    run = {
+        "started_at": datetime.now(UTC).replace(tzinfo=None),
+        "status": "running",
+        "dataset_kind": "bounded",
+        "target_parts": 10_000,
+        "scheduled_job_run_id": 23,
+        "scheduled_job_name": "catalog",
+        "scheduled_trigger_mode": "daemon",
+        "scheduled_job_status": "running",
+        "scheduled_crawl_count": 1,
+    }
+    cursor = mock.MagicMock()
+    cursor.fetchone.return_value = run
+    database._execute.return_value = cursor
+    repository = CrawlRepository(database, "full-verify-test")
+
+    with pytest.raises(RuntimeError, match="not an active formal full crawl"):
+        repository.verify_run_evidence_full(17)
+    database._execute.assert_called_once()
