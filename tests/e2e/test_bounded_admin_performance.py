@@ -441,7 +441,7 @@ def test_admin_schema_repairs_published_snapshot_foreign_key_contract(
         connection.close()
 
 
-def test_fresh_admin_schema_current_view_is_verified_bounded_only(
+def test_fresh_admin_schema_current_view_switches_bounded_and_qualified_full(
     performance_database: PerformanceDatabase,
 ) -> None:
     _apply_sql_paths(performance_database, FRESH_SCHEMA_PATHS[1:3])
@@ -455,16 +455,21 @@ def test_fresh_admin_schema_current_view_is_verified_bounded_only(
     finally:
         connection.close()
 
+    # 039 之後 current view 以 full_ready 切換：bounded 分支沿用既有
+    # 收據閘，full 分支只在合格 archive 出現時接管。
     assert "bounded_parts" in view_sql
     assert "receipt_integrity" in view_sql
     assert "verified_bounded_group_receipts" in view_sql
     assert "v_current_catalog_parts_evidence_base" in view_sql
+    assert "full_ready" in view_sql
+    assert "full_snapshot" in view_sql
+    assert "published_parts" in view_sql
+    # 016 的舊 full 分支名稱不得殘留；bounded 的 evidence 語意不變。
+    assert "formal_full_parts" not in view_sql
     assert "verified_bounded_evidence" in evidence_base_view_sql
     assert "verified_bounded_records" in evidence_base_view_sql
     assert "evidence_record_sha256" in evidence_base_view_sql
     assert "catalog_desired_bounded_scope" in evidence_base_view_sql
-    assert "formal_full_parts" not in view_sql
-    assert "published_parts" not in view_sql
 
 
 @pytest.fixture

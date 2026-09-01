@@ -672,7 +672,7 @@ def test_migration_028_upgrades_sparse_fitments_from_027_and_is_repeatable(
             )
             cursor.execute("CREATE OR REPLACE VIEW v_vin_part_fitments AS " + legacy_definition)
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (28,29,30,31,32,33,34,35,36,37,38,39)"
             )
             cursor.execute(
                 "SELECT MAX(version) AS latest_version FROM catalog_schema_ledger "
@@ -685,7 +685,7 @@ def test_migration_028_upgrades_sparse_fitments_from_027_and_is_repeatable(
             )
             assert cursor.fetchone() == {"row_count": 0}
 
-        assert runner.apply() == (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -729,9 +729,9 @@ def test_migration_028_upgrades_sparse_fitments_from_027_and_is_repeatable(
             assert cursor.fetchone() == {"row_count": 0}
 
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (28,29,30,31,32,33,34,35,36,37,38,39)"
             )
-        assert runner.apply() == (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -905,10 +905,10 @@ def test_migration_029_adds_repeatable_model_scope_contract(
                 "DROP COLUMN scope_model, DROP COLUMN scope_brand"
             )
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (29,30,31,32,33,34,35,36,37,38,39)"
             )
 
-        assert runner.apply() == (29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
 
         with connection.cursor() as cursor:
@@ -979,10 +979,10 @@ def test_migration_029_adds_repeatable_model_scope_contract(
                 "CHECK (scope_brand IS NULL OR scope_brand IS NOT NULL)"
             )
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (29,30,31,32,33,34,35,36,37,38,39)"
             )
 
-        assert runner.apply() == (29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
         with connection.cursor() as cursor:
             with pytest.raises(pymysql.MySQLError) as error:
@@ -1021,7 +1021,7 @@ def test_migration_032_backfills_only_unchanged_unique_snapshot_evidence(
             cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_parts_update")
             cursor.execute("ALTER TABLE bounded_parts DROP COLUMN evidence_record_sha256")
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35,36,37,38,39)"
             )
             cursor.execute(
                 "INSERT INTO brands(name,code,url) VALUES "
@@ -1132,7 +1132,7 @@ def test_migration_032_backfills_only_unchanged_unique_snapshot_evidence(
                 (first_artifact_id, crawl_run_id, "1" * 64, "2" * 64, "3" * 64, part_id),
             )
 
-        assert runner.apply() == (32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1180,10 +1180,10 @@ def test_migration_032_backfills_only_unchanged_unique_snapshot_evidence(
                 (part_id,),
             )
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35,36,37,38,39)"
             )
 
-        assert runner.apply() == (32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (32, 33, 34, 35, 36, 37, 38, 39)
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT evidence_record_sha256 FROM bounded_parts WHERE part_id=%s",
@@ -1236,10 +1236,10 @@ def test_migration_032_backfills_only_unchanged_unique_snapshot_evidence(
             )
             cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_parts_update")
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (32,33,34,35,36,37,38,39)"
             )
 
-        assert runner.apply() == (32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (32, 33, 34, 35, 36, 37, 38, 39)
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT evidence_record_sha256 FROM bounded_parts WHERE part_id=%s",
@@ -1261,9 +1261,9 @@ def test_migration_032_backfills_only_unchanged_unique_snapshot_evidence(
                 "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
                 "'bounded_parts snapshot is immutable; publish a replacement snapshot'"
             )
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (35,36,37,38)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (35,36,37,38,39)")
 
-        assert runner.apply() == (35, 36, 37, 38)
+        assert runner.apply() == (35, 36, 37, 38, 39)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1321,9 +1321,9 @@ def test_migration_036_upgrades_legacy_current_view_and_preserves_receipt_gate(
             cursor.execute("DROP TRIGGER IF EXISTS prevent_bounded_group_receipt_delete")
             cursor.execute("DROP TABLE bounded_group_receipts")
             cursor.execute("ALTER TABLE bounded_parts DROP INDEX idx_bounded_run_group")
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (36,37,38)")
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (36,37,38,39)")
 
-        assert runner.apply() == (36, 37, 38)
+        assert runner.apply() == (36, 37, 38, 39)
         runner.check()
         assert runner.apply() == ()
 
@@ -1427,8 +1427,8 @@ def test_migration_036_upgrades_legacy_current_view_and_preserves_receipt_gate(
             runner.check()
 
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (36,37,38)")
-        assert runner.apply() == (36, 37, 38)
+            cursor.execute("DELETE FROM catalog_schema_ledger WHERE version IN (36,37,38,39)")
+        assert runner.apply() == (36, 37, 38, 39)
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute("SET FOREIGN_KEY_CHECKS=0")
@@ -1683,7 +1683,7 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
             cursor.execute(f"CREATE PROCEDURE {exact_name}() SELECT 1")
             cursor.execute(f"CREATE PROCEDURE {near_name}() SELECT 1")
@@ -1710,6 +1710,7 @@ def test_forward_cleanup_drops_only_exact_superseded_routines(
             36,
             37,
             38,
+            39,
         )
         runner.check()
 
@@ -1738,7 +1739,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_verified_evidence")
             cursor.execute("ALTER TABLE crawl_runs DROP CHECK chk_crawl_run_evidence_status")
@@ -1940,6 +1941,7 @@ def test_migration_022_rebuilds_index_and_rejects_only_invalid_bounded_runs(
             36,
             37,
             38,
+            39,
         )
         runner.check()
         assert runner.apply() == ()
@@ -2117,7 +2119,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             )
             cursor.execute("ALTER TABLE partsouq_http_artifacts DROP COLUMN sanitizer_version")
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
 
         assert runner.apply() == (
@@ -2140,6 +2142,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             36,
             37,
             38,
+            39,
         )
         runner.check()
 
@@ -2203,7 +2206,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
                 ("partsouq-html-public-v1", crawl_run_id),
             )
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
             cursor.execute(
                 "INSERT INTO catalog_schema_ledger "
@@ -2238,6 +2241,7 @@ def test_migration_020_backfills_and_rejects_legacy_verified_artifact(
             36,
             37,
             38,
+            39,
         )
         runner.check()
 
@@ -2358,9 +2362,27 @@ def test_migration_023_creates_http_diagnostics_from_missing_table(
         with connection.cursor() as cursor:
             cursor.execute("DROP TABLE partsouq_http_diagnostics")
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
-        assert runner.apply() == (23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+        )
         runner.check()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -2410,7 +2432,7 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
                 "ALTER TABLE partsouq_http_diagnostics MODIFY COLUMN content_type TEXT NOT NULL"
             )
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
         with pytest.raises(MigrationError, match="migration:023 failed"):
             runner.apply()
@@ -2438,6 +2460,7 @@ def test_migration_023_exact_postflight_marks_dirty_before_finish_and_can_retry(
             36,
             37,
             38,
+            39,
         )
         runner.check()
         with connection.cursor() as cursor:
@@ -2461,14 +2484,14 @@ def test_migration_024_upgrades_legacy_nhtsa_schema_and_is_repeatable(
         with connection.cursor() as cursor:
             _downgrade_nhtsa_024_schema(cursor)
 
-        assert runner.apply() == (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
 
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM catalog_schema_ledger WHERE version IN (24,25,26,27,28,29,30,31,32,33,34,35,36,37,38)"
+                "DELETE FROM catalog_schema_ledger WHERE version IN (24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)"
             )
-        assert runner.apply() == (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38)
+        assert runner.apply() == (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
         runner.check()
     finally:
         connection.close()
