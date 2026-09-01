@@ -47,7 +47,7 @@ def test_ci_has_python_312_quality_unit_mysql_and_browser_gates() -> None:
     assert "upload-artifact" not in workflow
     assert "uv run --locked mypy" in quality_job
     assert "--allow-message" in unit_job
-    assert "--expected-count 272" in unit_job
+    assert "--expected-count 311" in unit_job
     assert "-W error" in unit_job
     assert "mysql:8.4.11@sha256:" in e2e_job
     assert 'MYSQL_ROOT_HOST: "%"' in e2e_job
@@ -57,7 +57,7 @@ def test_ci_has_python_312_quality_unit_mysql_and_browser_gates() -> None:
     assert 'STATION_ADMIN_E2E: "1"' in e2e_job
     assert "-W error" in e2e_job
     assert "playwright install --with-deps chromium" in e2e_job
-    assert "--expected-count 56" in e2e_job
+    assert "--expected-count 72" in e2e_job
     assert (
         "uv run --locked python scripts/ci_assert_pytest_skips.py "
         "artifacts/mysql-browser-e2e.xml" in e2e_job

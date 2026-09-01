@@ -70,11 +70,12 @@ jobs:
       - name: Reject undocumented skips
         run: |
           uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/unit.xml \
-            --expected-count 272 \
+            --expected-count 311 \
             --allow-message "set NHTSA_TEST_MYSQL=1 to run MySQL integration tests" \
             --allow-message "set STATION_ADMIN_E2E=1 to run the station-admin browser E2E gate" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL bounded tests" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL catalog tests" \
+            --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL runtime-lock tests" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL full snapshot tests" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL mapping tests" \
             --allow-message "set UNIFIED_TEST_MYSQL=1 to run shared MySQL quarantine plan tests" \
@@ -148,5 +149,5 @@ jobs:
       - name: Reject undocumented skips
         run: |
           uv run --locked python scripts/ci_assert_pytest_skips.py artifacts/mysql-browser-e2e.xml \
-            --expected-count 56 \
+            --expected-count 72 \
             --allow-message "requires macOS zsh, plutil, and LaunchAgent filesystem semantics"
