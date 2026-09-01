@@ -125,3 +125,17 @@
   真實 flock。fixture 統一 mock。
 - 現況：crawl_run 44 走到 Lexus，15,931 組 done、256,476 parts current、
   18,644 artifacts、零 challenge。
+
+## migration 039：正式 snapshot 切換全量（commit ae02182）
+
+- 新增切換閘 `full_ready`：published_parts 全部來自同一個 full run（success、
+  證據已封存、catalog daemon completed exit=0、單一 linked crawl）時 current
+  view 改讀全量；任一條件不成立維持 bounded 10k。兩分支互斥不並存。
+- 踩坑三件：CTE body 不能巢狀 WITH（全部攤平頂層）；CTE 引用須先定義後使用
+  （full_snapshot 移到 chosen 前）；full_snapshot 的 ON 殘留 full_ready 的
+  `published` 別名（1054 一小時才抓到）。
+- 契約同步：CATALOG_MANIFEST sha、runner ledger 清單與 apply 期望延伸到 39、
+  敘述句 1 筆（總和 726）、fresh schema 視圖測試改釘切換語意。
+- 正式庫已手動套用（view 已切換語意、bounded 10k 照常輸出）；ledger 補記
+  需等 crawl_run 44 結束（runner 拒絕 running writer），屆時 apply 為冪等。
+- 測試庫 ledger 已到 39。
