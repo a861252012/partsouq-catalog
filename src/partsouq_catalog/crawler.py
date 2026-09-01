@@ -1797,17 +1797,23 @@ class Crawler:
                     )
                     if artifact_id is None:
                         raise RuntimeError("formal part evidence did not produce an artifact")
-                    self.crawl.record_bounded_group_receipt(
-                        self.run_id,
-                        group_id,
-                        artifact_id,
-                        status=(
-                            "done" if len(eligible_parts) == len(parsed_source_parts) else "partial"
-                        ),
-                        parsed_part_count=len(parsed_source_parts),
-                        accepted_part_count=len(eligible_parts),
-                        skipped_record_count=skipped_nameless,
-                    )
+                    # bounded 收據只服務 bounded snapshot 的發布稽核；full
+                    # run 的覆蓋性由 verify_run_evidence_full 的 part 對帳
+                    # 保證，寫這張收據反而會被它的 bounded 驗證拒絕。
+                    if self.bounded_mode:
+                        self.crawl.record_bounded_group_receipt(
+                            self.run_id,
+                            group_id,
+                            artifact_id,
+                            status=(
+                                "done"
+                                if len(eligible_parts) == len(parsed_source_parts)
+                                else "partial"
+                            ),
+                            parsed_part_count=len(parsed_source_parts),
+                            accepted_part_count=len(eligible_parts),
+                            skipped_record_count=skipped_nameless,
+                        )
                 if skipped_nameless:
                     self.parts.quarantine_parts(group_id, run_key, skipped_rows)
                 if quality_rejected:
@@ -1888,15 +1894,17 @@ class Crawler:
                     )
                     if artifact_id is None:
                         raise RuntimeError("formal part evidence did not produce an artifact")
-                    self.crawl.record_bounded_group_receipt(
-                        self.run_id,
-                        group_id,
-                        artifact_id,
-                        status=receipt_status,
-                        parsed_part_count=len(parsed_source_parts),
-                        accepted_part_count=len(parts),
-                        skipped_record_count=skipped_nameless,
-                    )
+                    # 同前：bounded 收據僅 bounded 模式寫入。
+                    if self.bounded_mode:
+                        self.crawl.record_bounded_group_receipt(
+                            self.run_id,
+                            group_id,
+                            artifact_id,
+                            status=receipt_status,
+                            parsed_part_count=len(parsed_source_parts),
+                            accepted_part_count=len(parts),
+                            skipped_record_count=skipped_nameless,
+                        )
                 if quality_rejected:
                     self.parts.quarantine_parts(
                         group_id,

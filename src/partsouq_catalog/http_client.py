@@ -417,8 +417,9 @@ class SessionManager:
                             _response_envelope(r, url, text, attempt),
                         )
                     # 其他 catalog 頁面（索引等）的轉址維持 fail-closed：
-                    # 不跟隨、不猜測語意。
-                    raise RobotsPolicyError(f"catalog redirect refused at {safe_url}")
+                    # 不跟隨、不猜測語意。錯誤訊息附上 Location 供運維
+                    # 判讀站方正規化行為。
+                    raise RobotsPolicyError(f"catalog redirect refused at {safe_url} -> {location}")
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
                     last_err = requests.RequestException(f"http {r.status_code} at {safe_url}")
