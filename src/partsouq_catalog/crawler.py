@@ -90,6 +90,14 @@ class SampleLimitReached(Exception):
     """代表筆數受限 run 已達零件上限；不是網站或解析錯誤。"""
 
 
+class UnitIdentityMismatch(RuntimeError):
+    """站方在 unit 連結上服務了不同 uid 的內容（uid 回收／重指派）。
+
+    身分斷言失敗：站方自己的連結列 uid=X，抓回的頁面卻自稱 uid=Y。
+    這是站端資料異常，重試大概率不會好；呼叫端應依 404 組語意把該組
+    收斂為 not_found（下個月 run_key 會自動重訪），不得整台車失敗。"""
+
+
 def _canonical_catalog_request_url(raw_url: object, expected_path: str) -> str:
     """把 parser 接受的站內網址統一成正式 HTTPS request URL。"""
 
@@ -586,7 +594,7 @@ class Crawler:
             )
             if all(hidden_values.get(key) == value for key, value in required_context.items()):
                 return
-        raise RuntimeError(
+        raise UnitIdentityMismatch(
             f"[group={group.get('group_code')}] fetched page does not identify expected "
             f"unit uid={expected_uid!r}; refusing receipt (wrong content at same URL?)"
         )
@@ -1262,6 +1270,52 @@ class Crawler:
                 for category_id in category_ids.values():
                     self._group_identities.pop(category_id, None)
 
+    @staticmethod
+    def _group_map_key(group: ParsedRecord) -> tuple[str, str, str]:
+        """receipt map 鍵：(cid, code, uid)。同分類同 code 仍可能有多個
+        變體 unit，省略 uid 會讓後一個變體被誤判為已完成。"""
+        return (
+            str(group.get("cid") or ""),
+            group.get("group_code") or "",
+            group.get("uid") or "",
+        )
+
+    def _resolve_group_id(
+        self,
+        vehicle_id: int,
+        group: ParsedRecord,
+        category_ids: CategoryIdMap | None,
+    ) -> int:
+        """解析（必要時建立）group 所屬 category 與 group 列，回傳 group_id。"""
+
+        category_name = group["category_name"]
+        category_key = str(group.get("cid") or category_name)
+        if category_ids is not None and category_key in category_ids:
+            category_id = category_ids[category_key]
+        else:
+            category_id = self.vehicles.upsert_category(vehicle_id, category_name, group["cid"])
+            if category_ids is not None:
+                category_ids[category_key] = category_id
+        # SOL review P2：同一 category 只 preload 一次 group 身分，省掉
+        # 每組的 image-row SELECT；快取隨 upsert_group 就地更新。加鎖
+        # 避免並行 worker 清空快取時，本車身分被誤拿/KeyError。
+        with self.lock:
+            identity = self._group_identities.get(category_id)
+            if identity is None:
+                identity = self.vehicles.preload_group_identity(category_id)
+                self._group_identities[category_id] = identity
+        source_url = public_source_url(
+            _canonical_catalog_request_url(group["url"], "/en/catalog/genuine/unit")
+        )
+        return self.vehicles.upsert_group(
+            category_id,
+            group["group_code"],
+            group["group_name"],
+            group["uid"],
+            source_url,
+            identity=identity,
+        )
+
     def crawl_groups(
         self,
         brand: str,
@@ -1394,16 +1448,32 @@ class Crawler:
                     # 全量續爬把缺零件的車當成 done。
                     truncated = len(groups) - i
                     break
-            part_truncated = self.crawl_group(
-                brand,
-                vehicle_id,
-                group,
-                skip_if_fetched=skip,
-                fetched=fetched,
-                prev_rows=prev_rows,
-                category_ids=category_ids,
-                evidence_vehicle_key=evidence_vehicle_key,
-            )
+            try:
+                part_truncated = self.crawl_group(
+                    brand,
+                    vehicle_id,
+                    group,
+                    skip_if_fetched=skip,
+                    fetched=fetched,
+                    prev_rows=prev_rows,
+                    category_ids=category_ids,
+                    evidence_vehicle_key=evidence_vehicle_key,
+                )
+            except UnitIdentityMismatch as error:
+                # 站方在同一 unit 連結服務不同 uid 的內容（uid 回收）：
+                # 該組身分已失效，依 404 組語意標 not_found 收斂。本 run
+                # 的 membership 一併清除；下個月新 run_key 會自動重訪。
+                group_id = self._resolve_group_id(vehicle_id, group, category_ids)
+                removed = self.parts.clear_group_membership(group_id, self.run_id)
+                self.crawl.mark_group_fetched(
+                    group_id, self.crawl.run_key or "", status="not_found"
+                )
+                self.db.commit()
+                self._bump("parts", -removed)
+                if fetched is not None:
+                    fetched[self._group_map_key(group)] = 0
+                log.warning("%s; marking group not_found", error)
+                continue
             if part_truncated:
                 truncated = len(groups) - i
                 break
@@ -1488,35 +1558,12 @@ class Crawler:
                 )
                 return False
 
-        category_name = group["category_name"]
-        category_key = str(group.get("cid") or category_name)
         unit_url = _canonical_catalog_request_url(
             group["url"],
             "/en/catalog/genuine/unit",
         )
         source_url = public_source_url(unit_url)
-        if category_ids is not None and category_key in category_ids:
-            category_id = category_ids[category_key]
-        else:
-            category_id = self.vehicles.upsert_category(vehicle_id, category_name, group["cid"])
-            if category_ids is not None:
-                category_ids[category_key] = category_id
-        # SOL review P2：同一 category 只 preload 一次 group 身分，省掉
-        # 每組的 image-row SELECT；快取隨 upsert_group 就地更新。加鎖
-        # 避免並行 worker 清空快取時，本車身分被誤拿/KeyError。
-        with self.lock:
-            identity = self._group_identities.get(category_id)
-            if identity is None:
-                identity = self.vehicles.preload_group_identity(category_id)
-                self._group_identities[category_id] = identity
-        group_id = self.vehicles.upsert_group(
-            category_id,
-            group["group_code"],
-            group["group_name"],
-            group["uid"],
-            source_url,
-            identity=identity,
-        )
+        group_id = self._resolve_group_id(vehicle_id, group, category_ids)
         self.db.commit()
         self._bump("groups")
 
