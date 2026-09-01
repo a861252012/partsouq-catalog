@@ -221,8 +221,10 @@ def test_catalog_manifest_hashes_and_parser_cover_every_statement() -> None:
         11,
         11,
         29,
+        11,
+        10,
     ]
-    assert sum(len(change.statements) for change in migrations if change.active) == 704
+    assert sum(len(change.statements) for change in migrations if change.active) == 725
     assert changes[-1].key == STATION_ADMIN_ASSET[0]
     assert changes[-1].statements
 

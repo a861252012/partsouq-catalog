@@ -650,16 +650,28 @@ FROM (
                   NULLIF(TRIM(vin_decode.model_name), '') IS NULL
                   OR CAST(REGEXP_REPLACE(UPPER(catalog_part.model), '[^A-Z0-9]', '') AS BINARY)
                       = CAST(REGEXP_REPLACE(UPPER(vin_decode.model_name), '[^A-Z0-9]', '') AS BINARY)
+                  OR (
+                      NULLIF(TRIM(catalog_part.model), '') IS NULL
+                      AND NULLIF(TRIM(vehicle_mapping.model_name), '') IS NOT NULL
+                  )
               )
               AND (
                   NULLIF(TRIM(vin_decode.engine_model), '') IS NULL
                   OR CAST(REGEXP_REPLACE(UPPER(catalog_part.engine), '[^A-Z0-9]', '') AS BINARY)
                       = CAST(REGEXP_REPLACE(UPPER(vin_decode.engine_model), '[^A-Z0-9]', '') AS BINARY)
+                  OR (
+                      NULLIF(TRIM(catalog_part.engine), '') IS NULL
+                      AND NULLIF(TRIM(vehicle_mapping.engine), '') IS NOT NULL
+                  )
               )
               AND (
                   NULLIF(TRIM(vin_decode.trim_name), '') IS NULL
                   OR CAST(REGEXP_REPLACE(UPPER(catalog_part.trim_name), '[^A-Z0-9]', '') AS BINARY)
                       = CAST(REGEXP_REPLACE(UPPER(vin_decode.trim_name), '[^A-Z0-9]', '') AS BINARY)
+                  OR (
+                      NULLIF(TRIM(catalog_part.trim_name), '') IS NULL
+                      AND NULLIF(TRIM(vehicle_mapping.trim_name), '') IS NOT NULL
+                  )
               )
           )
           OR (

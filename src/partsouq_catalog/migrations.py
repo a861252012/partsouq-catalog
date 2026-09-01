@@ -64,6 +64,8 @@ CATALOG_MANIFEST = (
     (34, "034_vin_fitment_strict_count.sql", "01d4131332cb49080dcf9687bc70e4c7af3194e1306e04653614dfb706726c9e"),
     (35, "035_revoke_invalid_legacy_snapshot_rows.sql", "d728ab56b7ca6c5f4838a48e41c43d240cb3b64a64733b4d93ccdb5f19c94357"),
     (36, "036_bounded_group_receipt_contract.sql", "84277d048b553415528597661d9dccf0df3f54007cc1ac33031953cbe6ee70ff"),
+    (37, "037_sparse_override_bridges_unknown_catalog_fields.sql", "b5d75b9f77b885159a9315544f7edc3a2cb1d20acaa38afaa645b8c8727ed561"),
+    (38, "038_vncs_source_identity_upsert.sql", "c0a336f266db25475145c31a8186299e6cdc0fd440e59f2e3f40862c62c0fb66"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(

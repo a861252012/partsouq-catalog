@@ -158,8 +158,9 @@ port 3308）。
 - **續爬語意**：receipt 已完成的型號／車款自動跳過；殘留 running
   marker 需滿 900 秒才可被新 run 回收。行程被殺後直接重啟即可續爬。
 - **VNCS**：翻頁依賴站方 Infragistics paging JS API（Playwright），
-  TLS 需 repo 內 TWCA 中繼憑證。非 VIN 引擎碼列無唯一約束，
-  重跑前需清理同名條件的重複列。
+  TLS 需 repo 內 TWCA 中繼憑證。非 VIN 引擎碼列由 038 的完整內容
+  指紋（`uq_vncs_source_identity`）保障重跑冪等：同內容合併為更新，
+  一碼多車（不同 model／approval）指紋互異，照樣保留。
 
 ## 操作指南
 

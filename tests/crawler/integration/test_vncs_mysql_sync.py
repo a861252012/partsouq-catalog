@@ -117,7 +117,7 @@ def _config() -> VncsConfig:
     return config
 
 
-def test_sync_end_to_end_is_idempotent_for_vin_and_appends_engine_codes() -> None:
+def test_sync_end_to_end_is_idempotent_for_vin_and_engine_codes() -> None:
     harvester = ScriptedHarvester({"G": GASOLINE_ROWS, "D": DIESEL_ROWS})
 
     async def scenario() -> None:
@@ -152,8 +152,8 @@ def test_sync_end_to_end_is_idempotent_for_vin_and_appends_engine_codes() -> Non
                 "柴油車",
             ]
 
-            # 同一批資料再跑一輪：VIN 走 uq_vncs_vin 條件唯一鍵 upsert 不重複；
-            # 非 VIN 引擎碼不參與唯一、可多筆。
+            # 同一批資料再跑一輪：VIN 走 uq_vncs_vin；非 VIN 列由 038 的
+            # 完整內容指紋 uq_vncs_source_identity 合併，重跑不產生重複。
             second = await service.run(run_key="vncs-fixture-second")
             assert second["status"] == "completed"
             with repository.connection.cursor() as cursor:
@@ -163,8 +163,41 @@ def test_sync_end_to_end_is_idempotent_for_vin_and_appends_engine_codes() -> Non
                 run_statuses = [str(row["status"]) for row in cursor.fetchall()]
             assert codes.count(VIN_A) == 1
             assert codes.count(VIN_B) == 1
-            assert codes.count(ENGINE_CODE) == 2
+            assert codes.count(ENGINE_CODE) == 1
             assert run_statuses == ["completed", "completed"]
+        finally:
+            repository.clear_for_tests()
+            repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_engine_code_shared_by_different_models_keeps_both_rows() -> None:
+    """一碼多車：同一引擎碼、不同車型內容的列，指紋不同，兩列都保留。"""
+
+    diesel_rows: list[list[dict[str, str]]] = [
+        [
+            _grid_row("柴油車", "CMC VERYCA 1200 2D 手排", "2023", "C5-D23", ENGINE_CODE, "六期"),
+            _grid_row("柴油車", "CMC DELICA 1800 4D 手排", "2023", "C5-D23", ENGINE_CODE, "六期"),
+        ],
+    ]
+
+    async def scenario() -> None:
+        harvester = ScriptedHarvester({"G": [], "D": diesel_rows})
+        config = _config()
+        repository = VncsMySQLRepository.create(config)
+        try:
+            repository.ensure_schema()
+            repository.clear_for_tests()
+            service = VncsSyncService(repository, config, harvester_factory=lambda cfg: harvester)
+            report = await service.run(run_key="vncs-shared-engine-code")
+
+            assert report["status"] == "completed"
+            with repository.connection.cursor() as cursor:
+                cursor.execute("SELECT model_raw FROM tw_vncs_vehicles ORDER BY id")
+                model_names = [str(row["model_raw"]) for row in cursor.fetchall()]
+            assert len(model_names) == 2
+            assert model_names[0] != model_names[1]
         finally:
             repository.clear_for_tests()
             repository.close()

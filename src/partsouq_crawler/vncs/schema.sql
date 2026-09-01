@@ -1,9 +1,10 @@
 -- 台灣 MOENV VNCS 汽油車/柴油車車輛主檔與極簡同步 run ledger。
--- 與 migrations/catalog/025_tw_vncs_vehicles.sql 保持逐欄一致。
+-- 與 migrations/catalog/025 + 038 保持一致。
 
 -- 唯一鍵為「條件唯一」：只有 17 碼 VIN 參與 uq_vncs_vin（generated column
--- 把非 VIN 列映射成 NULL，MySQL 多 NULL 不衝突）；非 VIN 引擎號碼可能
--- 一碼多車，只建一般索引 idx_vncs_code，絕不靜默丟資料。
+-- 把非 VIN 列映射成 NULL，MySQL 多 NULL 不衝突）。非 VIN 列由 038 的
+-- 完整內容指紋 uq_vncs_source_identity 保障重跑冪等：一碼多車的列在
+-- model_raw／approval_date 等欄位上必然不同，指紋互異，絕不靜默丟資料。
 CREATE TABLE IF NOT EXISTS tw_vncs_vehicles (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     vehicle_kind ENUM('汽油車', '柴油車') NOT NULL,
@@ -28,7 +29,15 @@ CREATE TABLE IF NOT EXISTS tw_vncs_vehicles (
     payload_json JSON NOT NULL,
     first_seen_at DATETIME(6) NOT NULL,
     last_synced_at DATETIME(6) NOT NULL,
+    source_identity_sha256 CHAR(64) GENERATED ALWAYS AS (
+        SHA2(CONVERT(JSON_ARRAY(
+            vehicle_kind, make, model_raw, displacement_cc, body_rule, transmission,
+            doors, style, model_year, model_group_code, body_or_engine_code,
+            is_vin, period, approval_date, check_code
+        ) USING utf8mb4), 256)
+    ) STORED NOT NULL,
     UNIQUE KEY uq_vncs_vin (vin_code),
+    UNIQUE KEY uq_vncs_source_identity (source_identity_sha256),
     KEY idx_vncs_code (body_or_engine_code, model_year),
     KEY idx_vncs_vehicle (make, model_raw(191), model_year),
     CONSTRAINT chk_vncs_vehicle_kind CHECK (vehicle_kind IN ('汽油車', '柴油車'))
