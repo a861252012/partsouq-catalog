@@ -6,6 +6,7 @@
 """
 
 from contextlib import contextmanager, nullcontext
+from datetime import UTC, datetime
 from unittest import mock
 
 import pytest
@@ -16,6 +17,7 @@ from partsouq_catalog.crawler import (
     _brand_from_url,
     _group_closure_mismatches,
 )
+from partsouq_catalog.evidence import CatalogHttpResponse
 
 
 def _group() -> dict:
@@ -409,6 +411,16 @@ def _null_group_row(uid: str, code: str, id_: int = 0) -> dict:
         "name": f"GROUP {code}",
         "uid": uid,
         "url": f"https://partsouq.com/en/catalog/genuine/unit?c=Toyota&uid={uid}",
+        "vehicle_name": "HILUX",
+        "model_code": "GUN125",
+        "prod_period": "09.2015 - ...",
+        "production_from": "2015-09",
+        "production_to": None,
+        "engine": "2GD-FTV",
+        "grade": "DLX",
+        "vid": "0",
+        "model_name": "HILUX",
+        "brand_name": "Toyota",
     }
 
 
@@ -461,6 +473,66 @@ def test_recover_null_groups_rejects_part_limit_truncation(sample_crawler) -> No
         sample_crawler.recover_null_groups(limit=10)
 
     sample_crawler.crawl.mark_group_fetched.assert_not_called()
+
+
+@pytest.fixture
+def full_run_crawler(monkeypatch):
+    """正式 full run（daemon lineage → evidence_mode）的 crawler。"""
+    monkeypatch.setattr("partsouq_catalog.crawler.catalog_writer_admission", nullcontext)
+    monkeypatch.setitem(CRAWL, "limit_parts", 0)
+    monkeypatch.setitem(CRAWL, "bounded_parts", 0)
+    monkeypatch.setitem(CRAWL, "scheduled_job_run_id", 6879)
+    instance = Crawler(mock.MagicMock(), mock.MagicMock(), workers=4)
+    instance.run_id = 17
+    instance.vehicles = mock.MagicMock()
+    instance.vehicles.upsert_category.return_value = 31
+    instance.vehicles.upsert_group.return_value = 41
+    instance.parts = mock.MagicMock()
+    instance.parts.upsert_parts.side_effect = lambda _group, rows, _run, **_kwargs: len(rows)
+    instance.crawl = mock.MagicMock()
+    instance.crawl.run_key = "2026-08-fixture"
+    instance.crawl.previous_row_count.return_value = 0
+    instance._get_response = mock.MagicMock(
+        side_effect=lambda _url: CatalogHttpResponse(
+            final_url=_url,
+            status_code=200,
+            content_type="text/html",
+            raw_body_sha256="a" * 64,
+            text="<html>unit</html>",
+            fetched_at=datetime.now(UTC),
+            elapsed_ms=10,
+            attempt=1,
+        )
+    )
+    yield instance
+    instance.close()
+
+
+def test_recover_null_groups_supplies_evidence_vehicle_key(full_run_crawler) -> None:
+    """正式 full run 收尾的 recover 在 evidence_mode 下必須組出 vehicle
+    natural key 傳給 crawl_group。
+
+    run 44 實錯：recover 未傳 key，crawl_group 的證據守門
+    （formal part evidence requires its vehicle context）把整批
+    62,736 組全部炸成 failed，run 收斂不了。"""
+    full_run_crawler.crawl.list_null_groups.return_value = [
+        _null_group_row("10001", "1101", id_=999)
+    ]
+    full_run_crawler.crawl_group = mock.MagicMock(return_value=False)
+
+    recovered = full_run_crawler.recover_null_groups(limit=10)
+
+    assert recovered == 1
+    crawl_group = full_run_crawler.crawl_group
+    assert isinstance(crawl_group, mock.MagicMock)
+    kwargs = crawl_group.call_args.kwargs
+    key = kwargs["evidence_vehicle_key"]
+    assert key["brand"] == "Toyota"
+    assert key["model"] == "HILUX"
+    assert key["name"] == "HILUX"
+    assert key["model_code"] == "GUN125"
+    assert key["engine"] == "2GD-FTV"
+    assert key["trim_name"] == "DLX"
 
 
 def test_standalone_recover_marks_partial_failure_as_error(sample_crawler) -> None:

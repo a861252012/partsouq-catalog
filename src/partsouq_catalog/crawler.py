@@ -2225,8 +2225,26 @@ class Crawler:
                 for row in rows:
                     after_id = max(after_id, int(cast(int, row["id"])))
                     attempted += 1
-                    brand = _brand_from_url(row["url"]) or "Toyota"
+                    # evidence_mode 下 crawl_group 需要 vehicle natural key，
+                    # 這裡直接採用 DB 的 brand/model/vehicle 身分（跟
+                    # vehicle-walk 同源），URL 的 c= 只當缺欄位時的後備。
+                    brand = (
+                        str(row["brand_name"])
+                        if row.get("brand_name")
+                        else (_brand_from_url(row["url"]) or "Toyota")
+                    )
                     vehicle_id = int(cast(int, row["vehicle_id"]))
+                    vehicle_record: ParsedRecord = {
+                        "name": row.get("vehicle_name"),
+                        "model_code": row.get("model_code"),
+                        "prod_period": row.get("prod_period"),
+                        "production_from": row.get("production_from"),
+                        "production_to": row.get("production_to"),
+                        "engine": row.get("engine"),
+                        "grade": row.get("grade"),
+                        "vid": row.get("vid"),
+                    }
+                    model_name = str(row["model_name"]) if row.get("model_name") else ""
                     group: ParsedRecord = {
                         "category_name": row["category_name"],
                         "cid": row["cid"],
@@ -2243,6 +2261,9 @@ class Crawler:
                             vehicle_id,
                             group,
                             skip_if_fetched=False,
+                            evidence_vehicle_key=vehicle_record_natural_key(
+                                brand, model_name, vehicle_record
+                            ),
                         )
                         if truncated:
                             raise RuntimeError("recover group was truncated by a part limit")

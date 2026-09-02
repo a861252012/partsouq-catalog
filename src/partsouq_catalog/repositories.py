@@ -885,12 +885,22 @@ class CrawlRepository:
             params = [after_id, run_key, run_id, run_id, limit]
         else:
             params = [after_id, limit]
+        # JOIN 出 brand/model/vehicle 識別欄位：full run 收尾的 recover pass
+        # 在 evidence_mode 下必須組出與 vehicle-walk 相同的 vehicle natural
+        # key（缺了會在 crawl_group 的證據守門直接炸掉整批 recover）。
         cur = self.db._execute(
             "SELECT groups_t.id, groups_t.category_id, groups_t.code, groups_t.name, "
             "groups_t.uid, groups_t.url, categories.vehicle_id, "
-            "categories.name AS category_name, categories.cid "
+            "categories.name AS category_name, categories.cid, "
+            "vehicles.name AS vehicle_name, vehicles.model_code, vehicles.prod_period, "
+            "vehicles.production_from, vehicles.production_to, vehicles.engine, "
+            "vehicles.grade, vehicles.vid, "
+            "models.name AS model_name, brands.name AS brand_name "
             "FROM groups_t "
             "JOIN categories ON categories.id = groups_t.category_id "
+            "JOIN vehicles ON vehicles.id = categories.vehicle_id "
+            "JOIN models ON models.id = vehicles.model_id "
+            "JOIN brands ON brands.id = models.brand_id "
             f"WHERE groups_t.id > %s AND ({where_clause}) "
             "ORDER BY groups_t.id LIMIT %s",
             tuple(params),
