@@ -330,7 +330,6 @@ class VehicleRepository:
                 (vehicle_id, name, cid),
             )
             return cast(int, cur.lastrowid)
-
         # cid 為 NULL 時 uq_cat_cid 不會判定重複，只能維持以名稱查找的
         # 相容路徑；不能假裝成安全的單句 upsert。
         identity_sql = "cid = %s" if cid else "name = %s"
@@ -354,6 +353,42 @@ class VehicleRepository:
             (vehicle_id, name, cid),
         )
         return cast(int, cur.lastrowid)
+
+    def resolve_vin_vehicle_id(self, brand: str, vid: str, ssd: str, url: str) -> int:
+        """為 VIN 補爬解出的 unit 解析/建立 vehicle_id。
+
+        VIN 解碼結果只給 brand/vid/ssd，沒有 model 階層。這裡為該
+        (brand, vid) 建立合成 model 與 vehicle，使 unit 能掛進既有的
+        brand->model->vehicle 樹，復用 crawl_group 記錄零件。合成名稱
+        具確定性（brand-vid），續爬可冪等 upsert，不會重複建車。
+        """
+        cur = self.db._execute(
+            "INSERT INTO brands (name, url) VALUES (%s, NULL) AS new "
+            "ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)",
+            (brand,),
+        )
+        brand_id = cur.lastrowid
+        if not brand_id:
+            brand_row = self.db._execute(
+                "SELECT id FROM brands WHERE name = %s", (brand,)
+            ).fetchone()
+            brand_id = cast(int, brand_row["id"]) if brand_row else 0
+        model_name = f"{brand}-{vid}"
+        cur = self.db._execute(
+            "INSERT INTO models (brand_id, name, ssd, url) VALUES (%s, %s, %s, %s) AS new "
+            "ON DUPLICATE KEY UPDATE ssd = COALESCE(new.ssd, models.ssd), "
+            "url = new.url, fetched_at = NOW(), id = LAST_INSERT_ID(id)",
+            (brand_id, model_name, ssd or None, None),
+        )
+        model_id = cast(int, cur.lastrowid)
+        vehicle = {
+            "name": vid or model_name,
+            "model_code": vid,
+            "ssd": ssd,
+            "vid": vid,
+            "url": url,
+        }
+        return self.upsert_vehicle(model_id, vehicle)
 
     def list_categories(self, vehicle_id: int) -> Sequence[Row]:
         """列出某車型下的所有分類（依 id 排序）。"""
@@ -769,6 +804,45 @@ class CrawlRepository:
             cur = self.db._execute("SELECT COUNT(*) AS n FROM groups_t")
         row = cast(Row, cur.fetchone())
         return cast(int, row["n"])
+
+    def record_vin_resolution(
+        self,
+        vin: str,
+        brand: str,
+        uid: str,
+        url: str,
+        cid: str,
+        vehicle_id: int,
+        run_key: str,
+        status: str,
+    ) -> None:
+        """紀錄一支 VIN 的解碼結果（VIN -> 站方 unit uid）與補爬狀態。"""
+        self.db._execute(
+            "INSERT INTO vin_resolved_uids "
+            "(vin, brand, resolved_uid, resolved_url, category_cid, vehicle_id, "
+            "source_run_key, status, crawled_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW()) AS new "
+            "ON DUPLICATE KEY UPDATE status = new.status, "
+            "vehicle_id = new.vehicle_id, crawled_at = NOW()",
+            (vin, brand, uid, url, cid, vehicle_id, run_key, status),
+        )
+
+    def list_unresolved_supplement_vins(self, limit: int) -> list[tuple[str, str]]:
+        """列出尚未解碼的 VIN 補爬來源（來自 NHTSA vPIC，品牌碼取小寫）。
+
+        只回傳長度為 17 的 VIN；品牌碼直接用 make_name 小寫（與站方
+        brand 路徑一致）。無法對應到站方品牌碼的會在解碼階段被 skip，
+        此處先全量撈出再由爬蟲過濾。
+        """
+        cur = self.db._execute(
+            "SELECT v.vin, LOWER(v.make_name) AS brand "
+            "FROM nhtsa_vin_decodes v "
+            "LEFT JOIN vin_resolved_uids r ON r.vin = v.vin "
+            "WHERE CHAR_LENGTH(v.vin) = 17 AND r.vin IS NULL "
+            "LIMIT %s",
+            (limit,),
+        )
+        return [(cast(str, r["vin"]), cast(str, r["brand"])) for r in cur.fetchall()]
 
     def list_null_groups(
         self,

@@ -35,6 +35,7 @@ from typing import Any, cast
 import pymysql
 
 from .admission import catalog_writer_admission
+from .cloak import login_to_partsouq
 from .config import CRAWL, SITE
 from .db import ConnectionLost, Database
 from .evidence import (
@@ -56,7 +57,13 @@ from .evidence import (
     vehicle_record_natural_key,
 )
 from .governor import RequestGovernor
-from .http_client import NotFoundError, SessionManager
+from .http_client import (
+    NotFoundError,
+    RobotsPolicyError,
+    SessionManager,
+    VinDecodeResult,
+    _parse_vin_decode_result,
+)
 from .parsers import (
     ParsedRecord,
     _soup,
@@ -2050,6 +2057,96 @@ class Crawler:
                 raise
 
         return not complete_group
+
+    # ------------------------------------------------------------- VIN 補爬
+
+    def decode_vin(self, vin: str, brand: str) -> VinDecodeResult:
+        """用站方 /locate VIN 搜尋解碼，回傳解析出的 unit / vehicle 連結。
+
+        /locate 需要登入：若被導向 /en/user/auth，先登入再重試一次。
+        解析委託純函式 _parse_vin_decode_result（可單測）。
+        """
+        url = f"{SITE['locate'].format(brand=brand)}&q={vin}"
+        try:
+            html, _ = self._fetch(url)
+        except RobotsPolicyError as error:
+            # 匿名存取 /locate 被導去登入頁：登入後重試一次。
+            if "user/auth" in str(error).lower():
+                if login_to_partsouq():
+                    html, _ = self._fetch(url)
+                else:
+                    return VinDecodeResult(units=[], vehicle_links=[], raw_html_len=0)
+            else:
+                raise
+        return _parse_vin_decode_result(html, brand)
+
+    def crawl_vin_supplements(self, limit: int = 500) -> int:
+        """VIN 補爬：對尚未解碼的 VIN 來源解碼，補抓瀏覽樹漏掉的 unit。
+
+        只補 groups_t 尚缺的 (vehicle, cid, uid)，已覆蓋的跳過（冪等）。
+        回傳本次實際補爬的 unit 數。站方登入與 VIN 解碼須在擁有有效
+        cookie 的瀏覽器 session 下執行（見 cloak.login_to_partsouq）。
+        """
+        rows = self.crawl.list_unresolved_supplement_vins(limit)
+        crawled = 0
+        run_key = self.crawl.run_key or ""
+        for vin, brand in rows:
+            result = self.decode_vin(vin, brand)
+            for unit in result.units:
+                if self._vin_uid_already_crawled(unit.uid):
+                    self.crawl.record_vin_resolution(
+                        vin, brand, unit.uid, unit.url, unit.cid, 0, run_key, "skipped"
+                    )
+                    continue
+                vehicle_id = self.vehicles.resolve_vin_vehicle_id(
+                    brand, unit.vid, unit.ssd, unit.url
+                )
+                category_id = self.vehicles.upsert_category(vehicle_id, unit.cid or "GEN", unit.cid)
+                group: ParsedRecord = {
+                    "uid": unit.uid,
+                    "url": unit.url,
+                    "cid": unit.cid,
+                    "group_code": unit.uid,
+                    "group_name": unit.uid,
+                    "ssd": unit.ssd,
+                    "vid": unit.vid,
+                }
+                category_ids = {unit.cid or "GEN": category_id}
+                evidence_key = None
+                if self.evidence_mode:
+                    evidence_key = vehicle_record_natural_key(
+                        brand,
+                        unit.vid or "",
+                        {
+                            "name": unit.vid,
+                            "model_code": unit.vid,
+                            "vid": unit.vid,
+                            "ssd": unit.ssd,
+                        },
+                    )
+                try:
+                    self.crawl_group(
+                        brand,
+                        vehicle_id,
+                        group,
+                        skip_if_fetched=True,
+                        category_ids=category_ids,
+                        evidence_vehicle_key=evidence_key,
+                    )
+                    self.crawl.record_vin_resolution(
+                        vin, brand, unit.uid, unit.url, unit.cid, vehicle_id, run_key, "crawled"
+                    )
+                    crawled += 1
+                except NotFoundError:
+                    self.crawl.record_vin_resolution(
+                        vin, brand, unit.uid, unit.url, unit.cid, vehicle_id, run_key, "not_found"
+                    )
+        return crawled
+
+    def _vin_uid_already_crawled(self, uid: str) -> bool:
+        """該 uid 是否已在 groups_t 中（瀏覽樹已覆蓋，補爬跳過）。"""
+        cur = self.db._execute("SELECT 1 FROM groups_t WHERE uid = %s LIMIT 1", (uid,))
+        return cur.fetchone() is not None
 
     # ------------------------------------------------------------- entry
 

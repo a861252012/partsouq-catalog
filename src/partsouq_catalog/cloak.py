@@ -273,7 +273,7 @@ def _finish_browser_shutdown() -> None:
     _BROWSER_SHUTDOWN.clear()
 
 
-def _launch_cloak() -> bool:
+def _launch_cloak(script_override: str | None = None) -> bool:
     """啟動本程序擁有的 CloakBrowser process group 並等待就緒訊號。
 
     子程序腳本負責：驅動 CloakBrowser 前往目標頁面、驗證型錄結構，
@@ -357,7 +357,7 @@ def _launch_cloak() -> bool:
     _ensure_state_directory(ready_file.parent)
     ready_file.unlink(missing_ok=True)
     ready_tmp.unlink(missing_ok=True)
-    script = (
+    default_script = (
         "import asyncio, hashlib, json, os, time, cloakbrowser\n"
         "OUT = %r\n"
         "READY = %r\n"
@@ -440,6 +440,7 @@ def _launch_cloak() -> bool:
         CRAWL["min_brands"],
         COOKIE_SETTLE_SECONDS,
     )  # noqa: UP031
+    script = script_override or default_script
     err_log = None
     try:
         # 只保留最後一次的 stderr，並在寫入前設為 owner-only。
@@ -1185,3 +1186,113 @@ def get_session() -> Cookies | None:
             return _session_state["cookies"]
     # TTL 已過期（或完全沒有快取）：執行一次刷新
     return refresh_session()
+
+
+def login_to_partsouq() -> bool:
+    """用站方帳密登入 partsouq，使 VIN 搜尋（/locate）回傳結果。
+
+    匿名存取 /locate 會被導向 /en/user/auth；VIN 補爬需要登入後的 session。
+    本函式啟動真實瀏覽器、填寫登入表單、送出，成功後把 cookie 匯出落盤
+    （與 _refresh_impl 相同的 export_file 機制，供 save_cookies 持久化）。
+
+    注意：表單欄位選擇器與等待條件依站方登入頁實際結構而定，本函式在
+    凍結發布包（cloak-venv 内含 cloakbrowser）環境下才能實際執行，開發
+    期單元測試不觸及瀏覽器。回傳是否登入成功（匯出含登入態 cookie）。
+    """
+    global _browser_err_log, _browser_proc
+    from .config import SITE_CREDENTIALS
+
+    email = SITE_CREDENTIALS.get("email", "")
+    password = SITE_CREDENTIALS.get("password", "")
+    if not email or not password:
+        log.error("partsouq site credentials missing (PARTSOUQ_SITE_EMAIL/PASSWORD)")
+        return False
+
+    with _process_refresh_lock() as acquired:
+        if not acquired:
+            log.error("browser lock held by another process; login skipped")
+            return False
+        prepared = _prepare_browser_launch()
+        if prepared is None:
+            return False
+        env, free_cache, browser_home, _binary, _sha = prepared
+        cookie_file = CLOAK["cookie_file"]
+        export_file = CLOAK["cookie_export_file"]
+        export_temp = export_file.with_name(f"{export_file.name}.tmp")
+        out_file = CLOAK["state_dir"] / ".cloak-login.html"
+        out_tmp = out_file.with_name(out_file.name + ".tmp")
+        auth_url = "https://partsouq.com/en/user/auth"
+        script = (
+            "import asyncio, json, os, time\n"
+            "from urllib.parse import urlsplit\n"
+            "import cloakbrowser\n"
+            f"COOKIE_FILE = {str(cookie_file)!r}\n"
+            f"EXPORT = {str(export_file)!r}\n"
+            f"OUT = {str(out_file)!r}\n"
+            f"AUTH = {auth_url!r}\n"
+            f"EMAIL = {email!r}\n"
+            f"PASSWORD = {password!r}\n"
+            "async def main():\n"
+            "    b = await cloakbrowser.launch_async(headless=False)\n"
+            "    try:\n"
+            "        ctx = await b.new_context(viewport={'width':1366,'height':900})\n"
+            "        try:\n"
+            "            raw = json.load(open(COOKIE_FILE))\n"
+            "            await ctx.add_cookies(\n"
+            "                [{'name': c['name'], 'value': c['value'],\n"
+            "                  'domain': c.get('domain', 'partsouq.com'),\n"
+            "                  'path': c.get('path', '/')} for c in raw]\n"
+            "            )\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        page = await ctx.new_page()\n"
+            "        await page.goto(AUTH, wait_until='domcontentloaded', timeout=60000)\n"
+            "        # 填寫登入表單（依站方欄位調整選擇器）\n"
+            "        await page.fill('input[name=email], input[type=email]', EMAIL)\n"
+            "        await page.fill('input[name=password], input[type=password]', PASSWORD)\n"
+            "        await page.click('button[type=submit], input[type=submit]')\n"
+            "        deadline = time.monotonic() + 90\n"
+            "        final = AUTH\n"
+            "        while time.monotonic() < deadline:\n"
+            "            final = page.url\n"
+            "            if 'user/auth' not in final:\n"
+            "                break\n"
+            "            await asyncio.sleep(2)\n"
+            "        html = await page.content()\n"
+            "        with open(OUT + '.tmp', 'w') as f:\n"
+            "            f.write(html)\n"
+            "        os.replace(OUT + '.tmp', OUT)\n"
+            "        if 'user/auth' in final:\n"
+            "            raise SystemExit('login did not leave auth page')\n"
+            "        cookies = await ctx.cookies()\n"
+            "        with open(EXPORT + '.tmp', 'w') as f:\n"
+            "            json.dump(cookies, f)\n"
+            "        os.replace(EXPORT + '.tmp', EXPORT)\n"
+            "    finally:\n"
+            "        await b.close()\n"
+            "asyncio.run(main())\n"
+        )
+        _stop_owned_browser()
+        try:
+            if not _launch_cloak(script_override=script):
+                log.error("login browser launch failed")
+                return False
+            if not export_file.exists():
+                log.error("login produced no cookie export")
+                return False
+            cookies = load_cookies(export_file)
+            if not cookies:
+                return False
+            save_cookies(cookies)
+            with _SESSION_COND:
+                _session_state["cookies"] = cookies
+                _session_state["ok_ts"] = time.monotonic()
+            log.info("partsouq login ok; cookies: %s", sorted({c["name"] for c in cookies}))
+            return True
+        finally:
+            _stop_owned_browser(graceful=True)
+            for path in (export_file, export_temp, out_tmp):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass

@@ -100,6 +100,13 @@ SITE: SiteConfig = {
     "unit": "https://partsouq.com/en/catalog/genuine/unit?c={brand}&ssd={ssd}&vid={vid}&cid={cid}&uid={uid}&q=",
 }
 
+# 站方登入憑證（VIN 搜尋 /locate 需要登入才會回結果，匿名會被導去
+# /en/user/auth）。僅用於 VIN 補爬 scope，不影響匿名瀏覽樹爬取。
+SITE_CREDENTIALS: dict[str, str] = {
+    "email": os.environ.get("PARTSOUQ_SITE_EMAIL", ""),
+    "password": os.environ.get("PARTSOUQ_SITE_PASSWORD", ""),
+}
+
 # CloakBrowser（隱匿瀏覽器）的整合設定
 CLOAK: CloakConfig = {
     "state_dir": CLOAK_STATE_DIR,

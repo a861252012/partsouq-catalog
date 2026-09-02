@@ -67,6 +67,7 @@ CATALOG_MANIFEST = (
     (37, "037_sparse_override_bridges_unknown_catalog_fields.sql", "b5d75b9f77b885159a9315544f7edc3a2cb1d20acaa38afaa645b8c8727ed561"),
     (38, "038_vncs_source_identity_upsert.sql", "c0a336f266db25475145c31a8186299e6cdc0fd440e59f2e3f40862c62c0fb66"),
     (39, "039_formal_full_snapshot_switch.sql", "3e3780bf5a690f32e16320a1edb243aef2a808e1b8a31cd7af5a8920b2dac919"),
+    (40, "040_vin_resolved_uids.sql", "9e71407df2638ed9e82890666768cefcae355813b71f9453141896745d51c8e6"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(

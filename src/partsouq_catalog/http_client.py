@@ -30,10 +30,13 @@ browser UA 送出（為了維持 cf_clearance session）；因此 robots 規則�
 import hashlib
 import logging
 import random
+import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from html import unescape
 from typing import Protocol
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
@@ -55,7 +58,7 @@ from .cloak import (
     reject_session,
     session_backoff_remaining,
 )
-from .config import CLOAK, CRAWL, Cookies
+from .config import CLOAK, CRAWL, SITE, Cookies
 from .evidence import CatalogHttpResponse, public_source_url
 
 log = logging.getLogger("http")
@@ -127,6 +130,62 @@ class NotFoundError(Exception):
 
 class RobotsPolicyError(Exception):
     """代表 robots.txt 無法確認允許正式 catalog 請求。"""
+
+
+@dataclass
+class VinUnit:
+    """VIN 解碼結果中的一個 unit（車輛設定變體）連結。"""
+
+    uid: str
+    url: str
+    cid: str
+    vid: str
+    ssd: str
+    brand: str
+
+
+@dataclass
+class VinDecodeResult:
+    """VIN 解碼結果：可能直接列出多個 unit，或列出 vehicle 頁待續爬。"""
+
+    units: list[VinUnit]
+    vehicle_links: list[str]
+    raw_html_len: int
+
+
+_UNIT_LINK_RE = re.compile(r"/en/catalog/genuine/unit\?([^\"'>\s]+)", re.IGNORECASE)
+_VEHICLE_LINK_RE = re.compile(r"/en/catalog/genuine/vehicle\?([^\"'>\s]+)", re.IGNORECASE)
+
+
+def _parse_vin_decode_result(html: str, brand: str) -> VinDecodeResult:
+    """從 /locate VIN 解碼結果頁解析 unit / vehicle 連結。
+
+    站方登入後的 VIN 搜尋結果可能是：(a) 直接跳到 unit 頁；(b) 列出多個
+    unit 的結果頁；(c) 列出 vehicle（車型）頁要再點進分類。本函式不假設
+    頁面型態，直接抽取所有 catalog 連結並解析查詢參數，最大程度相容站方
+    改版。純函式，可用 fixture 單測。
+    """
+    units: list[VinUnit] = []
+    vehicle_links: list[str] = []
+    html = unescape(html)
+    for raw_qs in _UNIT_LINK_RE.findall(html):
+        qs = parse_qs(raw_qs)
+        uid_vals = qs.get("uid")
+        if not uid_vals:
+            continue
+        units.append(
+            VinUnit(
+                uid=uid_vals[0],
+                url=f"{SITE['base']}/en/catalog/genuine/unit?{raw_qs}",
+                cid=(qs.get("cid") or [""])[0],
+                vid=(qs.get("vid") or [""])[0],
+                ssd=(qs.get("ssd") or [""])[0],
+                brand=brand,
+            )
+        )
+    for raw_qs in _VEHICLE_LINK_RE.findall(html):
+        vehicle_links.append(f"{SITE['base']}/en/catalog/genuine/vehicle?{raw_qs}")
+    return VinDecodeResult(units=units, vehicle_links=vehicle_links, raw_html_len=len(html))
 
 
 def _response_envelope(

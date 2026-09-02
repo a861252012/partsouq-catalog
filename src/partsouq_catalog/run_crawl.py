@@ -55,6 +55,18 @@ def main() -> int:
         help="只重抓 fetched_status IS NULL 的孤兒組並結束，不跑整趟爬取；"
         "與正式爬取共用 crawler.lock，不可和線上 daemon 並行",
     )
+    parser.add_argument(
+        "--vin-supplement",
+        action="store_true",
+        help="VIN 補爬：解碼 NHTSA vPIC 的 VIN 來源，補抓瀏覽樹漏掉的 unit；"
+        "需要站方登入 cookie（見 cloak.login_to_partsouq）",
+    )
+    parser.add_argument(
+        "--vin-limit",
+        type=int,
+        default=500,
+        help="VIN 補爬每趟解碼的 VIN 數上限",
+    )
     args = parser.parse_args()
 
     ensure_private_state_directory(LOG_DIR)
@@ -213,6 +225,20 @@ def main() -> int:
                 log.exception("recover-only 未完整收斂")
                 return 1
             log.info("recover-only 完成：收斂 %d 組", recovered)
+            return 0
+        if args.vin_supplement:
+            if crawler.sample_mode or crawler.bounded_mode or crawler.part_limit:
+                log.error("vin-supplement requires PSQ_LIMIT_PARTS=0 and PSQ_BOUNDED_PARTS=0")
+                return 64
+            try:
+                crawled = crawler.crawl_vin_supplements(limit=args.vin_limit)
+            except AdmissionLockBusy:
+                log.warning("schema migration in progress; vin-supplement deferred before writing")
+                return 75
+            except Exception:
+                log.exception("vin-supplement 未完整收斂")
+                return 1
+            log.info("vin-supplement 完成：補爬 %d 組", crawled)
             return 0
         try:
             counts = crawler.run()
