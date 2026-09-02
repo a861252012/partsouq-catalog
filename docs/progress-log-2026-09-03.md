@@ -96,8 +96,45 @@ run 腳本與 installer 改成從 scheduler.env 讀
 - 全套關卡：ruff、mypy strict（六個更動檔）、pytest（真 MySQL）
   1,334 passed、9 skipped。
 
+## 部署：兩次失敗後 full run 恢復運轉
+
+重建發布包沒有一把過，踩到兩個新問題：
+
+1. **正式庫 ledger checksum drift（migration:040）**。前個 session 套用
+   040 之後，040 的 SQL 後來改成 `IF NOT EXISTS`、sha256 跟著變了，
+   正式庫 ledger 卻還記著舊雜湊。scheduler 啟動時的 apply 直接報
+   `ledger checksum drift` 拒絕啟動，installer 的 child readiness
+   等不到 marker，回滾又因 launchctl EIO 失敗（job 留在未載入狀態）。
+   修法：UPDATE ledger 的 040 sha256 到新值，`migrations check` 綠後
+   重裝成功。
+2. **evidence 預算還停在 bounded 預設**。run 44 resume 後立刻撞
+   fail-closed 儲存預算（scheduler.env 沒設 PSQ_EVIDENCE_MAX_*，
+   預設 1GiB／50,000 artifacts，對百萬頁 full 遠遠不夠）。依 09-01
+   全量設定補進 `.env`：body 8MiB、run 100GiB、artifacts 300 萬。
+
+## migration 041：品牌總覽頁納入證據 URL 約束
+
+預算放行後 full run 還是斷在
+`Check constraint 'chk_partsouq_artifact_public_url' is violated`——
+017 的 URL 約束只認 /en/catalog/genuine 前綴，brands-16.html 的
+輸入證據寫不進去。程式端放行了、資料庫端沒跟上。
+
+041 以冪等 procedure 重建約束：精確放行
+`https://partsouq.com/en/brands-16.html`，禁 ssd 與禁 fragment
+不變。CATALOG_MANIFEST（041、sha256）、敘述句清單（+6、總和 733）、
+e2e 降級清單與版本序列斷言（40 → 41）全部同步。正式庫已套用，
+check 綠。
+
+## 現況
+
+- 發布包 895c552（含全部修復），launchd scheduler 運轉中。
+- crawl_run 44 恢復 running（daemon lineage 6887）：done 車輛跳過、
+  1,991 個 error/pending 重試、15 個新品牌從頭爬、62,736 組 NULL
+  由修好的 recover pass 收斂。
+- 啟動觀察：最近 2 分鐘 13 個 artifact、全 200、零 challenge。
+
 ## 下一步
 
-重建發布包後重啟 launchd scheduler，full run 會以 run_key `2026-09`
-續爬：done 的跳過、1,991 個 error/pending 重試、15 個新品牌從頭爬。
-VIN 補爬維持擱置，等有 reCAPTCHA 解法再說。
+監督 full run 收斂：爬完 18 個品牌後 run 44 應以 success 收尾，
+屆時 039 的 full_ready 閘放行全量 snapshot。VIN 補爬維持擱置，
+等有 reCAPTCHA 解法再說。
