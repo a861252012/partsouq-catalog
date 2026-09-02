@@ -71,6 +71,7 @@ def _make_staged_runtime(
     scope_brand: str = "TOYOTA",
     scope_model: str = "TACOMA",
     year_window: str = "20",
+    full_dataset: bool = False,
 ) -> tuple[Path, Path, Path]:
     home = tmp_path / "home"
     release = home / "Library/Application Support/partsouq-catalog/releases" / "test-release"
@@ -81,15 +82,32 @@ def _make_staged_runtime(
         PROJECT_ROOT / "deploy/run-macos-catalog-scheduler.zsh",
         deploy / "run-macos-catalog-scheduler.zsh",
     )
+    if full_dataset:
+        scope_env = "PSQ_LIMIT_PARTS=0\nPSQ_BOUNDED_PARTS=0\n"
+        child_scope_assertions = (
+            '[[ "$PSQ_BOUNDED_PARTS" = "0" ]]\n'
+            '[[ -z "${PSQ_BOUNDED_BRAND:-}" ]]\n'
+            '[[ -z "${PSQ_BOUNDED_MODEL:-}" ]]\n'
+        )
+    else:
+        scope_env = (
+            f"PSQ_BOUNDED_BRAND={shlex.quote(scope_brand)}\n"
+            f"PSQ_BOUNDED_MODEL={shlex.quote(scope_model)}\n"
+            f"PSQ_VEHICLE_YEAR_WINDOW={shlex.quote(year_window)}\n"
+        )
+        child_scope_assertions = (
+            '[[ "$PSQ_BOUNDED_PARTS" = "10000" ]]\n'
+            f'[[ "$PSQ_BOUNDED_BRAND" = {scope_brand!r} ]]\n'
+            f'[[ "$PSQ_BOUNDED_MODEL" = {scope_model!r} ]]\n'
+            f'[[ "$PSQ_VEHICLE_YEAR_WINDOW" = {year_window!r} ]]\n'
+        )
     (release / "scheduler.env").write_text(
         "PARTSOUQ_DB_HOST=127.0.0.1\n"
         "PARTSOUQ_DB_PORT=3308\n"
         f"PARTSOUQ_DB_NAME={database}\n"
         "PARTSOUQ_DB_USER=partsouq\n"
         "PARTSOUQ_DB_PASSWORD=db-secret\n"
-        f"PSQ_BOUNDED_BRAND={shlex.quote(scope_brand)}\n"
-        f"PSQ_BOUNDED_MODEL={shlex.quote(scope_model)}\n"
-        f"PSQ_VEHICLE_YEAR_WINDOW={shlex.quote(year_window)}\n",
+        f"{scope_env}",
         encoding="utf-8",
     )
     execution_log = tmp_path / "runtime-execution.log"
@@ -97,10 +115,7 @@ def _make_staged_runtime(
         "#!/bin/zsh\n"
         "set -eu\n"
         '[[ "$PARTSOUQ_DB_NAME" = "partsouq_catalog" ]]\n'
-        '[[ "$PSQ_BOUNDED_PARTS" = "10000" ]]\n'
-        f'[[ "$PSQ_BOUNDED_BRAND" = {scope_brand!r} ]]\n'
-        f'[[ "$PSQ_BOUNDED_MODEL" = {scope_model!r} ]]\n'
-        f'[[ "$PSQ_VEHICLE_YEAR_WINDOW" = {year_window!r} ]]\n'
+        f"{child_scope_assertions}"
         '[[ "$PSQ_LIMIT_PARTS" = "0" ]]\n'
         '[[ "$PSQ_MIN_BRANDS" = "15" ]]\n'
         '[[ "$CLOAKBROWSER_AUTO_UPDATE" = "false" ]]\n'
@@ -399,8 +414,12 @@ def test_macos_catalog_scheduler_stages_a_tcc_safe_locked_runtime() -> None:
     assert 'export CLOAKBROWSER_CACHE_DIR="$HOST_STATE_DIR/cloak/free-browser-cache"' in launcher
     assert 'export PSQ_RUNTIME_LOG_DIR="$HOST_STATE_DIR/logs/runtime"' in launcher
     assert "export CLOAKBROWSER_AUTO_UPDATE=false" in launcher
-    assert "export PSQ_LIMIT_PARTS=0" in launcher
-    assert "export PSQ_BOUNDED_PARTS=10000" in launcher
+    assert "export PSQ_LIMIT_PARTS=$DATASET_LIMIT_PARTS" in launcher
+    assert "export PSQ_BOUNDED_PARTS=$DATASET_BOUNDED_PARTS" in launcher
+    assert "DATASET_LIMIT_PARTS=${PSQ_LIMIT_PARTS:-0}" in launcher
+    assert "DATASET_BOUNDED_PARTS=${PSQ_BOUNDED_PARTS:-10000}" in launcher
+    assert "full catalog scheduler refuses non-empty PSQ_BOUNDED_BRAND" in launcher
+    assert "full catalog scheduler refuses non-empty PSQ_BOUNDED_BRAND" in installer
     assert '"PSQ_BOUNDED_BRAND=$SCOPE_BRAND"' in launcher
     assert '"PSQ_BOUNDED_MODEL=$SCOPE_MODEL"' in launcher
     assert '"PSQ_VEHICLE_YEAR_WINDOW=$SCOPE_YEAR_WINDOW"' in launcher
@@ -575,6 +594,71 @@ def test_macos_catalog_scheduler_rejects_invalid_model_scope_before_child(
 
     assert result.returncode == 2
     assert "requires non-empty PSQ_BOUNDED_BRAND" in result.stderr
+    assert not execution_log.exists()
+
+
+@MACOS_LAUNCH_AGENT_ONLY
+def test_macos_catalog_scheduler_passes_full_dataset_scope_to_child(tmp_path: Path) -> None:
+    """full 排程（LIMIT_PARTS=0 且 BOUNDED_PARTS=0）必須把空 model scope
+    原樣傳給 child；bounded 已收斂後這是 full run 的正式派發路徑。"""
+    home, project, execution_log = _make_staged_runtime(tmp_path, full_dataset=True)
+
+    result = subprocess.run(
+        [project / "deploy/run-macos-catalog-scheduler.zsh"],
+        cwd=tmp_path,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ["PATH"],
+            "PARTSOUQ_LAUNCHD_JOB": "1",
+            "LAUNCHD_JOB": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert execution_log.exists()
+
+
+@MACOS_LAUNCH_AGENT_ONLY
+def test_macos_catalog_scheduler_rejects_full_dataset_with_model_scope(tmp_path: Path) -> None:
+    """full 與 bounded 互斥：LIMIT/BOUNDED_PARTS 皆 0 卻殘留 model scope
+    必須在派發前拒絕，不得讓 scheduler 進站後才炸。"""
+    home, project, execution_log = _make_staged_runtime(
+        tmp_path,
+        full_dataset=True,
+        scope_brand="TOYOTA",
+        scope_model="TACOMA",
+    )
+    release = project.parent
+    scheduler_config = release / "scheduler.env"
+    scheduler_config.write_text(
+        scheduler_config.read_text(encoding="utf-8")
+        + "PSQ_BOUNDED_BRAND=TOYOTA\nPSQ_BOUNDED_MODEL=TACOMA\n",
+        encoding="utf-8",
+    )
+    (release / "runtime.sha256").write_text(
+        "\n".join(_runtime_manifest_lines(release)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [project / "deploy/run-macos-catalog-scheduler.zsh"],
+        cwd=tmp_path,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ["PATH"],
+            "PARTSOUQ_LAUNCHD_JOB": "1",
+            "LAUNCHD_JOB": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "full catalog scheduler refuses non-empty PSQ_BOUNDED_BRAND" in result.stderr
     assert not execution_log.exists()
 
 

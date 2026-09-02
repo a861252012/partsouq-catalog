@@ -216,20 +216,31 @@ fi
 SCOPE_BRAND=${PSQ_BOUNDED_BRAND:-}
 SCOPE_MODEL=${PSQ_BOUNDED_MODEL:-}
 SCOPE_YEAR_WINDOW=${PSQ_VEHICLE_YEAR_WINDOW:-}
-if [[ -z "${SCOPE_BRAND//[[:space:]]/}" \
-    || -z "${SCOPE_MODEL//[[:space:]]/}" \
-    || "$SCOPE_YEAR_WINDOW" != <-> \
-    || "$SCOPE_YEAR_WINDOW" -le 0 ]]; then
-  print -u2 "formal catalog scheduler requires non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL and positive PSQ_VEHICLE_YEAR_WINDOW"
-  exit 2
+DATASET_LIMIT_PARTS=${PSQ_LIMIT_PARTS:-0}
+DATASET_BOUNDED_PARTS=${PSQ_BOUNDED_PARTS:-10000}
+if [[ "$DATASET_LIMIT_PARTS" == "0" && "$DATASET_BOUNDED_PARTS" == "0" ]]; then
+  # 全量正式排程：full 與 bounded 互斥，model scope 必須為空。
+  if [[ -n "${SCOPE_BRAND//[[:space:]]/}" || -n "${SCOPE_MODEL//[[:space:]]/}" ]]; then
+    print -u2 "full catalog scheduler refuses non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL"
+    exit 2
+  fi
+  SCOPE_YEAR_WINDOW=0
+else
+  if [[ -z "${SCOPE_BRAND//[[:space:]]/}" \
+      || -z "${SCOPE_MODEL//[[:space:]]/}" \
+      || "$SCOPE_YEAR_WINDOW" != <-> \
+      || "$SCOPE_YEAR_WINDOW" -le 0 ]]; then
+    print -u2 "formal catalog scheduler requires non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL and positive PSQ_VEHICLE_YEAR_WINDOW"
+    exit 2
+  fi
 fi
 export CLOAKBROWSER_BINARY_PATH="$EXPECTED_CLOAK_BINARY"
 
 export PARTSOUQ_HOME="$PROJECT_ROOT"
 export PSQ_CLOAK_PYTHON="$RELEASE_DIR/cloak-venv/bin/python"
 export PSQ_CLOAK_LAUNCHER=""
-export PSQ_LIMIT_PARTS=0
-export PSQ_BOUNDED_PARTS=10000
+export PSQ_LIMIT_PARTS=$DATASET_LIMIT_PARTS
+export PSQ_BOUNDED_PARTS=$DATASET_BOUNDED_PARTS
 export PSQ_START_BRAND=""
 export PSQ_LIMIT_BRANDS=0
 export PSQ_LIMIT_MODELS=0

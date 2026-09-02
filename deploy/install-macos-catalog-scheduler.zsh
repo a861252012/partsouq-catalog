@@ -138,6 +138,8 @@ CONFIG_ENV=(
   PSQ_MAX_DELAY
   PSQ_MAX_RUN_DAYS
   PSQ_MIN_BRANDS
+  PSQ_LIMIT_PARTS
+  PSQ_BOUNDED_PARTS
   PSQ_BOUNDED_BRAND
   PSQ_BOUNDED_MODEL
   PSQ_VEHICLE_YEAR_WINDOW
@@ -172,7 +174,15 @@ CONFIG_EXPORTS=$(/usr/bin/env -i "${CONFIG_INPUT_ENV[@]}" /bin/zsh -c '
   SCOPE_BRAND=${PSQ_BOUNDED_BRAND:-}
   SCOPE_MODEL=${PSQ_BOUNDED_MODEL:-}
   SCOPE_YEAR_WINDOW=${PSQ_VEHICLE_YEAR_WINDOW:-}
-  if [[ -z "${SCOPE_BRAND//[[:space:]]/}" \
+  DATASET_LIMIT_PARTS=${PSQ_LIMIT_PARTS:-0}
+  DATASET_BOUNDED_PARTS=${PSQ_BOUNDED_PARTS:-10000}
+  if [[ "$DATASET_LIMIT_PARTS" == "0" && "$DATASET_BOUNDED_PARTS" == "0" ]]; then
+    # 全量正式排程：full 與 bounded 互斥，model scope 必須為空。
+    if [[ -n "${SCOPE_BRAND//[[:space:]]/}" || -n "${SCOPE_MODEL//[[:space:]]/}" ]]; then
+      print -u2 "full catalog scheduler refuses non-empty PSQ_BOUNDED_BRAND/PSQ_BOUNDED_MODEL"
+      exit 2
+    fi
+  elif [[ -z "${SCOPE_BRAND//[[:space:]]/}" \
       || -z "${SCOPE_MODEL//[[:space:]]/}" \
       || "$SCOPE_YEAR_WINDOW" != <-> \
       || "$SCOPE_YEAR_WINDOW" -le 0 ]]; then
