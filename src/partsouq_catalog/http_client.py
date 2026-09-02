@@ -409,6 +409,7 @@ class SessionManager:
             if (url_parts.hostname or "").lower() in CATALOG_HOSTS
             and (
                 normalized_path == "/en/catalog/genuine"
+                or normalized_path == "/en/brands-16.html"
                 or normalized_path.startswith("/en/catalog/genuine/")
             )
             else urlunsplit((url_parts.scheme, url_parts.hostname or "", url_parts.path, "", ""))
@@ -623,7 +624,11 @@ class SessionManager:
             or any(segment in {".", ".."} for segment in path_segments)
         ):
             raise RobotsPolicyError(f"ambiguous PartSouq path refused: {parts.path[:100]}")
-        is_catalog_path = parts.path == "/en/catalog" or parts.path.startswith("/en/catalog/")
+        is_catalog_path = (
+            parts.path == "/en/catalog"
+            or parts.path == "/en/brands-16.html"
+            or parts.path.startswith("/en/catalog/")
+        )
         if not is_catalog_path:
             return
         if (
@@ -692,13 +697,16 @@ class SessionManager:
 
     @staticmethod
     def _is_catalog_url(url: str) -> bool:
-        """判斷 URL 是否落在正式 catalog 主機的 /en/catalog 路徑下。
+        """判斷 URL 是否落在正式 catalog 主機的 catalog 路徑下。
 
         只用於決定是否對被挑戰的請求啟用瀏覽器抓取後備：非 catalog 的
-        請求（robots.txt、圖片等）不應走這條路。"""
+        請求（robots.txt、圖片等）不應走這條路。品牌總覽頁也列入
+        （它是 full crawl 的品牌來源，被挑戰時同樣需要瀏覽器後備）。"""
         parts = urlsplit(url)
         return (parts.hostname or "").lower() in CATALOG_HOSTS and (
-            parts.path == "/en/catalog" or parts.path.startswith("/en/catalog/")
+            parts.path == "/en/catalog"
+            or parts.path == "/en/brands-16.html"
+            or parts.path.startswith("/en/catalog/")
         )
 
     @staticmethod

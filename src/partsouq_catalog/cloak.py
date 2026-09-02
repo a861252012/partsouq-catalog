@@ -754,6 +754,7 @@ def fetch_page(url: str, *, timeout_seconds: float = PAGE_FETCH_TIMEOUT_SECONDS)
             f"MARKER = {str(marker_file)!r}\n"
             "IDENTITY_KEYS = {\n"
             "    '/en/catalog/genuine': (),\n"
+            "    '/en/brands-16.html': (),\n"
             "    '/en/catalog/genuine/locate': ('c',),\n"
             "    '/en/catalog/genuine/pick': ('c', 'model'),\n"
             "    '/en/catalog/genuine/vehicle': ('c', 'vid'),\n"

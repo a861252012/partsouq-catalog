@@ -421,7 +421,10 @@ def public_source_url(url: str) -> str:
         raise ValueError("evidence source URL contains unsupported authority components")
     canonical_path = parts.path.rstrip("/") or "/"
     if not (
-        canonical_path == "/en/catalog/genuine" or canonical_path.startswith("/en/catalog/genuine/")
+        canonical_path == "/en/catalog/genuine"
+        # 站方品牌總覽頁（full crawl 的品牌來源，robots 允許）
+        or canonical_path == "/en/brands-16.html"
+        or canonical_path.startswith("/en/catalog/genuine/")
     ):
         raise ValueError("evidence source URL must be a genuine catalog path")
     query = [

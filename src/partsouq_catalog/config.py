@@ -19,6 +19,7 @@ type Cookies = list[Cookie]
 
 class SiteConfig(TypedDict):
     base: str
+    brands: str
     genuine: str
     locate: str
     pick: str
@@ -94,6 +95,9 @@ DB_CONFIG = {
 SITE: SiteConfig = {
     "base": "https://partsouq.com",
     "genuine": "https://partsouq.com/en/catalog/genuine",
+    # 站方品牌總覽頁（首頁側欄只是浮動子集；2026-09 實測總覽頁 18 廠牌、
+    # 首頁只列 16 個且缺 Toyota/Kia）。full crawl 的品牌來源以此為主。
+    "brands": "https://partsouq.com/en/brands-16.html",
     "locate": "https://partsouq.com/en/catalog/genuine/locate?c={brand}",
     "pick": "https://partsouq.com/en/catalog/genuine/pick?c={brand}&model={model}&ssd={ssd}",
     "vehicle": "https://partsouq.com/en/catalog/genuine/vehicle?c={brand}&ssd={ssd}&vid={vid}&q=",

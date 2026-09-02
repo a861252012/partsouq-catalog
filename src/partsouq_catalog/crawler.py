@@ -607,32 +607,53 @@ class Crawler:
         )
 
     def _brands(self) -> list[ParsedRecord]:
-        """從首頁取得品牌清單。"""
-        # 首頁是唯一直接使用主 SessionManager 的請求；其餘頁面都走
-        # _get_response。lazy cookie bootstrap 後，這裡也必須先檢查
-        # freshness，且此時 Crawler.run 已提交 running marker。
-        self.http.ensure_fresh()
-        response = self.http.get_response(SITE["genuine"])
-        html = response.text
+        """取得品牌清單：站方品牌總覽頁優先，首頁側欄為後備。
+
+        /en/brands-16.html 列出站方支援的全部品牌；首頁側欄只是浮動
+        子集（2026-09 實測 16 個且缺 Toyota/Kia），只依賴首頁會讓
+        full run 永遠爬不到完整品牌面。總覽頁失效（挑戰／404／解析
+        0 筆）時退回首頁側欄，維持 fail-closed。
+        """
         from .parsers import parse_brands
 
-        brands, malformed = parse_brands(html, diagnostics=True)
-        if malformed:
-            raise RuntimeError(
-                f"brand index contains {malformed} malformed canonical link(s); "
-                "refusing partial catalog"
-            )
-        self._guard_parse(html, brands, "brands", "genuine index")
+        last_error: Exception | None = None
+        for url, context in (
+            (SITE["brands"], "brands index"),
+            (SITE["genuine"], "genuine index"),
+        ):
+            # 首頁是唯一直接使用主 SessionManager 的請求；其餘頁面都走
+            # _get_response。lazy cookie bootstrap 後，這裡也必須先檢查
+            # freshness，且此時 Crawler.run 已提交 running marker。
+            try:
+                self.http.ensure_fresh()
+                response = self.http.get_response(url)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                log.warning("brand source %s fetch failed: %s", context, exc)
+                continue
+            html = response.text
 
-        self._capture_http_evidence(
-            response,
-            page_type="genuine",
-            parser_name="parse_brands",
-            parser_context={},
-            live_records=brand_record_evidence(brands),
-            malformed_rows=malformed,
-        )
-        return brands
+            brands, malformed = parse_brands(html, diagnostics=True)
+            if malformed:
+                last_error = RuntimeError(
+                    f"brand index contains {malformed} malformed canonical link(s); "
+                    "refusing partial catalog"
+                )
+                log.warning("brand source %s rejected: %s", context, last_error)
+                continue
+            self._guard_parse(html, brands, "brands", context)
+
+            self._capture_http_evidence(
+                response,
+                page_type="genuine",
+                parser_name="parse_brands",
+                parser_context={},
+                live_records=brand_record_evidence(brands),
+                malformed_rows=malformed,
+            )
+            return brands
+        assert last_error is not None
+        raise last_error
 
     def _check_capacity(self, run_key: str) -> None:
         """在網路請求前記錄已知工作的最低容量需求。
