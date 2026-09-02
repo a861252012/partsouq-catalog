@@ -68,6 +68,7 @@ CATALOG_MANIFEST = (
     (38, "038_vncs_source_identity_upsert.sql", "c0a336f266db25475145c31a8186299e6cdc0fd440e59f2e3f40862c62c0fb66"),
     (39, "039_formal_full_snapshot_switch.sql", "3e3780bf5a690f32e16320a1edb243aef2a808e1b8a31cd7af5a8920b2dac919"),
     (40, "040_vin_resolved_uids.sql", "6c6c35ac583febc18fda31be329eefd77051649070bc89be4093ad5cc62319cb"),
+    (41, "041_brands_overview_evidence_url.sql", "54a3dfbe56c7db978b66fb08d1e8e349b2b0114b6a76b831f0f44cdb81ae22f6"),
 )
 # fmt: on
 ACTIVE_VERSIONS = tuple(
