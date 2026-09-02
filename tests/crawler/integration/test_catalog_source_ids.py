@@ -356,7 +356,12 @@ def test_full_candidate_archive_preserves_source_ids_without_formal_mapping() ->
         assert snapshot is not None
         for key, value in expected.items():
             assert snapshot[key] == value
-        assert current_view is None
+        # migration 039 切換閘：本測試的 full run 已滿足
+        # 「success、證據已封存、daemon completed exit=0、單一 linked crawl」，
+        # current view 讀全量快照，輸出與 published_parts 相同的身分欄位。
+        assert current_view is not None
+        for key, value in expected.items():
+            assert current_view[key] == value
         assert mapping_view is None
     finally:
         database.rollback()

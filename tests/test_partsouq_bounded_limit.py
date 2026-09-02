@@ -3530,9 +3530,13 @@ def test_mysql_full_candidate_archive_requires_verified_evidence() -> None:
             (scheduled_job_run_id,),
         )
         database.commit()
+        # migration 039 切換閘：published 來自同一筆 full run（success、
+        # 證據已封存、daemon completed exit=0、單一 linked crawl）時，
+        # v_current_catalog_parts 改讀全量快照——published 的 1 筆在此
+        # 全部條件成立後輸出。
         assert database._execute(
             "SELECT COUNT(*) AS row_count FROM v_current_catalog_parts"
-        ).fetchone() == {"row_count": 0}
+        ).fetchone() == {"row_count": 1}
         expected_snapshot = database._execute(
             "SELECT part_number, part_name, code FROM published_parts"
         ).fetchone()
@@ -3735,9 +3739,11 @@ def test_mysql_full_candidate_archive_requires_verified_evidence() -> None:
             (resumed_job_id,),
         )
         database.commit()
+        # migration 039 切換閘：resumed 的 full 快照（success、證據已封存、
+        # daemon completed exit=0、單一 linked crawl）在此成為 current view。
         assert database._execute(
             "SELECT COUNT(*) AS row_count FROM v_current_catalog_parts"
-        ).fetchone() == {"row_count": 0}
+        ).fetchone() == {"row_count": 1}
     finally:
         database.rollback()
         _clear_mysql_fixture(database)

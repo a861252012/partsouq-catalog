@@ -4,7 +4,7 @@
 -- 解碼抵達的車輛設定（uid）。本表記錄「已知 VIN -> 解出的 uid」，補爬時
 -- 只抓 groups_t 尚缺的 (vehicle, cid, uid)，避免重複抓已覆蓋的組。
 
-CREATE TABLE vin_resolved_uids (
+CREATE TABLE IF NOT EXISTS vin_resolved_uids (
     id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     vin             CHAR(17)        NOT NULL,
     brand           VARCHAR(64)     NOT NULL,
