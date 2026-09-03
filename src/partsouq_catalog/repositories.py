@@ -644,7 +644,7 @@ class PartRepository:
         閘門排除的列則會讓 receipt 保持 partial 或整組失敗。兩者都用
         quarantine 表追蹤，站方修正來源後，下次 run 會重新判定。
 
-        resolved_at / resolution（migration 012）供運維標記處置狀態：
+        resolved_at / resolution（migration 012）供維運標記處置狀態：
         管理員核對後可填寫，作為審計紀錄；純紀錄用途，不影響流程。
 
         以 (group_id, part_number, range_str, reason) 為唯一鍵，重複發現
@@ -913,7 +913,7 @@ class CrawlRepository:
         return rows if rows is not None else []
 
     def count_quarantined(self, run_key: str = "") -> int:
-        """回傳指定 run 列進 part_quarantine 的料號列數（供運維查詢）。
+        """回傳指定 run 列進 part_quarantine 的料號列數（供維運查詢）。
 
         無名稱純料號列是「忽略 + 紀錄」政策（使用者決定）：quarantine
         表是完整紀錄，不阻擋任何發布 gate。resolved_at 已填的列視為

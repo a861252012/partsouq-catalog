@@ -3,7 +3,7 @@
 # 啟用/更新 com.partsouq.vncs-scheduler LaunchAgent（VNCS 汽柴油車籍同步）。
 # 與 catalog scheduler 各自持有不同 job 的鎖，兩者可並存。
 #
-# launchd 沒有使用者的 Desktop／文件夾 TCC 權限，因此 runtime 以 git archive
+# launchd 沒有使用者的 Desktop／資料夾 TCC 權限，因此 runtime 以 git archive
 # stage 到 ~/Library/Application Support 下的 release 目錄執行，不直接跑
 # repo 工作樹；Playwright 瀏覽器續用 ~/Library/Caches/ms-playwright。
 

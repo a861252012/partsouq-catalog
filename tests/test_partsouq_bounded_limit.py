@@ -3880,7 +3880,7 @@ def test_mysql_full_publish_rejects_group_receipt_inconsistency() -> None:
 def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
     """「忽略 + 紀錄」政策（使用者決定）：quarantine 列是紀錄、不阻擋
     發布 —— 組照常標 done、進 fetched map；count_quarantined 可供
-    運維查詢（resolved_at 填上後不再計入）。"""
+    維運查詢（resolved_at 填上後不再計入）。"""
     if not str(DB_CONFIG["database"]).endswith("_test"):
         raise ValueError("UNIFIED_TEST_MYSQL requires a database name ending in _test")
 
@@ -3916,7 +3916,7 @@ def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
         run_key = "bounded-mysql-gate"
         database.commit()
 
-        # 組含無名稱列：quarantine 記錄 + 照常標 done（不阻擋發布）
+        # 組含無名稱列：quarantine 紀錄 + 照常標 done（不阻擋發布）
         parts.quarantine_parts(group_id, run_key, [_parts(1)[0]])
         crawl.mark_group_fetched(group_id, run_key, status="done", row_count=1)
         database.commit()
@@ -3924,7 +3924,7 @@ def test_mysql_quarantine_records_nameless_rows_without_blocking() -> None:
         assert crawl.fetched_group_map(vehicle_id, run_key) == {("1", "1101", "10001"): 1}
         assert crawl.is_group_fetched(vehicle_id, "1101", "10001", run_key) is True
 
-        # 運維標記處置：resolved_at 填上後 count_quarantined 不再計入
+        # 維運標記處置：resolved_at 填上後 count_quarantined 不再計入
         database._execute(
             "UPDATE part_quarantine SET resolved_at = NOW(), resolution = %s WHERE group_id = %s",
             ("verified removed from site", group_id),

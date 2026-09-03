@@ -276,7 +276,7 @@ class SessionManager:
         # 刷新（見 ensure_fresh / get 的處理）。
         self.no_browser = no_browser
         # 連線池與重試設定：見模組文件說明。SOL P1：adapter 層
-        # max_retries=0 —— 重試統一由 get() 的迴圈控制，每次迭代都會
+        # max_retries=0 —— 重試統一由 get() 的迴圈控制，每次疊代都會
         # 重新 acquire 全域時槽，否則 urllib3 層的重試會繞過限流。
         self._mount_adapter()
         self.cookies: Cookies | None = cookies
@@ -492,7 +492,7 @@ class SessionManager:
                             _response_envelope(r, url, text, attempt),
                         )
                     # 其餘 catalog 頁面轉址維持 fail-closed：不跟隨、不猜
-                    # 測語意。錯誤訊息附上 Location 供運維判讀站方正規化
+                    # 測語意。錯誤訊息附上 Location 供維運判讀站方正規化
                     # 行為。
                     raise RobotsPolicyError(
                         f"catalog redirect refused at {safe_url} -> {location}",
@@ -547,7 +547,7 @@ class SessionManager:
                 refresh_failures = 0
                 refresh_successes += 1
                 # F4 修復：刷新成功不消耗 attempt 預算 —— 保證下一輪
-                # 迭代用新 cookie 發 follow-up 請求（舊碼最後一次
+                # 疊代用新 cookie 發 follow-up 請求（舊碼最後一次
                 # attempt 刷新成功後沒有第 6 次請求，直接拋舊錯誤）。
                 attempt -= 1
                 time.sleep(2 + random.random() * 3)

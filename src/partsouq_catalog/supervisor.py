@@ -317,7 +317,7 @@ class Supervisor:
                 )
 
             for pid in others:
-                # 診斷：被殺的進程是什麼（完整命令 + PPID）
+                # 診斷：被殺的程序是什麼（完整命令 + PPID）
                 try:
                     diag = subprocess.run(
                         ["ps", "-o", "ppid=,command=", "-p", str(pid)],
@@ -569,7 +569,7 @@ class Supervisor:
         瀏覽器刷新是 crawler 子程序自己的職責（http_client 的
         ensure_fresh 在每個請求前檢查、403 時觸發 refresh_session，
         single-flight 保證併發 worker 不會重複刷新）。supervisor
-        若在這裡呼叫 get_session() 刷新，會與 crawler 進程各自持有一份
+        若在這裡呼叫 get_session() 刷新，會與 crawler 程序各自持有一份
         空的 session 狀態，兩邊同時把同一隻 CloakBrowser 當成
         「stale browser」互相殺掉重啟 —— 永遠無法進入正常爬取。
         """

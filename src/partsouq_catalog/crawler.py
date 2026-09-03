@@ -245,7 +245,7 @@ def _group_closure_mismatches(
 class Crawler:
     """爬蟲服務：一趟完整的全站爬取（可續爬、多工並行）。
 
-    依賴注入的組件：
+    依賴注入的元件：
     - http  ：HTTP 傳輸 + Cookie 管理（基礎設施層）
     - db    ：MySQL 連線管理（基礎設施層，僅用於 commit 交易）
     - 其餘  ：各 Repository（資料存取層）
@@ -1834,7 +1834,7 @@ class Crawler:
         # 三輪 run 位元組級重現）。HTTP 200 且 0 malformed —— 這是站方
         # 的合法「此組無零件」，只標 group done，不得讓整輪 run 失敗。
         if not parts and not malformed and has_empty_parts_table(html):
-            # 身分斷言：空表殼页也可能是「同 URL 回傳別的頁面」（/locate
+            # 身分斷言：空表殼頁也可能是「同 URL 回傳別的頁面」（/locate
             # 轉址頁若剛好含表殼、或站方回錯內容），receipt 前必須驗明正身。
             self._assert_expected_unit(html, group)
             log.info(

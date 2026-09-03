@@ -202,7 +202,7 @@ done」只剩清收據全量重爬一條路，那會換掉整份快照又違反�
 最後重裝 LaunchAgent（ed7f12c release，間隔維持 30 天）。daemon 依間隔判定
 不會立即觸發——最後一筆 daemon catalog job 5831 距今不到 30 天，下次排程在
 09-29 前後。啟動後 `scheduled_job_runs` 無新記錄、無 running、stderr 無新
-錯誤。stdout 是 Python 緩衝所以暫時看不到新行，process 持續運行即可確認
+錯誤。stdout 是 Python 緩衝所以暫時看不到新行，process 持續執行即可確認
 沒有 crash loop。
 
 本輪結束時的正式狀態：migration 036 已套用、receipt 契約生效（402 done＋

@@ -517,7 +517,7 @@ GPT5.6 SOL MAX 覆核 `ff66574` 後指出 2 個 P1 + 3 個 P2 + P3 文件；
   組照常標 `done`（進 fetched map、同 run 不重抓、正常發布）。
 - 移除 `count_partial_groups` 與三個發布 gate（bounded 早收、bounded
   收尾、full success 的 partial/quarantine/remaining_group_count 檢查）；
-  `count_quarantined` 保留為運維查詢（`resolved_at` 填上後不再計入）。
+  `count_quarantined` 保留為維運查詢（`resolved_at` 填上後不再計入）。
 - `fetched_group_map()` / `is_group_fetched()` 恢復單純以
   `fetched_run_key` 判斷（不再排除 partial，partial 不再產生）。
 - migration 011/012 的註解同步更新（partial 為歷史設計；resolved_at /

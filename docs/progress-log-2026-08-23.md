@@ -374,7 +374,7 @@
    可用），code/text 留存於 error_code/error_text/payload_json。
    實證：42+ 筆入庫，含 sparse 與 code=1 案例。失敗者為 NHTSA 完全無
    申報的台灣專屬車（由 VNCS 自身 make/model/cc 兜底，設計內）。
-4. **運維教訓**：admin_crawl_requests 完成時會遮罩 VIN（隱私設計）——
+4. **維運教訓**：admin_crawl_requests 完成時會遮罩 VIN（隱私設計）——
    重試須從源頭表 tw_vncs_vehicles 重新取 VIN，不可重用舊列；
    queue-scheduler/admin 容器映像必須隨碼重建，否則對新 ledger crash-loop。
 5. **VNCS 全量**：汽油車 686 頁全量入庫成功；柴油首輪因連續高頻請求後
@@ -408,7 +408,7 @@ next brand」）。就驗收而言成立（精確 10,000＋evidence verified＋�
 (a) 直接啟動全量 crawl（LaunchAgent 已具備，改 interval/一次性觸發）
 (b) 先以現有 10k 完成 C1-C2-D2 工具鏈，全量資料到位後重跑。
 
-## 2026-08-24（工作階段6）全量 crawl 正式啟動與運維配置
+## 2026-08-24（工作階段6）全量 crawl 正式啟動與維運配置
 
 **使用者決策**：直接啟動全量 crawl（選項 a）；要求詳細記錄實際完成時間並於
 完成時報告；硬碟保底 50GB，接近即自動停止。

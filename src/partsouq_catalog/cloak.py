@@ -278,7 +278,7 @@ def _launch_cloak(script_override: str | None = None) -> bool:
 
     子程序腳本負責：驅動 CloakBrowser 前往目標頁面、驗證型錄結構，
     最後把已驗證頁面的 session cookie 匯出成 JSON 檔案。
-    不再仰賴 agent-browser 的常駐 daemon（其長時間運行曾造成
+    不再仰賴 agent-browser 的常駐 daemon（其長時間執行曾造成
     cookie 匯出不穩定的問題）。
     """
     global _browser_err_log, _browser_proc
@@ -1197,7 +1197,7 @@ def login_to_partsouq() -> bool:
     （與 _refresh_impl 相同的 export_file 機制，供 save_cookies 持久化）。
 
     注意：表單欄位選擇器與等待條件依站方登入頁實際結構而定，本函式在
-    凍結發布包（cloak-venv 内含 cloakbrowser）環境下才能實際執行，開發
+    凍結發布包（cloak-venv 內含 cloakbrowser）環境下才能實際執行，開發
     期單元測試不觸及瀏覽器。回傳是否登入成功（匯出含登入態 cookie）。
     """
     global _browser_err_log, _browser_proc

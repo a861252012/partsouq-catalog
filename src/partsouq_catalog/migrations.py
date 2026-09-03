@@ -39,7 +39,7 @@ CATALOG_MANIFEST = (
     (9, "009_bounded_production_dataset.sql", "6aa35e72a6b5d4dc3bce1c0dad58266406bc6918965cb69bae1ddef222625bc3"),
     (10, "010_group_uid_identity.sql", "043601d84cd39b1cc75650940012adbc5535ac6360c59e6c54247e80c5e69cb3"),
     (11, "011_part_quarantine.sql", "6640ad784cc61350d6c72d840dbc98a12086d9fd0475e02e5c6124a2e81a3fee"),
-    (12, "012_part_quarantine_resolution.sql", "2b1d6da3ed387dbc215a7032667291c8c75db05ae56ac0f46c12575a42b21280"),
+    (12, "012_part_quarantine_resolution.sql", "d7bc34841dc62850e30b7c89a18395c69561031a0c9884bd1f42d12535937dc4"),
     (13, "013_part_quarantine_run_key_updated_index.sql", "a131023995543a4408f415b9d518e6455c65a5abff27c8479ff4c3cfe0ee9d10"),
     (14, "014_part_quarantine_run_key_resolved_updated_index.sql", "1bf0828d5a5cf0ecf9510e57cc14b8daad583b3f372795ba7bb8b870c3ad41a5"),
     (15, "015_quarantine_index_contract_cleanup.sql", "f6018b0d488462cb9c9ec229975b8a22c49208786164c4cc21d289027c5c80af"),

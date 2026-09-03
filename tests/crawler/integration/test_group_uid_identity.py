@@ -525,7 +525,7 @@ def test_identity_cache_path_matches_no_cache_path() -> None:
         database.commit()
 
         # 5) 全新 preload 與快取路徑在「真實存在的列」上一致；唯一差異是
-        # 快取在升級後保留 ("", uid) 的 stale 項目（文件已註明無害）。
+        # 快取在升級後保留 ("", uid) 的 stale 項目（檔案已註明無害）。
         fresh = vehicles.preload_group_identity(category_id)
         assert fresh.image_by_uid == identity.image_by_uid
         for key, row_id in fresh.by_key.items():
