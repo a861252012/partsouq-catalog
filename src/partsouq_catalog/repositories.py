@@ -63,7 +63,11 @@ _EVIDENCE_PARENT_TYPE = {
 _EVIDENCE_PAGE_PARSERS = {
     ("genuine", "parse_brands"),
     ("locate", "parse_brand_index"),
+    # pick 頁有兩種用法：型號下的車型清單（parse_vehicles），以及
+    # locate 入口被 301 正規化後、brand 層改抓的型號清單
+    # （parse_brand_index，實證 Toyota）。
     ("pick", "parse_vehicles"),
+    ("pick", "parse_brand_index"),
     ("vehicle", "parse_category_links"),
     ("vehicle", "parse_groups"),
     ("category", "parse_groups"),

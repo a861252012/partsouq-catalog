@@ -131,6 +131,12 @@ class NotFoundError(Exception):
 class RobotsPolicyError(Exception):
     """代表 robots.txt 無法確認允許正式 catalog 請求。"""
 
+    def __init__(self, message: str, *, redirect_location: str = "") -> None:
+        super().__init__(message)
+        # catalog 內部轉址被拒時附上 Location，讓呼叫端能辨識站方
+        # 正規化行為（例：locate?c=Toyota -> /catalog/toyota）。
+        self.redirect_location = redirect_location
+
 
 @dataclass
 class VinUnit:
@@ -488,7 +494,10 @@ class SessionManager:
                     # 其餘 catalog 頁面轉址維持 fail-closed：不跟隨、不猜
                     # 測語意。錯誤訊息附上 Location 供運維判讀站方正規化
                     # 行為。
-                    raise RobotsPolicyError(f"catalog redirect refused at {safe_url} -> {location}")
+                    raise RobotsPolicyError(
+                        f"catalog redirect refused at {safe_url} -> {location}",
+                        redirect_location=location,
+                    )
                 if not (200 <= r.status_code < 300):
                     # 其他非 2xx（500/502...）不該被當成成功頁面，重試
                     last_err = requests.RequestException(f"http {r.status_code} at {safe_url}")

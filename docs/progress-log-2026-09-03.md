@@ -138,3 +138,28 @@ check 綠。
 監督 full run 收斂：爬完 18 個品牌後 run 44 應以 success 收尾，
 屆時 039 的 full_ready 閘放行全量 snapshot。VIN 補爬維持擱置，
 等有 reCAPTCHA 解法再說。
+
+## 收攤：案子停止，爬取終止
+
+下午把 Toyota 的 redirect 問題查透了：站方把
+`locate?c=Toyota` 永久 301 到品牌著陸頁 `/catalog/toyota`，那頁
+沒有型號清單（0 個 pick 錨點），品牌層重試會無限失敗。同一份
+型號清單在 `pick?c=Toyota` 可取得（275 個型號、0 malformed），
+修復已寫好——locate 撞這種 301 時改抓 pick 層，解析契約原樣
+複用。
+
+修到這裡，整條 full run 的路徑上已經累積了太多站方行為的
+例外處理：首頁品牌清單浮動、brands 總覽頁要另外抓、URL 約束
+跟著改、evidence 預算要調、 Toyota 的 locate 又被 301。每一
+項都修得起，但站方行為不受我們控制，下次正常化改版又是新一
+輪。加上 VIN 補爬被 reCAPTCHA 擋死，專案決定停損：full crawl
+不繼續，正式資料維持 Lexus／Nissan／Toyota 三品牌約 388.9 萬
+筆 parts。
+
+收攤狀態：
+
+- LaunchAgent 已 bootout，plist 也移除了，重啟電腦不會復活。
+- crawl_run 44 停在 running 殘留；沒有排程器在跑，不會有人
+  動它。殘留 marker 依 900 秒回收規則留著無妨。
+- Toyota pick 後備修復連同測試 commit 備查，未部署。
+- 正式庫 migration 041 已套用，`migrations check` 綠。

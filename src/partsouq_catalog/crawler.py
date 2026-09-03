@@ -167,6 +167,28 @@ def _brand_from_url(url: object) -> str | None:
         return None
 
 
+def _is_brand_landing_redirect(location: str) -> bool:
+    """判斷轉址目標是否為站方品牌著陸頁（/catalog/<單段 slug>）。
+
+    實證 2026-09-02：locate?c=Toyota 被 301 永久正規化為
+    https://partsouq.com/catalog/toyota。著陸頁同域、路徑恰一段、
+    無 query 與 fragment；不符任何一項都視為可疑轉址，維持
+    fail-closed 由呼叫端直接拋出。
+    """
+    if not location:
+        return False
+    target = urllib.parse.urlsplit(location)
+    slug = target.path[len("/catalog/") :] if target.path.startswith("/catalog/") else ""
+    return (
+        target.scheme in ("", "https")
+        and target.netloc in ("", "partsouq.com")
+        and bool(slug)
+        and "/" not in slug
+        and target.query == ""
+        and target.fragment == ""
+    )
+
+
 def _group_closure_mismatches(
     known_codes: dict[str, set[str]],
     parsed_groups: list[ParsedRecord],
@@ -690,7 +712,26 @@ class Crawler:
         這趟是否真的全站成功。
         """
         locate_url = SITE["locate"].format(brand=urllib.parse.quote(brand))
-        html, response = self._fetch(locate_url)
+        try:
+            html, response = self._fetch(locate_url)
+        except RobotsPolicyError as error:
+            # 站方會把部分品牌的 locate 入口 301 正規化為品牌著陸頁
+            # （實證 2026-09-02：locate?c=Toyota -> /catalog/toyota，
+            # 301 永久轉址）。著陸頁沒有型號清單（0 個 pick 錨點），
+            # 無法解析；同層的 pick?c={brand}（不帶 model）才是同一份
+            # 型號清單，parse_brand_index 原樣可用。其餘轉址維持
+            # fail-closed。
+            landing = getattr(error, "redirect_location", "")
+            if not _is_brand_landing_redirect(landing):
+                raise
+            log.info(
+                "[%s] locate 入口被正規化為品牌著陸頁；改抓 pick 層型號清單",
+                brand,
+            )
+            pick_index_url = "https://partsouq.com/en/catalog/genuine/pick?c=" + urllib.parse.quote(
+                brand
+            )
+            html, response = self._fetch(pick_index_url)
         models, malformed = parse_brand_index(html, brand, diagnostics=True)
         if malformed:
             raise RuntimeError(
@@ -699,9 +740,17 @@ class Crawler:
         self._guard_parse(html, models, "models", brand)
 
         if response is not None:
+            # 後備路徑實際抓的是 pick 層清單頁，page_type 依最終 URL
+            # 如實記錄，證據鏈的 page_type 才不會與 public_source_url
+            # 矛盾。
+            page_type = (
+                "pick"
+                if urllib.parse.urlsplit(response.final_url).path.endswith("/genuine/pick")
+                else "locate"
+            )
             self._capture_http_evidence(
                 response,
-                page_type="locate",
+                page_type=page_type,
                 parser_name="parse_brand_index",
                 parser_context={"brand": brand},
                 live_records=model_record_evidence(brand, models),
