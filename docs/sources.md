@@ -27,7 +27,7 @@ catalog 請求仍先檢查 robots.txt 與 origin（fail-closed），不跟隨 re
 目前 Compose image 已安裝 CloakBrowser runtime、Chromium 與 Xvfb 顯示
 環境，容器內以 `xvfb-run` 啟動。browser readiness marker 只證明瀏覽器已啟動，不能證明
 型錄頁或 cookie 可被 HTTP transport 接受；原生 host 的 Python venv 路徑不能在 container 中使用。
-目前本機 PartSouq 正式排程走受限於 Aqua session 的 host LaunchAgent；Linux
+本機 PartSouq 正式排程曾走受限於 Aqua session 的 host LaunchAgent（2026-09-03 收攤後已停止並移除）；Linux
 Compose scheduler 保留 fail-closed，需先通過相同 live smoke 才能取代 host 路徑。
 
 NHTSA vPIC 不提供可列舉的完整 VIN 名冊。完整 VIN 僅能由合法持有者提供後送交官方 `DecodeVinValues` 解碼；bulk complaints 內的 11 碼 VIN 欄位不會被當成完整 VIN。

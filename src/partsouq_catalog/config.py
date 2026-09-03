@@ -24,7 +24,6 @@ class SiteConfig(TypedDict):
     locate: str
     pick: str
     vehicle: str
-    unit: str
 
 
 class CloakConfig(TypedDict):
@@ -101,7 +100,6 @@ SITE: SiteConfig = {
     "locate": "https://partsouq.com/en/catalog/genuine/locate?c={brand}",
     "pick": "https://partsouq.com/en/catalog/genuine/pick?c={brand}&model={model}&ssd={ssd}",
     "vehicle": "https://partsouq.com/en/catalog/genuine/vehicle?c={brand}&ssd={ssd}&vid={vid}&q=",
-    "unit": "https://partsouq.com/en/catalog/genuine/unit?c={brand}&ssd={ssd}&vid={vid}&cid={cid}&uid={uid}&q=",
 }
 
 # 站方登入憑證（VIN 搜尋 /locate 需要登入才會回結果，匿名會被導去

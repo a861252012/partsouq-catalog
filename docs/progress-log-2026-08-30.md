@@ -50,7 +50,7 @@ scope。因此舊 10,000 筆 snapshot 套用後會被刻意隱藏；這不是原
   Trim 不會由 PartSouq 猜填。
 - VIN 與 PartSouq 車款 mapping、VIN 零件 fitment 只有在來源欄位與人工確認條件
   都符合時才會出現。不能把品牌相同當成已確認 mapping。
-- raw full crawl 不具備本次 bounded evidence 契約，不能宣稱為正式發布資料。
+- raw full crawl 不具備本次 bounded evidence 契約，不能宣稱為正式發布資料（補註：2026-09-01 起 full run 已有同規格證據契約，見 migration 039）。
 
 ## 本次驗證
 

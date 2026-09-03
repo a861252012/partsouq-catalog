@@ -112,16 +112,16 @@ docker compose up -d mysql
 ```
 
 runner 會以固定 manifest 從 001 開始檢查並重播尚未記錄的 active migration
-（001–012、015–036），不靠人工猜測既有 volume 的版本。013／014 已被 015
+（001–012、015–041），不靠人工猜測既有 volume 的版本。013／014 已被 015
 取代，不會在新升級執行。
 migration 019 會讓正式 bounded view fail closed：除了精確 10,000 筆與成功的
 daemon provenance，還必須有已 seal 的 live HTTP evidence、六種頁面類型與逐筆
 accepted part coverage；resume 的每個 scheduler attempt 也必須符合各自的 daemon
 狀態與擷取時間窗。沒有 evidence 或只有 fixture evidence 的資料仍可供原始
 診斷查詢，但不會出現在正式後台 view 或 VIN mapping。
-這個 evidence gate 目前只涵蓋 bounded 10,000；既有 full snapshot 分支仍只有
-scheduler provenance，尚未保存同級 live HTTP evidence，不在本次 10,000 筆正式
-驗收範圍，也不能據此宣稱 full crawl 已完成 live evidence 驗證。
+這個 evidence gate 涵蓋 bounded 10,000 與 full run：兩者都以同規格的 live
+HTTP evidence 驗收（migration 039 的 full_ready 閘只在合格全量 archive
+出現時才切換正式輸出）。
 migration 020 會把 sanitizer 版本記到每筆 HTTP artifact；不相容的舊證據會
 自動改為 rejected，排程也會建立新的 bounded run，不把不同 sanitizer 版本
 混成同一份正式驗收 manifest。
@@ -277,7 +277,8 @@ host 路徑。browser readiness marker 只代表瀏覽器已啟動，不代表 C
 challenge 已通過；只有實際型錄頁出現完整品牌連結後才接受並保存 session cookie。
 2026-08-22 實測同一網路下，Linux/Xvfb image 仍停在 challenge（0 個品牌連結），
 macOS host 則取得 18 個品牌連結，且 cookie 交給 HTTP client 後可讀回完整型錄頁。
-因此目前本機正式 PartSouq 排程應使用 Aqua LaunchAgent 在 host 執行；Compose
+因此本機正式 PartSouq 排程使用 Aqua LaunchAgent 在 host 執行（2026-09-03
+收攤後已停止並移除）；Compose
 `scheduler` 只保留給未來已通過相同 smoke 的 Linux 環境，不得只以 browser ready
 或 cookie 檔存在就啟動 10,000 筆驗收。
 
@@ -303,9 +304,9 @@ free browser checksum 後，runner 才以內部固定 binary path 啟動；這�
 覆寫；binary resolve 後必須位於 dedicated cache 的 `chromium-*` 非 Pro 版本目錄。
 checksum 不符的目標 free version 會移到 owner-only quarantine，再由
 hash-locked CloakBrowser 重新下載及複驗，其他 cache 不會被刪除。正式排程硬性要求既有
-`partsouq_catalog`，並覆寫為
-`PSQ_LIMIT_PARTS=0` 與 `PSQ_BOUNDED_PARTS=10000`，不能被舊 sample 設定或
-`_test` DB 降級。cookie／refresh lock 與 scheduler lock 固定共用上述
+`partsouq_catalog`。`PSQ_LIMIT_PARTS`／`PSQ_BOUNDED_PARTS` 由 `.env` 帶入
+scheduler.env：預設（或未設）為 bounded 10,000；兩者皆 0 走正式 full
+模式，不能被舊 sample 設定或 `_test` DB 降級。cookie／refresh lock 與 scheduler lock 固定共用上述
 Application Support 目錄，避免不同 checkout 同時啟動瀏覽器或覆寫 cookie。
 
 headed Chromium 必須從 macOS Aqua session 啟動；LaunchAgent 除了
@@ -356,7 +357,8 @@ runner 會在啟動前後重驗固定 binary SHA，但不以額外 daemon 或付
 
 預設排程如下；都可用同名環境變數調整，不需要人工逐次觸發：
 
-- host catalog scheduler：啟動後自動執行正式 10,000 筆 bounded PartSouq crawl，之後每 30 天執行。
+- host catalog scheduler：啟動後自動執行正式 PartSouq crawl（bounded 10,000
+  或 `.env` 指定的 full 模式），之後每 30 天執行。
 - `nhtsa-scheduler`：依序同步 NHTSA bulk 與 allowlist API，完成後每 24 小時執行。
 - `queue-scheduler`：每 30 秒消費 8086 建立的要求；VIN 只處理使用者提供或獲授權的 17 碼值，不枚舉 VIN。
 
@@ -387,9 +389,10 @@ database-scoped named lock，並在每次 commit 前確認 ownership。不同 ch
 
 host catalog scheduler 明確使用 `PSQ_BOUNDED_PARTS=10000` 並覆寫
 `PSQ_LIMIT_PARTS=0`；Compose service 也維持相同資料契約。
-正式 catalog scheduler 必須設定非空白的 `PSQ_BOUNDED_BRAND`、
+bounded 模式的正式 catalog scheduler 必須設定非空白的 `PSQ_BOUNDED_BRAND`、
 `PSQ_BOUNDED_MODEL` 與正整數 `PSQ_VEHICLE_YEAR_WINDOW`；host installer、runner、
-scheduler child 都會在 DB 或瀏覽器啟動前拒絕缺值。Compose 正式預設為
+scheduler child 都會在 DB 或瀏覽器啟動前拒絕缺值。full 模式（兩者皆 0）
+則禁止殘留 brand/model scope。Compose 正式預設為
 `TOYOTA`／`TACOMA`／`20`。首頁與 locate 頁仍完整解析及保存 evidence，
 只在其後挑出唯一目標；找不到或重名會停止。續跑與每月 interval 會比對凍結後的
 年份下限，避免跨年沿用不同 scope。`production_to=NULL` 視為仍在產或未封閉，允許；
@@ -450,7 +453,7 @@ MySQL database，啟動真實 HTTP server，再用本機 Chrome 操作 8086 站�
 驗證範圍包含 PartSouq parser／publish、NHTSA artifact／VIN decode、後台 mapping
 API、年份區間交集、重複資料阻擋，以及站方後台的瀏覽器到 MySQL 寫入生命週期。
 
-目前的契約、驗證範圍與未完成邊界見 [docs/progress-log-2026-08-30.md](docs/progress-log-2026-08-30.md)。歷史測試紀錄見 [docs/verification-2026-08-15.md](docs/verification-2026-08-15.md)。
+目前的契約、驗證範圍與收攤狀態見 [docs/progress-log-2026-09-03.md](docs/progress-log-2026-09-03.md)；bounded 時期契約見 [docs/progress-log-2026-08-30.md](docs/progress-log-2026-08-30.md)。歷史測試紀錄見 [docs/verification-2026-08-15.md](docs/verification-2026-08-15.md)。
 簡報逐項需求邊界見
 [docs/pptx-requirements-audit-2026-08-20.md](docs/pptx-requirements-audit-2026-08-20.md)。
 
