@@ -10,3 +10,7 @@ output/
 outputs/
 data/
 work/
+.env.*
+!*.example
+*.out
+artifacts/
